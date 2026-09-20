@@ -28,6 +28,8 @@ def main():
                     help="COLMAP text model directory; defaults to <dense-dir>/sparse")
     ap.add_argument("--images-dir", required=True, help="dense/images (undistorted images)")
     ap.add_argument("--classes-json", required=True)
+    ap.add_argument("--class-set", choices=("outdoor", "indoor"), default="outdoor",
+                    help="semantic class set used for SAM3 prompts")
     ap.add_argument("--min-votes", type=int, default=1,
                     help="minimum agreeing images before a class is assigned; default 1 keeps single-view classifications")
     ap.add_argument("--tile-size", type=int, default=1008, help="tile size in pixels, should match SAM3's native input size")
@@ -39,7 +41,7 @@ def main():
     model_dir = Path(args.model_dir) if args.model_dir else dense_dir / "sparse"
     with open(args.classes_json, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    class_names = cfg["aussen"]
+    class_names = cfg[args.class_set]
     unknown_id = cfg.get("unknown_class_id", 0)
 
     print(f"[1/5] Loading dense point cloud from {dense_dir / 'fused.ply'}")

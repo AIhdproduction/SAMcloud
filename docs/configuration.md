@@ -29,10 +29,11 @@ stored at `models/sam3.pt` and is excluded from Git.
 
 ## `classes.json`
 
-This file is the ordered semantic prompt list. Its order maps to the existing
-SAM3 class IDs. The LAS exporter maps those IDs to Cyclone-compatible LAS
-codes, including standard ASPRS codes where available and custom codes from 66
-for project-specific classes.
+This file provides separate ordered prompt lists for `outdoor` and `indoor`
+classification. The project setting `classification.class_set` chooses one of
+them before a SAM3 run. The LAS exporter maps the selected IDs to
+Cyclone-compatible LAS codes, including standard ASPRS codes where available
+and custom codes for project-specific classes.
 
 ## `viewer.yml`
 

@@ -3,6 +3,7 @@ model:
   confidence_threshold: 0.4
 
 inference:
+  class_set: outdoor
   image_size: 644
   tile_size_px: 1008
   tile_minimum_overlap: 0.2

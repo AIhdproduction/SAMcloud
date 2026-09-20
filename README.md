@@ -41,7 +41,7 @@ The target workflow is divided into independent stages:
 3. Align images with COLMAP and inspect the sparse point cloud and cameras.
 4. Import ground control points as `name,x,y,z` CSV and mark them in images.
 5. Create a dense COLMAP point cloud.
-6. Run SAM3 semantic classification with multi-view voting.
+6. Select the indoor or outdoor semantic class set and run SAM3 classification with multi-view voting.
 7. Inspect the dense cloud in RGB or class mode and isolate individual classes.
 8. Export classified PLY and LAS data in the chosen coordinate system.
 
@@ -147,3 +147,10 @@ venv\Scripts\python -m pytest
 ## Author and group size
 
 Single-developer project.
+
+## License
+
+SAMcloud is source-available under the [SAMcloud Personal and Educational Use
+License](LICENSE). Private, educational, research, and other noncommercial use
+are permitted. Companies require prior written agreement with the copyright
+holder and a separate commercial license.

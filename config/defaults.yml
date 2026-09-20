@@ -22,3 +22,6 @@ workflow:
   georeferencing_mode: optional
   control_points_enabled: false
   export_format: LAS
+
+classification:
+  class_set: outdoor

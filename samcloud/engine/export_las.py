@@ -24,28 +24,20 @@ PLY_DTYPE = np.dtype(
 # LAS class codes used by Cyclone 3DR. Standard ASPRS classes are used whenever
 # one describes the semantic class. The remaining classes use the Cyclone
 # recommended user-defined range starting at 66.
-CLASSIFICATION_CODES = np.array(
-    [
-        0,   # Unknown/noise -> Unclassified
-        2,   # Ground
-        11,  # Road surface
-        66,  # Sidewalk
-        67,  # Curb
-        3,   # Low vegetation
-        5,   # High vegetation / tree
-        6,   # Building
-        68,  # Vehicle
-        69,  # Construction machinery
-        70,  # Utility pole / streetlight
-        71,  # Traffic sign
-        72,  # Fence / barrier
-        14,  # Wire - conductor
-        73,  # Scaffolding
-        74,  # Construction container / material
-        9,   # Water
-    ],
-    dtype=np.uint8,
-)
+CLASSIFICATION_CODE_SETS = {
+    "outdoor": np.array(
+        [
+            0, 2, 11, 66, 67, 3, 5, 6, 68, 69, 70, 71, 72, 14, 73, 74, 9,
+        ],
+        dtype=np.uint8,
+    ),
+    "indoor": np.array(
+        [
+            0, 2, 75, 6, 76, 77, 78, 79, 80, 81, 82,
+        ],
+        dtype=np.uint8,
+    ),
+}
 
 
 def read_ply_header(path: Path) -> tuple[int, int]:
@@ -78,19 +70,20 @@ def read_ply_header(path: Path) -> tuple[int, int]:
         return source.tell(), vertex_count
 
 
-def load_class_mapping(path: Path, target_crs: str) -> dict[str, object]:
+def load_class_mapping(path: Path, target_crs: str, class_set: str) -> dict[str, object]:
     """Build human-readable metadata from the pipeline class configuration."""
     config = json.loads(path.read_text(encoding="utf-8"))
-    class_names = config["aussen"]
+    class_names = config[class_set]
     source_names = [config.get("unknown_class_name", "Unknown/noise"), *class_names]
     mapping = {
         str(las_code): source_names[source_id]
-        for source_id, las_code in enumerate(CLASSIFICATION_CODES)
+        for source_id, las_code in enumerate(CLASSIFICATION_CODE_SETS[class_set])
     }
     return {
         "classification_field": "classification",
         "coordinate_reference": target_crs,
         "classification_scheme": "Cyclone 3DR / ASPRS LAS 1.4",
+        "semantic_class_set": class_set,
         "class_mapping": mapping,
     }
 
@@ -102,10 +95,16 @@ def export_las(
     chunk_size: int,
     source_crs: str,
     target_crs: str,
+    class_set: str,
 ) -> int:
     payload_offset, vertex_count = read_ply_header(input_path)
     transformer = _create_transformer(source_crs, target_crs)
-    metadata = json.dumps(load_class_mapping(classes_path, target_crs), separators=(",", ":")).encode("utf-8")
+    if class_set not in CLASSIFICATION_CODE_SETS:
+        raise ValueError(f"Unsupported class set: {class_set}")
+    classification_codes = CLASSIFICATION_CODE_SETS[class_set]
+    metadata = json.dumps(
+        load_class_mapping(classes_path, target_crs, class_set), separators=(",", ":")
+    ).encode("utf-8")
 
     header = laspy.LasHeader(point_format=7, version="1.4")
     header.scales = np.array([0.001, 0.001, 0.001])
@@ -143,9 +142,9 @@ def export_las(
             las_points.red = points["red"].astype(np.uint16) * 257
             las_points.green = points["green"].astype(np.uint16) * 257
             las_points.blue = points["blue"].astype(np.uint16) * 257
-            if points["scalar_class"].max(initial=0) >= len(CLASSIFICATION_CODES):
+            if points["scalar_class"].max(initial=0) >= len(classification_codes):
                 raise ValueError("PLY contains a class ID not defined by this export")
-            las_points.classification = CLASSIFICATION_CODES[points["scalar_class"]]
+            las_points.classification = classification_codes[points["scalar_class"]]
             las_points.return_number = np.ones(count, dtype=np.uint8)
             las_points.number_of_returns = np.ones(count, dtype=np.uint8)
             destination.write_points(las_points)
@@ -170,6 +169,8 @@ def main() -> None:
     parser.add_argument("--input", required=True, type=Path, help="classified PLY with scalar_class")
     parser.add_argument("--output", required=True, type=Path, help="destination LAS path")
     parser.add_argument("--classes-json", required=True, type=Path, help="pipeline class configuration")
+    parser.add_argument("--class-set", choices=("outdoor", "indoor"), default="outdoor",
+                        help="semantic class set used in the PLY")
     parser.add_argument("--source-crs", default="LOCAL", help="CRS of the input point cloud, for example EPSG:2056")
     parser.add_argument("--target-crs", default="LOCAL", help="CRS written to LAS, for example EPSG:2056")
     parser.add_argument("--chunk-size", type=int, default=1_000_000, help="points written per batch")
@@ -184,6 +185,7 @@ def main() -> None:
         args.chunk_size,
         args.source_crs,
         args.target_crs,
+        args.class_set,
     )
     print(f"Wrote {count:,} classified points to {args.output}")
 

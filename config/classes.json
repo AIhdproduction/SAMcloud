@@ -1,5 +1,5 @@
 {
-  "aussen": [
+  "outdoor": [
     "ground, terrain, soil, bare earth",
     "road, street, asphalt, carriageway",
     "sidewalk, footpath, pedestrian path, pavement",
@@ -16,6 +16,18 @@
     "scaffolding, construction scaffold",
     "construction container, site container, building material, construction material",
     "water, pond, stream, puddle"
+  ],
+  "indoor": [
+    "floor, ground, interior floor, flooring, floor slab",
+    "ceiling, interior ceiling, soffit, suspended ceiling",
+    "wall, interior wall, partition wall, facade wall",
+    "door, doorway, door frame, entrance",
+    "window, glazing, glass window, window frame",
+    "stairs, staircase, steps, stairway",
+    "column, beam, support, structural column, girder",
+    "pipe, pipeline, plumbing pipe, duct",
+    "electrical installation, electrical cable, power cable, conduit, cable tray",
+    "furniture, furnishing, chair, table, cabinet, desk"
   ],
   "unknown_class_id": 0,
   "unknown_class_name": "Unknown/noise"

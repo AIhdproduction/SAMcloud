@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--outdir", required=True, help="project/output folder")
     ap.add_argument("--min-votes", type=int, default=1,
                     help="minimum agreeing images per point; default 1 keeps single-view classifications")
+    ap.add_argument("--class-set", choices=("outdoor", "indoor"), default="outdoor",
+                    help="semantic class set used for SAM3 classification")
     ap.add_argument("--colmap-bin", default=None)
     ap.add_argument("--gpu", default="1", help="1 = use GPU for colmap steps, 0 = CPU only")
     ap.add_argument("--rtk", action="store_true",
@@ -179,6 +181,7 @@ def main():
          "--images-dir", str(dense_dir / "images"),
          "--model-dir", str(dense_sparse_txt),
          "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
+         "--class-set", args.class_set,
          "--min-votes", str(args.min_votes),
          "--out", str(outdir / "classified.ply")])
 
@@ -188,6 +191,7 @@ def main():
          "--input", str(outdir / "classified.ply"),
          "--output", str(outdir / "classified.las"),
          "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
+         "--class-set", args.class_set,
          "--source-crs", args.source_crs,
          "--target-crs", args.export_crs])
 
