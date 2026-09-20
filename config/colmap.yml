@@ -1,0 +1,18 @@
+camera:
+  single_camera: true
+  camera_model: AUTO
+
+alignment:
+  matching_strategy: exhaustive
+  use_gpu: true
+  mapper: incremental
+
+georeferencing:
+  rtk_max_error_m: 0.1
+  standard_gps_max_error_m: 3.0
+  control_point_minimum_observations: 2
+  control_point_crs: EPSG:2056
+
+dense_reconstruction:
+  use_geometric_consistency: true
+  output: fused.ply

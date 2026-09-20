@@ -1,0 +1,14 @@
+model:
+  weights: models/sam3.pt
+  confidence_threshold: 0.4
+
+inference:
+  image_size: 644
+  tile_size_px: 1008
+  tile_minimum_overlap: 0.2
+  minimum_votes: 1
+
+output:
+  unknown_class_id: 0
+  write_ply: true
+  write_las: true

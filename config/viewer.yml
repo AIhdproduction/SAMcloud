@@ -1,0 +1,11 @@
+viewer:
+  engine: potree
+  point_budget: 5000000
+  default_display_mode: rgb
+  allow_measurements: true
+  allow_clipping_volumes: true
+
+classification:
+  default_visibility: true
+  allow_isolation: true
+  allow_rgb_switch: true

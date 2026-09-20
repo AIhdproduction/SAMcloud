@@ -1,0 +1,22 @@
+{
+  "aussen": [
+    "ground, terrain, soil, bare earth",
+    "road, street, asphalt, carriageway",
+    "sidewalk, footpath, pedestrian path, pavement",
+    "curb, kerb, curb stone, edge stone",
+    "low vegetation, grass, shrubs, bushes",
+    "tree, tall vegetation, tree canopy, foliage",
+    "building, house, facade, exterior wall",
+    "vehicle, car, van, truck",
+    "construction machinery, excavator, digger, bulldozer, loader",
+    "utility pole, light pole, streetlight, lamp post",
+    "traffic sign, road sign, signpost",
+    "fence, barrier, railing, gate",
+    "overhead power line, utility wire, cable",
+    "scaffolding, construction scaffold",
+    "construction container, site container, building material, construction material",
+    "water, pond, stream, puddle"
+  ],
+  "unknown_class_id": 0,
+  "unknown_class_name": "Unknown/noise"
+}

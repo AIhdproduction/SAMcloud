@@ -1,0 +1,32 @@
+# Python environment and cache
+venv/
+__pycache__/
+*.py[cod]
+
+# Local editor and environment settings
+.env
+.vscode/
+.idea/
+
+# Local projects and generated processing data
+projects/*
+!projects/.gitkeep
+output/
+test/
+*.las
+*.laz
+*.ply
+
+# Large external tools, model weights, and local source data
+colmap/
+models/
+sam3.pt
+gps_*.txt
+*.nav
+*.obs
+*.bin
+*.MRK
+
+# Generated Potree data
+assets/potree/*
+!assets/potree/README.md

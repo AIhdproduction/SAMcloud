@@ -1,0 +1,24 @@
+application:
+  projects_directory: projects
+  language: en
+
+project:
+  image_storage: external_reference
+  keep_intermediate_files: true
+
+coordinate_systems:
+  input_crs: EPSG:4326
+  working_crs: LOCAL
+  export_crs: EPSG:2056
+  supported_presets:
+    - LOCAL
+    - EPSG:2056
+    - EPSG:4326
+  custom_epsg_allowed: true
+
+workflow:
+  use_gpu: true
+  alignment_mode: incremental
+  georeferencing_mode: optional
+  control_points_enabled: false
+  export_format: LAS

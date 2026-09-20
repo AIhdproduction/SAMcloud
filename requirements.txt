@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0+cu126
+torchvision==0.29.0+cu126
+numpy==2.2.6
+plyfile==1.1.2
+tqdm==4.67.1
+opencv-python==4.12.0.88
+ultralytics==8.4.138
+exifread==3.5.0
+laspy==2.7.0
+matplotlib==3.10.7
+pandas==2.3.3
+PyYAML==6.0.3
+pyproj==3.7.2
+nicegui==3.17.1
+pytest==8.4.2

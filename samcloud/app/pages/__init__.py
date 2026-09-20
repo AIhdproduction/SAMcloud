@@ -1,0 +1,1 @@
+"""SAMcloud application pages."""
