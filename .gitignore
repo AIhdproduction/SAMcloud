@@ -18,7 +18,7 @@ test/
 *.ply
 
 # Large external tools, model weights, and local source data
-colmap/
+/colmap/
 models/
 sam3.pt
 gps_*.txt
