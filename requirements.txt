@@ -11,6 +11,6 @@ laspy==2.7.0
 matplotlib==3.10.7
 pandas==2.3.3
 PyYAML==6.0.3
-pyproj==3.7.2
+pyproj==3.7.1
 nicegui==3.17.1
 pytest==8.4.2

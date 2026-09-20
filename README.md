@@ -1,8 +1,9 @@
 # SAMcloud
 
 SAMcloud is a local photogrammetry application that reconstructs 3D point
-clouds from drone images with COLMAP and assigns semantic LAS classes with
-SAM3. The project is designed for the Digital Twin Programming module at HSLU.
+clouds from drone, standard-camera, and 360 degree Insta360 imagery with
+COLMAP and assigns semantic LAS classes with SAM3. The project is designed for
+the Digital Twin Programming module at HSLU.
 
 ## Project overview and objective
 
@@ -29,15 +30,18 @@ workflow. The project differs from a generic point cloud viewer because it
 keeps the relationship between drone images, reconstructed cameras, manually
 defined control point observations, and the final classified point cloud.
 
-The scope is outdoor drone imagery. It does not aim to replace a commercial
-photogrammetry suite or provide a general-purpose BIM editor.
+The scope covers outdoor and indoor image datasets. It does not aim to replace
+a commercial photogrammetry suite or provide a general-purpose BIM editor.
 
 ## Functionality
 
 The target workflow is divided into independent stages:
 
-1. Create or reopen a persistent project.
-2. Select image data and configure camera, GPU, and coordinate settings.
+1. Create or reopen a persistent project and select drone GPS/RTK, standard
+   camera, or 360 degree camera capture.
+2. Select image data and configure camera, GPU, semantic classes, and coordinate settings.
+   A 360 degree project accepts an exported 2:1 MP4 video, a directory of 2:1
+   JPG panoramas, or both sources together.
 3. Align images with COLMAP and inspect the sparse point cloud and cameras.
 4. Import ground control points as `name,x,y,z` CSV and mark them in images.
 5. Create a dense COLMAP point cloud.
@@ -133,6 +137,21 @@ projects/<project-name>/
 Source images are referenced at their original location by default. This
 avoids duplicating large drone datasets while preserving the complete project
 state. If images are moved, their path can be updated in the project settings.
+For 360 degree projects, extracted video frames, cubemap views, and a source
+manifest are stored below `inputs/`. Capture settings are locked once those
+derived inputs are prepared.
+
+## 360 degree Insta360 workflow
+
+Export the footage from Insta360 Studio before creating the project. SAMcloud
+supports stitched 2:1 equirectangular `.mp4` videos and `.jpg` panorama photos;
+raw `.insv` files are not supported. Select `360 degree camera / Insta360`, then
+choose `Indoor` or `Outdoor`. Add either source or both. Video frames are
+extracted at a fixed interval of one second by default and converted into six
+perspective cubemap views per panorama for the COLMAP 4.0.3 workflow.
+
+Projects without drone GPS start in `LOCAL` coordinates. Add control points to
+georeference them before exporting to a real coordinate reference system.
 
 ## Tests
 

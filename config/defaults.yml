@@ -25,3 +25,13 @@ workflow:
 
 classification:
   class_set: outdoor
+
+acquisition:
+  panorama:
+    frame_interval_seconds: 1.0
+    cubemap_face_size: 1024
+    supported_image_extensions:
+      - .jpg
+      - .jpeg
+    supported_video_extensions:
+      - .mp4

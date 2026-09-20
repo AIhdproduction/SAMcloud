@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from samcloud.acquisition import CaptureValidationError, prepare_panorama_inputs
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,9 +47,46 @@ def write_image_list(images_dir, out_path):
     return len(image_paths)
 
 
+def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) -> tuple[Path, bool]:
+    """Resolve normal images or prepare virtual perspective images for 360 media."""
+    if args.capture_type != "panorama_360":
+        if not args.images:
+            parser.error("--images is required for drone_gps and camera capture types")
+        images_dir = Path(args.images).resolve()
+        if not images_dir.is_dir():
+            parser.error(f"Image directory was not found: {images_dir}")
+        return images_dir, False
+
+    try:
+        prepared = prepare_panorama_inputs(
+            args.panorama_images or "",
+            args.panorama_video or "",
+            Path(args.panorama_workdir).resolve() if args.panorama_workdir else outdir / "inputs",
+            args.frame_interval,
+            args.cubemap_face_size,
+        )
+    except CaptureValidationError as error:
+        parser.error(str(error))
+    print(
+        "Prepared 360 degree inputs: "
+        f"{prepared.panorama_count} panoramas, {prepared.video_frame_count} video frames, "
+        f"{prepared.cubemap_image_count} virtual camera images."
+    )
+    print(f"Panorama source manifest: {prepared.manifest_path}")
+    return prepared.cubemap_directory, True
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--images", required=True, help="folder with the raw input photos")
+    ap.add_argument("--capture-type", choices=("drone_gps", "camera", "panorama_360"), default="drone_gps")
+    ap.add_argument("--images", help="folder with normal drone or camera photos")
+    ap.add_argument("--panorama-images", help="folder with exported 2:1 JPG panoramas")
+    ap.add_argument("--panorama-video", help="exported 2:1 MP4 panorama video")
+    ap.add_argument("--panorama-workdir", help="project-owned directory for frames, cubemaps, and manifest")
+    ap.add_argument("--frame-interval", type=float, default=1.0,
+                    help="fixed 360 degree video frame interval in seconds")
+    ap.add_argument("--cubemap-face-size", type=int, default=1024,
+                    help="side length in pixels for generated cubemap faces")
     ap.add_argument("--outdir", required=True, help="project/output folder")
     ap.add_argument("--min-votes", type=int, default=1,
                     help="minimum agreeing images per point; default 1 keeps single-view classifications")
@@ -69,14 +108,18 @@ def main():
 
     if args.gps_max_error is not None and args.gps_max_error <= 0:
         ap.error("--gps-max-error must be greater than zero")
+    if args.frame_interval <= 0:
+        ap.error("--frame-interval must be greater than zero")
+    if args.cubemap_face_size <= 0:
+        ap.error("--cubemap-face-size must be greater than zero")
     gps_alignment_max_error = (
         args.gps_max_error if args.gps_max_error is not None
         else 0.1 if args.rtk else 3.0
     )
 
-    images_dir = Path(args.images).resolve()
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    images_dir, is_panorama = resolve_input_images(args, outdir, ap)
 
     db_path = outdir / "database.db"
     sparse_dir = outdir / "sparse"
@@ -97,10 +140,17 @@ def main():
          "--ImageReader.single_camera", "1",
          "--FeatureExtraction.use_gpu", args.gpu])
 
-    # 2) Matching. Exhaustive is fine up to a few hundred images.
-    run([colmap, "exhaustive_matcher",
-         "--database_path", str(db_path),
-         "--FeatureMatching.use_gpu", args.gpu])
+    # 2) Video panoramas use sequential matching. A photo directory additionally
+    # uses exhaustive matching so it can connect to the video frames as well.
+    if is_panorama and args.panorama_video:
+        run([colmap, "sequential_matcher",
+             "--database_path", str(db_path),
+             "--FeatureMatching.use_gpu", args.gpu,
+             "--SequentialMatching.overlap", "10"])
+    if not is_panorama or args.panorama_images:
+        run([colmap, "exhaustive_matcher",
+             "--database_path", str(db_path),
+             "--FeatureMatching.use_gpu", args.gpu])
 
     # 3) Sparse reconstruction (SfM)
     run([colmap, "mapper",
@@ -112,39 +162,40 @@ def main():
     if not model0.exists():
         sys.exit("colmap mapper did not produce a reconstruction (sparse/0 missing). Check image overlap/quality.")
 
-    # 3b) Georeference using GPS EXIF, otherwise the reconstruction is in an
-    #     arbitrary scale/frame and downstream metric tiling (2cm grid, 10x10m
-    #     tiles) breaks.
-    gps_script = Path(__file__).resolve().parent / "extract_gps.py"
-    gps_ref_path = outdir / "gps_ref.txt"
-    run([sys.executable, str(gps_script),
-         "--images-dir", str(images_dir),
-         "--out", str(gps_ref_path),
-         "--require-all"])
+    # 3b) GPS alignment only applies to drone images. Other capture types retain
+    # a local frame until control points or another georeferencing step is used.
+    if args.capture_type == "drone_gps":
+        gps_script = Path(__file__).resolve().parent / "extract_gps.py"
+        gps_ref_path = outdir / "gps_ref.txt"
+        run([sys.executable, str(gps_script),
+             "--images-dir", str(images_dir),
+             "--out", str(gps_ref_path),
+             "--require-all"])
 
-    print(
-        "Using GPS alignment maximum error: "
-        f"{gps_alignment_max_error:.3f} m "
-        f"({'RTK' if args.rtk else 'standard GPS'})"
-    )
-
-    model0_geo = sparse_dir / "0_geo"
-    model0_geo.mkdir(exist_ok=True)
-    run([colmap, "model_aligner",
-         "--input_path", str(model0),
-         "--output_path", str(model0_geo),
-         "--ref_images_path", str(gps_ref_path),
-         "--ref_is_gps", "1",
-         "--alignment_type", "enu",
-         "--alignment_max_error", str(gps_alignment_max_error)])
-
-    if not model0_geo.exists() or not any(model0_geo.iterdir()):
-        sys.exit(
-            "model_aligner produced no output. Check the gps_ref.txt and the "
-            "colmap model_aligner flags for your installed COLMAP version "
-            "(see README.md, this step is unverified)."
+        print(
+            "Using GPS alignment maximum error: "
+            f"{gps_alignment_max_error:.3f} m "
+            f"({'RTK' if args.rtk else 'standard GPS'})"
         )
-    model0 = model0_geo
+
+        model0_geo = sparse_dir / "0_geo"
+        model0_geo.mkdir(exist_ok=True)
+        run([colmap, "model_aligner",
+             "--input_path", str(model0),
+             "--output_path", str(model0_geo),
+             "--ref_images_path", str(gps_ref_path),
+             "--ref_is_gps", "1",
+             "--alignment_type", "enu",
+             "--alignment_max_error", str(gps_alignment_max_error)])
+
+        if not model0_geo.exists() or not any(model0_geo.iterdir()):
+            sys.exit(
+                "model_aligner produced no output. Check the gps_ref.txt and the "
+                "colmap model_aligner flags for your installed COLMAP version."
+            )
+        model0 = model0_geo
+    else:
+        print("GPS alignment skipped. The reconstruction remains in LOCAL coordinates.")
 
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model
     #    we can read as plain text for the camera poses.
