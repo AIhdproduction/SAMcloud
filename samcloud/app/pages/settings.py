@@ -151,4 +151,4 @@ def render() -> None:
 
             ui.button("Prepare 360 degree inputs", on_click=prepare_inputs).props("outline")
 
-    render_page("Settings", content)
+    render_page("Settings", content, current_path="/settings")

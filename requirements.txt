@@ -1,3 +1,5 @@
+# Verified on Windows x64 with Python 3.13 and CUDA 12.6.
+# The CUDA wheels below are required for GPU-accelerated SAM3/COLMAP workflows.
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.14.0+cu126
 torchvision==0.29.0+cu126

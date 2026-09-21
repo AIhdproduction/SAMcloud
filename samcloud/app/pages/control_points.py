@@ -27,4 +27,4 @@ def render() -> None:
                 ui.label(f"Control points with image observations: {len(observations)}")
                 ui.button("Open project settings", on_click=lambda: ui.navigate.to("/settings"))
 
-    render_page("Control Points", content)
+    render_page("Control Points", content, current_path="/control-points")

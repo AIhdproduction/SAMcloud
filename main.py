@@ -8,7 +8,7 @@ from samcloud.app.application import create_application
 def main() -> None:
     """Register the UI and start the local SAMcloud application."""
     create_application()
-    ui.run(title="SAMcloud", favicon="cloud", reload=False, port=8080)
+    ui.run(title="SAMcloud", reload=False, port=8080)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

@@ -24,4 +24,4 @@ def render() -> None:
                 ui.separator()
                 ui.label("Control point observations will be listed here.")
 
-    render_page("Sparse Cloud", content)
+    render_page("Sparse Cloud", content, current_path="/sparse")
