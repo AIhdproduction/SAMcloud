@@ -38,16 +38,18 @@ a commercial photogrammetry suite or provide a general-purpose BIM editor.
 The target workflow is divided into independent stages:
 
 1. Create or reopen a persistent project and select drone GPS/RTK, standard
-   camera, or 360 degree camera capture.
+   camera, or 360 degree camera capture. Choose either **No control points**
+   for an uninterrupted automatic run, or **Use control points after
+   alignment** to pause before dense reconstruction.
 2. Select image data and configure camera, GPU, semantic classes, and coordinate settings.
    A 360 degree project accepts an exported 2:1 MP4 video, a directory of 2:1
    JPG panoramas, or both sources together.
-3. Align images with COLMAP and inspect the sparse point cloud and cameras.
-4. Import ground control points as `name,x,y,z` CSV and mark them in images.
-5. Create a dense COLMAP point cloud.
-6. Select the indoor or outdoor semantic class set and run SAM3 classification with multi-view voting.
-7. Inspect the dense cloud in RGB or class mode and isolate individual classes.
-8. Export classified PLY and LAS data in the chosen coordinate system.
+3. Start processing. COLMAP aligns the images and creates the sparse model.
+4. If **No control points** was selected, dense reconstruction and SAM3
+   classification continue automatically. If control points were enabled, the
+   run pauses after alignment so the points can be added before continuing.
+5. Inspect the dense cloud in RGB or class mode and isolate individual classes.
+6. Export the classified PLY to LAS manually after checking the result.
 
 The UI is built with NiceGUI. Potree is used as the intended high-performance
 viewer for large dense point clouds, including class visibility filters. The
@@ -188,6 +190,15 @@ perspective cubemap views per panorama for the COLMAP 4.0.3 workflow.
 
 Projects without drone GPS start in `LOCAL` coordinates. Add control points to
 georeference them before exporting to a real coordinate reference system.
+
+## Processing modes
+
+Every project stores `workflow.control_points_mode` as either `none` or
+`after_alignment`. The default `none` mode runs alignment, dense reconstruction,
+and SAM3 classification without waiting for manual points. The
+`after_alignment` mode deliberately pauses after COLMAP alignment. In both
+modes the classified PLY is produced first; LAS export is a separate manual
+action from the dashboard so the result can be reviewed before export.
 
 ## Tests
 

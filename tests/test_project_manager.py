@@ -47,3 +47,29 @@ def test_create_project_stores_panorama_sources(tmp_path: Path) -> None:
     assert project["acquisition"]["sources"]["panorama_image_directory"] == "D:/panoramas"
     assert project["acquisition"]["sources"]["panorama_video_path"] == "D:/tour.mp4"
     assert project["acquisition"]["panorama"]["frame_interval_seconds"] == 0.5
+
+
+def test_create_project_defaults_to_automatic_processing_without_control_points(tmp_path: Path) -> None:
+    manager = ProjectManager(tmp_path / "projects")
+
+    project = manager.load(manager.create_project("Automatic run", "D:/images"))
+
+    assert project["workflow"]["control_points_mode"] == "none"
+    assert project["workflow"]["control_points"] == "skipped"
+    assert project["settings"]["workflow"]["control_points_enabled"] is False
+
+
+def test_create_project_can_pause_after_alignment_for_control_points(tmp_path: Path) -> None:
+    manager = ProjectManager(tmp_path / "projects")
+
+    project = manager.load(
+        manager.create_project(
+            "Survey with points",
+            "D:/images",
+            control_points_mode="after_alignment",
+        )
+    )
+
+    assert project["workflow"]["control_points_mode"] == "after_alignment"
+    assert project["workflow"]["control_points"] == "not_started"
+    assert project["settings"]["workflow"]["control_points_enabled"] is True

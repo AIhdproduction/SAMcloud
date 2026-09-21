@@ -30,6 +30,14 @@ def render() -> None:
                 label="Semantic class set",
                 value=None,
             )
+            control_points_mode = ui.select(
+                {
+                    "none": "No control points - continue automatically",
+                    "after_alignment": "Use control points after alignment",
+                },
+                label="Ground control points",
+                value="none",
+            )
 
             with ui.column().classes("w-full gap-3").bind_visibility_from(
                 capture_type, "value", lambda value: value in {"drone_gps", "camera"}
@@ -74,6 +82,7 @@ def render() -> None:
                         panorama_video_path=panorama_video_path.value or "",
                         frame_interval_seconds=float(frame_interval_seconds.value or 0),
                         rtk_enabled=rtk_enabled.value,
+                        control_points_mode=control_points_mode.value,
                     )
                     state.open_project(project_directory)
                     ui.notify(f"Project created: {project_directory.name}")

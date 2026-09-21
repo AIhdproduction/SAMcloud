@@ -44,6 +44,7 @@ class ProjectManager:
         panorama_video_path: str = "",
         frame_interval_seconds: float | None = None,
         rtk_enabled: bool = False,
+        control_points_mode: str = "none",
     ) -> Path:
         """Create a self-contained project folder without copying source images."""
         normalized_name = self._normalize_name(name)
@@ -60,6 +61,7 @@ class ProjectManager:
             panorama_video_path=panorama_video_path,
             frame_interval_seconds=frame_interval_seconds,
             rtk_enabled=rtk_enabled,
+            control_points_mode=control_points_mode,
         )
 
         ensure_workspace_directories()
@@ -123,6 +125,7 @@ class ProjectManager:
         panorama_video_path: str,
         frame_interval_seconds: float | None,
         rtk_enabled: bool,
+        control_points_mode: str,
     ) -> dict[str, Any]:
         defaults = deepcopy(load_global_config("defaults.yml"))
         panorama_defaults = defaults.get("acquisition", {}).get("panorama", {})
@@ -130,6 +133,8 @@ class ProjectManager:
             frame_interval_seconds = float(panorama_defaults.get("frame_interval_seconds", 1.0))
         if class_set not in {"outdoor", "indoor"}:
             raise ValueError("Select the indoor or outdoor semantic class set")
+        if control_points_mode not in {"none", "after_alignment"}:
+            raise ValueError("Select whether control points should be used after alignment")
         validate_capture_configuration(
             capture_type,
             image_directory=image_directory,
@@ -138,6 +143,7 @@ class ProjectManager:
             frame_interval_seconds=frame_interval_seconds,
         )
         defaults["classification"]["class_set"] = class_set
+        defaults["workflow"]["control_points_enabled"] = control_points_mode == "after_alignment"
         coordinates = defaults["coordinate_systems"]
         is_gps_capture = capture_type == "drone_gps"
         if not is_gps_capture:
@@ -184,9 +190,10 @@ class ProjectManager:
             "settings": defaults,
             "workflow": {
                 "alignment": "not_started",
-                "control_points": "not_started",
+                "control_points": "not_started" if control_points_mode == "after_alignment" else "skipped",
                 "dense_cloud": "not_started",
                 "classification": "not_started",
                 "export": "not_started",
+                "control_points_mode": control_points_mode,
             },
         }

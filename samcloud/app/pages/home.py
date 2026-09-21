@@ -60,6 +60,22 @@ def _render_project_workspace(project: dict | None) -> None:
         with ui.row().classes("q-mt-xl gap-3"):
             ui.button("Review project settings", icon="tune", on_click=lambda: ui.navigate.to("/settings")).classes("sam-button-primary")
             ui.button("Open sparse cloud", icon="hub", on_click=lambda: ui.navigate.to("/sparse")).props("outline").classes("sam-button-secondary")
+        workflow = project.get("workflow", {})
+        processing_active = state.processing.is_running(state.active_project_directory) if state.active_project_directory else False
+        mode = workflow.get("control_points_mode", "none")
+        if processing_active:
+            ui.label("Processing is running. The status is saved in the project.").classes("sam-muted text-sm q-mt-md")
+        elif workflow.get("classification") != "completed":
+            action_label = (
+                "Start alignment and wait for control points"
+                if mode == "after_alignment"
+                else "Start automatic processing"
+            )
+            ui.button(action_label, icon="play_arrow", on_click=lambda: _start_processing()).classes("sam-button-primary q-mt-md")
+        elif workflow.get("export") != "completed":
+            ui.button("Export LAS manually", icon="file_download", on_click=lambda: _export_las()).classes("sam-button-primary q-mt-md")
+        if project.get("processing", {}).get("last_error"):
+            ui.label(project["processing"]["last_error"]).classes("text-red-4 text-sm q-mt-md")
 
 
 def _render_workflow(project: dict | None) -> None:
@@ -102,3 +118,25 @@ def _render_recent_projects() -> None:
 def _open_project(project_directory: Path) -> None:
     state.open_project(project_directory)
     ui.navigate.to("/")
+
+
+def _start_processing() -> None:
+    if state.active_project_directory is None:
+        return
+    try:
+        state.processing.start_pipeline(state.active_project_directory)
+        ui.notify("Processing started. Keep SAMcloud open while COLMAP and SAM3 run.")
+        ui.navigate.to("/")
+    except (OSError, ValueError) as error:
+        ui.notify(str(error), type="negative")
+
+
+def _export_las() -> None:
+    if state.active_project_directory is None:
+        return
+    try:
+        state.processing.export_las(state.active_project_directory)
+        ui.notify("LAS export started. The result will be saved in products/classified.")
+        ui.navigate.to("/")
+    except (OSError, ValueError) as error:
+        ui.notify(str(error), type="negative")

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from samcloud.core.project_manager import ProjectManager
+from samcloud.app.processing import ProcessingManager
 
 
 class ApplicationState:
@@ -11,6 +12,7 @@ class ApplicationState:
     def __init__(self) -> None:
         self.projects = ProjectManager()
         self.active_project_directory: Path | None = None
+        self.processing = ProcessingManager(self)
 
     def open_project(self, project_directory: Path) -> None:
         """Set the project used by all workflow pages."""

@@ -14,6 +14,7 @@ are written to `projects/<project-name>/project.samcloud.yml`.
 | `coordinate_systems.working_crs` | Internal coordinate frame. `LOCAL` is valid before georeferencing. |
 | `coordinate_systems.export_crs` | Default CRS for LAS export. Any CRS accepted by PROJ may be entered per project. |
 | `workflow.use_gpu` | Enables GPU use for supported COLMAP and SAM3 stages. |
+| `workflow.control_points_mode` | `none` runs through classification automatically; `after_alignment` pauses for manual control points. |
 | `acquisition.panorama.frame_interval_seconds` | Default fixed interval used to extract frames from a 360 degree MP4 video. |
 | `acquisition.panorama.cubemap_face_size` | Resolution of the perspective cubemap views generated for COLMAP. |
 

@@ -21,6 +21,7 @@ def render() -> None:
             return
 
         settings = project["settings"]
+        workflow = settings["workflow"]
         coordinates = settings["coordinate_systems"]
         classification = settings.setdefault("classification", {"class_set": "outdoor"})
         acquisition = project.setdefault(
@@ -43,6 +44,10 @@ def render() -> None:
             "camera": "Standard camera without GPS",
             "panorama_360": "360 degree camera / Insta360",
         }.get(capture_type, "Unknown")
+        control_points_mode = project.get("workflow", {}).get(
+            "control_points_mode",
+            "after_alignment" if workflow.get("control_points_enabled", False) else "none",
+        )
 
         with ui.card().classes("w-full"):
             ui.label("Capture sources").classes("text-lg font-medium")
@@ -88,8 +93,16 @@ def render() -> None:
             ui.label("Use LOCAL, an EPSG code such as EPSG:2056, or another CRS accepted by PROJ.").classes("text-sm")
         with ui.card().classes("w-full"):
             ui.label("Processing settings").classes("text-lg font-medium")
-            use_gpu = ui.switch("Use GPU", value=settings["workflow"]["use_gpu"])
-            control_points_enabled = ui.switch("Enable control points", value=settings["workflow"]["control_points_enabled"])
+            use_gpu = ui.switch("Use GPU", value=workflow["use_gpu"])
+            control_points = ui.select(
+                {
+                    "none": "No control points - continue automatically",
+                    "after_alignment": "Use control points after alignment",
+                },
+                label="Ground control points",
+                value=control_points_mode,
+            )
+            control_points.set_enabled(not acquisition_locked)
             class_set = ui.select(
                 {"outdoor": "Outdoor", "indoor": "Indoor"},
                 value=classification["class_set"],
@@ -117,8 +130,9 @@ def render() -> None:
                 coordinates["input_crs"] = input_crs.value
                 coordinates["working_crs"] = working_crs.value
                 coordinates["export_crs"] = export_crs.value
-                settings["workflow"]["use_gpu"] = use_gpu.value
-                settings["workflow"]["control_points_enabled"] = control_points_enabled.value
+                workflow["use_gpu"] = use_gpu.value
+                workflow["control_points_enabled"] = control_points.value == "after_alignment"
+                project.setdefault("workflow", {})["control_points_mode"] = control_points.value
                 classification["class_set"] = class_set.value
                 state.projects.save(project_directory, project)
                 ui.notify("Project settings saved")

@@ -104,7 +104,31 @@ def main():
                     help="CRS of the reconstructed point cloud before LAS export")
     ap.add_argument("--export-crs", default="LOCAL",
                     help="target CRS of the exported LAS file")
+    ap.add_argument(
+        "--control-points-mode",
+        choices=("none", "after_alignment"),
+        default="none",
+        help="continue automatically without control points, or stop after alignment",
+    )
+    ap.add_argument(
+        "--stop-after-alignment",
+        action="store_true",
+        help="finish after sparse alignment so control points can be added",
+    )
+    ap.add_argument(
+        "--skip-export",
+        action="store_true",
+        help="leave classified.ply ready for the manual LAS export step",
+    )
+    ap.add_argument(
+        "--classified-output",
+        default=None,
+        help="path for the classified PLY (defaults to <outdir>/classified.ply)",
+    )
     args = ap.parse_args()
+
+    if args.control_points_mode == "after_alignment":
+        args.stop_after_alignment = True
 
     if args.gps_max_error is not None and args.gps_max_error <= 0:
         ap.error("--gps-max-error must be greater than zero")
@@ -199,6 +223,12 @@ def main():
 
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model
     #    we can read as plain text for the camera poses.
+    if args.stop_after_alignment:
+        print(
+            "Alignment finished. Waiting for control points before dense reconstruction."
+        )
+        return
+
     run([colmap, "image_undistorter",
          "--image_path", str(images_dir),
          "--image_list_path", str(image_list_path),
@@ -227,6 +257,12 @@ def main():
 
     # 8) SAM3 classification + multi-view voting
     classify_script = Path(__file__).resolve().parent / "classify.py"
+    classified_output = (
+        Path(args.classified_output).resolve()
+        if args.classified_output
+        else outdir / "classified.ply"
+    )
+    classified_output.parent.mkdir(parents=True, exist_ok=True)
     run([sys.executable, str(classify_script),
          "--dense-dir", str(dense_dir),
          "--images-dir", str(dense_dir / "images"),
@@ -234,19 +270,23 @@ def main():
          "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
          "--class-set", args.class_set,
          "--min-votes", str(args.min_votes),
-         "--out", str(outdir / "classified.ply")])
+         "--out", str(classified_output)])
+
+    if args.skip_export:
+        print(f"Finished. Classified point cloud ready for manual export: {classified_output}")
+        return
 
     # 9) Export a standards-compliant LAS file with RGB and class IDs.
     las_script = Path(__file__).resolve().parent / "export_las.py"
     run([sys.executable, str(las_script),
-         "--input", str(outdir / "classified.ply"),
+         "--input", str(classified_output),
          "--output", str(outdir / "classified.las"),
          "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
          "--class-set", args.class_set,
          "--source-crs", args.source_crs,
          "--target-crs", args.export_crs])
 
-    print(f"\nFinished. Classified point cloud: {outdir / 'classified.ply'}")
+    print(f"\nFinished. Classified point cloud: {classified_output}")
     print(f"LAS with class IDs: {outdir / 'classified.las'}")
 
 

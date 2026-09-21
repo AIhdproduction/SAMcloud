@@ -21,6 +21,7 @@ workflow:
   alignment_mode: incremental
   georeferencing_mode: optional
   control_points_enabled: false
+  control_points_mode: none
   export_format: LAS
 
 classification:
