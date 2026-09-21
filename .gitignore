@@ -1,12 +1,21 @@
 # Python environment and cache
 venv/
+.venv/
+venv-*/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
 
 # Local editor and environment settings
 .env
 .vscode/
 .idea/
+.ultralytics/
+.DS_Store
+Thumbs.db
 
 # Local projects and generated processing data
 projects/*
@@ -26,6 +35,12 @@ gps_*.txt
 *.obs
 *.bin
 *.MRK
+*.whl
+
+# Local build and package artifacts
+build/
+dist/
+*.egg-info/
 
 # Generated Potree data
 assets/potree/*

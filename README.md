@@ -75,12 +75,31 @@ Git. More details are available in [the architecture documentation](docs/archite
 
 ## Development environment
 
-- Language: Python 3.10 or later
-- Environment: `venv`
+- Language: Python 3.13.x (the pinned dependency set is verified with Python
+  3.13; Python 3.14 is not supported by the pinned NumPy release)
+- Environment: `venv` created by `setup.bat`
 - Editor: Visual Studio Code
 - Version control: Git and a public GitHub repository
 - External modules: NiceGUI, Pandas, PyProj, PyYAML, COLMAP, Ultralytics SAM3,
   laspy, NumPy, OpenCV, and Matplotlib
+
+### Verified Windows versions
+
+The following versions are the reference stack for this repository:
+
+| Component | Version / build |
+|---|---|
+| Python | 3.13.x (Windows x64) |
+| COLMAP | 4.2.0, Windows CUDA, `colmap/COLMAP.bat` |
+| PyTorch | 2.14.0 + CUDA 12.6 (`cu126`) |
+| TorchVision | 0.29.0 + CUDA 12.6 (`cu126`) |
+| NumPy | 2.2.6 |
+| NiceGUI | 3.17.1 |
+| Ultralytics | 8.4.138 |
+
+The complete Python pin set is maintained in
+[`requirements.txt`](requirements.txt). Do not replace the CUDA COLMAP build
+with the `nocuda` archive: dense reconstruction requires the CUDA build.
 
 Pandas is used to load, validate, and write ground control point CSV files.
 PyProj validates and transforms configured coordinate reference systems.
@@ -88,16 +107,33 @@ NiceGUI provides the local user interface.
 
 ## Installation and start on Windows
 
-1. Install Python 3.10 or later and add it to `PATH`.
-2. Download the Windows CUDA release of COLMAP from
-   <https://github.com/colmap/colmap/releases>.
-3. Extract it to `colmap/` so that `colmap/COLMAP.bat` exists, or install it
-   elsewhere and add it to `PATH`.
+1. Install Python 3.13.x (Windows x64). `setup.bat` selects it explicitly via
+   `py -3.13`; no administrator password is required.
+2. Download the Windows CUDA release of COLMAP 4.2.0 from
+   <https://github.com/colmap/colmap/releases/tag/4.2.0>.
+3. Extract it to `colmap/` so that `colmap/COLMAP.bat` exists. The installed
+   build must print `COLMAP 4.2.0 ... with CUDA` when running
+   `colmap\COLMAP.bat --help`.
 4. Request SAM3 model access at <https://huggingface.co/facebook/sam3>.
 5. Store the downloaded checkpoint as `models/sam3.pt`.
-6. Run `setup.bat` once. It creates the local `venv` and installs all Python
-   dependencies.
-7. Run `start.bat` to open SAMcloud at `http://127.0.0.1:8080`.
+6. Run `setup.bat` once from the repository root. It creates the Python 3.13
+   `venv`, checks COLMAP, and installs the pinned CUDA/Python dependencies.
+   The script uses retry-friendly pip timeouts for large CUDA packages.
+7. Run `start.bat`. Keep its console window open and open
+   `http://127.0.0.1:8080` in a browser if it does not open automatically.
+
+To verify the installation before starting the UI:
+
+```bat
+venv\Scripts\python --version
+colmap\COLMAP.bat --help
+venv\Scripts\python -c "import nicegui, torch, ultralytics; print(torch.__version__, torch.cuda.is_available())"
+```
+
+If `start.bat` closes immediately, run it from an existing Command Prompt in
+the repository root. The error remains visible there; the most common cause
+is an incomplete `setup.bat` run or an existing `venv` created with another
+Python version.
 
 The virtual environment, model weight, processing data, generated point
 clouds, and local project folders are excluded by `.gitignore` and must never

@@ -22,25 +22,41 @@ if %errorlevel% neq 0 (
 )
 echo COLMAP found.
 
-where python >nul 2>nul
+where py >nul 2>nul
 if %errorlevel% neq 0 (
-    echo Python was not found. Install Python 3.10+ and add it to PATH.
+    echo Python Launcher was not found. Install Python 3.13 and try again.
+    pause
+    exit /b 1
+)
+
+set "PYTHON_CMD=py -3.13"
+%PYTHON_CMD% -c "import sys; assert (3,10) <= sys.version_info[:2] < (3,14)" >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Python 3.13 was not found. Install Python 3.13 and try again.
     pause
     exit /b 1
 )
 
 if not exist "venv" (
     echo Creating virtual environment...
-    python -m venv venv
+    %PYTHON_CMD% -m venv venv
+) else (
+    venv\Scripts\python.exe -c "import sys; assert (3,10) <= sys.version_info[:2] < (3,14)" >nul 2>nul
+    if %errorlevel% neq 0 (
+        echo The existing venv uses an incompatible Python version.
+        echo Remove the venv folder and run setup.bat again.
+        pause
+        exit /b 1
+    )
 )
-
-call venv\Scripts\activate.bat
 
 if not exist "models" mkdir models
 
 echo Installing dependencies...
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+set "PIP_DEFAULT_TIMEOUT=300"
+set "PIP_RETRIES=10"
+venv\Scripts\python.exe -m pip install --upgrade pip
+venv\Scripts\python.exe -m pip install -r requirements.txt
 
 echo.
 echo SAM3 weights are access-gated and are not downloaded automatically.
