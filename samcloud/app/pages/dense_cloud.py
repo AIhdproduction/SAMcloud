@@ -37,7 +37,7 @@ def render() -> None:
                 ui.button("Show all")
                 ui.button("Hide all").props("outline")
 
-    render_page("Dense Cloud", content)
+    render_page("Dense Cloud", content, current_path="/dense")
 
 
 def _load_classes(class_set: str) -> list[str]:

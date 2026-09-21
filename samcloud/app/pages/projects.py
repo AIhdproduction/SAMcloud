@@ -103,7 +103,7 @@ def render() -> None:
                         ui.label(capture_label).classes("text-xs text-slate-500")
                     ui.button("Open", on_click=lambda path=project_directory: _open_project(path))
 
-    render_page("Projects", content)
+    render_page("Projects", content, current_path="/projects")
 
 
 def _open_project(project_directory: Path) -> None:
