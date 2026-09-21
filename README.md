@@ -1,5 +1,7 @@
 # SAMcloud
 
+<img src="assets/SAMcloud.png" alt="SAMcloud logo" width="96">
+
 SAMcloud is a local photogrammetry application that reconstructs 3D point
 clouds from drone, standard-camera, and 360 degree Insta360 imagery with
 COLMAP and assigns semantic LAS classes with SAM3. The project is designed for
