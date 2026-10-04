@@ -40,9 +40,9 @@ and custom codes for project-specific classes.
 
 ## `viewer.yml`
 
-This file contains the Potree point budget, default display mode, and enabled
-viewer features. Class colors and class visibility will be written to a
-project-specific viewer manifest when viewer data is generated.
+This file contains the Canvas 2D preview point budget, default display mode,
+and viewer feature flags. The default preview budget is 300,000 points. Class
+colors are stored per project in `settings.classification.class_colors`.
 
 ## Capture settings stored per project
 

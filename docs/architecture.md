@@ -11,7 +11,7 @@ NiceGUI pages
         -> COLMAP alignment and dense reconstruction
         -> control point CSV and image observations
         -> SAM3 classification
-        -> LAS export and Potree viewer data
+        -> LAS export and Canvas point cloud previews
 ```
 
 The `samcloud/engine/` folder contains the existing command-line processing

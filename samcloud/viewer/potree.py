@@ -1,4 +1,8 @@
-"""Create the class scheme consumed by the Potree viewer integration."""
+"""Compatibility helper for legacy viewer manifests.
+
+SAMcloud now serves compact previews to its built-in Canvas 2D viewer.  The
+manifest remains available for existing project tooling that imports it.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from typing import Any
 
 
 def write_viewer_manifest(path: Path, classes: list[dict[str, Any]], point_cloud_url: str) -> None:
-    """Write a viewer manifest containing labels, colors, and class visibility."""
+    """Write a legacy manifest containing labels, colors, and visibility."""
     manifest = {
         "point_cloud_url": point_cloud_url,
         "display_mode": "rgb",

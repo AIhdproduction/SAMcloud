@@ -1,9 +1,9 @@
 viewer:
-  engine: potree
-  point_budget: 5000000
+  engine: canvas_2d
+  point_budget: 300000
   default_display_mode: rgb
-  allow_measurements: true
-  allow_clipping_volumes: true
+  allow_measurements: false
+  allow_clipping_volumes: false
 
 classification:
   default_visibility: true

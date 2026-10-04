@@ -1,1 +1,1 @@
-"""Potree viewer configuration services."""
+"""Canvas point cloud preview services."""
