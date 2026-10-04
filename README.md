@@ -218,7 +218,4 @@ Single-developer project.
 
 ## License
 
-SAMcloud is source-available under the [SAMcloud Personal and Educational Use
-License](LICENSE). Private, educational, research, and other noncommercial use
-are permitted. Companies require prior written agreement with the copyright
-holder and a separate commercial license.
+SAMcloud is licensed under the [GNU Affero General Public License, version 3](LICENSE) (AGPL-3.0).
