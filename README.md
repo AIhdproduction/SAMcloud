@@ -7,6 +7,10 @@ clouds from drone, standard-camera, and 360 degree Insta360 imagery with
 COLMAP and assigns semantic LAS classes with SAM3. The project is designed for
 the Digital Twin Programming module at HSLU.
 
+<img src="assets/dense-cloud-view.jpg" alt="SAMcloud UI with classified dense point cloud" width="900">
+
+*SAMcloud dense cloud view with class-coloured semantic classification.*
+
 ## Project overview and objective
 
 The objective is to provide a guided workflow comparable to common
