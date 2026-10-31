@@ -10,11 +10,6 @@ coordinate_systems:
   input_crs: EPSG:4326
   working_crs: LOCAL
   export_crs: EPSG:2056
-  supported_presets:
-    - LOCAL
-    - EPSG:2056
-    - EPSG:4326
-  custom_epsg_allowed: true
 
 workflow:
   use_gpu: true
@@ -24,8 +19,24 @@ workflow:
   control_points_mode: none
   export_format: LAS
 
+control_points:
+  crs: EPSG:2056+5728
+  min_points: 3
+  min_observations_per_point: 2
+  max_reprojection_px: 3.0
+  min_triangulation_angle_deg: 2.0
+  max_residual_warning_m: 0.10
+
 classification:
+  geometry_refinement: true
   class_set: outdoor
+  min_votes: 1
+  tile_size: 1008
+  tile_min_overlap: 0.2
+  mode: segearth_ov3
+  background_threshold: 0.4
+  query_threshold: 0.4
+  threshold_sweep: []
 
 acquisition:
   panorama:

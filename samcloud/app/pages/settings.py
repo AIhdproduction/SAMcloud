@@ -9,6 +9,12 @@ from samcloud.acquisition import (
 )
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
+from samcloud.core.configuration import load_export_crs_presets
+
+
+def _export_crs_options() -> dict[str, str]:
+    """Return settings select options from the central export CRS configuration."""
+    return {key: str(preset["label"]) for key, preset in load_export_crs_presets().items()}
 
 
 def render() -> None:
@@ -24,6 +30,14 @@ def render() -> None:
         workflow = settings["workflow"]
         coordinates = settings["coordinate_systems"]
         classification = settings.setdefault("classification", {"class_set": "outdoor"})
+        classification.setdefault("geometry_refinement", True)
+        classification.setdefault("min_votes", 1)
+        classification.setdefault("tile_size", 1008)
+        classification.setdefault("tile_min_overlap", 0.2)
+        classification.setdefault("mode", "segearth_ov3")
+        classification.setdefault("background_threshold", 0.4)
+        classification.setdefault("query_threshold", 0.4)
+        classification.setdefault("threshold_sweep", [])
         acquisition = project.setdefault(
             "acquisition",
             {
@@ -89,8 +103,16 @@ def render() -> None:
             ui.label("Coordinate systems").classes("text-lg font-medium")
             input_crs = ui.input("Image/GNSS CRS", value=coordinates["input_crs"])
             working_crs = ui.input("Working CRS", value=coordinates["working_crs"])
-            export_crs = ui.input("Export CRS", value=coordinates["export_crs"])
-            ui.label("Use LOCAL, an EPSG code such as EPSG:2056, or another CRS accepted by PROJ.").classes("text-sm")
+            export_crs_options = _export_crs_options()
+            export_crs_value = str(coordinates.get("export_crs", "EPSG:2056")).upper()
+            if export_crs_value not in export_crs_options:
+                export_crs_value = "EPSG:2056"
+            export_crs = ui.select(
+                export_crs_options,
+                label="Export CRS",
+                value=export_crs_value,
+            )
+            ui.label("Choose the output coordinate system configured in config/export_crs.yml.").classes("text-sm")
         with ui.card().classes("w-full"):
             ui.label("Processing settings").classes("text-lg font-medium")
             use_gpu = ui.switch("Use GPU", value=workflow["use_gpu"])
@@ -103,10 +125,57 @@ def render() -> None:
                 value=control_points_mode,
             )
             control_points.set_enabled(not acquisition_locked)
+        with ui.card().classes("w-full"):
+            ui.label("SAM3 classification").classes("text-lg font-medium")
+            ui.label("These values apply to the next SAM3 classification run.").classes("text-sm")
             class_set = ui.select(
                 {"outdoor": "Outdoor", "indoor": "Indoor"},
                 value=classification["class_set"],
                 label="Semantic class set",
+            )
+            min_votes = ui.number(
+                "Minimum agreeing images per point",
+                value=int(classification["min_votes"]),
+                min=1,
+                max=20,
+                step=1,
+            )
+            classification_mode = ui.select(
+                {
+                    "legacy": "Legacy (instance masks, majority vote)",
+                    "segearth_ov3": "SegEarth-OV3 (head fusion, presence gate, weighted voting)",
+                },
+                value=classification["mode"],
+                label="Classification mode",
+            )
+            background_threshold = ui.number(
+                "SegEarth-OV3 background threshold",
+                value=float(classification["background_threshold"]),
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                format="%.2f",
+            )
+            tile_size = ui.select(
+                {
+                    768: "768 px - faster, lower detail",
+                    1008: "1008 px - balanced",
+                    1280: "1280 px - higher detail, more GPU memory",
+                },
+                value=int(classification["tile_size"]),
+                label="SAM3 tile size",
+            )
+            tile_min_overlap = ui.number(
+                "Tile overlap",
+                value=float(classification["tile_min_overlap"]),
+                min=0.0,
+                max=0.8,
+                step=0.05,
+                format="%.2f",
+            )
+            geometry_refinement = ui.switch(
+                "Geometric refinement (height & flatness check)",
+                value=bool(classification["geometry_refinement"]),
             )
 
         def save_settings() -> None:
@@ -134,6 +203,22 @@ def render() -> None:
                 workflow["control_points_enabled"] = control_points.value == "after_alignment"
                 project.setdefault("workflow", {})["control_points_mode"] = control_points.value
                 classification["class_set"] = class_set.value
+                classification["min_votes"] = int(min_votes.value or 0)
+                classification["mode"] = classification_mode.value
+                classification["background_threshold"] = float(background_threshold.value or 0)
+                classification["tile_size"] = int(tile_size.value or 0)
+                classification["tile_min_overlap"] = float(tile_min_overlap.value or 0)
+                classification["geometry_refinement"] = bool(geometry_refinement.value)
+                if classification["min_votes"] < 1:
+                    raise ValueError("Minimum agreeing images must be at least 1")
+                if classification["mode"] not in {"legacy", "segearth_ov3"}:
+                    raise ValueError("Select a supported classification mode")
+                if not 0.0 <= classification["background_threshold"] <= 1.0:
+                    raise ValueError("Background threshold must be between 0.00 and 1.00")
+                if classification["tile_size"] not in {768, 1008, 1280}:
+                    raise ValueError("Select a supported SAM3 tile size")
+                if not 0.0 <= classification["tile_min_overlap"] <= 0.8:
+                    raise ValueError("Tile overlap must be between 0.00 and 0.80")
                 state.projects.save(project_directory, project)
                 ui.notify("Project settings saved")
             except (CaptureValidationError, ValueError) as error:

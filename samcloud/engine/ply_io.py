@@ -20,6 +20,18 @@ def read_fused_points(ply_path):
     return xyz, rgb
 
 
+def read_classified_ply(ply_path):
+    """Return xyz, RGB and scalar class IDs from a classified PLY."""
+    ply = PlyData.read(str(ply_path))
+    vertex = ply["vertex"]
+    names = vertex.data.dtype.names
+    if "scalar_class" not in names:
+        raise ValueError(f"Classified PLY has no scalar_class property: {ply_path}")
+    xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32)
+    rgb = np.stack([vertex["red"], vertex["green"], vertex["blue"]], axis=1).astype(np.uint8)
+    return xyz, rgb, np.asarray(vertex["scalar_class"], dtype=np.uint8)
+
+
 def read_vis_file(vis_path):
     """
     COLMAP fused.ply.vis format, per point in the same order as fused.ply:

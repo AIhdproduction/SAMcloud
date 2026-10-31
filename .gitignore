@@ -45,3 +45,7 @@ dist/
 # Generated Potree data
 assets/potree/*
 !assets/potree/README.md
+
+# Local dev tooling (Graphify code graph)
+.codex-tools/
+graphify-out/

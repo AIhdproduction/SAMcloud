@@ -1,6 +1,7 @@
 camera:
   single_camera: true
   camera_model: AUTO
+  max_image_size: 3200
 
 alignment:
   matching_strategy: exhaustive
@@ -15,4 +16,7 @@ georeferencing:
 
 dense_reconstruction:
   use_geometric_consistency: true
+  max_image_size: 3200
+  num_iterations: 3
+  gpu_index: 0
   output: fused.ply

@@ -1,0 +1,21 @@
+# Export coordinate systems offered in the settings page.
+# To add a CRS: add an entry with a PROJ-readable target (EPSG code, compound
+# "EPSG:xxxx+yyyy", WKT or PROJ string) and list every PROJ grid it needs under
+# required_grids. Install those grids yourself into the pyproj data directory
+# (python -c "import pyproj.datadir as d; print(d.get_data_dir())"), for example
+# with `pyproj sync --file <grid>` or from the provider. SAMcloud never falls
+# back to approximate ("ballpark") transformations.
+presets:
+  LOCAL:
+    label: "Local (no transformation)"
+    target: LOCAL
+    height: "as reconstructed"
+  EPSG:4326:
+    label: "WGS84 (EPSG:4326), ellipsoidal height"
+    target: "EPSG:4979"
+    height: "ellipsoidal (WGS84/ETRS89)"
+  EPSG:2056:
+    label: "LV95 (EPSG:2056) + LN02 height"
+    target: "EPSG:2056+5728"
+    height: "LN02 (swisstopo CHGeo2004)"
+    required_grids: [ch_swisstopo_chgeo2004_ETRS89_LN02.tif]

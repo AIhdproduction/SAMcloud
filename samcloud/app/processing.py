@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
 from typing import TYPE_CHECKING
+
+from samcloud.pointcloud.georeference import fit_enu_to_ecef, save_georeference
 
 if TYPE_CHECKING:
     from samcloud.app.state import ApplicationState
@@ -59,7 +62,12 @@ class ProcessingManager:
         workflow["classification"] = "queued"
         workflow["export"] = "not_started"
         project.setdefault("acquisition", {})["locked"] = True
-        project.setdefault("processing", {})["last_error"] = ""
+        project.setdefault("processing", {}).update({
+            "last_error": "",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": "",
+            "progress": {"percent": 0, "stage": "Preparing images", "detail": ""},
+        })
         self._state.projects.save(project_directory, project)
 
         command = self._pipeline_command(project_directory, project, mode)
@@ -95,6 +103,7 @@ class ProcessingManager:
         coordinates = settings.get("coordinate_systems", {})
         class_set = classification.get("class_set", "outdoor")
         output = classified.with_suffix(".las")
+        georeference = self._ensure_georeference(project_directory)
         command = [
             sys.executable,
             "-m",
@@ -112,9 +121,16 @@ class ProcessingManager:
             "--target-crs",
             coordinates.get("export_crs", "LOCAL"),
         ]
+        if georeference is not None:
+            command.extend(["--georeference", str(georeference)])
 
         project.setdefault("workflow", {})["export"] = "running"
-        project.setdefault("processing", {})["last_error"] = ""
+        project.setdefault("processing", {}).update({
+            "last_error": "",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": "",
+            "progress": {"percent": 98, "stage": "Exporting LAS", "detail": ""},
+        })
         self._state.projects.save(project_directory, project)
         try:
             process = self._launch(command, project_directory / "reports" / "export.log")
@@ -127,7 +143,59 @@ class ProcessingManager:
             self._jobs[project_directory] = process
         Thread(target=self._watch_export, args=(project_directory, process), daemon=True).start()
 
-    def _pipeline_command(self, project_directory: Path, project: dict, mode: str) -> list[str]:
+    def continue_after_control_points(self, project_directory: Path) -> None:
+        """Start Phase B after validating that enough GCP clicks are available."""
+        project_directory = project_directory.resolve()
+        if self.is_running(project_directory):
+            raise ValueError("Processing is already running for this project")
+        project = self._state.projects.load(project_directory)
+        if project.get("workflow", {}).get("control_points") != "waiting":
+            raise ValueError("Control points are not waiting for continuation")
+        from samcloud.control_points.repository import load_observations, read_control_points
+
+        settings = project.get("settings", {}).get("control_points", {})
+        minimum_points = int(settings.get("min_points", 3))
+        minimum_observations = int(settings.get("min_observations_per_point", 2))
+        control_points = project_directory / "control_points"
+        points = read_control_points(control_points / "control_points.csv")
+        observations = load_observations(control_points / "observations.json")
+        usable = sum(len(observations.get(str(name), [])) >= minimum_observations for name in points["name"])
+        if usable < minimum_points:
+            raise ValueError(f"At least {minimum_points} control points with {minimum_observations} observations are required")
+        workflow = project.setdefault("workflow", {})
+        workflow.update({"control_points": "running", "dense_cloud": "running", "classification": "queued"})
+        project.setdefault("processing", {}).update({"last_error": "", "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": "", "progress": {"percent": 57, "stage": "Applying control points", "detail": ""}})
+        self._state.projects.save(project_directory, project)
+        command = self._pipeline_command(project_directory, project, "none", resume_after_control_points=True)
+        try:
+            process = self._launch(command, project_directory / "reports" / "pipeline.log")
+        except OSError as error:
+            workflow["control_points"] = "failed"
+            project["processing"]["last_error"] = str(error)
+            self._state.projects.save(project_directory, project)
+            raise
+        with self._lock:
+            self._jobs[project_directory] = process
+        Thread(target=self._watch_pipeline, args=(project_directory, "resume", process), daemon=True).start()
+
+    @staticmethod
+    def _ensure_georeference(project_directory: Path) -> Path | None:
+        """Create a reusable GPS georeference for projects processed before this feature."""
+        products = project_directory / "products"
+        georeference = products / "georeference.json"
+        if georeference.is_file():
+            return georeference
+        gps_ref = products / "gps_ref.txt"
+        model_dir = products / "dense" / "sparse_txt"
+        if not gps_ref.is_file() or not model_dir.is_dir():
+            return None
+        try:
+            save_georeference(georeference, fit_enu_to_ecef(model_dir, gps_ref))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Could not create GPS georeference for LAS export: {error}") from error
+        return georeference
+
+    def _pipeline_command(self, project_directory: Path, project: dict, mode: str, *, resume_after_control_points: bool = False) -> list[str]:
         settings = project.get("settings", {})
         workflow_settings = settings.get("workflow", {})
         acquisition = project.get("acquisition", {})
@@ -135,6 +203,7 @@ class ProcessingManager:
         capture_type = acquisition.get("type", "drone_gps")
         products = project_directory / "products"
         classified_output = products / "classified" / "classified.ply"
+        classification = settings.get("classification", {})
         command = [
             sys.executable,
             "-m",
@@ -146,7 +215,21 @@ class ProcessingManager:
             "--gpu",
             "1" if workflow_settings.get("use_gpu", True) else "0",
             "--class-set",
-            settings.get("classification", {}).get("class_set", "outdoor"),
+            classification.get("class_set", "outdoor"),
+            "--min-votes",
+            str(classification.get("min_votes", 1)),
+            "--sam-tile-size",
+            str(classification.get("tile_size", 1008)),
+            "--sam-tile-min-overlap",
+            str(classification.get("tile_min_overlap", 0.2)),
+            "--classification-mode",
+            classification.get("mode", "segearth_ov3"),
+            "--background-threshold",
+            str(classification.get("background_threshold", 0.4)),
+            "--query-threshold",
+            str(classification.get("query_threshold", 0.4)),
+            "--geometry-refinement",
+            "1" if classification.get("geometry_refinement", True) else "0",
             "--control-points-mode",
             mode,
             "--skip-export",
@@ -156,7 +239,17 @@ class ProcessingManager:
             settings.get("coordinate_systems", {}).get("working_crs", "LOCAL"),
             "--export-crs",
             settings.get("coordinate_systems", {}).get("export_crs", "LOCAL"),
+            "--progress-file",
+            str(project_directory / "reports" / "progress.json"),
         ]
+        threshold_sweep = classification.get("threshold_sweep", [])
+        if threshold_sweep:
+            threshold_sweep_value = (
+                threshold_sweep
+                if isinstance(threshold_sweep, str)
+                else ",".join(str(value) for value in threshold_sweep)
+            )
+            command.extend(["--threshold-sweep", threshold_sweep_value])
         if capture_type == "panorama_360":
             if sources.get("panorama_image_directory"):
                 command.extend(["--panorama-images", sources["panorama_image_directory"]])
@@ -174,6 +267,10 @@ class ProcessingManager:
             command.extend(["--images", image_directory])
             if acquisition.get("georeferencing", {}).get("rtk_enabled", False):
                 command.append("--rtk")
+        if resume_after_control_points:
+            control_points = settings.get("control_points", {})
+            command.extend(["--resume-after-control-points", "--control-points-dir", str(project_directory / "control_points"),
+                            "--control-points-crs", str(control_points.get("crs", "EPSG:2056+5728"))])
         return command
 
     @staticmethod
@@ -201,16 +298,28 @@ class ProcessingManager:
             workflow["alignment"] = "completed"
             if mode == "after_alignment":
                 workflow["control_points"] = "waiting"
+            elif mode == "resume":
+                workflow["control_points"] = "completed"
+                workflow["dense_cloud"] = "completed"
+                workflow["classification"] = "completed"
             else:
                 workflow["control_points"] = "skipped"
                 workflow["dense_cloud"] = "completed"
                 workflow["classification"] = "completed"
+            project.setdefault("processing", {}).update({
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "progress": {"percent": 100, "stage": "Complete", "detail": ""},
+            })
         else:
             current = "alignment" if workflow.get("dense_cloud") == "queued" else "dense_cloud"
             workflow[current] = "failed"
             project.setdefault("processing", {})["last_error"] = (
                 f"Pipeline ended with exit code {return_code}. See reports/pipeline.log."
             )
+            project.setdefault("processing", {}).setdefault("progress", {}).update({
+                "stage": "Failed",
+                "detail": project["processing"]["last_error"],
+            })
         self._state.projects.save(project_directory, project)
         with self._lock:
             self._jobs.pop(project_directory, None)
@@ -221,11 +330,19 @@ class ProcessingManager:
         workflow = project.setdefault("workflow", {})
         if return_code == 0:
             workflow["export"] = "completed"
+            project.setdefault("processing", {}).update({
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "progress": {"percent": 100, "stage": "Complete", "detail": ""},
+            })
         else:
             workflow["export"] = "failed"
             project.setdefault("processing", {})["last_error"] = (
                 f"LAS export ended with exit code {return_code}. See reports/export.log."
             )
+            project.setdefault("processing", {}).setdefault("progress", {}).update({
+                "stage": "Failed",
+                "detail": project["processing"]["last_error"],
+            })
         self._state.projects.save(project_directory, project)
         with self._lock:
             self._jobs.pop(project_directory, None)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ASSETS_DIRECTORY = PROJECT_ROOT / "assets"
 CONFIG_DIRECTORY = PROJECT_ROOT / "config"
 PROJECTS_DIRECTORY = PROJECT_ROOT / "projects"
 MODELS_DIRECTORY = PROJECT_ROOT / "models"

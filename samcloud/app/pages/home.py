@@ -1,5 +1,7 @@
 """Project dashboard page."""
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from nicegui import ui
@@ -16,6 +18,12 @@ _WORKFLOW = (
     ("Classify with SAM3", "classification"),
     ("Export LAS / PLY", "export"),
 )
+
+_PHASE_RANGES = {
+    "alignment": (0.0, 57.0),
+    "dense_cloud": (57.0, 84.0),
+    "classification": (87.0, 98.0),
+}
 
 
 def render() -> None:
@@ -57,14 +65,33 @@ def _render_project_workspace(project: dict | None) -> None:
         ui.icon("folder_open")
         ui.label("Project workspace is ready").classes("sam-dropzone-title")
         ui.label(source or "No image source selected yet").classes("sam-muted text-sm q-mt-sm").style("max-width: 80%; overflow-wrap: anywhere")
+        workflow = _live_workflow(project)
         with ui.row().classes("q-mt-xl gap-3"):
             ui.button("Review project settings", icon="tune", on_click=lambda: ui.navigate.to("/settings")).classes("sam-button-primary")
-            ui.button("Open sparse cloud", icon="hub", on_click=lambda: ui.navigate.to("/sparse")).props("outline").classes("sam-button-secondary")
-        workflow = project.get("workflow", {})
+            sparse_ready = workflow.get("alignment") == "completed"
+            sparse_button = ui.button(
+                "Open sparse cloud",
+                icon="hub",
+                on_click=lambda: ui.navigate.to("/sparse"),
+            ).props("outline").classes("sam-button-secondary")
+            sparse_button.set_enabled(sparse_ready)
         processing_active = state.processing.is_running(state.active_project_directory) if state.active_project_directory else False
         mode = workflow.get("control_points_mode", "none")
         if processing_active:
             ui.label("Processing is running. The status is saved in the project.").classes("sam-muted text-sm q-mt-md")
+        if processing_active or _workflow_is_active(workflow):
+            _render_processing_progress(project)
+        elif workflow.get("control_points") == "waiting":
+            ui.button(
+                "Continue processing",
+                icon="play_arrow",
+                on_click=lambda: _continue_after_control_points(),
+            ).classes("sam-button-primary q-mt-md")
+            ui.button(
+                "Review control points",
+                icon="my_location",
+                on_click=lambda: ui.navigate.to("/control-points"),
+            ).props("outline").classes("sam-button-secondary q-mt-md q-ml-sm")
         elif workflow.get("classification") != "completed":
             action_label = (
                 "Start alignment and wait for control points"
@@ -78,9 +105,165 @@ def _render_project_workspace(project: dict | None) -> None:
             ui.label(project["processing"]["last_error"]).classes("text-red-4 text-sm q-mt-md")
 
 
+def _workflow_is_active(workflow: dict) -> bool:
+    """Return whether any persisted workflow stage still needs processing."""
+    return any(
+        status in {"running", "queued"}
+        for status in workflow.values()
+        if isinstance(status, str)
+    )
+
+
+def _live_workflow(project: dict | None) -> dict:
+    """Overlay live pipeline progress onto persisted workflow statuses."""
+    if project is None:
+        return {}
+    statuses = dict(project.get("workflow", {}))
+    if not _workflow_is_active(statuses):
+        return statuses
+    snapshot = _read_progress(project, state.active_project_directory)
+    percent = float(snapshot.get("percent", 0))
+    stage = str(snapshot.get("stage", ""))
+    if stage == "Waiting for control points":
+        statuses.update({
+            "alignment": "completed",
+            "control_points": "waiting",
+            "dense_cloud": "not_started",
+            "classification": "not_started",
+        })
+    else:
+        if percent >= 57:
+            statuses["alignment"] = "completed"
+            statuses["dense_cloud"] = "completed" if percent >= 87 else "running"
+        if percent >= 87:
+            statuses["classification"] = "completed" if percent >= 100 else "running"
+    return statuses
+
+
+def _read_progress(project: dict, project_directory: Path | None) -> dict:
+    """Read pipeline progress, with a stage-based fallback for older runs."""
+    processing = project.get("processing", {})
+    progress = dict(processing.get("progress", {}))
+    if project_directory is not None:
+        progress_path = project_directory / "reports" / "progress.json"
+        if progress_path.exists():
+            try:
+                progress.update(json.loads(progress_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass
+
+    workflow = project.get("workflow", {})
+    if project_directory is not None and not progress.get("stage"):
+        log_path = project_directory / "reports" / "pipeline.log"
+        if log_path.exists():
+            try:
+                log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                last_command = next(
+                    (line.lower() for line in reversed(log_lines) if line.startswith(">>>")),
+                    "",
+                )
+                log_stage = (
+                    ("patch_match_stereo", 62, "Building dense cloud"),
+                    ("stereo_fusion", 78, "Fusing dense cloud"),
+                    ("model_converter", 84, "Preparing classification"),
+                    ("classify.py", 87, "Classifying point cloud"),
+                    ("image_undistorter", 57, "Preparing dense reconstruction"),
+                    ("mapper", 32, "Aligning cameras"),
+                    ("feature_extractor", 5, "Extracting features"),
+                    ("matcher", 18, "Matching images"),
+                )
+                for marker, percent, stage in log_stage:
+                    if marker in last_command:
+                        progress.update({"percent": percent, "stage": stage})
+                        break
+            except OSError:
+                pass
+    fallback = (
+        ("alignment", 32, "Aligning cameras"),
+        ("dense_cloud", 62, "Building dense cloud"),
+        ("classification", 87, "Classifying point cloud"),
+        ("export", 98, "Exporting LAS"),
+    )
+    if not progress.get("stage"):
+        for key, percent, stage in fallback:
+            if workflow.get(key) in {"running", "queued"}:
+                progress.update({"percent": percent, "stage": stage})
+                break
+
+    if not progress:
+        progress = {"percent": 0, "stage": "Preparing images", "detail": ""}
+    return progress
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "calculating..."
+    total_seconds = int(seconds)
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m remaining"
+    return f"{minutes}m {remaining_seconds:02d}s remaining"
+
+
+def _format_elapsed(seconds: float | None) -> str:
+    formatted = _format_duration(seconds)
+    return formatted.removesuffix(" remaining")
+
+
+def _render_processing_progress(project: dict) -> None:
+    """Render a live progress bar and refresh it while processing runs."""
+    initial = _read_progress(project, state.active_project_directory)
+    progress_bar = ui.linear_progress(
+        value=float(initial.get("percent", 0)) / 100,
+        show_value=False,
+    ).classes("w-full q-mt-md")
+    stage_label = ui.label().classes("sam-muted text-sm")
+    photo_label = ui.label().classes("sam-muted text-sm")
+    eta_label = ui.label().classes("sam-muted text-sm")
+
+    def refresh() -> None:
+        current_project = state.active_project()
+        if current_project is None:
+            return
+        snapshot = _read_progress(current_project, state.active_project_directory)
+        percent = max(0.0, min(100.0, float(snapshot.get("percent", 0))))
+        started_at = (
+            snapshot.get("started_at")
+            or current_project.get("processing", {}).get("started_at")
+            or current_project.get("project", {}).get("updated_at")
+        )
+        elapsed = None
+        if isinstance(started_at, (int, float)):
+            elapsed = max(0.0, datetime.now(timezone.utc).timestamp() - float(started_at))
+        elif isinstance(started_at, str):
+            try:
+                elapsed = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds())
+            except ValueError:
+                pass
+        eta = elapsed * (100.0 - percent) / percent if elapsed and percent > 0 else None
+        progress_bar.set_value(percent / 100.0)
+        stage_label.set_text(f"{snapshot.get('stage', 'Processing')} · {percent:.0f}%")
+        if snapshot.get("photo_total"):
+            photo_label.set_text(
+                f"Photos: {snapshot['photo_processed']} / {snapshot['photo_total']} "
+                f"({snapshot['photo_percent']:.0f}%)"
+            )
+        else:
+            photo_label.set_text("")
+        eta_label.set_text(f"Elapsed: {_format_elapsed(elapsed)} · ETA: {_format_duration(eta)}")
+
+    refresh()
+    ui.timer(1.0, refresh)
+
+
 def _render_workflow(project: dict | None) -> None:
     ui.label("Project workflow").classes("sam-workflow-title")
-    statuses = project.get("workflow", {}) if project else {}
+    statuses = _live_workflow(project)
+    progress = _read_progress(project, state.active_project_directory) if project else {}
+    phase_bars = {}
+    phase_labels = {}
+    status_labels = {}
     for index, (label, key) in enumerate(_WORKFLOW, start=1):
         status = "ready" if key is None and project is not None else statuses.get(key, "not started")
         step_class = "sam-workflow-step"
@@ -93,7 +276,46 @@ def _render_workflow(project: dict | None) -> None:
         with ui.element("div").classes(step_class):
             ui.label(str(index)).classes("sam-step-number")
             ui.label(label).classes("sam-step-label")
-            ui.label(status.replace("_", " ")).classes("sam-step-status")
+            status_label = ui.label(status.replace("_", " ")).classes("sam-step-status")
+            status_labels[key] = status_label
+            if key in _PHASE_RANGES and project is not None:
+                phase_percent = _phase_percent(key, statuses, progress)
+                with ui.row().classes("items-center gap-2 w-full q-mt-xs"):
+                    phase_bar = ui.linear_progress(
+                        value=phase_percent / 100.0,
+                        show_value=False,
+                    ).classes("flex-1")
+                    phase_label = ui.label(f"{phase_percent:.0f}%").classes("text-xs sam-muted")
+                phase_bars[key] = phase_bar
+                phase_labels[key] = phase_label
+
+    if project is not None and _workflow_is_active(project.get("workflow", {})):
+        def refresh_workflow() -> None:
+            current_project = state.active_project()
+            if current_project is None:
+                return
+            current_statuses = _live_workflow(current_project)
+            current_progress = _read_progress(current_project, state.active_project_directory)
+            for stage, bar in phase_bars.items():
+                value = _phase_percent(stage, current_statuses, current_progress)
+                bar.set_value(value / 100.0)
+                phase_labels[stage].set_text(f"{value:.0f}%")
+            for stage, label in status_labels.items():
+                if stage in current_statuses:
+                    label.set_text(str(current_statuses[stage]).replace("_", " "))
+
+        ui.timer(1.0, refresh_workflow)
+
+
+def _phase_percent(stage: str, statuses: dict, progress: dict) -> float:
+    """Convert global pipeline progress into an independent phase percentage."""
+    start, end = _PHASE_RANGES[stage]
+    if statuses.get(stage) == "completed" or float(progress.get("percent", 0)) >= end:
+        return 100.0
+    if statuses.get(stage) in {"not_started", "queued"} and float(progress.get("percent", 0)) <= start:
+        return 0.0
+    global_percent = max(start, min(end, float(progress.get("percent", 0))))
+    return (global_percent - start) / (end - start) * 100.0
 
 
 def _render_recent_projects() -> None:
@@ -126,6 +348,17 @@ def _start_processing() -> None:
     try:
         state.processing.start_pipeline(state.active_project_directory)
         ui.notify("Processing started. Keep SAMcloud open while COLMAP and SAM3 run.")
+        ui.navigate.to("/")
+    except (OSError, ValueError) as error:
+        ui.notify(str(error), type="negative")
+
+
+def _continue_after_control_points() -> None:
+    if state.active_project_directory is None:
+        return
+    try:
+        state.processing.continue_after_control_points(state.active_project_directory)
+        ui.notify("Control-point georeferencing and processing started.")
         ui.navigate.to("/")
     except (OSError, ValueError) as error:
         ui.notify(str(error), type="negative")

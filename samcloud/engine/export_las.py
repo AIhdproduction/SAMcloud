@@ -8,6 +8,16 @@ import laspy
 import numpy as np
 from pyproj import CRS, Transformer
 
+from samcloud.pointcloud.georeference import (
+    enu_to_target,
+    export_height_system,
+    export_target_crs,
+    format_residuals,
+    load_georeference,
+    require_export_grids,
+    strict_transformer,
+)
+
 
 PLY_DTYPE = np.dtype(
     [
@@ -81,7 +91,8 @@ def load_class_mapping(path: Path, target_crs: str, class_set: str) -> dict[str,
     }
     return {
         "classification_field": "classification",
-        "coordinate_reference": target_crs,
+        "coordinate_reference": export_target_crs(target_crs),
+        "height_system": export_height_system(target_crs),
         "classification_scheme": "Cyclone 3DR / ASPRS LAS 1.4",
         "semantic_class_set": class_set,
         "class_mapping": mapping,
@@ -96,9 +107,13 @@ def export_las(
     source_crs: str,
     target_crs: str,
     class_set: str,
+    georeference_path: Path | None = None,
 ) -> int:
     payload_offset, vertex_count = read_ply_header(input_path)
-    transformer = _create_transformer(source_crs, target_crs)
+    output_crs = export_target_crs(target_crs)
+    require_export_grids(target_crs)
+    georeference = _load_georeference_for_export(source_crs, target_crs, georeference_path)
+    transformer = _create_transformer(source_crs, output_crs, georeference is not None)
     if class_set not in CLASSIFICATION_CODE_SETS:
         raise ValueError(f"Unsupported class set: {class_set}")
     classification_codes = CLASSIFICATION_CODE_SETS[class_set]
@@ -107,33 +122,27 @@ def export_las(
     ).encode("utf-8")
 
     header = laspy.LasHeader(point_format=7, version="1.4")
-    header.scales = np.array([0.001, 0.001, 0.001])
-    header.offsets = np.array([0.0, 0.0, 0.0])
+    header.scales = _las_scales(output_crs)
+    header.offsets = _offsets_from_transformed_data(
+        input_path, payload_offset, vertex_count, chunk_size, transformer, georeference, target_crs
+    )
     if target_crs.upper() != "LOCAL":
-        header.add_crs(CRS.from_user_input(target_crs))
+        header.add_crs(CRS.from_user_input(output_crs))
     header.vlrs.append(
         laspy.VLR(
             user_id="colmap_sam",
             record_id=1,
-            description="Semantic class mapping",
+            description="Semantic class mapping and height system",
             record_data=metadata,
         )
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with input_path.open("rb") as source, laspy.open(output_path, mode="w", header=header) as destination:
-        source.seek(payload_offset)
-        remaining = vertex_count
-        while remaining:
-            count = min(chunk_size, remaining)
-            data = source.read(count * PLY_DTYPE.itemsize)
-            if len(data) != count * PLY_DTYPE.itemsize:
-                raise ValueError("PLY data ended before all declared vertices were read")
-            points = np.frombuffer(data, dtype=PLY_DTYPE)
+        for points in _ply_chunks(source, payload_offset, vertex_count, chunk_size):
+            count = len(points)
             xyz = np.column_stack((points["x"], points["y"], points["z"]))
-            if transformer is not None:
-                x, y, z = transformer.transform(xyz[:, 0], xyz[:, 1], xyz[:, 2])
-                xyz = np.column_stack((x, y, z))
+            xyz = _transform_xyz(xyz, transformer, georeference, target_crs)
 
             las_points = laspy.ScaleAwarePointRecord.zeros(count, header=header)
             las_points.x = xyz[:, 0]
@@ -148,20 +157,107 @@ def export_las(
             las_points.return_number = np.ones(count, dtype=np.uint8)
             las_points.number_of_returns = np.ones(count, dtype=np.uint8)
             destination.write_points(las_points)
-            remaining -= count
+
+    if georeference is not None:
+        print(f"Georeference residuals: {format_residuals(georeference)}")
+    print(f"Export height system: {export_height_system(target_crs)}")
 
     return vertex_count
 
 
-def _create_transformer(source_crs: str, target_crs: str) -> Transformer | None:
+def _create_transformer(
+    source_crs: str,
+    target_crs: str,
+    has_georeference: bool = False,
+) -> Transformer | None:
     """Return a transformer or validate that no transformation is required."""
     source = source_crs.upper()
     target = target_crs.upper()
     if source == target:
         return None
-    if "LOCAL" in {source, target}:
-        raise ValueError("A local point cloud needs a defined CRS before transformation")
-    return Transformer.from_crs(source_crs, target_crs, always_xy=True)
+    if source == "LOCAL":
+        if has_georeference:
+            return None
+        raise ValueError(
+            "This project is in LOCAL coordinates and has no GPS georeference. "
+            "It must be exported as LOCAL; georeferencing via control points is not available yet."
+        )
+    if target == "LOCAL":
+        raise ValueError("A defined CRS cannot be transformed to LOCAL coordinates")
+    return strict_transformer(source_crs, target_crs)
+
+
+def _load_georeference_for_export(
+    source_crs: str,
+    target_crs: str,
+    georeference_path: Path | None,
+) -> dict[str, object] | None:
+    if source_crs.upper() != "LOCAL" or target_crs.upper() == "LOCAL":
+        return None
+    if georeference_path is None:
+        return None
+    path = Path(georeference_path)
+    if not path.is_file():
+        raise ValueError(f"Georeference file was not found: {path}")
+    return load_georeference(path)
+
+
+def _ply_chunks(source, payload_offset: int, vertex_count: int, chunk_size: int):
+    source.seek(payload_offset)
+    remaining = vertex_count
+    while remaining:
+        count = min(chunk_size, remaining)
+        data = source.read(count * PLY_DTYPE.itemsize)
+        if len(data) != count * PLY_DTYPE.itemsize:
+            raise ValueError("PLY data ended before all declared vertices were read")
+        yield np.frombuffer(data, dtype=PLY_DTYPE)
+        remaining -= count
+
+
+def _transform_xyz(
+    xyz: np.ndarray,
+    transformer: Transformer | None,
+    georeference: dict[str, object] | None,
+    target_crs: str,
+) -> np.ndarray:
+    if georeference is not None:
+        return enu_to_target(xyz, georeference, target_crs)
+    if transformer is None:
+        return xyz
+    x, y, z = transformer.transform(xyz[:, 0], xyz[:, 1], xyz[:, 2])
+    return np.column_stack((x, y, z))
+
+
+def _offsets_from_transformed_data(
+    input_path: Path,
+    payload_offset: int,
+    vertex_count: int,
+    chunk_size: int,
+    transformer: Transformer | None,
+    georeference: dict[str, object] | None,
+    target_crs: str,
+) -> np.ndarray:
+    minimum: np.ndarray | None = None
+    with input_path.open("rb") as source:
+        for points in _ply_chunks(source, payload_offset, vertex_count, chunk_size):
+            xyz = np.column_stack((points["x"], points["y"], points["z"]))
+            transformed = _transform_xyz(xyz, transformer, georeference, target_crs)
+            if not np.all(np.isfinite(transformed)):
+                raise ValueError("Coordinate transformation produced non-finite values")
+            chunk_minimum = transformed.min(axis=0)
+            minimum = chunk_minimum if minimum is None else np.minimum(minimum, chunk_minimum)
+    if minimum is None:
+        raise ValueError("PLY contains no vertices")
+    return np.floor(minimum)
+
+
+def _las_scales(target_crs: str) -> np.ndarray:
+    """Return LAS scales appropriate for geographic or metre-based coordinates."""
+    if target_crs.upper() == "LOCAL":
+        return np.array([0.001, 0.001, 0.001])
+    if CRS.from_user_input(target_crs).is_geographic:
+        return np.array([1e-7, 1e-7, 0.001])
+    return np.array([0.001, 0.001, 0.001])
 
 
 def main() -> None:
@@ -173,6 +269,8 @@ def main() -> None:
                         help="semantic class set used in the PLY")
     parser.add_argument("--source-crs", default="LOCAL", help="CRS of the input point cloud, for example EPSG:2056")
     parser.add_argument("--target-crs", default="LOCAL", help="CRS written to LAS, for example EPSG:2056")
+    parser.add_argument("--georeference", type=Path, default=None,
+                        help="ENU-to-ECEF georeference JSON for LOCAL GPS-aligned projects")
     parser.add_argument("--chunk-size", type=int, default=1_000_000, help="points written per batch")
     args = parser.parse_args()
 
@@ -186,6 +284,7 @@ def main() -> None:
         args.source_crs,
         args.target_crs,
         args.class_set,
+        args.georeference,
     )
     print(f"Wrote {count:,} classified points to {args.output}")
 

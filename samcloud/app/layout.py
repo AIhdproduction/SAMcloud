@@ -21,7 +21,7 @@ _STYLE = """
 body { background:var(--sam-bg)!important; color:var(--sam-text); }
 .sam-shell { min-height:100vh; width:100%; background:var(--sam-bg); color:var(--sam-text); }
 .sam-sidebar { width:260px; min-width:260px; min-height:100vh; padding:30px 16px 22px; border-right:1px solid var(--sam-line); background:linear-gradient(180deg,#0a1824 0%,#0a1520 100%); }
-.sam-wordmark { margin:0 14px 38px; font-size:32px; line-height:1; letter-spacing:-1.4px; color:var(--sam-text); }.sam-wordmark strong { color:var(--sam-accent); font-weight:800; }
+.sam-wordmark { margin:0 14px 38px; display:flex; align-items:center; gap:10px; font-size:32px; line-height:1; letter-spacing:-1.4px; color:var(--sam-text); }.sam-wordmark-logo { width:34px; height:34px; flex:none; object-fit:contain; }.sam-wordmark strong { color:var(--sam-accent); font-weight:800; }
 .sam-nav { width:100%; min-height:52px; padding:0 14px; margin:3px 0; justify-content:flex-start; color:#d5e1eb!important; border-radius:8px; font-size:15px; }.sam-nav .q-icon { margin-right:13px; font-size:21px; color:#a8bfd1; }.sam-nav:hover { background:rgba(55,137,182,.14); }
 .sam-nav-active { color:#effbff!important; background:rgba(36,150,207,.22); border-left:3px solid var(--sam-accent); border-radius:0 8px 8px 0; padding-left:11px; }.sam-nav-active .q-icon { color:var(--sam-accent); }
 .sam-sidebar-footer { margin:auto 11px 0; padding-top:24px; color:#7890a5; font-size:10px; letter-spacing:1.5px; }
@@ -34,8 +34,8 @@ body { background:var(--sam-bg)!important; color:var(--sam-text); }
 .sam-step-number { position:absolute; left:0; top:7px; width:35px; height:35px; display:grid; place-items:center; border:1px solid #5f7a90; border-radius:50%; color:#d9e9f4; font-size:13px; }.sam-workflow-step.is-active { margin:0 -8px; padding-left:58px; border:1px solid #24719b; border-radius:7px; background:rgba(24,105,150,.14); }.sam-workflow-step.is-active .sam-step-number { left:8px; border-color:var(--sam-accent); background:var(--sam-accent); color:#06202f; }.sam-workflow-step.is-complete .sam-step-number { border-color:var(--sam-success); color:var(--sam-success); }
 .sam-step-label { display:block; font-size:15px; }.sam-step-status { display:block; margin-top:3px; color:var(--sam-muted); font-size:12px; text-transform:capitalize; }
 .sam-recent { margin-top:22px; padding:20px 22px 10px; }.sam-recent-head { padding-bottom:16px; border-bottom:1px solid var(--sam-line); }.sam-project-row { padding:16px 2px; border-bottom:1px solid var(--sam-line-soft); }.sam-project-row:last-child { border-bottom:0; }.sam-project-name { color:var(--sam-text); font-weight:600; }.sam-project-path { color:var(--sam-muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.sam-empty-row { padding:22px 2px; color:var(--sam-muted); }
-.q-field__label,.q-field__native,.q-field__input,.q-select__dropdown-icon { color:var(--sam-text)!important; }.q-field--outlined .q-field__control:before { border-color:#456176!important; }.q-field--outlined .q-field__control:hover:before { border-color:var(--sam-accent)!important; }.q-toggle__label,.q-checkbox__label,.q-radio__label { color:var(--sam-text); }.q-btn { text-transform:none; letter-spacing:0; }
-@media (max-width:820px) { .sam-sidebar { width:58px; min-width:58px; padding:24px 5px; }.sam-wordmark { margin:0 0 32px; font-size:0; text-align:center; }.sam-wordmark strong { font-size:26px; }.sam-nav { min-width:48px; padding:0; justify-content:center; font-size:0; }.sam-nav .q-btn__content { font-size:0; }.sam-nav .q-icon { margin:0; font-size:21px!important; }.sam-nav-active { padding-left:0; border-left-width:2px; }.sam-sidebar-footer { display:none; }.sam-page { padding:30px 18px 48px; }.sam-page-title { font-size:29px; }.sam-dropzone { min-height:320px; } }
+.q-field__label,.q-field__native,.q-field__input,.q-select__dropdown-icon,.q-select .q-field__native span,.q-menu .q-item { color:var(--sam-text)!important; }.q-menu { background:var(--sam-panel)!important; color:var(--sam-text)!important; }.q-field--outlined .q-field__control:before { border-color:#456176!important; }.q-field--outlined .q-field__control:hover:before { border-color:var(--sam-accent)!important; }.q-toggle__label,.q-checkbox__label,.q-radio__label { color:var(--sam-text); }.q-btn { text-transform:none; letter-spacing:0; }
+@media (max-width:820px) { .sam-sidebar { width:58px; min-width:58px; padding:24px 5px; }.sam-wordmark { margin:0 0 32px; justify-content:center; }.sam-wordmark-text { display:none; }.sam-nav { min-width:48px; padding:0; justify-content:center; font-size:0; }.sam-nav .q-btn__content { font-size:0; }.sam-nav .q-icon { margin:0; font-size:21px!important; }.sam-nav-active { padding-left:0; border-left-width:2px; }.sam-sidebar-footer { display:none; }.sam-page { padding:30px 18px 48px; }.sam-page-title { font-size:29px; }.sam-dropzone { min-height:320px; } }
 </style>
 """
 
@@ -47,7 +47,7 @@ def render_page(title: str, content: Callable[[], None], *, current_path: str) -
     ui.dark_mode(value=True)
     with ui.element("div").classes("sam-shell row no-wrap"):
         with ui.element("aside").classes("sam-sidebar column"):
-            ui.html('<div class="sam-wordmark"><strong>SAM</strong>cloud</div>')
+            ui.html('<div class="sam-wordmark"><img class="sam-wordmark-logo" src="/assets-static/samcloud-logo-96.png" alt="SAMcloud logo"><span class="sam-wordmark-text"><strong>SAM</strong>cloud</span></div>')
             for label, path, icon in _NAVIGATION:
                 classes = "sam-nav sam-nav-active" if path == current_path else "sam-nav"
                 ui.button(label, icon=icon, on_click=lambda destination=path: ui.navigate.to(destination)).props("flat no-caps").classes(classes)

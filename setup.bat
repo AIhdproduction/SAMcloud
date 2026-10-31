@@ -58,6 +58,13 @@ set "PIP_RETRIES=10"
 venv\Scripts\python.exe -m pip install --upgrade pip
 venv\Scripts\python.exe -m pip install -r requirements.txt
 
+echo Ensuring the Swiss LN02 height grid is available...
+venv\Scripts\python.exe -m pyproj sync --system-directory --file ch_swisstopo_chgeo2004_ETRS89_LN02.tif
+if %errorlevel% neq 0 (
+    echo WARNING: The Swiss LN02 height grid could not be downloaded.
+    echo LV95 exports require ch_swisstopo_chgeo2004_ETRS89_LN02.tif and will fail until it is installed.
+)
+
 echo.
 echo SAM3 weights are access-gated and are not downloaded automatically.
 echo Request access at https://huggingface.co/facebook/sam3, download sam3.pt,

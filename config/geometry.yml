@@ -1,0 +1,58 @@
+# Geometric refinement runs only for calibrated outdoor ENU point clouds.
+enabled_class_sets: [outdoor]
+
+terrain:
+  # One metre cells retain terrain relief while averaging dense reconstruction noise.
+  cell_size: 1.0
+  # The low rank rejects occasional below-ground outliers without using an unsafe minimum.
+  percentile: 5
+  min_points: 5
+  # Larger than ordinary flat roofs, so mislabeled roof plateaus are removed from the DTM.
+  opening_window_m: 40
+  ground_classes: [ground, road, sidewalk, curb, low vegetation, water]
+
+# SAM mean P_final confidence. Start values are intentionally easy to tune per project.
+confidence:
+  protect_above: 0.85
+  dtm_min_confidence: 0.5
+  second_best_min: 0.2
+
+support:
+  cell_size: 1.0
+  percentile: 5
+  min_points: 3
+  window_m: 3
+
+features:
+  voxel_size: 0.5
+  min_points: 6
+
+neighbors:
+  voxel_radius: 1
+  min_share: 0.05
+  iterations: 1
+
+flat_roof:
+  source_classes: [ground, road, sidewalk, curb, water]
+  min_hag: 2.5
+  strong_min_hag: 5.0
+  ambiguous_max_confidence: 0.6
+  min_normal_z: 0.9
+  min_planarity: 0.3
+
+rules:
+  ground: {max_hag: 1.0}
+  road: {max_hag: 0.5, min_normal_z: 0.85, max_roughness: 0.15}
+  sidewalk: {max_hag: 0.6, min_normal_z: 0.85, max_roughness: 0.15}
+  curb: {max_hag: 0.6, adjacent_classes: [road, sidewalk], min_adjacent_points: 3, adjacent_voxel_radius: 2}
+  water: {max_hag: 0.5, min_normal_z: 0.9}
+  low vegetation: {max_hag: 2.0, max_height_above_support: 2.0}
+  tree: {min_hag: 2.0}
+  building: {min_hag: 2.0, or_vertical: {max_normal_z: 0.35, min_hag: 0.3}}
+  vehicle: {max_hag: 4.5}
+  # Roof railings and parapet fences are evaluated relative to their local support.
+  fence: {max_hag: 3.0, max_height_above_support: 3.0}
+  overhead power line: {min_hag: 3.0, max_planarity: 0.4}
+  traffic sign: {max_hag: 6.0}
+  construction container: {max_hag: 6.0}
+  construction machinery: {max_hag: 10.0}

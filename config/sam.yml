@@ -8,6 +8,10 @@ inference:
   tile_size_px: 1008
   tile_minimum_overlap: 0.2
   minimum_votes: 1
+  mode: segearth_ov3
+  background_threshold: 0.4
+  query_threshold: 0.4
+  threshold_sweep: []
 
 output:
   unknown_class_id: 0
