@@ -15,6 +15,14 @@ _NAVIGATION = (
 )
 
 
+_PROJECT_PAGES = {"/sparse", "/control-points", "/dense"}
+
+
+def _visible_navigation(project_open: bool) -> list[tuple[str, str, str]]:
+    """Hide project-specific pages until a project is open."""
+    return [item for item in _NAVIGATION if project_open or item[1] not in _PROJECT_PAGES]
+
+
 _STYLE = """
 <style>
 :root { --sam-bg:#09131d; --sam-panel:#0e1c28; --sam-line:#20394b; --sam-line-soft:rgba(113,154,181,.18); --sam-text:#eaf2f8; --sam-muted:#96aabe; --sam-accent:#26b7ef; --sam-success:#4bc692; }
@@ -26,6 +34,7 @@ body { background:var(--sam-bg)!important; color:var(--sam-text); }
 .sam-nav-active { color:#effbff!important; background:rgba(36,150,207,.22); border-left:3px solid var(--sam-accent); border-radius:0 8px 8px 0; padding-left:11px; }.sam-nav-active .q-icon { color:var(--sam-accent); }
 .sam-sidebar-footer { margin:auto 11px 0; padding-top:24px; color:#7890a5; font-size:10px; letter-spacing:1.5px; }
 .sam-main { min-width:0; flex:1 1 auto; }.sam-topbar { height:32px; border-bottom:1px solid var(--sam-line-soft); }.sam-page { width:min(1220px,100%); margin:0 auto; padding:46px clamp(22px,4vw,58px) 64px; }
+.sam-page-wide { width:100%; max-width:none; padding:18px clamp(12px,1.6vw,26px) 24px; }.sam-page-wide .sam-page-title { margin:0 0 10px; font-size:clamp(24px,2.2vw,32px); }
 .sam-page-title { margin:0 0 31px; font-size:clamp(30px,3vw,42px); font-weight:650; letter-spacing:-.8px; line-height:1.12; color:var(--sam-text); }.sam-section-title { color:var(--sam-text); font-size:20px; font-weight:600; letter-spacing:-.2px; }.sam-muted { color:var(--sam-muted); }
 .sam-surface, .q-card { background:var(--sam-panel)!important; border:1px solid var(--sam-line)!important; border-radius:9px!important; box-shadow:none!important; color:var(--sam-text); }
 .sam-dropzone { min-height:390px; padding:42px 30px; border:1px dashed #47718a; border-radius:9px; background:radial-gradient(circle at 50% 25%,rgba(24,93,126,.14),transparent 45%),#0c1924; }.sam-dropzone .q-icon { color:#c2d7e6; font-size:64px; }.sam-dropzone-title { margin-top:18px; font-size:21px; font-weight:520; color:var(--sam-text); }
@@ -40,20 +49,29 @@ body { background:var(--sam-bg)!important; color:var(--sam-text); }
 """
 
 
-def render_page(title: str, content: Callable[[], None], *, current_path: str) -> None:
+def render_page(
+    title: str,
+    content: Callable[[], None],
+    *,
+    current_path: str,
+    wide: bool = False,
+) -> None:
     """Render the common navigation shell around a page's functional content."""
+    from samcloud.app.state import state
+
+    project_open = state.active_project_directory is not None and state.active_project() is not None
     ui.add_head_html(_STYLE)
     ui.colors(primary="#26b7ef", positive="#4bc692", negative="#ef6b73")
     ui.dark_mode(value=True)
     with ui.element("div").classes("sam-shell row no-wrap"):
         with ui.element("aside").classes("sam-sidebar column"):
             ui.html('<div class="sam-wordmark"><img class="sam-wordmark-logo" src="/assets-static/samcloud-logo-96.png" alt="SAMcloud logo"><span class="sam-wordmark-text"><strong>SAM</strong>cloud</span></div>')
-            for label, path, icon in _NAVIGATION:
+            for label, path, icon in _visible_navigation(project_open):
                 classes = "sam-nav sam-nav-active" if path == current_path else "sam-nav"
                 ui.button(label, icon=icon, on_click=lambda destination=path: ui.navigate.to(destination)).props("flat no-caps").classes(classes)
             ui.label("COLMAP · SAM3").classes("sam-sidebar-footer")
         with ui.element("main").classes("sam-main"):
             ui.element("div").classes("sam-topbar")
-            with ui.element("section").classes("sam-page"):
+            with ui.element("section").classes("sam-page sam-page-wide" if wide else "sam-page"):
                 ui.label(title).classes("sam-page-title")
                 content()

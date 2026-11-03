@@ -25,6 +25,58 @@ _PHASE_RANGES = {
     "classification": (87.0, 98.0),
 }
 
+_PHASE_STAGES = {
+    "alignment": ("feature_extraction", "matching", "mapping", "tiepoint_filtering"),
+    "control_points": ("control_points",),
+    "dense_cloud": ("undistortion", "dense_stereo", "dense_fusion"),
+    "classification": ("classification", "geometry_refinement"),
+}
+
+_TIME_GROUPS = (
+    ("Ausrichtung", ("Preparing GPS references", "Feature extraction", "Image matching", "Sparse reconstruction",
+                     "Tie point analysis", "GPS alignment")),
+    ("Passpunkte", ("Preparing automatic control points", "Applying control points", "Preparing control points")),
+    ("Dichte Punktwolke", ("Preparing dense reconstruction", "Dense stereo", "Dense fusion")),
+    ("Klassifizierung", ("Preparing classification", "SAM3 classification", "Geometric refinement", "Georeference")),
+    ("Export", ("LAS export",)),
+)
+
+
+def _processing_time_summary(project_directory: Path | None) -> dict | None:
+    """Total processing time of the latest completed run chain (alignment run + resume run)."""
+    if project_directory is None:
+        return None
+    runs = []
+    for path in (project_directory / "reports").glob("run_metrics_*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data.get("total_seconds"), (int, float)):
+            runs.append(data)
+    runs.sort(key=lambda item: str(item.get("started_at", "")))
+    completed = [index for index, item in enumerate(runs) if item.get("status") == "Completed"]
+    if not completed:
+        return None
+    chain = [runs[completed[-1]]]
+    if "Sparse reconstruction" not in chain[0].get("stage_seconds", {}):
+        for item in reversed(runs[:completed[-1]]):
+            if "Sparse reconstruction" in item.get("stage_seconds", {}):
+                chain.insert(0, item)
+                break
+    total = float(sum(float(item["total_seconds"]) for item in chain))
+    groups: dict[str, float] = {name: 0.0 for name, _ in _TIME_GROUPS}
+    for item in chain:
+        for stage, seconds in item.get("stage_seconds", {}).items():
+            for name, members in _TIME_GROUPS:
+                if stage in members or (name == "Ausrichtung" and (stage.startswith("Tie point filtering") or stage.startswith("Bundle adjustment"))):
+                    groups[name] += float(seconds)
+                    break
+    other = max(0.0, total - sum(groups.values()))
+    if other >= 1.0:
+        groups["Übrige Schritte"] = other
+    return {"total_seconds": total, "groups": {name: value for name, value in groups.items() if value >= 1.0}, "runs": len(chain)}
+
 
 def render() -> None:
     """Render the active-project dashboard or a practical starting workspace."""
@@ -241,9 +293,17 @@ def _render_processing_progress(project: dict) -> None:
                 elapsed = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds())
             except ValueError:
                 pass
-        eta = elapsed * (100.0 - percent) / percent if elapsed and percent > 0 else None
+        eta = snapshot.get("eta_seconds")
+        if eta is None:
+            eta = elapsed * (100.0 - percent) / percent if elapsed and percent > 0 else None
         progress_bar.set_value(percent / 100.0)
-        stage_label.set_text(f"{snapshot.get('stage', 'Processing')} · {percent:.0f}%")
+        if snapshot.get("stage_eta_seconds") is not None:
+            stage_label.set_text(
+                f"{snapshot.get('stage', 'Processing')} · {float(snapshot.get('stage_percent', 0)):.0f}% · "
+                f"Schritt noch {_format_duration(snapshot['stage_eta_seconds'])}"
+            )
+        else:
+            stage_label.set_text(f"{snapshot.get('stage', 'Processing')} · {percent:.0f}%")
         if snapshot.get("photo_total"):
             photo_label.set_text(
                 f"Photos: {snapshot['photo_processed']} / {snapshot['photo_total']} "
@@ -251,13 +311,19 @@ def _render_processing_progress(project: dict) -> None:
             )
         else:
             photo_label.set_text("")
-        eta_label.set_text(f"Elapsed: {_format_elapsed(elapsed)} · ETA: {_format_duration(eta)}")
+        eta_label.set_text(f"Elapsed: {_format_elapsed(elapsed)} · Gesamt-ETA: {_format_duration(eta)}")
 
     refresh()
     ui.timer(1.0, refresh)
 
 
 def _render_workflow(project: dict | None) -> None:
+    ui.add_head_html(
+        "<style>"
+        ".sam-processing-time { margin-top:14px; padding-top:12px; border-top:1px solid var(--sam-line); }"
+        ".sam-processing-total { font-size:15px; font-weight:600; color:var(--sam-text); margin-bottom:6px; }"
+        "</style>"
+    )
     ui.label("Project workflow").classes("sam-workflow-title")
     statuses = _live_workflow(project)
     progress = _read_progress(project, state.active_project_directory) if project else {}
@@ -289,6 +355,16 @@ def _render_workflow(project: dict | None) -> None:
                 phase_bars[key] = phase_bar
                 phase_labels[key] = phase_label
 
+    if project is not None and project.get("workflow", {}).get("classification") == "completed":
+        timing = _processing_time_summary(state.active_project_directory)
+        if timing is not None:
+            with ui.element("div").classes("sam-processing-time"):
+                ui.label(f"Rechenzeit gesamt: {_format_elapsed(timing['total_seconds'])}").classes("sam-processing-total")
+                for name, seconds in timing["groups"].items():
+                    with ui.row().classes("items-center justify-between w-full no-wrap"):
+                        ui.label(name).classes("text-xs sam-muted")
+                        ui.label(_format_elapsed(seconds)).classes("text-xs sam-muted")
+
     if project is not None and _workflow_is_active(project.get("workflow", {})):
         def refresh_workflow() -> None:
             current_project = state.active_project()
@@ -309,6 +385,16 @@ def _render_workflow(project: dict | None) -> None:
 
 def _phase_percent(stage: str, statuses: dict, progress: dict) -> float:
     """Convert global pipeline progress into an independent phase percentage."""
+    if statuses.get(stage) == "completed":
+        return 100.0
+    members = _PHASE_STAGES.get(stage, ())
+    estimator_stages = [item for item in progress.get("stages", []) if item.get("key") in members]
+    if estimator_stages:
+        weights = [max(float(item.get("expected_seconds") or 0.0), 1.0) for item in estimator_stages]
+        values = [100.0 if item.get("status") in {"done", "skipped"} else float(item.get("percent") or 0.0) for item in estimator_stages]
+        return sum(value * weight for value, weight in zip(values, weights)) / sum(weights)
+    if stage not in _PHASE_RANGES:
+        return 0.0
     start, end = _PHASE_RANGES[stage]
     if statuses.get(stage) == "completed" or float(progress.get("percent", 0)) >= end:
         return 100.0

@@ -102,7 +102,7 @@ def render() -> None:
                     on_click=lambda: _restore_default_colors(class_set, len(labels)),
                 ).props("outline")
 
-    render_page("Dense Cloud", content, current_path="/dense")
+    render_page("Dense Cloud", content, current_path="/dense", wide=True)
 
 
 def _load_classes(class_set: str) -> list[str]:

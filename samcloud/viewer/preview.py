@@ -65,6 +65,7 @@ def _source_path(project_directory: Path, kind: str) -> Path | None:
     products = project_directory / "products"
     if kind == "sparse":
         candidates = (
+            products / "sparse" / "gcp_adjusted" / "points3D.bin",
             products / "sparse" / "0_geo" / "points3D.bin",
             products / "sparse" / "0" / "points3D.bin",
         )

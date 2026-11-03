@@ -71,6 +71,25 @@ def fill_empty_cells(grid: np.ndarray, max_iterations: int | None = None) -> np.
     return result
 
 
+def progressive_morphological_filter(
+    surface: np.ndarray, cell_size: float, windows_m: tuple[float, ...] = (1, 3, 6, 12, 24, 40),
+    slope: float = 0.35, initial_threshold_m: float = 0.15, max_threshold_m: float = 3.0,
+) -> np.ndarray:
+    """Zhang et al. (2003): remove objects with growing windows while keeping terrain slopes."""
+    filled = fill_empty_cells(surface.copy())
+    current = filled.copy()
+    terrain = np.isfinite(surface)
+    previous_window = 0.0
+    for window in windows_m:
+        cells = max(1, int(round(window / cell_size)))
+        opened = morphological_opening(current, cells)
+        threshold = min(max_threshold_m, initial_threshold_m + slope * (window - previous_window))
+        terrain &= (current - opened) <= threshold
+        current = opened
+        previous_window = float(window)
+    return fill_empty_cells(np.where(terrain, filled, np.nan))
+
+
 def build_dtm(
     xyz: np.ndarray,
     ground_mask: np.ndarray,
@@ -78,6 +97,9 @@ def build_dtm(
     percentile: float,
     min_points: int,
     opening_window_m: float,
+    *,
+    method: str = "opening",
+    pmf: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Build a low-percentile, morphologically opened terrain raster.
 
@@ -109,6 +131,14 @@ def build_dtm(
         raster_flat[flat[start]] = np.partition(values, rank)[rank]
     raster = raster_flat.reshape((shape[1], shape[0]))
     filled = fill_empty_cells(raster)
+    if method == "pmf":
+        options = pmf or {}
+        terrain = progressive_morphological_filter(
+            raster, cell_size, tuple(float(w) for w in options.get("windows_m", (1, 3, 6, 12, 24, 40))),
+            float(options.get("slope", 0.35)), float(options.get("initial_threshold_m", 0.15)),
+            float(options.get("max_threshold_m", 3.0)),
+        )
+        return terrain, origin.astype(np.float64), float(cell_size)
     opened = morphological_opening(filled, int(np.ceil(opening_window_m / cell_size)))
     return opened, origin.astype(np.float64), float(cell_size)
 

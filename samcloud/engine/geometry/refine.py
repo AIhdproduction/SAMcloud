@@ -21,6 +21,7 @@ from samcloud.engine.geometry.neighbors import build_voxel_neighbour_index, voxe
 from samcloud.engine.geometry.rules import passes_for_class
 from samcloud.engine.geometry.rules.building import flat_roof_passes
 from samcloud.engine.geometry.support import build_local_support, height_above_support
+from samcloud.engine.geometry.surface import apply_surface_rule, neighbourhood_majority
 from samcloud.engine.geometry.terrain import build_dtm, height_above_ground, populated_terrain_cells
 from samcloud.engine.ply_io import read_classified_ply, write_classified_ply
 
@@ -310,6 +311,7 @@ def refine_classification(
     id_to_name: dict[int, str],
     name_to_id: dict[str, int],
     scores: dict[str, np.ndarray] | None = None,
+    rgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Run the complete geometry refinement on in-memory points and labels."""
     started = time.perf_counter()
@@ -338,6 +340,7 @@ def refine_classification(
     dtm, origin, cell_size = build_dtm(
         xyz, dtm_mask, float(terrain_config["cell_size"]), float(terrain_config["percentile"]),
         int(terrain_config["min_points"]), float(terrain_config["opening_window_m"]),
+        method=str(terrain_config.get("method", "opening")), pmf=terrain_config.get("pmf"),
     )
     feature_values, voxel_coords, _ = compute_voxel_features(
         xyz, float(config["features"]["voxel_size"]), int(config["features"]["min_points"]),
@@ -349,7 +352,8 @@ def refine_classification(
         "second_conf": second_conf,
         **feature_values,
     }
-    refined, flat_roof_count = apply_flat_roof_rule(class_ids, features, name_to_id, config)
+    surface_input, surface_stats = apply_surface_rule(class_ids, xyz, rgb, features["hag"], name_to_id, config.get("surface", {}))
+    refined, flat_roof_count = apply_flat_roof_rule(surface_input, features, name_to_id, config)
     support_config = config.get("support", {})
     horizontal = np.isfinite(features["normal_z"]) & (features["normal_z"] >= 0.9)
     support_ids = [name_to_id[name] for name in terrain_config.get("ground_classes", []) if name in name_to_id]
@@ -391,6 +395,18 @@ def refine_classification(
             reassigned[id_to_name.get(class_id, str(class_id))] += count
         unknown += unresolved
         resolution.update(resolved_by)
+    smoothing = config.get("smoothing", {})
+    smoothed_count = 0
+    if smoothing.get("enabled", True):
+        protected_ids = tuple(name_to_id[name] for name in smoothing.get("protected_classes", []) if name in name_to_id)
+        before_smoothing = refined
+        refined = neighbourhood_majority(
+            xyz, refined, max(int(refined.max(initial=0)), max(id_to_name, default=0)) + 1,
+            voxel=float(smoothing.get("voxel_size", 0.3)), iterations=int(smoothing.get("iterations", 2)),
+            own_max_share=float(smoothing.get("own_max_share", 0.25)),
+            majority_min_share=float(smoothing.get("majority_min_share", 0.6)), protected=protected_ids,
+        )
+        smoothed_count = int(np.count_nonzero(before_smoothing != refined))
     changed = np.flatnonzero(class_ids != refined)
     final_transitions = Counter(zip(map(int, class_ids[changed]), map(int, refined[changed])))
     return refined, {
@@ -409,6 +425,9 @@ def refine_classification(
             {"from": id_to_name.get(source, "unknown"), "to": id_to_name.get(target, "unknown"), "count": count}
             for (source, target), count in final_transitions.most_common(12)
         ],
+        "surface_rule": surface_stats,
+        "smoothed_points": smoothed_count,
+        "dtm_method": str(terrain_config.get("method", "opening")),
         "runtime_seconds": time.perf_counter() - started,
         "terrain_cells": [int(dtm.shape[1]), int(dtm.shape[0])],
     }
@@ -467,7 +486,7 @@ def main() -> None:
     id_to_name, name_to_id = class_name_mapping(args.classes_json, args.class_set)
     scores = load_scores(args.scores, len(xyz)) if args.scores else None
     _write_progress(args.progress_file, "Estimating terrain and local geometry")
-    refined, summary = refine_classification(xyz, class_ids, config, id_to_name, name_to_id, scores)
+    refined, summary = refine_classification(xyz, class_ids, config, id_to_name, name_to_id, scores, rgb=rgb)
     summary["confidence_percentiles_per_class"] = (
         confidence_percentiles(class_ids, scores["top1_conf"], id_to_name) if scores is not None else {}
     )

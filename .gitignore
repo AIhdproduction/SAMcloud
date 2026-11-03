@@ -49,3 +49,6 @@ assets/potree/*
 # Local dev tooling (Graphify code graph)
 .codex-tools/
 graphify-out/
+
+# Local external tools (PotreeConverter)
+/tools/

@@ -1,16 +1,37 @@
 camera:
-  single_camera: true
   camera_model: AUTO
-  max_image_size: 3200
+  grouping: sequence_number
+  max_image_size: 4000
+
+features:
+  max_num_features: 16384
+  estimate_affine_shape: false
+  domain_size_pooling: false
 
 alignment:
-  matching_strategy: exhaustive
+  matching_strategy: auto
+  spatial_max_num_neighbors: 50
+  spatial_max_distance_m: 200
   use_gpu: true
-  mapper: incremental
+  mapper: pose_prior
+
+tiepoint_filter:
+  enabled: true
+  passes:
+    - max_reproj_error: 2.0
+      min_tri_angle: 1.5
+      min_track_len: 2
+    - max_reproj_error: 1.0
+      min_tri_angle: 2.0
+      min_track_len: 3
 
 georeferencing:
   rtk_max_error_m: 0.1
   standard_gps_max_error_m: 3.0
+  rtk_prior_std_xy_m: 0.03
+  rtk_prior_std_z_m: 0.05
+  standard_gps_prior_std_xy_m: 3.0
+  standard_gps_prior_std_z_m: 5.0
   control_point_minimum_observations: 2
   control_point_crs: EPSG:2056
 
@@ -20,3 +41,8 @@ dense_reconstruction:
   num_iterations: 3
   gpu_index: 0
   output: fused.ply
+  fusion:
+    min_num_pixels: 5
+    max_reproj_error: 1.0
+    max_depth_error: 0.005
+    max_normal_error: 10

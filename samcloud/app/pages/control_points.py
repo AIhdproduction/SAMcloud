@@ -9,8 +9,9 @@ from urllib.parse import quote
 from nicegui import events, ui
 
 from samcloud.app.layout import render_page
+from samcloud.app.pages.gcp_review import render_review_workspace
 from samcloud.app.state import state
-from samcloud.control_points.repository import load_observations, read_control_points, save_observations, write_control_points
+from samcloud.control_points.repository import apply_roles, load_observations, read_control_points, save_observations, write_control_points
 from samcloud.control_points.georeference import georeference_from_control_points
 from samcloud.engine.pipeline import _create_pristine_gcp_backups
 
@@ -32,28 +33,76 @@ def render() -> None:
         settings.setdefault("crs", "EPSG:2056+5728"); settings.setdefault("min_points", 3); settings.setdefault("min_observations_per_point", 2)
         selected = {"name": None, "image": None}
         preview = {"report": None, "error": ""}
+        pending_import: dict[str, object] = {"points": None}
 
         def points(): return read_control_points(csv_path) if csv_path.exists() else None
         def clicks(): return load_observations(observations_path)
         def save_crs(event: events.ValueChangeEventArguments) -> None:
             settings["crs"] = event.value; state.projects.save(project_directory, project)
 
+        def save_role(name: str, role: str) -> None:
+            control_points = points()
+            if control_points is not None:
+                write_control_points(apply_roles(control_points, {name: role}), csv_path)
+                table.refresh()
+
         with ui.card().classes("w-full"):
             ui.label("Control point coordinates").classes("text-lg font-medium")
             ui.label("Import name, x, y, z coordinates. The default is Swiss LV95 + LN02.").classes("sam-muted text-sm")
             ui.select(_CRS_OPTIONS, label="Control-point CRS", value=settings["crs"], on_change=save_crs).classes("w-full max-w-md")
             async def import_csv(event: events.UploadEventArguments) -> None:
-                upload = control_directory / ".uploaded_control_points.csv"
+                upload = control_directory / ".uploaded_control_points"
                 await event.file.save(upload)
-                try: write_control_points(read_control_points(upload), csv_path)
+                try:
+                    pending_import["points"] = read_control_points(upload)
                 except ValueError as error: ui.notify(str(error), type="negative")
-                finally:
-                    if upload.exists(): upload.unlink()
-                table.refresh(); workspace.refresh()
-            ui.upload(on_upload=import_csv, auto_upload=True, label="Import control-point CSV").props("accept=.csv").classes("q-mt-md")
+                import_table.refresh()
+            ui.upload(on_upload=import_csv, auto_upload=True, label="Punktdatei importieren").props("accept=.csv,.txt,.dat").classes("q-mt-md")
+
+        @ui.refreshable
+        def import_table() -> None:
+            imported = pending_import["points"]
+            if imported is None:
+                return
+            control_points = imported
+            ui.label("Rollen vor dem Import festlegen").classes("text-lg font-medium q-mt-md")
+            with ui.row().classes("gap-2 q-mb-sm"):
+                def set_all_pass() -> None:
+                    current = pending_import["points"]
+                    pending_import["points"] = apply_roles(current, {str(name): "pass" for name in current["name"]})
+                    import_table.refresh()
+                def assign_cp_prefix() -> None:
+                    current = pending_import["points"]
+                    pending_import["points"] = apply_roles(current, {str(name): "control" for name in current["name"] if str(name).casefold().startswith("cp")})
+                    import_table.refresh()
+                ui.button("Alle als Passpunkte", on_click=set_all_pass).props("outline")
+                ui.button("CP-Präfix automatisch zuordnen", on_click=assign_cp_prefix).props("outline")
+            with ui.element("table").classes("w-full"):
+                with ui.element("thead"):
+                    with ui.element("tr"):
+                        for label in ("Name", "X", "Y", "Z", "Rolle"):
+                            with ui.element("th"):
+                                ui.label(label)
+                with ui.element("tbody"):
+                    for row in control_points.to_dict("records"):
+                        with ui.element("tr"):
+                            for key in ("name", "x", "y", "z"):
+                                with ui.element("td"):
+                                    ui.label(str(row[key]))
+                            with ui.element("td"):
+                                def set_role(event: events.ValueChangeEventArguments, name: str = str(row["name"])) -> None:
+                                    pending_import["points"] = apply_roles(control_points, {name: event.value})
+                                ui.select({"pass": "Passpunkt", "control": "Kontrollpunkt"}, value=row["role"], on_change=set_role).classes("w-48")
+            def commit_import() -> None:
+                write_control_points(pending_import["points"], csv_path)
+                pending_import["points"] = None
+                import_table.refresh(); table.refresh(); workspace.refresh()
+            ui.button("Import", on_click=commit_import).classes("sam-button-primary q-mt-sm")
 
         @ui.refreshable
         def table() -> None:
+            if (control_directory / "detections.json").is_file():
+                return
             control_points = points()
             if control_points is None:
                 ui.label("No control-point CSV imported yet.").classes("sam-muted q-mt-md"); return
@@ -64,11 +113,19 @@ def render() -> None:
                 try: residuals = {item["name"]: item for item in json.loads(report_path.read_text(encoding="utf-8")).get("points", [])}
                 except (OSError, ValueError): pass
             rows = [{**row, "observations": len(current.get(str(row["name"]), [])), "status": "Ready" if len(current.get(str(row["name"]), [])) >= int(settings["min_observations_per_point"]) else "Needs two images", "residual_m": residuals.get(str(row["name"]), {}).get("residual_m", ""), "leave_one_out_m": residuals.get(str(row["name"]), {}).get("leave_one_out_residual_m", "")} for row in control_points.to_dict("records")]
-            columns = [{"name": key, "label": label, "field": key} for key, label in (("name", "Name"), ("x", "X"), ("y", "Y"), ("z", "Z"), ("observations", "Images"), ("status", "Status"), ("residual_m", "Residual m"), ("leave_one_out_m", "Leave-one-out m"))]
+            columns = [{"name": key, "label": label, "field": key} for key, label in (("name", "Name"), ("x", "X"), ("y", "Y"), ("z", "Z"), ("role", "Rolle"), ("observations", "Images"), ("status", "Status"), ("residual_m", "Residual m"), ("leave_one_out_m", "Leave-one-out m"))]
             ui.table(columns=columns, rows=rows, row_key="name").classes("w-full q-mt-md")
+            ui.label("Rolle vor der Verarbeitung ändern").classes("sam-muted text-sm q-mt-sm")
+            for row in control_points.to_dict("records"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(str(row["name"])).classes("w-40")
+                    ui.select({"pass": "Passpunkt", "control": "Kontrollpunkt"}, value=row["role"], on_change=lambda event, name=str(row["name"]): save_role(name, event.value)).classes("w-48")
 
         @ui.refreshable
         def workspace() -> None:
+            if (control_directory / "detections.json").is_file():
+                render_review_workspace()
+                return
             control_points = points(); image_root = project_directory / "products" / "dense" / "images"
             if control_points is None: return
             if not image_root.is_dir():
@@ -127,8 +184,8 @@ def render() -> None:
                 leave_one_out = point.get("leave_one_out_residual_m")
                 suffix = f", leave-one-out {leave_one_out:.3f} m" if leave_one_out is not None else ""
                 ui.label(f"{point['name']}: residual {point['residual_m']:.3f} m{suffix}{warning}").classes("text-red-4" if warning else "sam-muted")
-        table(); workspace(); preview_panel()
-    render_page("Control points", content, current_path="/control-points")
+        import_table(); table(); workspace(); preview_panel()
+    render_page("Control points", content, current_path="/control-points", wide=True)
 
 
 def _continue(project_directory: Path) -> None:

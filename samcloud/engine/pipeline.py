@@ -6,44 +6,158 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 from samcloud.acquisition import CaptureValidationError, prepare_panorama_inputs
+from samcloud.colmap.alignment import (
+    extract_features_by_group,
+    feature_extractor_command,
+    filter_pass_is_safe,
+    mapper_command,
+    matching_command,
+    parse_model_analyzer_stats,
+    pose_prior_covariance_count,
+    pose_prior_count,
+    resolve_camera_model,
+    select_matching_strategy,
+    stereo_fusion_command,
+    tiepoint_pass_commands,
+    write_pose_priors_from_gps_ref,
+)
+from samcloud.colmap.camera_groups import assign_camera_groups
 from samcloud.core.configuration import load_global_config
 from samcloud.engine.run_summary import RunSummary
-from samcloud.control_points.georeference import georeference_from_control_points, save_control_point_report
+from samcloud.engine.extract_gps import is_dji_rtk_project
+from samcloud.control_points.georeference import coordinates_to_ecef, enu_rotation_at_ecef, georeference_from_control_points, save_control_point_report
 from samcloud.control_points.model_transform import transform_text_model
-from samcloud.pointcloud.georeference import fit_enu_to_ecef, format_residuals, save_georeference
+from samcloud.control_points.repository import load_detections, load_observations, read_control_points, save_detections, save_observations
+from samcloud.control_points.auto_detect import automatic_detection, populate_undistorted_coordinates
+from samcloud.control_points.adjustment import build_control_point_report, camera_intrinsics, leave_one_out_errors, populate_review_projections, pose_priors_in_model_frame, quality_gate, run_gcp_bundle_adjustment
+from samcloud.pointcloud.georeference import fit_enu_to_ecef, fit_similarity, format_residuals, save_georeference
+from samcloud.engine.eta import ProgressEstimator, RateStore, stage_units
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProgressTracker:
-    """Persist coarse pipeline progress for the local dashboard."""
+    """Persist pipeline progress and a stage-based ETA for the local dashboard."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, estimator: "ProgressEstimator | None" = None) -> None:
         self.path = path
         self.started_at = time.time()
+        self.estimator = estimator
+        self._last_write = 0.0
+        self._stage = "Preparing images"
+        self._detail = ""
+        self._percent = 0.0
 
     def update(self, percent: float, stage: str, detail: str = "") -> None:
+        self._percent, self._stage, self._detail = float(percent), stage, detail
+        self.write(force=True)
+
+    def begin(self, key: str, units: float | None = None) -> None:
+        if self.estimator is not None:
+            self.estimator.start_stage(key, units)
+            self.write(force=True)
+
+    def finish(self) -> None:
+        if self.estimator is not None:
+            self.estimator.finish_stage()
+            self.estimator.rates.save()
+            self.write(force=True)
+
+    def feed_line(self, line: str) -> None:
+        if self.estimator is not None and self.estimator.parse_line(line):
+            self.write()
+
+    def write(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_write < 2.0:
+            return
+        self._last_write = now
         payload = {
-            "percent": round(max(0.0, min(100.0, float(percent))), 1),
-            "stage": stage,
-            "detail": detail,
+            "percent": round(max(0.0, min(100.0, self._percent)), 1),
+            "stage": self._stage,
+            "detail": self._detail,
             "started_at": self.started_at,
-            "updated_at": time.time(),
+            "updated_at": now,
         }
+        if self.estimator is not None:
+            snapshot = self.estimator.snapshot()
+            payload.update(snapshot)
+            if self._percent >= 100.0:
+                payload["percent"] = 100.0
+                payload["eta_seconds"] = 0.0
+            if snapshot.get("stage_key") is None:
+                payload["stage"] = self._stage
+            current = next((item for item in snapshot["stages"] if item["status"] == "running"), None)
+            if current is not None and current["key"] == "classification":
+                stage_obj = self.estimator.current
+                total = int(round(stage_obj.units)) if stage_obj is not None else 0
+                payload["photo_total"] = total
+                payload["photo_processed"] = int(round(total * current["percent"] / 100.0))
+                payload["photo_percent"] = current["percent"]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def run(cmd, *, summary: RunSummary | None = None, stage: str | None = None, **kwargs):
+_ACTIVE_PROGRESS: ProgressTracker | None = None
+
+
+def run(
+    cmd, *, summary: RunSummary | None = None, stage: str | None = None,
+    allow_failure: bool = False, **kwargs,
+):
     print("\n>>>", " ".join(str(c) for c in cmd))
     started_at = time.perf_counter()
-    result = subprocess.run(cmd, **kwargs)
+    if _ACTIVE_PROGRESS is not None and not ({"capture_output", "stdout", "stderr"} & set(kwargs)):
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   encoding="utf-8", errors="replace", bufsize=1, **kwargs)
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            _ACTIVE_PROGRESS.feed_line(line)
+        sys.stdout.flush()
+        result = subprocess.CompletedProcess(cmd, process.wait())
+    else:
+        result = subprocess.run(cmd, **kwargs)
     if summary and stage:
         summary.record_stage(stage, time.perf_counter() - started_at)
-    if result.returncode != 0:
+    if result.returncode != 0 and not allow_failure:
         sys.exit(f"Command failed with exit code {result.returncode}: {' '.join(str(c) for c in cmd)}")
+    return result
+
+
+def _build_estimator(args, num_images: int, colmap_config: dict, *, resume: bool) -> ProgressEstimator:
+    dense = colmap_config.get("dense_reconstruction", {})
+    camera = colmap_config.get("camera", {})
+    alignment = colmap_config.get("alignment", {})
+    tiepoints = colmap_config.get("tiepoint_filter", {})
+    size = int(dense.get("max_image_size", camera.get("max_image_size", 3200)))
+    iterations = int(dense.get("num_iterations", 3))
+    geometric = bool(dense.get("use_geometric_consistency", True))
+    strategy = str(alignment.get("matching_strategy", "auto"))
+    matching = "exhaustive" if strategy == "exhaustive" or (strategy == "auto" and num_images <= 300) else "spatial"
+    automatic = args.control_points_mode == "automatic"
+    plan: list[tuple[str, float]] = []
+    if not resume:
+        plan += [("feature_extraction", num_images),
+                 ("matching", stage_units("matching", images=num_images, matching=matching,
+                                          spatial_neighbors=int(alignment.get("spatial_max_num_neighbors", 50)))),
+                 ("mapping", num_images)]
+        if tiepoints.get("enabled", True):
+            plan.append(("tiepoint_filtering", num_images))
+    if automatic:
+        plan.append(("control_points", num_images))
+    plan.append(("undistortion", num_images))
+    if not args.stop_after_alignment:
+        plan += [("dense_stereo", stage_units("dense_stereo", images=num_images, max_image_size=size,
+                                              num_iterations=iterations, geometric_consistency=geometric)),
+                 ("dense_fusion", num_images), ("classification", num_images)]
+        if args.geometry_refinement == "1":
+            plan.append(("geometry_refinement", num_images))
+    return ProgressEstimator(plan, RateStore(PROJECT_ROOT / "projects" / ".samcloud_stage_rates.json"))
 
 
 def find_colmap_exe(colmap_bin):
@@ -76,6 +190,139 @@ def write_image_list(images_dir, out_path):
     return len(image_paths)
 
 
+def _model_point_count(model_path: Path) -> int | None:
+    """Read a COLMAP binary point count without requiring COLMAP bindings."""
+    points_path = model_path / "points3D.bin"
+    try:
+        with points_path.open("rb") as file:
+            raw = file.read(8)
+        return int.from_bytes(raw, "little") if len(raw) == 8 else None
+    except OSError:
+        return None
+
+
+def _analyze_model(colmap: str, model_path: Path, summary: RunSummary) -> dict[str, float]:
+    """Collect model_analyzer output, tolerating format changes across COLMAP builds."""
+    result = run(
+        [colmap, "model_analyzer", "--path", str(model_path)],
+        summary=summary,
+        stage="Tie point analysis",
+        capture_output=True,
+        text=True,
+        allow_failure=True,
+    )
+    output = getattr(result, "stdout", "") or ""
+    error_output = getattr(result, "stderr", "") or ""
+    if output:
+        print(output.strip())
+    stats = parse_model_analyzer_stats(output + "\n" + error_output)
+    if "points" not in stats:
+        point_count = _model_point_count(model_path)
+        if point_count is not None:
+            stats["points"] = float(point_count)
+    return stats
+
+
+def _run_tiepoint_filtering(
+    colmap: str,
+    model_path: Path,
+    settings: dict,
+    summary: RunSummary,
+    *,
+    use_pose_priors: bool = False,
+    database_path: Path | None = None,
+    prior_std_xy_m: float = 3.0,
+    prior_std_z_m: float = 5.0,
+) -> tuple[Path, list[dict[str, object]]]:
+    """Run guarded filtering and bundle adjustment passes in separate model folders."""
+    if not settings.get("enabled", True):
+        return model_path, []
+    passes = settings.get("passes", [])
+    if not isinstance(passes, list):
+        raise ValueError("tiepoint_filter.passes must be a list")
+    current_model = model_path
+    statistics: list[dict[str, object]] = []
+    for index, pass_settings in enumerate(passes, start=1):
+        if not isinstance(pass_settings, dict):
+            raise ValueError("Every tiepoint_filter pass must be a mapping")
+        before = _analyze_model(colmap, current_model, summary)
+        filtered_model = current_model.parent / f"{current_model.name}_filter_{index}"
+        adjusted_model = current_model.parent / f"{current_model.name}_ba_{index}"
+        filtering, adjustment = tiepoint_pass_commands(
+            colmap, current_model, filtered_model, adjusted_model, pass_settings
+        )
+        filtered_model.mkdir(parents=True, exist_ok=True)
+        run(filtering, summary=summary, stage=f"Tie point filtering pass {index}")
+        after = _analyze_model(colmap, filtered_model, summary)
+        before_points = int(before["points"]) if "points" in before else None
+        after_points = int(after["points"]) if "points" in after else None
+        entry: dict[str, object] = {
+            "pass": index,
+            "thresholds": dict(pass_settings),
+            "before": before,
+            "after_filter": after,
+        }
+        if not filter_pass_is_safe(before_points, after_points):
+            entry["skipped"] = "removed more than 60 percent of points or left fewer than 1000"
+            print(f"WARNING: Tie point filtering pass {index} was skipped because it is too destructive.")
+            statistics.append(entry)
+            continue
+        adjusted_model.mkdir(parents=True, exist_ok=True)
+        if use_pose_priors:
+            if database_path is None:
+                raise ValueError("A COLMAP database is required for pose-prior bundle adjustment")
+            started_at = time.perf_counter()
+            _run_pose_prior_bundle_adjustment(
+                filtered_model, adjusted_model, database_path, prior_std_xy_m, prior_std_z_m,
+            )
+            summary.record_stage(f"Bundle adjustment pass {index}", time.perf_counter() - started_at)
+        else:
+            run(adjustment, summary=summary, stage=f"Bundle adjustment pass {index}")
+        current_model = adjusted_model
+        entry["skipped"] = False
+        statistics.append(entry)
+    return current_model, statistics
+
+
+def _run_pose_prior_bundle_adjustment(
+    input_model: Path,
+    output_model: Path,
+    database_path: Path,
+    prior_std_xy_m: float,
+    prior_std_z_m: float,
+) -> None:
+    """Refine a filtered GPS model without discarding its pose priors."""
+    import pycolmap
+
+    reconstruction = pycolmap.Reconstruction(input_model)
+    with pycolmap.Database.open(database_path) as database:
+        priors = database.read_all_pose_priors()
+    if not priors:
+        raise ValueError("Pose-prior bundle adjustment requires pose priors in the COLMAP database")
+    priors = pose_priors_in_model_frame(reconstruction, priors, fallback_std_xy_m=float(prior_std_xy_m), fallback_std_z_m=float(prior_std_z_m))
+    config = pycolmap.BundleAdjustmentConfig()
+    for image_id in reconstruction.reg_image_ids():
+        config.add_image(image_id)
+    options = pycolmap.BundleAdjustmentOptions(
+        refine_focal_length=True,
+        refine_principal_point=True,
+        refine_extra_params=True,
+    )
+    options.ceres.loss_function_type = pycolmap.LossFunctionType.CAUCHY
+    options.ceres.loss_function_scale = 1.0
+    prior_options = pycolmap.PosePriorBundleAdjustmentOptions(
+        prior_position_fallback_stddev=float(max(prior_std_xy_m, prior_std_z_m)),
+    )
+    prior_options.ceres.prior_position_loss_function_type = pycolmap.LossFunctionType.CAUCHY
+    prior_options.ceres.prior_position_loss_scale = float(max(prior_std_xy_m, prior_std_z_m))
+    adjuster = pycolmap.create_pose_prior_bundle_adjuster(
+        options, prior_options, config, priors, reconstruction,
+    )
+    adjuster.solve()
+    output_model.mkdir(parents=True, exist_ok=True)
+    reconstruction.write(output_model)
+
+
 def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) -> tuple[Path, bool]:
     """Resolve normal images or prepare virtual perspective images for 360 media."""
     if args.capture_type != "panorama_360":
@@ -105,16 +352,94 @@ def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) ->
     return prepared.cubemap_directory, True
 
 
+def _resume_automatic_control_points(
+    args, outdir: Path, report_dir: Path, summary: RunSummary, progress: ProgressTracker | None,
+    colmap_config: dict, dense_max_image_size: int, dense_num_iterations: int,
+    dense_gpu_index: int, classified_output: Path, control_points_dir: Path,
+) -> None:
+    """Continue reviewed automatic GCP projects exactly like a passed automatic run."""
+    if not args.images:
+        raise ValueError("The original image directory (--images) is required to continue automatic control points")
+    images_dir = Path(args.images).resolve()
+    image_list_path = outdir / "image_list.txt"
+    if progress and progress.estimator is None:
+        num_images = len([l for l in image_list_path.read_text(encoding="utf-8").splitlines() if l.strip()]) if image_list_path.is_file() else 0
+        progress.estimator = _build_estimator(args, num_images, colmap_config, resume=True)
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = progress
+    sparse_dir = outdir / "sparse"
+    dense_dir = outdir / "dense"
+    dense_config = colmap_config.get("dense_reconstruction", {})
+    colmap = find_colmap_exe(args.colmap_bin)
+    if progress:
+        progress.begin("control_points")
+        progress.update(57, "Applying control points")
+    adjusted_model = _automatic_control_points(
+        sparse_dir / "pre_gcp", sparse_dir / "pre_gcp_txt", images_dir, control_points_dir, args.control_points_crs,
+        outdir / "gps_ref.txt", dict(load_global_config("defaults.yml").get("control_points", {})),
+        report_dir / "control_points_report.json", rtk=bool(args.rtk),
+    )
+    if adjusted_model is None:
+        if progress:
+            progress.finish()
+        sys.exit("Control-point quality gate did not pass. Review the control points and optimise again.")
+    dense_dir.mkdir(parents=True, exist_ok=True)
+    if progress:
+        progress.begin("undistortion")
+    run([colmap, "image_undistorter",
+         "--image_path", str(images_dir),
+         "--image_list_path", str(image_list_path),
+         "--input_path", str(adjusted_model),
+         "--output_path", str(dense_dir),
+         "--output_type", "COLMAP",
+         "--max_image_size", str(dense_max_image_size)], summary=summary, stage="Preparing dense reconstruction")
+    _prepare_detections_for_resume(
+        control_points_dir / "detections.json", control_points_dir / "observations.json", adjusted_model, dense_dir / "sparse",
+    )
+    _clear_stereo_cache(dense_dir)
+    if progress:
+        progress.begin("dense_stereo")
+        progress.update(62, "Building dense cloud")
+    run([colmap, "patch_match_stereo", "--workspace_path", str(dense_dir),
+         "--PatchMatchStereo.geom_consistency", "1" if dense_config.get("use_geometric_consistency", True) else "0",
+         "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
+         "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
+         "--PatchMatchStereo.max_image_size", str(dense_max_image_size)], summary=summary, stage="Dense stereo")
+    if progress:
+        progress.begin("dense_fusion")
+    run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", dense_config.get("fusion", {})),
+        summary=summary, stage="Dense fusion")
+    sparse_txt = dense_dir / "sparse_txt"
+    sparse_txt.mkdir(parents=True, exist_ok=True)
+    run([colmap, "model_converter", "--input_path", str(dense_dir / "sparse"), "--output_path", str(sparse_txt),
+         "--output_type", "TXT"], summary=summary, stage="Preparing classification")
+    _classify_and_finish(args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, True)
+
+
 def _resume_after_control_points(
     args, outdir: Path, report_dir: Path, summary: RunSummary, progress: ProgressTracker | None,
     colmap_config: dict, dense_max_image_size: int, dense_num_iterations: int,
     dense_gpu_index: int, classified_output: Path,
 ) -> None:
     """Run Phase B without repeating feature extraction, mapping, or undistortion."""
+    if progress and progress.estimator is None:
+        image_list_path = outdir / "image_list.txt"
+        num_images = len([l for l in image_list_path.read_text(encoding="utf-8").splitlines() if l.strip()]) if image_list_path.is_file() else 0
+        progress.estimator = _build_estimator(args, num_images, colmap_config, resume=True)
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = progress
     dense_dir = outdir / "dense"
+    fusion_config = colmap_config.get("dense_reconstruction", {}).get("fusion", {})
     dense_sparse = dense_dir / "sparse"
     sparse_txt = dense_dir / "sparse_txt"
     images_dir = dense_dir / "images"
+    control_points_dir = Path(args.control_points_dir).resolve() if args.control_points_dir else outdir.parent / "control_points"
+    if (control_points_dir / "detections.json").is_file() and (outdir / "sparse" / "pre_gcp").is_dir():
+        _resume_automatic_control_points(
+            args, outdir, report_dir, summary, progress, colmap_config, dense_max_image_size,
+            dense_num_iterations, dense_gpu_index, classified_output, control_points_dir,
+        )
+        return
     missing = [str(path) for path in (dense_sparse, sparse_txt, images_dir) if not path.exists()]
     if missing:
         raise ValueError(
@@ -123,7 +448,6 @@ def _resume_after_control_points(
     pristine_sparse = dense_dir / "sparse_pre_gcp"
     pristine_sparse_txt = dense_dir / "sparse_txt_pre_gcp"
     _create_pristine_gcp_backups(dense_sparse, sparse_txt, pristine_sparse, pristine_sparse_txt)
-    control_points_dir = Path(args.control_points_dir).resolve() if args.control_points_dir else outdir.parent / "control_points"
     settings = dict(load_global_config("defaults.yml").get("control_points", {}))
     gps_residuals = None
     gps_georeference = outdir / "georeference.json"
@@ -151,16 +475,50 @@ def _resume_after_control_points(
     shutil.rmtree(transformed_txt)
     _clear_stereo_cache(dense_dir)
     if progress:
+        progress.begin("dense_stereo")
         progress.update(62, "Building dense cloud")
     run([colmap, "patch_match_stereo", "--workspace_path", str(dense_dir),
-         "--PatchMatchStereo.geom_consistency", "1", "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
+         "--PatchMatchStereo.geom_consistency", "1" if colmap_config.get("dense_reconstruction", {}).get("use_geometric_consistency", True) else "0", "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
          "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
          "--PatchMatchStereo.max_image_size", str(dense_max_image_size)], summary=summary, stage="Dense stereo")
-    run([colmap, "stereo_fusion", "--workspace_path", str(dense_dir), "--output_path", str(dense_dir / "fused.ply")], summary=summary, stage="Dense fusion")
+    dense_dir.mkdir(parents=True, exist_ok=True)
+    if progress:
+        progress.begin("dense_fusion")
+    run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", fusion_config), summary=summary, stage="Dense fusion")
     shutil.rmtree(sparse_txt)
     sparse_txt.mkdir(parents=True, exist_ok=True)
     run([colmap, "model_converter", "--input_path", str(dense_sparse), "--output_path", str(sparse_txt), "--output_type", "TXT"], summary=summary, stage="Preparing classification")
     _classify_and_finish(args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, True)
+
+
+def _prepare_detections_for_resume(
+    detections_path: Path, observations_path: Path, distorted_model: Path | None = None, undistorted_model: Path | None = None,
+) -> None:
+    """Expose reviewed detections to the legacy dense-coordinate consumer.
+
+    The original-image detections remain authoritative. This compatibility
+    projection lets existing control-point editing projects continue while the
+    GCP BA reads the same reviewed entries on the next automatic run.
+    """
+    detections = load_detections(detections_path)
+    if distorted_model is not None and undistorted_model is not None and distorted_model.is_dir() and undistorted_model.is_dir():
+        import pycolmap
+        populate_undistorted_coordinates(
+            pycolmap.Reconstruction(distorted_model), pycolmap.Reconstruction(undistorted_model), detections,
+        )
+        save_detections(detections_path, detections)
+    observations = load_observations(observations_path)
+    detected = {
+        name: [
+            {"image": str(item["image"]), "u": float(item["u_undist"]), "v": float(item["v_undist"])}
+            for item in entry.get("observations", []) if item.get("enabled", True)
+        ]
+        for name, entry in detections.items()
+    }
+    for name, items in detected.items():
+        observations.setdefault(name, items)
+    if detected:
+        save_observations(observations_path, observations)
 
 
 def _create_pristine_gcp_backups(
@@ -173,13 +531,139 @@ def _create_pristine_gcp_backups(
         shutil.copytree(sparse_txt, pristine_sparse_txt)
 
 
+def _image_path_map(images_dir: Path) -> dict[str, Path]:
+    """Map COLMAP image names (relative POSIX paths, incl. sub-folders) to files; unique bare names as fallback."""
+    files = [path for path in images_dir.rglob("*") if path.is_file()]
+    mapping = {path.relative_to(images_dir).as_posix(): path for path in files}
+    counts: dict[str, int] = {}
+    for path in files:
+        counts[path.name] = counts.get(path.name, 0) + 1
+    for path in files:
+        if counts[path.name] == 1:
+            mapping.setdefault(path.name, path)
+    return mapping
+
+
+def _automatic_control_points(
+    model_path: Path, model_txt: Path, images_dir: Path, control_points_dir: Path, control_points_crs: str,
+    gps_ref_path: Path, settings: dict, report_path: Path, *, rtk: bool,
+) -> Path | None:
+    """Detect, adjust and transform GPS projects into the GCP-local ENU frame."""
+    if not gps_ref_path.is_file():
+        report = {"gate": {"passed": False, "reasons": ["manual seeds needed"]}, "points": []}
+        save_control_point_report(report_path, report)
+        return None
+    import pycolmap
+
+    points = read_control_points(control_points_dir / "control_points.csv")
+    georef = fit_enu_to_ecef(model_txt, gps_ref_path)
+    scale = float(georef["scale"])
+    rotation = np.asarray(georef["rotation"], dtype=float)
+    translation = np.asarray(georef["translation"], dtype=float)
+    ecef = coordinates_to_ecef(points[["x", "y", "z"]].to_numpy(dtype=float), control_points_crs)
+    references = {
+        str(row.name): rotation.T @ ((ecef[index] - translation) / scale)
+        for index, (_, row) in enumerate(points.set_index("name").iterrows())
+    }
+    roles = dict(zip(points["name"].astype(str), points["role"].astype(str), strict=True))
+    paths = _image_path_map(images_dir)
+    detections, detection_statistics = automatic_detection(
+        pycolmap.Reconstruction(model_path), references, roles, paths, settings,
+        0.03 if rtk else 3.0, 0.05 if rtk else 5.0,
+        existing=load_detections(control_points_dir / "detections.json"),
+    )
+    before = camera_intrinsics(pycolmap.Reconstruction(model_path))
+    pose_priors = None
+    database_path = model_path.parents[1] / "database.db"
+    if database_path.is_file():
+        with pycolmap.Database.open(database_path) as database:
+            pose_priors = database.read_all_pose_priors()
+    raw_adjusted = model_path.parent / "gcp_adjusted_raw"
+    adjustment: dict[str, object] = {}
+    gate: tuple[bool, list[str], dict[str, dict[str, float]]] | None = None
+    for iteration in range(int(settings.get("max_gate_iterations", 3))):
+        iteration_model = raw_adjusted if iteration == 0 else model_path.parent / f"gcp_adjusted_raw_{iteration + 1}"
+        adjustment = run_gcp_bundle_adjustment(
+            model_path, iteration_model, detections, references, pose_priors=pose_priors,
+            prior_stddev=0.05 if rtk else 5.0,
+        )
+        adjusted = pycolmap.Reconstruction(iteration_model)
+        gate = quality_gate(adjusted, detections, references, settings)
+        if gate[0] or iteration + 1 >= int(settings.get("max_gate_iterations", 3)):
+            raw_adjusted = iteration_model
+            break
+    assert gate is not None
+    adjusted = pycolmap.Reconstruction(raw_adjusted)
+    populate_review_projections(adjusted, detections, references)
+    save_detections(control_points_dir / "detections.json", detections)
+    if not gate[0]:
+        report = build_control_point_report(detections, gate, before, adjustment["intrinsics"])
+        report["detection_statistics"] = detection_statistics
+        save_control_point_report(report_path, report)
+        return None
+    centroid = ecef.mean(axis=0)
+    enu_rotation = enu_rotation_at_ecef(centroid)
+    target_enu = (enu_rotation @ (ecef - centroid).T).T
+    enabled_pass = [str(name) for name in points.loc[points["role"] == "pass", "name"] if detections.get(str(name), {}).get("enabled")]
+    source = np.asarray([references[name] for name in enabled_pass], dtype=float)
+    destination = np.asarray([target_enu[points.index[points["name"] == name][0]] for name in enabled_pass], dtype=float)
+    local_scale, local_rotation, local_translation, residuals = fit_similarity(source, destination)
+    if float(residuals["max"]) >= 0.001:
+        raise ValueError(f"GCP-local frame change residual is {residuals['max']:.6f} m, expected below 0.001 m")
+    print(f"GCP-local frame change residual: {residuals['max']:.6f} m")
+    adjusted.transform(pycolmap.Sim3d(np.column_stack((local_scale * local_rotation, local_translation))))
+    local_model = model_path.parent / "gcp_adjusted"
+    local_model.mkdir(parents=True, exist_ok=True)
+    adjusted.write(local_model)
+    for name, entry in detections.items():
+        if entry["triangulated_model_xyz"] is not None:
+            entry["triangulated_model_xyz"] = (local_scale * local_rotation @ np.asarray(entry["triangulated_model_xyz"], dtype=float) + local_translation).tolist()
+    local_references = {name: local_scale * local_rotation @ reference + local_translation for name, reference in references.items()}
+    local_recon = pycolmap.Reconstruction(local_model)
+    final_gate = quality_gate(local_recon, detections, local_references, settings)
+    populate_review_projections(local_recon, detections, local_references)
+    leave_one_out = leave_one_out_errors(
+        model_path, model_path.parent / "gcp_leave_one_out", detections, references,
+        pose_priors=pose_priors, prior_stddev=0.05 if rtk else 5.0,
+    )
+    leave_one_out = {name: None if error is None else float(local_scale) * error for name, error in leave_one_out.items()}
+    report = build_control_point_report(detections, final_gate, before, adjustment["intrinsics"], leave_one_out=leave_one_out)
+    report["detection_statistics"] = detection_statistics
+    print("Marker | Error [px] | Projections | Status")
+    for point in report["points"]:
+        error = point["reprojection_rms_px"]
+        error_text = "n/a" if error is None or not np.isfinite(error) else f"{error:.3f}"
+        print(f"{point['name']} | {error_text} | {point['projections']} | {point['status']}")
+    save_detections(control_points_dir / "detections.json", detections)
+    report["residual_m"] = residuals
+    save_control_point_report(report_path, report)
+    if not final_gate[0]:
+        return None
+    save_georeference(model_path.parents[1] / "georeference.json", {
+        "source_frame": "gcp_local_enu", "method": "gcp_bundle_adjustment", "scale": 1.0,
+        "rotation": enu_rotation.T.tolist(), "translation": centroid.tolist(), "pairs": len(points),
+        "residual_m": residuals, "control_points": {"crs": control_points_crs, "origin_ecef": centroid.tolist()},
+    })
+    return local_model
+
+
 def _clear_stereo_cache(dense_dir: Path) -> None:
-    """Discard depths/normals because COLMAP may otherwise reuse old geometry."""
+    """Discard depths/normals because COLMAP may otherwise reuse old geometry.
+
+    COLMAP does not create sub-folders for images stored in sub-directories, so the
+    empty cache folders are recreated with the same structure as ``dense/images``.
+    """
     stereo = dense_dir / "stereo"
+    images = dense_dir / "images"
     for name in ("depth_maps", "normal_maps"):
         cache = stereo / name
         if cache.exists():
             shutil.rmtree(cache)
+        cache.mkdir(parents=True, exist_ok=True)
+        if images.is_dir():
+            for folder in images.rglob("*"):
+                if folder.is_dir():
+                    (cache / folder.relative_to(images)).mkdir(parents=True, exist_ok=True)
 
 
 def _classify_and_finish(
@@ -192,6 +676,8 @@ def _classify_and_finish(
     classified_raw = classified_output.with_name("classified_raw.ply") if geometry_enabled else classified_output
     classified_scores = classified_output.parent / "classified_scores.npz"
     classified_output.parent.mkdir(parents=True, exist_ok=True)
+    if progress:
+        progress.begin("classification")
     classify_command = [sys.executable, str(classify_script), "--dense-dir", str(dense_dir),
         "--images-dir", str(dense_dir / "images"), "--model-dir", str(dense_sparse_txt),
         "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"), "--class-set", args.class_set,
@@ -204,10 +690,12 @@ def _classify_and_finish(
     if geometry_enabled and args.classification_mode == "segearth_ov3":
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
-        classify_command.extend(["--progress-file", str(args.progress_file)])
+        classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
     run(classify_command, summary=summary, stage="SAM3 classification")
     if geometry_enabled and georeferenced:
         refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
+        if progress:
+            progress.begin("geometry_refinement")
         run([sys.executable, str(refine_script), "--input", str(classified_raw), "--output", str(classified_output),
             "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"), "--class-set", args.class_set,
             "--config", str(PROJECT_ROOT / "config" / "geometry.yml"), "--summary-file", str(report_dir / "geometry_summary.json"),
@@ -216,6 +704,7 @@ def _classify_and_finish(
         shutil.copy2(classified_raw, classified_output)
     if args.skip_export:
         if progress:
+            progress.finish()
             progress.update(100, "Complete")
         summary.write("Completed")
         return
@@ -223,6 +712,8 @@ def _classify_and_finish(
          "--output", str(outdir / "classified.las"), "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
          "--class-set", args.class_set, "--source-crs", args.source_crs, "--target-crs", args.export_crs,
          "--georeference", str(outdir / "georeference.json")], summary=summary, stage="LAS export")
+    if progress:
+        progress.finish()
     summary.write("Completed")
 
 
@@ -270,9 +761,9 @@ def main():
                     help="target CRS of the exported LAS file")
     ap.add_argument(
         "--control-points-mode",
-        choices=("none", "after_alignment"),
+        choices=("none", "after_alignment", "automatic"),
         default="none",
-        help="continue automatically without control points, or stop after alignment",
+        help="continue without control points, stop for manual points, or detect targets automatically",
     )
     ap.add_argument(
         "--stop-after-alignment",
@@ -332,20 +823,25 @@ def main():
         ap.error("--threshold-sweep must be comma-separated floats")
     if any(not 0.0 <= threshold <= 1.0 for threshold in threshold_sweep):
         ap.error("--threshold-sweep values must be between 0 and 1")
-    gps_alignment_max_error = (
-        args.gps_max_error if args.gps_max_error is not None
-        else 0.1 if args.rtk else 3.0
-    )
+    gps_alignment_max_error = args.gps_max_error if args.gps_max_error is not None else (0.1 if args.rtk else 3.0)
     colmap_config = load_global_config("colmap.yml")
     camera_config = colmap_config.get("camera", {})
+    features_config = colmap_config.get("features", {})
+    alignment_config = colmap_config.get("alignment", {})
+    tiepoint_config = colmap_config.get("tiepoint_filter", {})
+    georeferencing_config = colmap_config.get("georeferencing", {})
     dense_config = colmap_config.get("dense_reconstruction", {})
-    max_image_size = int(camera_config.get("max_image_size", 3200))
+    max_image_size = int(camera_config.get("max_image_size", 4000))
     dense_max_image_size = int(dense_config.get("max_image_size", max_image_size))
     dense_num_iterations = int(dense_config.get("num_iterations", 3))
     dense_gpu_index = int(dense_config.get("gpu_index", 0))
 
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
+    control_points_dir = Path(args.control_points_dir).resolve() if args.control_points_dir else outdir.parent / "control_points"
+    if args.control_points_mode == "automatic" and not (control_points_dir / "control_points.csv").is_file():
+        print("Automatic control points skipped: control_points/control_points.csv is missing.")
+        args.control_points_mode = "none"
     classified_output = (
         Path(args.classified_output).resolve()
         if args.classified_output
@@ -360,6 +856,13 @@ def main():
         "gpu": args.gpu == "1",
         "dense_max_image_size": dense_max_image_size,
         "dense_num_iterations": dense_num_iterations,
+        "alignment_quality": {
+            "camera_grouping": camera_config.get("grouping", "sequence_number"),
+            "camera_model": None,
+            "matching_strategy": None,
+            "mapper": None,
+            "tiepoint_filter": {"enabled": bool(tiepoint_config.get("enabled", True)), "passes": []},
+        },
         "class_set": args.class_set,
         "min_votes": args.min_votes,
         "sam_tile_size": args.sam_tile_size,
@@ -384,32 +887,105 @@ def main():
     db_path = outdir / "database.db"
     sparse_dir = outdir / "sparse"
     dense_dir = outdir / "dense"
-    sparse_dir.mkdir(exist_ok=True)
-    dense_dir.mkdir(exist_ok=True)
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    dense_dir.mkdir(parents=True, exist_ok=True)
     image_list_path = outdir / "image_list.txt"
     num_images = write_image_list(images_dir, image_list_path)
     summary.settings["image_count"] = num_images
     print(f"Using {num_images} supported images from {images_dir}")
     if progress:
+        progress.estimator = _build_estimator(args, num_images, colmap_config, resume=False)
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = progress
+    image_paths = [images_dir / name for name in image_list_path.read_text(encoding="utf-8").splitlines()]
+    auto_rtk = args.capture_type == "drone_gps" and is_dji_rtk_project(image_paths)
+    effective_rtk = args.rtk or auto_rtk
+    if auto_rtk and not args.rtk:
+        print("Detected DJI RTK fixed metadata in at least 90 percent of images; using RTK settings.")
+    if args.gps_max_error is None:
+        gps_alignment_max_error = 0.1 if effective_rtk else 3.0
+    summary.settings["gps_mode"] = "RTK" if effective_rtk else "Standard GPS" if args.capture_type == "drone_gps" else "Not used"
+    summary.settings["gps_max_error_m"] = gps_alignment_max_error if args.capture_type == "drone_gps" else "Not used"
+    summary.settings["auto_rtk"] = auto_rtk
+    if progress:
         progress.update(5, "Preparing images", f"Found {num_images} supported images")
 
     colmap = find_colmap_exe(args.colmap_bin)
+    gps_ref_path = outdir / "gps_ref.txt"
+    if args.capture_type == "drone_gps":
+        gps_script = Path(__file__).resolve().parent / "extract_gps.py"
+        run([sys.executable, str(gps_script),
+             "--images-dir", str(images_dir),
+             "--out", str(gps_ref_path),
+             "--require-all"], summary=summary, stage="Preparing GPS references")
 
     # 1) Feature extraction
     if progress:
+        progress.begin("feature_extraction")
         progress.update(5, "Extracting features")
-    run([colmap, "feature_extractor",
-         "--database_path", str(db_path),
-         "--image_path", str(images_dir),
-         "--image_list_path", str(image_list_path),
-         "--ImageReader.single_camera", "1",
-         "--ImageReader.max_image_size", str(max_image_size),
-         "--FeatureExtraction.use_gpu", args.gpu], summary=summary, stage="Feature extraction")
+    camera_model = resolve_camera_model(camera_config.get("camera_model"), is_panorama)
+    summary.settings["alignment_quality"]["camera_model"] = camera_model
+    if is_panorama:
+        feature_command = feature_extractor_command(
+            colmap, db_path, images_dir, image_list_path,
+            gpu=args.gpu == "1",
+            camera_model=camera_model,
+            max_image_size=max_image_size,
+            max_num_features=int(features_config.get("max_num_features", 16384)),
+            estimate_affine_shape=bool(features_config.get("estimate_affine_shape", False)),
+            domain_size_pooling=bool(features_config.get("domain_size_pooling", True)),
+            single_camera=True,
+        )
+        feature_result = run(
+            feature_command, summary=summary, stage="Feature extraction",
+            allow_failure=bool(features_config.get("domain_size_pooling", True)),
+        )
+        if getattr(feature_result, "returncode", 0) and bool(features_config.get("domain_size_pooling", True)):
+            print("WARNING: COLMAP rejected domain-size pooling; retrying feature extraction without it.")
+            feature_command[feature_command.index("--SiftExtraction.domain_size_pooling") + 1] = "0"
+            run(feature_command, summary=summary, stage="Feature extraction")
+    else:
+        grouping = str(camera_config.get("grouping", "sequence_number"))
+        names = [line.strip() for line in image_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        groups = assign_camera_groups(names, grouping)
+        group_counts = extract_features_by_group(
+            lambda command: run(command, summary=summary, stage="Feature extraction"),
+            colmap,
+            db_path,
+            images_dir,
+            names,
+            groups,
+            outdir,
+            gpu=args.gpu == "1",
+            camera_model=camera_model,
+            max_image_size=max_image_size,
+            max_num_features=int(features_config.get("max_num_features", 16384)),
+            estimate_affine_shape=bool(features_config.get("estimate_affine_shape", False)),
+            domain_size_pooling=bool(features_config.get("domain_size_pooling", True)),
+        )
+        for group, count in sorted(group_counts.items()):
+            print(f"Camera group {group + 1:02d}: {count} images")
+        summary.settings["alignment_quality"]["camera_groups"] = group_counts
+
+    has_pose_priors = False
+    if args.capture_type == "drone_gps":
+        prior_count = write_pose_priors_from_gps_ref(
+            db_path, gps_ref_path, images_dir,
+            standard_gps_std_xy_m=float(georeferencing_config.get("standard_gps_prior_std_xy_m", 3.0)),
+            standard_gps_std_z_m=float(georeferencing_config.get("standard_gps_prior_std_z_m", 5.0)),
+        )
+        print(f"Wrote {prior_count} GPS pose priors to the COLMAP database.")
+        prior_count = pose_prior_count(db_path)
+        has_pose_priors = prior_count == num_images
+        if not has_pose_priors:
+            print("WARNING: GPS pose priors are incomplete; using the incremental mapper.")
     if progress:
         progress.update(18, "Extracting features")
 
     # 2) Video panoramas use sequential matching. A photo directory additionally
     # uses exhaustive matching so it can connect to the video frames as well.
+    if progress:
+        progress.begin("matching")
     if is_panorama and args.panorama_video:
         if progress:
             progress.update(18, "Matching images")
@@ -422,19 +998,43 @@ def main():
     if not is_panorama or args.panorama_images:
         if progress:
             progress.update(18 if not is_panorama else 25, "Matching images")
-        run([colmap, "exhaustive_matcher",
-             "--database_path", str(db_path),
-             "--FeatureMatching.use_gpu", args.gpu], summary=summary, stage="Image matching")
+        matching_strategy = select_matching_strategy(
+            str(alignment_config.get("matching_strategy", "auto")), num_images, has_pose_priors,
+        ) if args.capture_type == "drone_gps" and not is_panorama else "exhaustive"
+        summary.settings["alignment_quality"]["matching_strategy"] = matching_strategy
+        run(matching_command(
+            colmap, db_path, gpu=args.gpu == "1", strategy=matching_strategy,
+            max_num_neighbors=int(alignment_config.get("spatial_max_num_neighbors", 50)),
+            max_distance=float(alignment_config.get("spatial_max_distance_m", 200)),
+        ), summary=summary, stage="Image matching")
         if progress:
             progress.update(32, "Matching images")
 
     # 3) Sparse reconstruction (SfM)
     if progress:
+        progress.begin("mapping")
         progress.update(32, "Aligning cameras")
-    run([colmap, "mapper",
-         "--database_path", str(db_path),
-         "--image_path", str(images_dir),
-         "--output_path", str(sparse_dir)], summary=summary, stage="Sparse reconstruction")
+    use_pose_priors = (
+        args.capture_type == "drone_gps"
+        and str(alignment_config.get("mapper", "pose_prior")) == "pose_prior"
+        and has_pose_priors
+    )
+    if args.capture_type == "drone_gps" and not use_pose_priors:
+        print("GPS pose-prior mapper is unavailable; falling back to the incremental mapper.")
+    summary.settings["alignment_quality"]["mapper"] = "pose_prior" if use_pose_priors else "incremental"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    run(mapper_command(
+        colmap, db_path, images_dir, sparse_dir,
+        use_pose_priors=use_pose_priors,
+        rtk=effective_rtk,
+        georeferencing={
+            "rtk_prior_std_xy_m": float(georeferencing_config.get("rtk_prior_std_xy_m", 0.03)),
+            "rtk_prior_std_z_m": float(georeferencing_config.get("rtk_prior_std_z_m", 0.05)),
+            "standard_gps_prior_std_xy_m": float(georeferencing_config.get("standard_gps_prior_std_xy_m", 3.0)),
+            "standard_gps_prior_std_z_m": float(georeferencing_config.get("standard_gps_prior_std_z_m", 5.0)),
+        },
+        per_image_covariances=pose_prior_covariance_count(db_path) == num_images,
+    ), summary=summary, stage="Sparse reconstruction")
     if progress:
         progress.update(52, "Aligning cameras")
 
@@ -442,27 +1042,40 @@ def main():
     if not model0.exists():
         sys.exit("colmap mapper did not produce a reconstruction (sparse/0 missing). Check image overlap/quality.")
 
+    # Keep GPS priors active during every filtering-pass adjustment. Otherwise
+    # ordinary BA can reintroduce the drift that the pose-prior mapper removed.
+    if use_pose_priors:
+        if progress:
+            progress.begin("tiepoint_filtering")
+        model0, tiepoint_statistics = _run_tiepoint_filtering(
+            colmap, model0, tiepoint_config, summary,
+            use_pose_priors=True,
+            database_path=db_path,
+            prior_std_xy_m=float(georeferencing_config.get(
+                "rtk_prior_std_xy_m" if effective_rtk else "standard_gps_prior_std_xy_m", 0.03 if effective_rtk else 3.0,
+            )),
+            prior_std_z_m=float(georeferencing_config.get(
+                "rtk_prior_std_z_m" if effective_rtk else "standard_gps_prior_std_z_m", 0.05 if effective_rtk else 5.0,
+            )),
+        )
+        summary.settings["alignment_quality"]["tiepoint_filter"]["passes"].extend(tiepoint_statistics)
+
     # 3b) GPS alignment only applies to drone images. Other capture types retain
     # a local frame until control points or another georeferencing step is used.
     georeferenced = False
-    gps_ref_path = outdir / "gps_ref.txt"
     if args.capture_type == "drone_gps":
-        gps_script = Path(__file__).resolve().parent / "extract_gps.py"
-        run([sys.executable, str(gps_script),
-             "--images-dir", str(images_dir),
-             "--out", str(gps_ref_path),
-             "--require-all"], summary=summary, stage="Preparing GPS references")
         if progress:
             progress.update(55, "Applying GPS alignment")
 
         print(
             "Using GPS alignment maximum error: "
             f"{gps_alignment_max_error:.3f} m "
-            f"({'RTK' if args.rtk else 'standard GPS'})"
+            f"({'RTK' if effective_rtk else 'standard GPS'})"
         )
 
         model0_geo = sparse_dir / "0_geo"
-        model0_geo.mkdir(exist_ok=True)
+        model0_geo.mkdir(parents=True, exist_ok=True)
+        print("COLMAP model_aligner will log the ENU similarity transform it applies below.")
         run([colmap, "model_aligner",
              "--input_path", str(model0),
              "--output_path", str(model0_geo),
@@ -483,10 +1096,43 @@ def main():
     else:
         print("GPS alignment skipped. The reconstruction remains in LOCAL coordinates.")
 
+    if not use_pose_priors:
+        if progress:
+            progress.begin("tiepoint_filtering")
+        model0, tiepoint_statistics = _run_tiepoint_filtering(
+            colmap, model0, tiepoint_config, summary
+        )
+        summary.settings["alignment_quality"]["tiepoint_filter"]["passes"].extend(tiepoint_statistics)
+
+    # Preserve the distorted sparse model before target observations or GCP BA.
+    # Existing snapshots are deliberately retained so a review re-run starts
+    # from exactly the same Phase-A reconstruction.
+    if args.control_points_mode == "automatic":
+        pristine_distorted = sparse_dir / "pre_gcp"
+        if not pristine_distorted.exists():
+            shutil.copytree(model0, pristine_distorted)
+        pristine_text = sparse_dir / "pre_gcp_txt"
+        pristine_text.mkdir(parents=True, exist_ok=True)
+        run([colmap, "model_converter", "--input_path", str(model0), "--output_path", str(pristine_text), "--output_type", "TXT"], summary=summary, stage="Preparing automatic control points")
+        if progress:
+            progress.begin("control_points")
+        automatic_model = _automatic_control_points(
+            pristine_distorted, pristine_text, images_dir, control_points_dir, args.control_points_crs,
+            gps_ref_path, dict(load_global_config("defaults.yml").get("control_points", {})),
+            report_dir / "control_points_report.json", rtk=effective_rtk,
+        )
+        if automatic_model is None:
+            args.stop_after_alignment = True
+            print("Automatic control-point quality gate did not pass. Waiting for control-point review.")
+        else:
+            model0 = automatic_model
+
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model
     #    we can read as plain text for the camera poses.
     if progress:
+        progress.begin("undistortion")
         progress.update(57, "Preparing dense reconstruction")
+    dense_dir.mkdir(parents=True, exist_ok=True)
     run([colmap, "image_undistorter",
          "--image_path", str(images_dir),
          "--image_list_path", str(image_list_path),
@@ -494,6 +1140,10 @@ def main():
          "--output_path", str(dense_dir),
          "--output_type", "COLMAP",
          "--max_image_size", str(dense_max_image_size)], summary=summary, stage="Preparing dense reconstruction")
+    if args.control_points_mode == "automatic":
+        detections_path = control_points_dir / "detections.json"
+        if detections_path.exists():
+            _prepare_detections_for_resume(detections_path, control_points_dir / "observations.json", model0, dense_dir / "sparse")
     if progress:
         progress.update(62, "Preparing dense reconstruction")
 
@@ -513,6 +1163,7 @@ def main():
             except Exception as error:
                 print(f"WARNING: Could not create GPS georeference: {error}")
         if progress:
+            progress.finish()
             progress.update(100, "Waiting for control points")
         print("Undistortion finished. Waiting for control points before dense reconstruction.")
         summary.write("Waiting for control points")
@@ -520,10 +1171,11 @@ def main():
 
     # 5) Dense stereo
     if progress:
+        progress.begin("dense_stereo")
         progress.update(62, "Building dense cloud")
     run([colmap, "patch_match_stereo",
          "--workspace_path", str(dense_dir),
-         "--PatchMatchStereo.geom_consistency", "1",
+         "--PatchMatchStereo.geom_consistency", "1" if dense_config.get("use_geometric_consistency", True) else "0",
          "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
          "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
          "--PatchMatchStereo.max_image_size", str(dense_max_image_size)], summary=summary, stage="Dense stereo")
@@ -532,10 +1184,12 @@ def main():
 
     # 6) Fusion -> fused.ply + fused.ply.vis
     if progress:
+        progress.begin("dense_fusion")
         progress.update(78, "Fusing dense cloud")
-    run([colmap, "stereo_fusion",
-         "--workspace_path", str(dense_dir),
-         "--output_path", str(dense_dir / "fused.ply")], summary=summary, stage="Dense fusion")
+    dense_dir.mkdir(parents=True, exist_ok=True)
+    run(stereo_fusion_command(
+        colmap, dense_dir, dense_dir / "fused.ply", dense_config.get("fusion", {})
+    ), summary=summary, stage="Dense fusion")
     if progress:
         progress.update(84, "Fusing dense cloud")
 
@@ -571,6 +1225,7 @@ def main():
     classified_scores = classified_output.parent / "classified_scores.npz"
     classified_output.parent.mkdir(parents=True, exist_ok=True)
     if progress:
+        progress.begin("classification")
         progress.update(87, "Classifying point cloud")
     classify_command = [sys.executable, str(classify_script),
          "--dense-dir", str(dense_dir),
@@ -591,7 +1246,7 @@ def main():
     if geometry_enabled and args.classification_mode == "segearth_ov3":
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
-        classify_command.extend(["--progress-file", str(args.progress_file)])
+        classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
     run(classify_command, summary=summary, stage="SAM3 classification")
     if progress:
         progress.update(98, "Classifying point cloud")
@@ -601,6 +1256,7 @@ def main():
         if georeferenced:
             refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
             if progress:
+                progress.begin("geometry_refinement")
                 progress.update(98, "Geometric refinement")
             run([
                 sys.executable, str(refine_script),
@@ -612,7 +1268,7 @@ def main():
                 "--summary-file", str(geometry_summary),
                 *(["--scores", str(classified_scores)]
                   if args.classification_mode == "segearth_ov3" else []),
-                *(["--progress-file", str(args.progress_file)] if args.progress_file else []),
+                *(["--progress-file", str(Path(args.progress_file).with_name("geometry_progress.json"))] if args.progress_file else []),
             ], summary=summary, stage="Geometric refinement")
         else:
             print("Geometric refinement skipped: reconstruction is not georeferenced.")
@@ -622,6 +1278,7 @@ def main():
 
     if args.skip_export:
         if progress:
+            progress.finish()
             progress.update(100, "Complete")
         summary.write("Completed")
         print(f"Finished. Classified point cloud ready for manual export: {classified_output}")
@@ -641,6 +1298,7 @@ def main():
          *(["--georeference", str(georeference_path)] if georeference_path.is_file() else [])],
         summary=summary, stage="LAS export")
     if progress:
+        progress.finish()
         progress.update(100, "Complete")
 
     summary.write("Completed")

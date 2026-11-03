@@ -7,10 +7,88 @@ Images without GPS EXIF are skipped with a warning by default. Use
 """
 
 import argparse
+from dataclasses import dataclass
+import re
 import sys
 from pathlib import Path
 
 import exifread
+
+
+@dataclass(frozen=True)
+class DjiRtkMetadata:
+    """RTK precision values embedded by DJI in an image XMP packet."""
+
+    flag: int
+    std_lon_m: float | None
+    std_lat_m: float | None
+    std_hgt_m: float | None
+
+
+_DJI_ATTRIBUTE = re.compile(
+    r"(?:drone-dji:)?(?P<name>RtkFlag|RtkStdLon|RtkStdLat|RtkStdHgt)\s*=\s*[\"'](?P<value>[^\"']+)[\"']",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_dji_rtk_xmp(data: bytes) -> DjiRtkMetadata | None:
+    """Read DJI RTK attributes from the first XMP packet bytes of a JPEG."""
+    values = {
+        match.group("name").casefold(): match.group("value")
+        for match in _DJI_ATTRIBUTE.finditer(data[:300_000].decode("utf-8", errors="ignore"))
+    }
+    if "rtkflag" not in values:
+        return None
+    try:
+        flag = int(float(values["rtkflag"]))
+    except ValueError:
+        return None
+    return DjiRtkMetadata(
+        flag=flag,
+        std_lon_m=_xmp_float(values.get("rtkstdlon")),
+        std_lat_m=_xmp_float(values.get("rtkstdlat")),
+        std_hgt_m=_xmp_float(values.get("rtkstdhgt")),
+    )
+
+
+def read_dji_rtk_xmp(image_path: Path) -> DjiRtkMetadata | None:
+    """Read DJI RTK metadata without loading the complete image file."""
+    with image_path.open("rb") as image_file:
+        return parse_dji_rtk_xmp(image_file.read(300_000))
+
+
+def dji_position_stddevs(
+    metadata: DjiRtkMetadata | None, standard_xy_m: float, standard_z_m: float,
+) -> tuple[float, float, float]:
+    """Choose per-image fixed-RTK precision or configured standard GPS values."""
+    if metadata is not None and metadata.flag == 50 and all(
+        value is not None for value in (metadata.std_lon_m, metadata.std_lat_m, metadata.std_hgt_m)
+    ):
+        return tuple(max(0.01, float(value)) for value in (
+            metadata.std_lon_m, metadata.std_lat_m, metadata.std_hgt_m,
+        ))
+    return float(standard_xy_m), float(standard_xy_m), float(standard_z_m)
+
+
+def is_dji_rtk_project(image_paths: list[Path]) -> bool:
+    """Return true when at least 90 percent of the selected images are RTK fixed."""
+    if not image_paths:
+        return False
+    fixed = 0
+    for image_path in image_paths:
+        try:
+            metadata = read_dji_rtk_xmp(image_path)
+        except OSError:
+            metadata = None
+        fixed += metadata is not None and metadata.flag == 50
+    return fixed / len(image_paths) >= 0.90
+
+
+def _xmp_float(value: str | None) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _dms_to_decimal(dms, ref):

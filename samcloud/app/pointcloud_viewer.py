@@ -31,7 +31,7 @@ DEFAULT_CLASS_COLORS = (
 
 _STYLE = """
 <style>
-.sam-cloud-viewer { position:relative; width:100%; height:calc(100vh - 180px); min-height:620px; overflow:hidden; border:1px solid #28475b; border-radius:9px; background:#050b12; }
+.sam-cloud-viewer { position:relative; width:100%; height:calc(100vh - 150px); min-height:480px; overflow:hidden; border:1px solid #28475b; border-radius:9px; background:#050b12; }
 .sam-cloud-viewer:fullscreen { width:100vw; height:100vh; min-height:100vh; border:0; border-radius:0; }
 .sam-cloud-viewer canvas { display:block; width:100%; height:100%; cursor:grab; touch-action:none; }
 .sam-cloud-viewer canvas.is-dragging { cursor:grabbing; }
@@ -55,8 +55,20 @@ def render_pointcloud_viewer(
     title: str,
     class_colors: list[list[int]] | None = None,
     class_labels: list[str] | None = None,
+    marker_endpoint: str | None = None,
 ) -> None:
     """Render a canvas viewer backed by the active project's compact point preview."""
+    from samcloud.viewer.potree import potree_available
+
+    if potree_available():
+        from samcloud.app.potree_viewer import render_potree_viewer
+
+        render_potree_viewer(
+            kind, title=title, class_colors=class_colors or default_class_colors(),
+            class_labels=class_labels, marker_endpoint=marker_endpoint,
+        )
+        return
+
     element_id = f"sam-cloud-{kind}"
     endpoint = f"/api/pointcloud/{kind}"
     class_panel = _class_panel_html(class_labels or [])
@@ -84,7 +96,7 @@ def render_pointcloud_viewer(
         sanitize=False,
     )
     ui.add_body_html(
-        _script(element_id, endpoint, class_colors or default_class_colors())
+        _script(element_id, endpoint, class_colors or default_class_colors(), marker_endpoint=marker_endpoint)
     )
 
 
@@ -116,13 +128,14 @@ def _class_panel_html(class_labels: list[str]) -> str:
 
 
 def _script(
-    element_id: str, endpoint: str, class_colors: list[list[int]] | None = None
+    element_id: str, endpoint: str, class_colors: list[list[int]] | None = None, *, marker_endpoint: str | None = None,
 ) -> str:
     config = json.dumps(
         {
             "element_id": element_id,
             "endpoint": endpoint,
             "class_colors": class_colors or default_class_colors(),
+            "marker_endpoint": marker_endpoint,
         }
     )
     return f"""
@@ -136,7 +149,7 @@ def _script(
     const canvas = root.querySelector('canvas');
     const context = canvas.getContext('2d');
     const status = root.querySelector('.sam-cloud-status');
-    const state = {{ points: null, colors: null, classes: null, count: 0, center: [0, 0, 0], baseCenter: [0, 0, 0], span3D: 1, yaw: .65, pitch: -.45, terrainTilt: 0, zoom: 1, viewMode: 'terrain', panX: 0, panY: 0, mode: 'rgb', pointSize: 1, classColors: config.class_colors, classVisible: config.class_colors.map(() => true), dragging: false, dragMode: '', lastX: 0, lastY: 0 }};
+    const state = {{ points: null, colors: null, classes: null, count: 0, center: [0, 0, 0], baseCenter: [0, 0, 0], span3D: 1, yaw: .65, pitch: -.45, terrainTilt: 0, zoom: 1, viewMode: 'terrain', panX: 0, panY: 0, mode: 'rgb', pointSize: 1, classColors: config.class_colors, classVisible: config.class_colors.map(() => true), markers: [], selectedMarker: '', dragging: false, dragMode: '', lastX: 0, lastY: 0 }};
     const classPanel = root.querySelector('.sam-cloud-class-panel');
     const syncClassControls = () => {{
       if (!classPanel) return;
@@ -226,6 +239,23 @@ def _script(
         const point = Math.max(.7, size * Math.min(2.5, Math.max(.8, projectedScale / scale * 1.8)));
         context.fillRect(px, py, point, point);
       }}
+      for (const marker of state.markers) {{
+        if (!Array.isArray(marker.coordinates) || marker.coordinates.length !== 3) continue;
+        const x = marker.coordinates[0] - state.center[0], y = marker.coordinates[1] - state.center[1], z = marker.coordinates[2] - state.center[2];
+        let x1, y1, depth;
+        if (state.viewMode === 'terrain') {{
+          const groundY = x * sy + y * cy; x1 = x * cy - y * sy; y1 = groundY * ct + z * st; depth = z * ct - groundY * st;
+        }} else {{
+          const z1 = x * sy + z * cy; x1 = x * cy - z * sy; y1 = y * cp - z1 * sp; depth = y * sp + z1 * cp;
+        }}
+        const depthFactor = Math.max(.72, Math.min(1.35, 1.0 - depth / (fitSpan * 7)));
+        const px = width * .5 + state.panX + x1 * scale * depthFactor, py = height * .5 + state.panY - y1 * scale * depthFactor;
+        const colors = {{ pass: '#26b7ef', control: '#ffb020', disabled: '#6b7c8a', needs_review: '#ff5a5a' }};
+        context.save(); context.fillStyle = colors[marker.state_color] || colors.needs_review;
+        context.beginPath(); context.moveTo(px, py - 12); context.lineTo(px + 7, py - 2); context.lineTo(px + 2, py - 2); context.lineTo(px + 2, py + 7); context.lineTo(px - 2, py + 7); context.lineTo(px - 2, py - 2); context.lineTo(px - 7, py - 2); context.closePath(); context.fill();
+        if (marker.name === state.selectedMarker) {{ context.strokeStyle = '#dcecf6'; context.lineWidth = 1.5; context.stroke(); }}
+        context.font = '12px sans-serif'; context.fillStyle = '#dcecf6'; context.fillText(marker.name, px + 9, py - 7); context.restore();
+      }}
     }};
     const fitAll = () => {{ state.zoom = 1; state.panX = 0; state.panY = 0; state.center = [...state.baseCenter]; draw(); }};
     const load = async () => {{
@@ -249,8 +279,27 @@ def _script(
         state.center = [...state.baseCenter];
         state.span3D = Math.max(Math.hypot(spanX, spanY, spanZ), .001);
         status.textContent = `Preview: ${{count.toLocaleString()}} points. Left drag rotates around the nearest point, right drag moves, wheel zooms.`;
-        resize();
+        await loadMarkers(); resize();
       }} catch (error) {{ status.textContent = `Point cloud unavailable: ${{error.message}}`; }}
+    }};
+    const loadMarkers = async () => {{
+      if (!config.marker_endpoint) return;
+      try {{ const response = await fetch(config.marker_endpoint, {{ cache: 'no-store' }}); if (!response.ok) return; const value = await response.json(); state.markers = value.markers || []; draw(); }} catch (_error) {{ }}
+    }};
+    const selectMarker = event => {{
+      if (!state.markers.length || !state.points) return false;
+      const rect = canvas.getBoundingClientRect(), targetX = event.clientX - rect.left, targetY = event.clientY - rect.top;
+      const width = rect.width, height = rect.height, scale = Math.min(width, height) * .82 * state.zoom / state.span3D;
+      const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw), cp = Math.cos(state.pitch), sp = Math.sin(state.pitch), ct = Math.cos(state.terrainTilt), st = Math.sin(state.terrainTilt);
+      let chosen = null, distance = 11;
+      for (const marker of state.markers) {{
+        if (!Array.isArray(marker.coordinates)) continue;
+        const x = marker.coordinates[0] - state.center[0], y = marker.coordinates[1] - state.center[1], z = marker.coordinates[2] - state.center[2]; let x1, y1, depth;
+        if (state.viewMode === 'terrain') {{ const groundY = x * sy + y * cy; x1 = x * cy - y * sy; y1 = groundY * ct + z * st; depth = z * ct - groundY * st; }} else {{ const z1 = x * sy + z * cy; x1 = x * cy - z * sy; y1 = y * cp - z1 * sp; depth = y * sp + z1 * cp; }}
+        const depthFactor = Math.max(.72, Math.min(1.35, 1.0 - depth / (state.span3D * 7))); const px = width * .5 + state.panX + x1 * scale * depthFactor, py = height * .5 + state.panY - y1 * scale * depthFactor; const current = Math.hypot(px - targetX, py - targetY);
+        if (current < distance) {{ distance = current; chosen = marker; }}
+      }}
+      if (!chosen) return false; state.selectedMarker = chosen.name; window.dispatchEvent(new CustomEvent('samcloud-marker-selected', {{ detail: chosen }})); draw(); return true;
     }};
     const setRotationPivot = (clientX, clientY) => {{
       if (!state.points) return;
@@ -308,6 +357,7 @@ def _script(
     canvas.oncontextmenu = event => event.preventDefault();
     canvas.onpointerdown = event => {{
       if (event.button !== 0 && event.button !== 2) return;
+      if (event.button === 0 && selectMarker(event)) return;
       state.dragging = true; state.dragMode = event.button === 2 ? 'pan' : 'rotate';
       if (state.dragMode === 'rotate') setRotationPivot(event.clientX, event.clientY);
       state.lastX = event.clientX; state.lastY = event.clientY; canvas.classList.add('is-dragging'); canvas.setPointerCapture(event.pointerId);

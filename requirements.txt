@@ -16,3 +16,4 @@ PyYAML==6.0.3
 pyproj==3.7.1
 nicegui==3.17.1
 pytest==8.4.2
+pycolmap==4.2.1

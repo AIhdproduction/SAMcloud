@@ -73,3 +73,14 @@ def test_create_project_can_pause_after_alignment_for_control_points(tmp_path: P
     assert project["workflow"]["control_points_mode"] == "after_alignment"
     assert project["workflow"]["control_points"] == "not_started"
     assert project["settings"]["workflow"]["control_points_enabled"] is True
+
+
+def test_create_project_accepts_automatic_control_point_mode(tmp_path: Path) -> None:
+    manager = ProjectManager(tmp_path)
+    project_directory = ProjectManager(tmp_path).create_project(
+        "auto_test", str(tmp_path), control_points_mode="automatic"
+    )
+    project = manager.load(project_directory)
+
+    assert project["workflow"]["control_points_mode"] == "automatic"
+    assert project["workflow"]["control_points"] == "not_started"

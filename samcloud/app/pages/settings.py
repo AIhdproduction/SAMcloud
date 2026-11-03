@@ -12,6 +12,13 @@ from samcloud.app.state import state
 from samcloud.core.configuration import load_export_crs_presets
 
 
+CONTROL_POINTS_MODE_OPTIONS = {
+    "none": "No control points - continue automatically",
+    "after_alignment": "Use control points after alignment",
+    "automatic": "Automatic (detect targets)",
+}
+
+
 def _export_crs_options() -> dict[str, str]:
     """Return settings select options from the central export CRS configuration."""
     return {key: str(preset["label"]) for key, preset in load_export_crs_presets().items()}
@@ -117,10 +124,7 @@ def render() -> None:
             ui.label("Processing settings").classes("text-lg font-medium")
             use_gpu = ui.switch("Use GPU", value=workflow["use_gpu"])
             control_points = ui.select(
-                {
-                    "none": "No control points - continue automatically",
-                    "after_alignment": "Use control points after alignment",
-                },
+                CONTROL_POINTS_MODE_OPTIONS,
                 label="Ground control points",
                 value=control_points_mode,
             )
@@ -200,7 +204,7 @@ def render() -> None:
                 coordinates["working_crs"] = working_crs.value
                 coordinates["export_crs"] = export_crs.value
                 workflow["use_gpu"] = use_gpu.value
-                workflow["control_points_enabled"] = control_points.value == "after_alignment"
+                workflow["control_points_enabled"] = control_points.value in {"after_alignment", "automatic"}
                 project.setdefault("workflow", {})["control_points_mode"] = control_points.value
                 classification["class_set"] = class_set.value
                 classification["min_votes"] = int(min_votes.value or 0)

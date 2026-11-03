@@ -26,6 +26,25 @@ control_points:
   max_reprojection_px: 3.0
   min_triangulation_angle_deg: 2.0
   max_residual_warning_m: 0.10
+  detection:
+    enabled: true
+    target_type: cross
+    secondary_target_type: none
+    polarity: bright
+    min_contrast: 50
+    min_score: 0.72
+    max_saturation: 70
+    ambiguity_ratio: 0.85
+  min_projections: 3
+  # Agisoft-style marker error (to the estimated marker position); painted crosses on oblique 20 m imagery reach ~1.2-1.4 px
+  max_marker_reprojection_px: 1.5
+  merge_tolerance_m: 0.5
+  search_radius_min_px: 40
+  search_radius_max_px: 800
+  stage2_radius_px: 25
+  observation_outlier_factor: 3.0
+  max_gate_iterations: 3
+  continue_automatically: true
 
 classification:
   geometry_refinement: true

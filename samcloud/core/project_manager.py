@@ -133,7 +133,7 @@ class ProjectManager:
             frame_interval_seconds = float(panorama_defaults.get("frame_interval_seconds", 1.0))
         if class_set not in {"outdoor", "indoor"}:
             raise ValueError("Select the indoor or outdoor semantic class set")
-        if control_points_mode not in {"none", "after_alignment"}:
+        if control_points_mode not in {"none", "after_alignment", "automatic"}:
             raise ValueError("Select whether control points should be used after alignment")
         validate_capture_configuration(
             capture_type,
@@ -143,7 +143,7 @@ class ProjectManager:
             frame_interval_seconds=frame_interval_seconds,
         )
         defaults["classification"]["class_set"] = class_set
-        defaults["workflow"]["control_points_enabled"] = control_points_mode == "after_alignment"
+        defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic"}
         coordinates = defaults["coordinate_systems"]
         is_gps_capture = capture_type == "drone_gps"
         if not is_gps_capture:
@@ -190,7 +190,7 @@ class ProjectManager:
             "settings": defaults,
             "workflow": {
                 "alignment": "not_started",
-                "control_points": "not_started" if control_points_mode == "after_alignment" else "skipped",
+                "control_points": "not_started" if control_points_mode in {"after_alignment", "automatic"} else "skipped",
                 "dense_cloud": "not_started",
                 "classification": "not_started",
                 "export": "not_started",
