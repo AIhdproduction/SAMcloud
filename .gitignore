@@ -52,3 +52,4 @@ graphify-out/
 
 # Local external tools (PotreeConverter)
 /tools/
+/_codex_pytest*/
