@@ -78,6 +78,16 @@ def _processing_time_summary(project_directory: Path | None) -> dict | None:
     return {"total_seconds": total, "groups": {name: value for name, value in groups.items() if value >= 1.0}, "runs": len(chain)}
 
 
+def _storage_summary(project_directory: Path | None) -> dict | None:
+    """Load the completed project's storage totals for the workflow panel."""
+    if project_directory is None:
+        return None
+    try:
+        return json.loads((project_directory / "reports" / "storage_summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def render() -> None:
     """Render the active-project dashboard or a practical starting workspace."""
     project = state.active_project()
@@ -364,6 +374,11 @@ def _render_workflow(project: dict | None) -> None:
                     with ui.row().classes("items-center justify-between w-full no-wrap"):
                         ui.label(name).classes("text-xs sam-muted")
                         ui.label(_format_elapsed(seconds)).classes("text-xs sam-muted")
+        storage = _storage_summary(state.active_project_directory)
+        if storage is not None:
+            after = float(storage.get("after_bytes", 0)) / 1024 ** 3
+            freed = float(storage.get("freed_bytes", 0)) / 1024 ** 3
+            ui.label(f"Speicher: {after:.1f} GB (gespart: {freed:.1f} GB)").classes("text-xs sam-muted")
 
     if project is not None and _workflow_is_active(project.get("workflow", {})):
         def refresh_workflow() -> None:

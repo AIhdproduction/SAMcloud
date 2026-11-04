@@ -52,6 +52,9 @@ def _point_count_from_ply(path: Path) -> int | None:
 
 def _file_size(path: Path) -> str:
     if not path.exists():
+        compressed = path.with_name(path.name + ".gz")
+        if compressed.exists():
+            return f"Compressed ({_file_size(compressed)})"
         return "Not available"
     size = path.stat().st_size
     for unit in ("B", "KB", "MB", "GB", "TB"):

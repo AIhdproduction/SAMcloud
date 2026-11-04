@@ -11,6 +11,13 @@ from samcloud.core.configuration import load_global_config
 from samcloud.core.project_deletion import delete_project
 
 
+STORAGE_OPTIONS = {
+    "keep_control_point_inputs": "Passpunkte später neu optimieren können",
+    "keep_classification_inputs": "Klassifizierung später neu rechnen können",
+    "keep_refinement_inputs": "Geometrie-Verfeinerung später neu rechnen können",
+}
+
+
 def render() -> None:
     """Render the persistent project manager."""
     def content() -> None:
@@ -40,6 +47,12 @@ def render() -> None:
                 label="Ground control points",
                 value="none",
             )
+            with ui.card().classes("w-full"):
+                ui.label("Speicher").classes("text-base font-medium")
+                storage_switches = {
+                    key: ui.switch(label, value=True)
+                    for key, label in STORAGE_OPTIONS.items()
+                }
 
             with ui.column().classes("w-full gap-3").bind_visibility_from(
                 capture_type, "value", lambda value: value in {"drone_gps", "camera"}
@@ -120,6 +133,7 @@ def render() -> None:
                         frame_interval_seconds=float(frame_interval_seconds.value or 0),
                         rtk_enabled=rtk_enabled.value,
                         control_points_mode=control_points_mode.value,
+                        storage={key: bool(control.value) for key, control in storage_switches.items()},
                     )
                     state.open_project(project_directory)
                     ui.notify(f"Project created: {project_directory.name}")

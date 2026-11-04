@@ -10,6 +10,7 @@ from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any
 
 from samcloud.core.configuration import load_global_config
+from samcloud.core.storage import ensure_text_model
 from samcloud.pointcloud.georeference import fit_enu_to_ecef, save_georeference
 
 if TYPE_CHECKING:
@@ -29,8 +30,9 @@ def optimize_control_points(project_directory: Path, project: dict[str, Any]) ->
     sparse = products / "sparse"
     pristine_model = sparse / "pre_gcp"
     pristine_text = sparse / "pre_gcp_txt"
-    if not pristine_model.is_dir() or not pristine_text.is_dir():
+    if not pristine_model.is_dir():
         raise ValueError("The pristine sparse model required for control-point optimization is unavailable")
+    ensure_text_model(pristine_model, pristine_text)
     control_settings = dict(load_global_config("defaults.yml").get("control_points", {}))
     # Only values the user edits in the UI override the global defaults; the rest of the project
     # snapshot may be outdated and must not shadow newer detection/gate defaults.
@@ -273,8 +275,10 @@ class ProcessingManager:
             return georeference
         gps_ref = products / "gps_ref.txt"
         model_dir = products / "dense" / "sparse_txt"
-        if not gps_ref.is_file() or not model_dir.is_dir():
+        binary_model = products / "dense" / "sparse"
+        if not gps_ref.is_file() or not binary_model.is_dir():
             return None
+        ensure_text_model(binary_model, model_dir)
         try:
             save_georeference(georeference, fit_enu_to_ecef(model_dir, gps_ref))
         except (OSError, ValueError) as error:

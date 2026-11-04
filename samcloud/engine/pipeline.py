@@ -10,6 +10,7 @@ import numpy as np
 
 from samcloud.acquisition import CaptureValidationError, prepare_panorama_inputs
 from samcloud.colmap.alignment import (
+    adaptive_dense_size,
     extract_features_by_group,
     feature_extractor_command,
     filter_pass_is_safe,
@@ -26,6 +27,8 @@ from samcloud.colmap.alignment import (
 )
 from samcloud.colmap.camera_groups import assign_camera_groups
 from samcloud.core.configuration import load_global_config
+from samcloud.core.project_manager import ProjectManager
+from samcloud.core.storage import compact_project, ensure_available, ensure_text_model, release_after_fusion, remove_generated, storage_settings
 from samcloud.engine.run_summary import RunSummary
 from samcloud.engine.extract_gps import is_dji_rtk_project
 from samcloud.control_points.georeference import coordinates_to_ecef, enu_rotation_at_ecef, georeference_from_control_points, save_control_point_report
@@ -129,12 +132,17 @@ def run(
     return result
 
 
-def _build_estimator(args, num_images: int, colmap_config: dict, *, resume: bool) -> ProgressEstimator:
+def _build_estimator(
+    args, num_images: int, colmap_config: dict, *, resume: bool, dense_max_image_size: int | None = None,
+) -> ProgressEstimator:
     dense = colmap_config.get("dense_reconstruction", {})
     camera = colmap_config.get("camera", {})
     alignment = colmap_config.get("alignment", {})
     tiepoints = colmap_config.get("tiepoint_filter", {})
-    size = int(dense.get("max_image_size", camera.get("max_image_size", 3200)))
+    configured_size = dense.get("max_image_size", camera.get("max_image_size", 3200))
+    size = dense_max_image_size if dense_max_image_size is not None else (
+        int(camera.get("max_image_size", 3200)) if configured_size == "auto" else int(configured_size)
+    )
     iterations = int(dense.get("num_iterations", 3))
     geometric = bool(dense.get("use_geometric_consistency", True))
     strategy = str(alignment.get("matching_strategy", "auto"))
@@ -158,6 +166,93 @@ def _build_estimator(args, num_images: int, colmap_config: dict, *, resume: bool
         if args.geometry_refinement == "1":
             plan.append(("geometry_refinement", num_images))
     return ProgressEstimator(plan, RateStore(PROJECT_ROOT / "projects" / ".samcloud_stage_rates.json"))
+
+
+def _dense_size_from_inputs(dense_config: dict, outdir: Path, images_dir: Path) -> tuple[int, str | None]:
+    """Resolve numeric or automatic dense resolution from the first project image."""
+    configured = dense_config.get("max_image_size", 3200)
+    if configured != "auto":
+        return int(configured), None
+    image_list = outdir / "image_list.txt"
+    names = [line.strip() for line in image_list.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not names:
+        raise ValueError("Cannot choose automatic dense resolution without images")
+    image_path = images_dir / names[0]
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except (ImportError, OSError, ValueError):
+        try:
+            import cv2
+
+            image = cv2.imread(str(image_path), cv2.IMREAD_REDUCED_COLOR_2)
+            if image is None:
+                raise ValueError
+            height, width = image.shape[:2]
+        except (ImportError, ValueError):
+            maximum = int(dense_config.get("auto", {}).get("maximum", 3200))
+            return maximum, f"Dense size {maximum}px because the first image header could not be read."
+    options = dense_config.get("auto", {})
+    size, reason = adaptive_dense_size(
+        max(width, height), len(names), shutil.disk_usage(outdir).free,
+        ratio=float(options.get("ratio", 0.55)),
+        minimum=int(options.get("minimum", 2000)),
+        maximum=int(options.get("maximum", 3200)),
+    )
+    return size, reason
+
+
+def _compact_completed_project(outdir: Path, summary: RunSummary) -> None:
+    """Compact only valid project products after successful completion."""
+    project_dir = outdir.parent
+    if not (project_dir / "project.samcloud.yml").is_file():
+        summary.settings["storage"] = {"skipped": "project settings are unavailable"}
+        return
+    try:
+        project = ProjectManager().load(project_dir)
+        settings = storage_settings(project.get("settings", {}))
+        summary.settings["storage"] = compact_project(outdir, settings)
+    except (OSError, ValueError) as error:
+        print(f"WARNING: Storage compaction was skipped: {error}")
+        summary.settings["storage"] = {"skipped": str(error)}
+
+
+def _ensure_if_compressed(path: Path) -> None:
+    """Restore an optional re-run input only when its compressed copy exists."""
+    if path.exists() or path.with_name(path.name + ".gz").exists():
+        ensure_available(path)
+
+
+def _release_fusion_cache(dense_dir: Path, summary: RunSummary) -> None:
+    products = dense_dir.parent
+    freed = release_after_fusion(dense_dir) if (products.parent / "project.samcloud.yml").is_file() else 0
+    if freed:
+        print(f"Released {freed / 1024 ** 3:.2f} GB of dense stereo cache.")
+    summary.settings["storage_freed_after_fusion_gb"] = round(
+        float(summary.settings.get("storage_freed_after_fusion_gb", 0)) + freed / 1024 ** 3, 3,
+    )
+
+
+def _release_sparse_intermediates(sparse_dir: Path, model0: Path) -> None:
+    """Discard superseded sparse filtering models once their successor is selected."""
+    products = sparse_dir.parent
+    if not (products.parent / "project.samcloud.yml").is_file():
+        return
+    for path in sparse_dir.iterdir() if sparse_dir.is_dir() else ():
+        is_intermediate = (
+            path.name in {"0", "0_geo"}
+            or "_filter_" in path.name
+            or "_ba_" in path.name
+        )
+        if path.is_dir() and is_intermediate and path != model0 and path.name not in {"pre_gcp", "gcp_adjusted"}:
+            remove_generated(path, products)
+
+
+def _write_final_model(sparse_dir: Path, model0: Path) -> None:
+    """Record the sparse model that later processing continues to use."""
+    (sparse_dir / "final_model.txt").write_text(model0.name + "\n", encoding="utf-8")
 
 
 def find_colmap_exe(colmap_bin):
@@ -364,7 +459,9 @@ def _resume_automatic_control_points(
     image_list_path = outdir / "image_list.txt"
     if progress and progress.estimator is None:
         num_images = len([l for l in image_list_path.read_text(encoding="utf-8").splitlines() if l.strip()]) if image_list_path.is_file() else 0
-        progress.estimator = _build_estimator(args, num_images, colmap_config, resume=True)
+        progress.estimator = _build_estimator(
+            args, num_images, colmap_config, resume=True, dense_max_image_size=dense_max_image_size,
+        )
         global _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = progress
     sparse_dir = outdir / "sparse"
@@ -409,6 +506,7 @@ def _resume_automatic_control_points(
         progress.begin("dense_fusion")
     run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", dense_config.get("fusion", {})),
         summary=summary, stage="Dense fusion")
+    _release_fusion_cache(dense_dir, summary)
     sparse_txt = dense_dir / "sparse_txt"
     sparse_txt.mkdir(parents=True, exist_ok=True)
     run([colmap, "model_converter", "--input_path", str(dense_dir / "sparse"), "--output_path", str(sparse_txt),
@@ -425,7 +523,9 @@ def _resume_after_control_points(
     if progress and progress.estimator is None:
         image_list_path = outdir / "image_list.txt"
         num_images = len([l for l in image_list_path.read_text(encoding="utf-8").splitlines() if l.strip()]) if image_list_path.is_file() else 0
-        progress.estimator = _build_estimator(args, num_images, colmap_config, resume=True)
+        progress.estimator = _build_estimator(
+            args, num_images, colmap_config, resume=True, dense_max_image_size=dense_max_image_size,
+        )
         global _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = progress
     dense_dir = outdir / "dense"
@@ -485,6 +585,7 @@ def _resume_after_control_points(
     if progress:
         progress.begin("dense_fusion")
     run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", fusion_config), summary=summary, stage="Dense fusion")
+    _release_fusion_cache(dense_dir, summary)
     shutil.rmtree(sparse_txt)
     sparse_txt.mkdir(parents=True, exist_ok=True)
     run([colmap, "model_converter", "--input_path", str(dense_sparse), "--output_path", str(sparse_txt), "--output_type", "TXT"], summary=summary, stage="Preparing classification")
@@ -555,6 +656,8 @@ def _automatic_control_points(
         return None
     import pycolmap
 
+    ensure_text_model(model_path, model_txt)
+
     points = read_control_points(control_points_dir / "control_points.csv")
     georef = fit_enu_to_ecef(model_txt, gps_ref_path)
     scale = float(georef["scale"])
@@ -575,6 +678,10 @@ def _automatic_control_points(
     before = camera_intrinsics(pycolmap.Reconstruction(model_path))
     pose_priors = None
     database_path = model_path.parents[1] / "database.db"
+    try:
+        ensure_available(database_path)
+    except FileNotFoundError:
+        pass
     if database_path.is_file():
         with pycolmap.Database.open(database_path) as database:
             pose_priors = database.read_all_pose_priors()
@@ -615,6 +722,7 @@ def _automatic_control_points(
     local_model = model_path.parent / "gcp_adjusted"
     local_model.mkdir(parents=True, exist_ok=True)
     adjusted.write(local_model)
+    _write_final_model(model_path.parent, local_model)
     for name, entry in detections.items():
         if entry["triangulated_model_xyz"] is not None:
             entry["triangulated_model_xyz"] = (local_scale * local_rotation @ np.asarray(entry["triangulated_model_xyz"], dtype=float) + local_translation).tolist()
@@ -644,6 +752,11 @@ def _automatic_control_points(
         "rotation": enu_rotation.T.tolist(), "translation": centroid.tolist(), "pairs": len(points),
         "residual_m": residuals, "control_points": {"crs": control_points_crs, "origin_ecef": centroid.tolist()},
     })
+    products = model_path.parents[1]
+    if (products.parent / "project.samcloud.yml").is_file():
+        for path in model_path.parent.glob("gcp_adjusted_raw*"):
+            if path != local_model:
+                remove_generated(path, products)
     return local_model
 
 
@@ -676,6 +789,8 @@ def _classify_and_finish(
     classified_raw = classified_output.with_name("classified_raw.ply") if geometry_enabled else classified_output
     classified_scores = classified_output.parent / "classified_scores.npz"
     classified_output.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_if_compressed(dense_dir / "fused.ply")
+    _ensure_if_compressed(dense_dir / "fused.ply.vis")
     if progress:
         progress.begin("classification")
     classify_command = [sys.executable, str(classify_script), "--dense-dir", str(dense_dir),
@@ -694,6 +809,9 @@ def _classify_and_finish(
     run(classify_command, summary=summary, stage="SAM3 classification")
     if geometry_enabled and georeferenced:
         refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
+        _ensure_if_compressed(classified_raw)
+        if args.classification_mode == "segearth_ov3":
+            _ensure_if_compressed(classified_scores)
         if progress:
             progress.begin("geometry_refinement")
         run([sys.executable, str(refine_script), "--input", str(classified_raw), "--output", str(classified_output),
@@ -706,6 +824,7 @@ def _classify_and_finish(
         if progress:
             progress.finish()
             progress.update(100, "Complete")
+        _compact_completed_project(outdir, summary)
         summary.write("Completed")
         return
     run([sys.executable, str(Path(__file__).resolve().parent / "export_las.py"), "--input", str(classified_output),
@@ -714,6 +833,7 @@ def _classify_and_finish(
          "--georeference", str(outdir / "georeference.json")], summary=summary, stage="LAS export")
     if progress:
         progress.finish()
+    _compact_completed_project(outdir, summary)
     summary.write("Completed")
 
 
@@ -832,7 +952,8 @@ def main():
     georeferencing_config = colmap_config.get("georeferencing", {})
     dense_config = colmap_config.get("dense_reconstruction", {})
     max_image_size = int(camera_config.get("max_image_size", 4000))
-    dense_max_image_size = int(dense_config.get("max_image_size", max_image_size))
+    configured_dense_size = dense_config.get("max_image_size", max_image_size)
+    dense_max_image_size = max_image_size if configured_dense_size == "auto" else int(configured_dense_size)
     dense_num_iterations = int(dense_config.get("num_iterations", 3))
     dense_gpu_index = int(dense_config.get("gpu_index", 0))
 
@@ -877,6 +998,12 @@ def main():
         "classification_summary": str(report_dir / "classification_summary.json"),
     })
     if args.resume_after_control_points:
+        resume_images = Path(args.images).resolve() if args.images else outdir / "dense" / "images"
+        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, resume_images)
+        if dense_reason:
+            print(dense_reason)
+        summary.settings["dense_max_image_size"] = dense_max_image_size
+        summary.settings["dense_size_reason"] = dense_reason
         _resume_after_control_points(
             args, outdir, report_dir, summary, progress, colmap_config, dense_max_image_size,
             dense_num_iterations, dense_gpu_index, classified_output,
@@ -891,10 +1018,17 @@ def main():
     dense_dir.mkdir(parents=True, exist_ok=True)
     image_list_path = outdir / "image_list.txt"
     num_images = write_image_list(images_dir, image_list_path)
+    dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, images_dir)
+    if dense_reason:
+        print(dense_reason)
+    summary.settings["dense_max_image_size"] = dense_max_image_size
+    summary.settings["dense_size_reason"] = dense_reason
     summary.settings["image_count"] = num_images
     print(f"Using {num_images} supported images from {images_dir}")
     if progress:
-        progress.estimator = _build_estimator(args, num_images, colmap_config, resume=False)
+        progress.estimator = _build_estimator(
+            args, num_images, colmap_config, resume=False, dense_max_image_size=dense_max_image_size,
+        )
         global _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = progress
     image_paths = [images_dir / name for name in image_list_path.read_text(encoding="utf-8").splitlines()]
@@ -1127,6 +1261,9 @@ def main():
         else:
             model0 = automatic_model
 
+    _release_sparse_intermediates(sparse_dir, model0)
+    _write_final_model(sparse_dir, model0)
+
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model
     #    we can read as plain text for the camera poses.
     if progress:
@@ -1190,6 +1327,7 @@ def main():
     run(stereo_fusion_command(
         colmap, dense_dir, dense_dir / "fused.ply", dense_config.get("fusion", {})
     ), summary=summary, stage="Dense fusion")
+    _release_fusion_cache(dense_dir, summary)
     if progress:
         progress.update(84, "Fusing dense cloud")
 
@@ -1224,6 +1362,8 @@ def main():
     classified_raw = classified_output.with_name("classified_raw.ply") if geometry_enabled else classified_output
     classified_scores = classified_output.parent / "classified_scores.npz"
     classified_output.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_if_compressed(dense_dir / "fused.ply")
+    _ensure_if_compressed(dense_dir / "fused.ply.vis")
     if progress:
         progress.begin("classification")
         progress.update(87, "Classifying point cloud")
@@ -1255,6 +1395,9 @@ def main():
         geometry_summary = report_dir / "geometry_summary.json"
         if georeferenced:
             refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
+            _ensure_if_compressed(classified_raw)
+            if args.classification_mode == "segearth_ov3":
+                _ensure_if_compressed(classified_scores)
             if progress:
                 progress.begin("geometry_refinement")
                 progress.update(98, "Geometric refinement")
@@ -1280,6 +1423,7 @@ def main():
         if progress:
             progress.finish()
             progress.update(100, "Complete")
+        _compact_completed_project(outdir, summary)
         summary.write("Completed")
         print(f"Finished. Classified point cloud ready for manual export: {classified_output}")
         return
@@ -1301,6 +1445,7 @@ def main():
         progress.finish()
         progress.update(100, "Complete")
 
+    _compact_completed_project(outdir, summary)
     summary.write("Completed")
     print(f"\nFinished. Classified point cloud: {classified_output}")
     print(f"LAS with class IDs: {outdir / 'classified.las'}")

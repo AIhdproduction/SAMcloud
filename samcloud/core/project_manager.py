@@ -12,6 +12,7 @@ import yaml
 from samcloud.acquisition import validate_capture_configuration
 from samcloud.core.configuration import load_global_config, load_yaml
 from samcloud.core.paths import PROJECTS_DIRECTORY, ensure_workspace_directories
+from samcloud.core.storage import DEFAULT_STORAGE
 
 
 PROJECT_FILENAME = "project.samcloud.yml"
@@ -45,6 +46,7 @@ class ProjectManager:
         frame_interval_seconds: float | None = None,
         rtk_enabled: bool = False,
         control_points_mode: str = "none",
+        storage: dict | None = None,
     ) -> Path:
         """Create a self-contained project folder without copying source images."""
         normalized_name = self._normalize_name(name)
@@ -62,6 +64,7 @@ class ProjectManager:
             frame_interval_seconds=frame_interval_seconds,
             rtk_enabled=rtk_enabled,
             control_points_mode=control_points_mode,
+            storage=storage,
         )
 
         ensure_workspace_directories()
@@ -126,6 +129,7 @@ class ProjectManager:
         frame_interval_seconds: float | None,
         rtk_enabled: bool,
         control_points_mode: str,
+        storage: dict | None = None,
     ) -> dict[str, Any]:
         defaults = deepcopy(load_global_config("defaults.yml"))
         panorama_defaults = defaults.get("acquisition", {}).get("panorama", {})
@@ -144,6 +148,7 @@ class ProjectManager:
         )
         defaults["classification"]["class_set"] = class_set
         defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic"}
+        defaults["storage"] = {**DEFAULT_STORAGE, **(storage or {})}
         coordinates = defaults["coordinate_systems"]
         is_gps_capture = capture_type == "drone_gps"
         if not is_gps_capture:

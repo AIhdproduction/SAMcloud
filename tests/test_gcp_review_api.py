@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from samcloud.app import application, processing
-from samcloud.app.gcp_review import displayed_pixel_to_original, marker_payload
+from samcloud.app.gcp_review import _image_roots, displayed_pixel_to_original, marker_payload
 from samcloud.app.state import state
 from samcloud.control_points.adjustment import add_pass_points_to_reconstruction
 from samcloud.control_points.repository import load_detections, save_detections
@@ -56,6 +56,12 @@ def _project(tmp_path: Path) -> Path:
     }
     (project / "reports" / "control_points_report.json").write_text(json.dumps(report), encoding="utf-8")
     return project
+
+
+def test_image_roots_falls_back_when_undistorted_images_are_missing(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    roots = _image_roots(project, "undistorted")
+    assert roots == [(project / "inputs" / "images").resolve(), (project / "inputs").resolve()]
 
 
 @pytest.fixture

@@ -129,7 +129,7 @@ def render() -> None:
             control_points = points(); image_root = project_directory / "products" / "dense" / "images"
             if control_points is None: return
             if not image_root.is_dir():
-                ui.label("Finish Phase A before marking points; undistorted images will appear here.").classes("sam-muted q-mt-md"); return
+                ui.label("Entzerrte Bilder wurden zum Speicher sparen entfernt.").classes("sam-muted q-mt-md"); return
             images = sorted(path.relative_to(image_root).as_posix() for path in image_root.rglob("*") if path.is_file())
             if not images: ui.label("No undistorted images are available yet.").classes("sam-muted q-mt-md"); return
             selected["name"] = selected["name"] or str(control_points.iloc[0]["name"]); selected["image"] = selected["image"] or images[0]

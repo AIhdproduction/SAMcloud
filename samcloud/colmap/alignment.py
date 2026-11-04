@@ -16,6 +16,32 @@ from samcloud.engine.extract_gps import dji_position_stddevs, read_dji_rtk_xmp
 VALID_CAMERA_MODELS = {"SIMPLE_RADIAL", "RADIAL", "OPENCV", "FULL_OPENCV"}
 
 
+def adaptive_dense_size(
+    image_long_side: int,
+    image_count: int,
+    free_bytes: int,
+    *,
+    ratio: float = 0.55,
+    minimum: int = 2000,
+    maximum: int = 3200,
+    bytes_per_pixel: float = 24.0,
+    safety: float = 1.25,
+) -> tuple[int, str]:
+    """Choose a dense resolution from input dimensions and available disk space."""
+    if image_long_side <= 0:
+        raise ValueError("Image long side must be positive")
+    base = round(image_long_side * ratio / 100) * 100
+    base = min(maximum, max(minimum, base), image_long_side)
+    size = base
+    while size > 1600 and image_count * size ** 2 * bytes_per_pixel * safety > free_bytes:
+        size -= 100
+    size = min(size, image_long_side)
+    reason = f"Dense size {size}px from {image_long_side}px input (base {base}px)."
+    if size < base:
+        reason += " Reduced because available disk space is limited."
+    return size, reason
+
+
 def resolve_camera_model(value: str | None, is_panorama: bool) -> str:
     """Resolve a configured camera model for the current capture type."""
     requested = (value or "AUTO").upper()

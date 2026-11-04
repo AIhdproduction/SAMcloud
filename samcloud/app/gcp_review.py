@@ -184,7 +184,7 @@ def resolve_project_image(project_directory: Path, image: str, source: str) -> P
 
 def _image_roots(project_directory: Path, source: str) -> list[Path]:
     dense = project_directory / "products" / "dense" / "images"
-    if source == "undistorted":
+    if source == "undistorted" and dense.is_dir():
         return [dense.resolve()]
     roots = [project_directory / "inputs" / "images", project_directory / "inputs"]
     project_path = project_directory / "project.samcloud.yml"

@@ -1,6 +1,8 @@
 from pathlib import Path
 import struct
 import subprocess
+from threading import Thread
+import time
 
 import laspy
 import numpy as np
@@ -14,6 +16,7 @@ from samcloud.viewer.potree import (
     potree_available,
     write_viewer_las,
 )
+from samcloud.viewer import potree
 
 
 def _read_ply_header_compat(source: Path):
@@ -197,6 +200,52 @@ def test_ensure_potree_converts_and_caches(tmp_path: Path, monkeypatch: pytest.M
     assert (cached_output / "metadata.json").is_file()
 
 
+def test_ensure_potree_serializes_concurrent_conversions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "project"
+    source = project / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ply")
+    calls: list[list[str]] = []
+    results: list[Path] = []
+    errors: list[Exception] = []
+
+    monkeypatch.setattr(potree, "potree_available", lambda: True)
+    monkeypatch.setattr(potree, "_ply_points", lambda _path: (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), None))
+
+    def fake_write_las(path, *_args) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"las")
+
+    monkeypatch.setattr(potree, "write_viewer_las", fake_write_las)
+
+    def slow_converter(command, **_kwargs):
+        calls.append(command)
+        time.sleep(0.1)
+        output = Path(command[command.index("-o") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "metadata.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(potree.subprocess, "run", slow_converter)
+
+    def convert() -> None:
+        try:
+            results.append(ensure_potree(project, "dense"))
+        except Exception as error:
+            errors.append(error)
+
+    threads = [Thread(target=convert), Thread(target=convert)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    expected = project.resolve() / "products" / "viewer" / "potree" / "dense"
+    assert not errors
+    assert len(calls) == 1
+    assert results == [expected, expected]
+
+
 def test_potree_route_rejects_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "project"
     octree_path = project / "products" / "viewer" / "potree" / "dense" / "octree.bin"
@@ -210,3 +259,150 @@ def test_potree_route_rejects_traversal(tmp_path: Path, monkeypatch: pytest.Monk
 
     res_valid = potree_file("dense", "octree.bin")
     assert res_valid.status_code == 200
+
+
+
+def test_potree_status_reports_building_then_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from threading import Event
+    from samcloud.viewer.potree import potree_status, start_potree_build
+
+    potree._POTREE_BUILD_STATES.clear()
+    project = tmp_path / "project"
+    source = project / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ply")
+
+    monkeypatch.setattr(potree, "potree_available", lambda: True)
+    monkeypatch.setattr(potree, "_ply_points", lambda _path: (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), None))
+
+    def fake_write_las(path, *_args) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"las")
+
+    monkeypatch.setattr(potree, "write_viewer_las", fake_write_las)
+
+    release_converter = Event()
+    converter_started = Event()
+
+    def fake_converter(command, **_kwargs):
+        converter_started.set()
+        release_converter.wait(timeout=5)
+        output = Path(command[command.index("-o") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "metadata.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(potree.subprocess, "run", fake_converter)
+
+    start_potree_build(project, "dense")
+    assert converter_started.wait(timeout=2)
+    assert potree_status(project, "dense")["state"] == "building"
+
+    release_converter.set()
+
+    deadline = time.time() + 5
+    state_str = ""
+    while time.time() < deadline:
+        status = potree_status(project, "dense")
+        state_str = status["state"]
+        if state_str == "ready":
+            break
+        time.sleep(0.05)
+
+    assert state_str == "ready"
+
+
+def test_start_potree_build_runs_one_conversion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from threading import Event
+    from samcloud.viewer.potree import potree_status, start_potree_build
+
+    potree._POTREE_BUILD_STATES.clear()
+    project = tmp_path / "project"
+    source = project / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ply")
+
+    monkeypatch.setattr(potree, "potree_available", lambda: True)
+    monkeypatch.setattr(potree, "_ply_points", lambda _path: (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), None))
+
+    def fake_write_las(path, *_args) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"las")
+
+    monkeypatch.setattr(potree, "write_viewer_las", fake_write_las)
+
+    calls: list[list[str]] = []
+    converter_started = Event()
+    release_converter = Event()
+
+    def fake_converter(command, **_kwargs):
+        calls.append(command)
+        converter_started.set()
+        release_converter.wait(timeout=5)
+        output = Path(command[command.index("-o") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "metadata.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(potree.subprocess, "run", fake_converter)
+
+    start_potree_build(project, "dense")
+    assert converter_started.wait(timeout=2)
+    start_potree_build(project, "dense")
+
+    release_converter.set()
+
+    deadline = time.time() + 5
+    state_str = ""
+    while time.time() < deadline:
+        status = potree_status(project, "dense")
+        state_str = status["state"]
+        if state_str == "ready":
+            break
+        time.sleep(0.05)
+
+    assert state_str == "ready"
+    assert len(calls) == 1
+
+
+def test_potree_status_reports_error_when_converter_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from samcloud.viewer.potree import potree_status, start_potree_build
+
+    potree._POTREE_BUILD_STATES.clear()
+    project = tmp_path / "project"
+    source = project / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ply")
+
+    monkeypatch.setattr(potree, "potree_available", lambda: True)
+    monkeypatch.setattr(potree, "_ply_points", lambda _path: (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), None))
+
+    def fake_write_las(path, *_args) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"las")
+
+    monkeypatch.setattr(potree, "write_viewer_las", fake_write_las)
+
+    def failing_converter(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(potree.subprocess, "run", failing_converter)
+
+    start_potree_build(project, "dense")
+
+    deadline = time.time() + 5
+    status: dict[str, object] = {}
+    while time.time() < deadline:
+        status = potree_status(project, "dense")
+        if status.get("state") != "building":
+            break
+        time.sleep(0.05)
+
+    assert status.get("state") == "error"
+    assert "boom" in str(status.get("message", ""))
+
+
+def test_viewer_config_contains_status_url() -> None:
+    from samcloud.app.potree_viewer import _viewer_config
+
+    assert _viewer_config("dense", "Dense", [[0, 0, 0]])["status_url"] == "/api/potree/dense/status"

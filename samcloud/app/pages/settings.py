@@ -10,6 +10,8 @@ from samcloud.acquisition import (
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
 from samcloud.core.configuration import load_export_crs_presets
+from samcloud.core.storage import storage_settings
+from samcloud.app.pages.projects import STORAGE_OPTIONS
 
 
 CONTROL_POINTS_MODE_OPTIONS = {
@@ -45,6 +47,7 @@ def render() -> None:
         classification.setdefault("background_threshold", 0.4)
         classification.setdefault("query_threshold", 0.4)
         classification.setdefault("threshold_sweep", [])
+        storage = settings.setdefault("storage", storage_settings(settings))
         acquisition = project.setdefault(
             "acquisition",
             {
@@ -130,6 +133,12 @@ def render() -> None:
             )
             control_points.set_enabled(not acquisition_locked)
         with ui.card().classes("w-full"):
+            ui.label("Speicher").classes("text-lg font-medium")
+            storage_switches = {
+                key: ui.switch(label, value=bool(storage.get(key, True)))
+                for key, label in STORAGE_OPTIONS.items()
+            }
+        with ui.card().classes("w-full"):
             ui.label("SAM3 classification").classes("text-lg font-medium")
             ui.label("These values apply to the next SAM3 classification run.").classes("text-sm")
             class_set = ui.select(
@@ -213,6 +222,7 @@ def render() -> None:
                 classification["tile_size"] = int(tile_size.value or 0)
                 classification["tile_min_overlap"] = float(tile_min_overlap.value or 0)
                 classification["geometry_refinement"] = bool(geometry_refinement.value)
+                storage.update({key: bool(control.value) for key, control in storage_switches.items()})
                 if classification["min_votes"] < 1:
                     raise ValueError("Minimum agreeing images must be at least 1")
                 if classification["mode"] not in {"legacy", "segearth_ov3"}:

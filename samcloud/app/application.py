@@ -5,7 +5,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 from samcloud.app.pages import control_points, dense_cloud, home, projects, settings, sparse_cloud
 from samcloud.app.state import state
-from samcloud.app.gcp_review import image_crop, marker_payload
+from samcloud.app.gcp_review import image_crop, marker_payload, resolve_project_image
 from samcloud.core.paths import ASSETS_DIRECTORY
 from samcloud.control_points.repository import (
     move_detection_observation,
@@ -16,7 +16,7 @@ from samcloud.control_points.repository import (
     set_detection_role,
 )
 from samcloud.viewer.preview import ensure_preview
-from samcloud.viewer.potree import ensure_potree
+from samcloud.viewer.potree import ensure_potree, potree_status, start_potree_build
 
 
 @app.get("/api/pointcloud/{kind}")
@@ -37,6 +37,19 @@ def pointcloud_preview(kind: str):
             "X-SAMcloud-Point-Count": str(point_count),
         },
     )
+
+
+@app.get("/api/potree/{kind}/status")
+def potree_build_status(kind: str):
+    """Start an octree build when needed and return its current status."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    try:
+        start_potree_build(project_directory, kind)
+        return JSONResponse(potree_status(project_directory, kind))
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=404)
 
 
 @app.get("/api/potree/{kind}/{file_path:path}")
@@ -69,6 +82,14 @@ def control_point_image(image_path: str):
     if project_directory is None:
         return JSONResponse({"error": "No project is open"}, status_code=404)
     image_root = (project_directory / "products" / "dense" / "images").resolve()
+    if not image_root.is_dir():
+        try:
+            return FileResponse(
+                resolve_project_image(project_directory, image_path, "original"),
+                headers={"Cache-Control": "no-store"},
+            )
+        except (FileNotFoundError, ValueError):
+            return JSONResponse({"error": "Image not found"}, status_code=404)
     candidate = (image_root / image_path).resolve()
     try:
         candidate.relative_to(image_root)

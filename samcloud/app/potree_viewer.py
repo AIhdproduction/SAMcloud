@@ -52,18 +52,8 @@ def render_potree_viewer(
     marker_endpoint: str | None = None,
 ) -> None:
     """Render a Potree viewer for the active project's sparse or dense cloud."""
-    element_id = f"sam-potree-{kind}"
-    config = {
-        "element_id": element_id,
-        "kind": kind,
-        "title": title,
-        "metadata_url": f"/api/potree/{kind}/metadata.json",
-        "class_colors": class_colors,
-        "class_labels": class_labels or [],
-        "marker_endpoint": marker_endpoint,
-        "show_classes": kind == "dense",
-        "show_markers": bool(marker_endpoint),
-    }
+    config = _viewer_config(kind, title, class_colors, class_labels, marker_endpoint)
+    element_id = config["element_id"]
     ui.add_head_html(_HEAD)
     ui.html(
         _html(
@@ -74,6 +64,28 @@ def render_potree_viewer(
         sanitize=False,
     ).classes("w-full")
     ui.add_body_html(_script(config))
+
+
+def _viewer_config(
+    kind: str,
+    title: str,
+    class_colors: list[list[int]],
+    class_labels: list[str] | None = None,
+    marker_endpoint: str | None = None,
+) -> dict:
+    """Build the browser configuration for one Potree cloud."""
+    return {
+        "element_id": f"sam-potree-{kind}",
+        "kind": kind,
+        "title": title,
+        "metadata_url": f"/api/potree/{kind}/metadata.json",
+        "status_url": f"/api/potree/{kind}/status",
+        "class_colors": class_colors,
+        "class_labels": class_labels or [],
+        "marker_endpoint": marker_endpoint,
+        "show_classes": kind == "dense",
+        "show_markers": bool(marker_endpoint),
+    }
 
 
 def _html(
@@ -183,20 +195,63 @@ const start = () => {
     if (action === "fullscreen") { document.fullscreenElement ? document.exitFullscreen() : root.requestFullscreen(); }
   });
   root.querySelector('[data-action="size"]').addEventListener("input", event => { if (cloud) cloud.material.size = Number(event.target.value); });
-  Potree.loadPointCloud(config.metadata_url, config.kind).then(event => {
-    cloud = event.pointcloud;
-    viewer.scene.addPointCloud(cloud);
-    cloud.material.size = 1.5;
-    cloud.material.pointSizeType = Potree.PointSizeType.ADAPTIVE;
-    cloud.material.activeAttributeName = "rgba";
-    viewer.fitToScreen(0.55);
-    setTimeout(() => viewer.fitToScreen(0.55), 1500);
-    fetch(config.metadata_url, { cache: "no-store" }).then(response => response.json()).then(metadata => {
-      const count = Number(metadata.points || 0).toLocaleString("de-CH");
-      status.textContent = `${config.title}: ${count} Punkte. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`;
-    }).catch(() => { status.textContent = `${config.title}. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`; });
-    loadMarkers();
-  }).catch(error => { status.textContent = `Punktwolke nicht verfügbar: ${error && error.message ? error.message : error}`; });
+  const pageStarted = Date.now();
+  let loadAttempts = 0;
+  const formatElapsed = seconds => {
+    const s = Math.max(0, Math.floor(seconds));
+    return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  };
+  const showError = message => {
+    status.innerHTML = "";
+    status.append(`Punktwolke nicht verfügbar: ${message} `);
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Erneut versuchen";
+    retry.className = "sam-potree-retry";
+    retry.style.cssText = "margin-left:8px;padding:2px 8px;border-radius:4px;border:1px solid #3a5a74;background:#16324a;color:#e6f1f8;cursor:pointer;";
+    retry.addEventListener("click", () => { loadAttempts = 0; pollStatus(); });
+    status.append(retry);
+  };
+  const loadCloud = () => {
+    Potree.loadPointCloud(config.metadata_url, config.kind).then(event => {
+      cloud = event.pointcloud;
+      viewer.scene.addPointCloud(cloud);
+      cloud.material.size = 1.5;
+      cloud.material.pointSizeType = Potree.PointSizeType.ADAPTIVE;
+      cloud.material.activeAttributeName = "rgba";
+      viewer.fitToScreen(0.55);
+      setTimeout(() => viewer.fitToScreen(0.55), 1500);
+      fetch(config.metadata_url, { cache: "no-store" }).then(response => response.json()).then(metadata => {
+        const count = Number(metadata.points || 0).toLocaleString("de-CH");
+        status.textContent = `${config.title}: ${count} Punkte. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`;
+      }).catch(() => { status.textContent = `${config.title}. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`; });
+      loadMarkers();
+    }).catch(error => {
+      loadAttempts += 1;
+      if (loadAttempts < 3) { setTimeout(pollStatus, 2000); return; }
+      showError(error && error.message ? error.message : String(error));
+    });
+  };
+  const pollStatus = async () => {
+    let state;
+    try {
+      const response = await fetch(config.status_url, { cache: "no-store" });
+      state = await response.json();
+    } catch (error) {
+      setTimeout(pollStatus, 2000);
+      return;
+    }
+    if (state.state === "ready") { loadCloud(); return; }
+    if (state.state === "error") { showError(state.message || "Fehler beim Vorbereiten"); return; }
+    if (state.state === "missing" && state.message && !String(state.message).includes("not been prepared")) {
+      status.textContent = `Punktwolke nicht verfügbar: ${state.message}`;
+      return;
+    }
+    const startedMs = state.started_at ? state.started_at * 1000 : pageStarted;
+    status.textContent = `Punktwolke wird vorbereitet … ${formatElapsed((Date.now() - startedMs) / 1000)}`;
+    setTimeout(pollStatus, 2000);
+  };
+  pollStatus();
   const colours = { pass: "#26b7ef", control: "#ffb020", disabled: "#6b7c8a", needs_review: "#ff5a5a" };
   const markerObjects = [];
   let markersVisible = true;
