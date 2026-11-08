@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -16,16 +17,23 @@ from samcloud.colmap.alignment import (
     filter_pass_is_safe,
     mapper_command,
     matching_command,
+    panorama_matching_command,
     parse_model_analyzer_stats,
     pose_prior_covariance_count,
     pose_prior_count,
     resolve_camera_model,
+    select_panorama_matching_strategy,
     select_matching_strategy,
+    dense_profile,
+    patch_match_arguments,
     stereo_fusion_command,
     tiepoint_pass_commands,
+    write_panorama_rig_config,
     write_pose_priors_from_gps_ref,
 )
 from samcloud.colmap.camera_groups import assign_camera_groups
+from samcloud.colmap.gravity import align_sparse_model
+from samcloud.colmap.plane_fill import fill_classified_cloud
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_manager import ProjectManager
 from samcloud.core.storage import compact_project, ensure_available, ensure_text_model, release_after_fusion, remove_generated, storage_settings
@@ -146,13 +154,24 @@ def _build_estimator(
     iterations = int(dense.get("num_iterations", 3))
     geometric = bool(dense.get("use_geometric_consistency", True))
     strategy = str(alignment.get("matching_strategy", "auto"))
-    matching = "exhaustive" if strategy == "exhaustive" or (strategy == "auto" and num_images <= 300) else "spatial"
+    capture_type = getattr(args, "capture_type", "drone_gps")
+    faces = 1
+    if capture_type == "panorama_360":
+        from samcloud.colmap.alignment import PANORAMA_FACES_PER_FRAME, PANORAMA_NEIGHBORING_FRAMES, select_panorama_matching_strategy
+
+        faces = PANORAMA_FACES_PER_FRAME
+        matching = select_panorama_matching_strategy(max(num_images, 1))
+        overlap = PANORAMA_FACES_PER_FRAME * PANORAMA_NEIGHBORING_FRAMES
+    else:
+        matching = "exhaustive" if strategy == "exhaustive" or (strategy == "auto" and num_images <= 300) else "spatial"
+        overlap = 60
     automatic = args.control_points_mode == "automatic"
     plan: list[tuple[str, float]] = []
     if not resume:
         plan += [("feature_extraction", num_images),
                  ("matching", stage_units("matching", images=num_images, matching=matching,
-                                          spatial_neighbors=int(alignment.get("spatial_max_num_neighbors", 50)))),
+                                          spatial_neighbors=int(alignment.get("spatial_max_num_neighbors", 50)),
+                                          faces_per_frame=faces, sequential_overlap=overlap)),
                  ("mapping", num_images)]
         if tiepoints.get("enabled", True):
             plan.append(("tiepoint_filtering", num_images))
@@ -163,9 +182,21 @@ def _build_estimator(
         plan += [("dense_stereo", stage_units("dense_stereo", images=num_images, max_image_size=size,
                                               num_iterations=iterations, geometric_consistency=geometric)),
                  ("dense_fusion", num_images), ("classification", num_images)]
+        if _depth_prior_settings(args) is not None:
+            plan.append(("depth_prior", num_images))
+        if _depth_fill_settings(args) is not None:
+            plan.append(("depth_fill", num_images))
+        if _cleaning_settings(args) is not None:
+            plan.append(("point_cleaning", num_images))
+        if _surface_fusion_settings(args) is not None:
+            plan.append(("surface_fusion", num_images))
+        if _plane_fill_settings(args) is not None:
+            plan.append(("plane_fill", num_images))
         if args.geometry_refinement == "1":
             plan.append(("geometry_refinement", num_images))
-    return ProgressEstimator(plan, RateStore(PROJECT_ROOT / "projects" / ".samcloud_stage_rates.json"))
+    return ProgressEstimator(
+        plan, RateStore(PROJECT_ROOT / "projects" / ".samcloud_stage_rates.json", profile=capture_type),
+    )
 
 
 def _dense_size_from_inputs(dense_config: dict, outdir: Path, images_dir: Path) -> tuple[int, str | None]:
@@ -255,6 +286,27 @@ def _write_final_model(sparse_dir: Path, model0: Path) -> None:
     (sparse_dir / "final_model.txt").write_text(model0.name + "\n", encoding="utf-8")
 
 
+def _align_panorama_gravity(sparse_dir: Path, model0: Path, report_dir: Path) -> tuple[Path, dict[str, object]]:
+    """Write the gravity-aligned panorama model selected for dense reconstruction."""
+    aligned_model = sparse_dir / "0_gravity"
+    report = align_sparse_model(model0, aligned_model)
+    report_path = report_dir / "gravity_alignment.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    plane = report.get("largest_horizontal_plane")
+    if isinstance(plane, dict) and plane.get("warning"):
+        print(
+            "WARNING: Sparse horizontal plane differs from gravity-aligned Z by "
+            f"{float(plane['angle_to_aligned_z_deg']):.2f} degrees."
+        )
+    print(
+        "Panorama gravity alignment: "
+        f"{report['frame_count']} rig frames, "
+        f"up-axis spread {float(report['up_spread_deg_rms']):.3f} degrees."
+    )
+    return aligned_model, report
+
+
 def find_colmap_exe(colmap_bin):
     if colmap_bin:
         return colmap_bin
@@ -270,12 +322,18 @@ def find_colmap_exe(colmap_bin):
     )
 
 
-def write_image_list(images_dir, out_path):
+def write_image_list(images_dir, out_path, *, include_roots: tuple[str, ...] | None = None):
     """Write image names relative to images_dir for COLMAP's recursive input mode."""
     extensions = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
     image_paths = sorted(
         p for p in images_dir.rglob("*") if p.is_file() and p.suffix.lower() in extensions
     )
+    if include_roots is not None:
+        allowed = set(include_roots)
+        image_paths = [
+            path for path in image_paths
+            if path.relative_to(images_dir).parts[0] in allowed
+        ]
     if not image_paths:
         sys.exit(f"No supported images found in {images_dir}")
     out_path.write_text(
@@ -294,6 +352,34 @@ def _model_point_count(model_path: Path) -> int | None:
         return int.from_bytes(raw, "little") if len(raw) == 8 else None
     except OSError:
         return None
+
+
+def _model_registered_image_count(model_path: Path) -> int | None:
+    """Read the registered-image count from a COLMAP binary model."""
+    images_path = model_path / "images.bin"
+    try:
+        with images_path.open("rb") as file:
+            raw = file.read(8)
+        return int.from_bytes(raw, "little") if len(raw) == 8 else None
+    except OSError:
+        return None
+
+
+def _require_usable_sparse_model(model_path: Path, input_image_count: int) -> None:
+    """Reject a syntactically valid but unusable sparse reconstruction."""
+    registered_images = _model_registered_image_count(model_path)
+    points = _model_point_count(model_path)
+    minimum_registered_images = max(1, math.ceil(input_image_count * 0.30))
+    if registered_images is None or points is None:
+        sys.exit(
+            "COLMAP produced an unreadable sparse reconstruction; expected images.bin and points3D.bin."
+        )
+    if registered_images < minimum_registered_images or points < 1000:
+        sys.exit(
+            "COLMAP sparse reconstruction is too small to continue: "
+            f"registered {registered_images}/{input_image_count} images and {points} points "
+            f"(requires at least {minimum_registered_images} registered images and 1000 points)."
+        )
 
 
 def _analyze_model(colmap: str, model_path: Path, summary: RunSummary) -> dict[str, float]:
@@ -418,7 +504,7 @@ def _run_pose_prior_bundle_adjustment(
     reconstruction.write(output_model)
 
 
-def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) -> tuple[Path, bool]:
+def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) -> tuple[Path, bool, int | None]:
     """Resolve normal images or prepare virtual perspective images for 360 media."""
     if args.capture_type != "panorama_360":
         if not args.images:
@@ -426,7 +512,7 @@ def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) ->
         images_dir = Path(args.images).resolve()
         if not images_dir.is_dir():
             parser.error(f"Image directory was not found: {images_dir}")
-        return images_dir, False
+        return images_dir, False, None
 
     try:
         prepared = prepare_panorama_inputs(
@@ -444,7 +530,7 @@ def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) ->
         f"{prepared.cubemap_image_count} virtual camera images."
     )
     print(f"Panorama source manifest: {prepared.manifest_path}")
-    return prepared.cubemap_directory, True
+    return prepared.cubemap_directory, True, prepared.face_size
 
 
 def _resume_automatic_control_points(
@@ -497,21 +583,78 @@ def _resume_automatic_control_points(
     if progress:
         progress.begin("dense_stereo")
         progress.update(62, "Building dense cloud")
-    run([colmap, "patch_match_stereo", "--workspace_path", str(dense_dir),
-         "--PatchMatchStereo.geom_consistency", "1" if dense_config.get("use_geometric_consistency", True) else "0",
-         "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
-         "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
-         "--PatchMatchStereo.max_image_size", str(dense_max_image_size)], summary=summary, stage="Dense stereo")
+    _run_dense_stereo(
+        colmap, dense_dir, dense_config, dense_gpu_index, dense_num_iterations,
+        dense_max_image_size, summary, capture_type=getattr(args, "capture_type", None),
+    )
     if progress:
         progress.begin("dense_fusion")
-    run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", dense_config.get("fusion", {})),
-        summary=summary, stage="Dense fusion")
-    _release_fusion_cache(dense_dir, summary)
+    _fuse_dense(colmap, dense_dir, dense_config, getattr(args, "capture_type", None), summary,
+        keep_depth_maps=_needs_depth_maps(args))
     sparse_txt = dense_dir / "sparse_txt"
     sparse_txt.mkdir(parents=True, exist_ok=True)
     run([colmap, "model_converter", "--input_path", str(dense_dir / "sparse"), "--output_path", str(sparse_txt),
          "--output_type", "TXT"], summary=summary, stage="Preparing classification")
     _classify_and_finish(args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, True)
+
+
+def _resume_dense_stereo(
+    args, outdir: Path, report_dir: Path, summary: RunSummary, progress: ProgressTracker | None,
+    colmap_config: dict, dense_max_image_size: int, dense_num_iterations: int,
+    dense_gpu_index: int, classified_output: Path,
+) -> None:
+    """Continue an existing undistorted workspace without redoing sparse reconstruction."""
+    dense_dir = outdir / "dense"
+    required = (
+        (dense_dir / "images", (dense_dir / "images").is_dir()),
+        (dense_dir / "sparse", (dense_dir / "sparse").is_dir()),
+        (dense_dir / "stereo" / "patch-match.cfg", (dense_dir / "stereo" / "patch-match.cfg").is_file()),
+        (dense_dir / "stereo" / "fusion.cfg", (dense_dir / "stereo" / "fusion.cfg").is_file()),
+    )
+    missing = [str(path) for path, valid in required if not valid]
+    if missing:
+        raise ValueError("Cannot resume dense stereo; workspace files are missing: " + ", ".join(missing))
+    if progress and progress.estimator is None:
+        image_list_path = outdir / "image_list.txt"
+        num_images = len([line for line in image_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]) if image_list_path.is_file() else 0
+        progress.estimator = _build_estimator(
+            args, num_images, colmap_config, resume=True, dense_max_image_size=dense_max_image_size,
+        )
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = progress
+
+    dense_config = colmap_config.get("dense_reconstruction", {})
+    colmap = find_colmap_exe(args.colmap_bin)
+    if progress:
+        progress.begin("dense_stereo")
+        progress.update(62, "Building dense cloud")
+    summary.settings["dense_stereo_resumed"] = True
+    summary.settings["dense_stereo_excluded_images"] = _run_dense_stereo(
+        colmap, dense_dir, dense_config, dense_gpu_index, dense_num_iterations,
+        dense_max_image_size, summary, capture_type=getattr(args, "capture_type", None),
+    )
+    if progress:
+        progress.begin("dense_fusion")
+        progress.update(78, "Fusing dense cloud")
+    _fuse_dense(colmap, dense_dir, dense_config, getattr(args, "capture_type", None), summary,
+        keep_depth_maps=_needs_depth_maps(args))
+
+    sparse_txt = dense_dir / "sparse_txt"
+    sparse_txt.mkdir(parents=True, exist_ok=True)
+    run([colmap, "model_converter", "--input_path", str(dense_dir / "sparse"), "--output_path", str(sparse_txt),
+         "--output_type", "TXT"], summary=summary, stage="Preparing classification")
+    georeferenced = (outdir / "gps_ref.txt").is_file()
+    if georeferenced:
+        try:
+            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt")
+            save_georeference(outdir / "georeference.json", georeference)
+            summary.settings["georeference_residual_m"] = georeference["residual_m"]
+        except Exception as error:
+            print(f"WARNING: Could not create GPS georeference: {error}")
+            georeferenced = False
+    _classify_and_finish(
+        args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, georeferenced,
+    )
 
 
 def _resume_after_control_points(
@@ -577,15 +720,15 @@ def _resume_after_control_points(
     if progress:
         progress.begin("dense_stereo")
         progress.update(62, "Building dense cloud")
-    run([colmap, "patch_match_stereo", "--workspace_path", str(dense_dir),
-         "--PatchMatchStereo.geom_consistency", "1" if colmap_config.get("dense_reconstruction", {}).get("use_geometric_consistency", True) else "0", "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
-         "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
-         "--PatchMatchStereo.max_image_size", str(dense_max_image_size)], summary=summary, stage="Dense stereo")
+    _run_dense_stereo(
+        colmap, dense_dir, colmap_config.get("dense_reconstruction", {}), dense_gpu_index,
+        dense_num_iterations, dense_max_image_size, summary, capture_type=getattr(args, "capture_type", None),
+    )
     dense_dir.mkdir(parents=True, exist_ok=True)
     if progress:
         progress.begin("dense_fusion")
-    run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", fusion_config), summary=summary, stage="Dense fusion")
-    _release_fusion_cache(dense_dir, summary)
+    _fuse_dense(colmap, dense_dir, colmap_config.get("dense_reconstruction", {}), getattr(args, "capture_type", None), summary,
+        keep_depth_maps=_needs_depth_maps(args))
     shutil.rmtree(sparse_txt)
     sparse_txt.mkdir(parents=True, exist_ok=True)
     run([colmap, "model_converter", "--input_path", str(dense_sparse), "--output_path", str(sparse_txt), "--output_type", "TXT"], summary=summary, stage="Preparing classification")
@@ -779,6 +922,551 @@ def _clear_stereo_cache(dense_dir: Path) -> None:
                     (cache / folder.relative_to(images)).mkdir(parents=True, exist_ok=True)
 
 
+def _stereo_workspace_image_data(sparse_model: Path) -> tuple[set[str], set[str], dict[str, list[str]]]:
+    """Return sparse image names, usable names, and ranked usable MVS source images."""
+    import pycolmap
+
+    reconstruction = pycolmap.Reconstruction(sparse_model)
+    names = {image.image_id: image.name for image in reconstruction.images.values()}
+    rotations = {
+        image.image_id: np.asarray(image.cam_from_world().rotation.matrix(), dtype=np.float32)
+        for image in reconstruction.images.values()
+    }
+    translations = {
+        image.image_id: np.asarray(image.cam_from_world().translation, dtype=np.float32)
+        for image in reconstruction.images.values()
+    }
+    usable_image_ids: set[int] = set()
+    for point in reconstruction.points3D.values():
+        xyz = np.asarray(point.xyz, dtype=np.float32)
+        for element in point.track.elements:
+            image_id = element.image_id
+            depth = np.dot(rotations[image_id][2], xyz) + translations[image_id][2]
+            if np.isfinite(depth) and depth > 0:
+                usable_image_ids.add(image_id)
+
+    source_scores: dict[int, dict[int, int]] = {image_id: {} for image_id in usable_image_ids}
+    for point in reconstruction.points3D.values():
+        xyz = np.asarray(point.xyz, dtype=np.float32)
+        visible_ids = [
+            element.image_id for element in point.track.elements
+            if element.image_id in usable_image_ids
+            and np.isfinite(np.dot(rotations[element.image_id][2], xyz) + translations[element.image_id][2])
+            and np.dot(rotations[element.image_id][2], xyz) + translations[element.image_id][2] > 0
+        ]
+        for reference_id in visible_ids:
+            scores = source_scores[reference_id]
+            for source_id in visible_ids:
+                if source_id != reference_id:
+                    scores[source_id] = scores.get(source_id, 0) + 1
+
+    ranked_sources = {
+        names[reference_id]: [names[source_id] for source_id, _ in sorted(
+            scores.items(), key=lambda item: (-item[1], names[item[0]]),
+        )]
+        for reference_id, scores in source_scores.items()
+    }
+    return set(names.values()), {names[image_id] for image_id in usable_image_ids}, ranked_sources
+
+
+def _stereo_images_with_depth_ranges(sparse_model: Path) -> set[str]:
+    """Return images for which COLMAP's MVS model can derive a positive depth range."""
+    _, usable_names, _ = _stereo_workspace_image_data(sparse_model)
+    return usable_names
+
+
+def _parse_stereo_sources(sources: str) -> tuple[str, int | list[str] | None]:
+    """Parse one COLMAP PatchMatch source-image line."""
+    values = [value.strip() for value in sources.split(",") if value.strip()]
+    if not values:
+        return "explicit", []
+    if values[0] == "__auto__":
+        if len(values) != 2:
+            raise ValueError(f"Invalid COLMAP automatic source selector: {sources}")
+        try:
+            source_count = int(values[1])
+        except ValueError as exc:
+            raise ValueError(f"Invalid COLMAP automatic source selector: {sources}") from exc
+        if source_count < 0:
+            raise ValueError(f"Invalid COLMAP automatic source selector: {sources}")
+        return "auto", source_count
+    if values == ["__all__"]:
+        return "all", None
+    return "explicit", values
+
+
+def _filtered_stereo_sources(
+    sources: str, reference: str, retained_names: set[str], ranked_sources: dict[str, list[str]],
+    convert_automatic: bool,
+) -> str | None:
+    """Remove unavailable sources and expand automatic selectors when required."""
+    mode, value = _parse_stereo_sources(sources)
+    if mode == "auto" and not convert_automatic:
+        return sources.strip()
+    if mode == "auto":
+        selected = [
+            name for name in ranked_sources.get(reference, []) if name in retained_names and name != reference
+        ][:int(value)]
+    elif mode == "all":
+        selected = sorted(retained_names - {reference})
+    else:
+        selected = []
+        for name in value or []:
+            if name in retained_names and name != reference and name not in selected:
+                selected.append(name)
+    return ", ".join(selected) if selected else None
+
+
+def _filter_fusion_config(
+    fusion_config: Path, retained_names: set[str], ranked_sources: dict[str, list[str]],
+    convert_automatic: bool,
+) -> None:
+    """Filter a standard fusion image list or an optional reference/source configuration."""
+    lines = [line.strip() for line in fusion_config.read_text(encoding="utf-8").splitlines() if line.strip()]
+    has_source_selectors = any(
+        "," in line or line == "__all__" or line.startswith("__auto__") for line in lines[1::2]
+    )
+    if has_source_selectors and len(lines) % 2 == 0:
+        entries = list(zip(lines[::2], lines[1::2]))
+        retained = []
+        for reference, sources in entries:
+            if reference not in retained_names:
+                continue
+            filtered_sources = _filtered_stereo_sources(
+                sources, reference, retained_names, ranked_sources, convert_automatic,
+            )
+            if filtered_sources is not None:
+                retained.append((reference, filtered_sources))
+        fusion_config.write_text(
+            "".join(f"{reference}\n{sources}\n" for reference, sources in retained), encoding="utf-8",
+        )
+        return
+    fusion_config.write_text(
+        "".join(f"{name}\n" for name in lines if name in retained_names), encoding="utf-8",
+    )
+
+
+def _filter_stereo_workspace(dense_dir: Path) -> list[str]:
+    """Remove unusable stereo references and sources from COLMAP configurations."""
+    sparse_model = dense_dir / "sparse"
+    patch_config = dense_dir / "stereo" / "patch-match.cfg"
+    fusion_config = dense_dir / "stereo" / "fusion.cfg"
+    missing = [
+        path for path, valid in (
+            (sparse_model, sparse_model.is_dir()),
+            (patch_config, patch_config.is_file()),
+            (fusion_config, fusion_config.is_file()),
+        ) if not valid
+    ]
+    if missing:
+        print(
+            "WARNING: Dense stereo workspace filtering was skipped because files are missing: "
+            + ", ".join(map(str, missing))
+        )
+        return []
+
+    patch_lines = patch_config.read_text(encoding="utf-8").splitlines()
+    nonempty_lines = [line.strip() for line in patch_lines if line.strip() and not line.lstrip().startswith("#")]
+    if len(nonempty_lines) % 2:
+        raise ValueError(f"Invalid COLMAP patch-match configuration: {patch_config}")
+    entries = list(zip(nonempty_lines[::2], nonempty_lines[1::2]))
+    sparse_names, usable_names, ranked_sources = _stereo_workspace_image_data(sparse_model)
+    excluded = sorted(sparse_names - usable_names)
+    retained = [(name, sources) for name, sources in entries if name in usable_names]
+    if not retained:
+        raise ValueError("Cannot run dense stereo because no image has a usable sparse depth range")
+
+    retained_names = {name for name, _ in retained}
+    convert_automatic = bool(excluded)
+    dropped_references: list[str] = []
+    while True:
+        filtered_entries = []
+        newly_dropped = []
+        for name, sources in retained:
+            if name not in retained_names:
+                continue
+            filtered_sources = _filtered_stereo_sources(
+                sources, name, retained_names, ranked_sources, convert_automatic,
+            )
+            if filtered_sources is None:
+                newly_dropped.append(name)
+                continue
+            filtered_entries.append((name, filtered_sources))
+        if not newly_dropped:
+            break
+        dropped_references.extend(newly_dropped)
+        retained_names.difference_update(newly_dropped)
+    if not filtered_entries:
+        raise ValueError("Cannot run dense stereo because no image has usable source images")
+
+    patch_config.write_text(
+        "".join(f"{name}\n{sources}\n" for name, sources in filtered_entries), encoding="utf-8",
+    )
+    retained_names = {name for name, _ in filtered_entries}
+    _filter_fusion_config(
+        fusion_config, retained_names, ranked_sources, convert_automatic,
+    )
+    if excluded:
+        print(
+            "Dense stereo excluded images without a usable sparse depth range: "
+            + ", ".join(excluded)
+        )
+    if dropped_references:
+        print(
+            "Dense stereo excluded references without usable source images: "
+            + ", ".join(dropped_references)
+        )
+    return excluded
+
+
+def _run_dense_stereo(
+    colmap: str, dense_dir: Path, dense_config: dict, dense_gpu_index: int,
+    dense_num_iterations: int, dense_max_image_size: int, summary: RunSummary,
+    *, capture_type: str | None = None,
+) -> list[str]:
+    """Run COLMAP PatchMatch after excluding reference images with no depth range."""
+    excluded = _filter_stereo_workspace(dense_dir)
+    patch_match = dense_profile(dense_config, capture_type)["patch_match"]
+    summary.settings["dense_patch_match"] = dict(patch_match)
+    run([colmap, "patch_match_stereo", "--workspace_path", str(dense_dir),
+         "--PatchMatchStereo.geom_consistency", "1" if dense_config.get("use_geometric_consistency", True) else "0",
+         "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
+         "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
+         "--PatchMatchStereo.max_image_size", str(dense_max_image_size),
+         *patch_match_arguments(patch_match)], summary=summary, stage="Dense stereo")
+    return excluded
+
+
+def _plane_fill_settings(args) -> dict | None:
+    """Settings of the class-confirmed plane fill, or None when it does not run.
+
+    The fill needs SAM's floor/ceiling/wall classes and therefore only runs for
+    the indoor class set; outdoor and drone projects are never filled.
+    """
+    if getattr(args, "class_set", None) != "indoor":
+        return None
+    dense_config = load_global_config("colmap.yml").get("dense_reconstruction", {})
+    settings = dense_profile(dense_config, getattr(args, "capture_type", None))["plane_fill"]
+    return settings if bool(settings.get("enabled", False)) else None
+
+
+def _dense_settings(args) -> dict:
+    """Dense settings merged with the profile of this capture type."""
+    dense_config = load_global_config("colmap.yml").get("dense_reconstruction", {})
+    return dense_profile(dense_config, getattr(args, "capture_type", None))
+
+
+def _cleaning_settings(args) -> dict | None:
+    """Free-space point cleaning of workflow step 6 (all capture types).
+
+    Not needed when surface fusion rebuilds the cloud from the fused field:
+    every camera's free space is already carved out there.
+    """
+    if _fusion_rebuilds_cloud(args):
+        return None
+    fusion = _surface_fusion_settings(args)
+    if fusion is not None and bool(fusion.get("visibility_check", True)):
+        return None  # the fusion's GPU visibility check does the same test in seconds
+    settings = _dense_settings(args)["point_cleaning"]
+    return settings if bool(settings.get("enabled", False)) else None
+
+
+def _depth_prior_settings(args) -> dict | None:
+    """Depth-Anything-V2 prior for step 6: indoor class set only, model chosen per project."""
+    if getattr(args, "class_set", None) != "indoor":
+        return None
+    if str(getattr(args, "depth_fill", "1")) != "1":  # Depth-Anything switched off in the project settings
+        return None
+    model = str(getattr(args, "depth_model", "large") or "off").lower()
+    if model == "off":
+        return None
+    from samcloud.colmap.depth_prior import DEFAULTS as PRIOR_DEFAULTS
+
+    return {**PRIOR_DEFAULTS, "model": model}
+
+
+def _depth_fill_settings(args) -> dict | None:
+    """Depth-Anything point fill of step 6: indoor only, with a depth model.
+
+    Replaced by surface fusion in ``extract`` mode, which fills from the same
+    priors but only where they agree with COLMAP.
+    """
+    if _depth_prior_settings(args) is None or _fusion_rebuilds_cloud(args):
+        return None
+    settings = _dense_settings(args)["depth_fill"]
+    return settings if bool(settings.get("enabled", False)) else None
+
+
+def _surface_fusion_settings(args) -> dict | None:
+    """TSDF surface fusion of step 6 (indoor): one surface layer from all depth maps.
+
+    Works with COLMAP depth alone; Depth-Anything (when on) adds depth only
+    where it agrees with COLMAP. Switchable per project.
+    """
+    if getattr(args, "class_set", None) != "indoor" or str(getattr(args, "surface_fusion", "1")) != "1":
+        return None
+    settings = _dense_settings(args)["surface_fusion"]
+    return settings if bool(settings.get("enabled", False)) else None
+
+
+def _fusion_rebuilds_cloud(args) -> bool:
+    settings = _surface_fusion_settings(args)
+    return settings is not None and str(settings.get("mode", "extract")) == "extract"
+
+
+def _needs_depth_maps(args) -> bool:
+    """Keep COLMAP's depth maps after fusion when step 6 still reads them."""
+    return (
+        _cleaning_settings(args) is not None
+        or _plane_fill_settings(args) is not None
+        or _depth_fill_settings(args) is not None
+        or _surface_fusion_settings(args) is not None
+    )
+
+
+def _fuse_dense(
+    colmap: str, dense_dir: Path, dense_config: dict, capture_type: str | None, summary: RunSummary,
+    *, keep_depth_maps: bool = False,
+) -> None:
+    """Fuse depth maps, then release the stereo cache unless step 6 still needs it."""
+    profile = dense_profile(dense_config, capture_type)
+    run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", profile["fusion"]),
+        summary=summary, stage="Dense fusion")
+    if not keep_depth_maps:
+        _release_fusion_cache(dense_dir, summary)
+
+
+def _labels_arguments(args, dense_dir: Path) -> list[str]:
+    """Ask classify.py to keep per-view SAM label rasters when a fill step will use them."""
+    needed = _plane_fill_settings(args) is not None or _depth_fill_settings(args) is not None
+    return ["--labels-dir", str(dense_dir / "sam_labels")] if needed else []
+
+
+def _estimator_progress(progress: "ProgressTracker | None"):
+    if progress is None or progress.estimator is None:
+        return None
+
+    def report(done: int, total: int) -> None:
+        progress.estimator.update(done, total)
+        progress.write()
+
+    return report
+
+
+def _refine_after_classification(
+    args, dense_dir: Path, classified_raw: Path, scores_path: Path, summary: RunSummary,
+    progress: "ProgressTracker | None" = None, *, keep_caches: bool = False, reuse_priors: bool = False,
+) -> None:
+    """Workflow step 6 "Verbessern & filtern" (before the geometric refinement).
+
+    1. indoor: Depth-Anything-V2 depth priors aligned to COLMAP,
+    2. indoor: fill measurement gaps with prior depth confirmed by several views,
+    3. all capture types: remove points that any camera proves to float in free
+       space (after the fill, so it also checks every filled point against all
+       cameras, not only the fill's neighbouring views),
+    4. optional plane grid fill (off by default).
+    Afterwards the depth caches, SAM label rasters and priors are released.
+    """
+    from samcloud.colmap.depth_prior import availability, compute_depth_priors, prior_reader
+    from samcloud.colmap.plane_fill import load_views
+    from samcloud.colmap.point_cleaning import clean_classified_cloud
+
+    if progress:
+        progress.update(93, "Improving and filtering")
+    scores = scores_path if scores_path.is_file() else None
+    has_depth = (dense_dir / "stereo" / "depth_maps").is_dir()
+    views = None
+    if has_depth and (dense_dir / "sparse").is_dir():
+        try:
+            views = load_views(dense_dir / "sparse")
+        except Exception as error:  # noqa: BLE001
+            print(f"WARNING: Dense views could not be loaded for step 6: {error}")
+    priors = None
+    prior_settings = _depth_prior_settings(args)
+    prior_dir = dense_dir / "depth_prior"
+    if prior_settings is not None and views is not None and reuse_priors and prior_dir.is_dir() and any(prior_dir.rglob("*.npy")):
+        print("Reusing the cached Depth-Anything-V2 priors.")
+        summary.settings["depth_prior"] = {"reused": True}
+        priors = prior_reader(dense_dir)
+    elif prior_settings is not None and views is not None:
+        reason = availability(prior_settings["model"])
+        if reason:
+            print(f"WARNING: Depth-Anything-V2 skipped: {reason}")
+            summary.settings["depth_prior"] = {"skipped": reason}
+        else:
+            if progress:
+                progress.begin("depth_prior", len(views))
+            started_at = time.perf_counter()
+            try:
+                report = compute_depth_priors(dense_dir, views, prior_settings, progress=_estimator_progress(progress))
+            except Exception as error:  # noqa: BLE001 - the run continues without priors
+                print(f"WARNING: Depth-Anything-V2 failed: {error}")
+                summary.settings["depth_prior"] = {"error": str(error)}
+            else:
+                summary.record_stage("Depth prior", time.perf_counter() - started_at)
+                summary.settings["depth_prior"] = report
+                print(f"Depth-Anything-V2 ({report['model']}) aligned {report['aligned_views']} + "
+                      f"{report['global_fit_views']} views to COLMAP.")
+                priors = prior_reader(dense_dir)
+                if not keep_caches and str(getattr(args, "keep_processing_cache", "0")) == "1":
+                    from samcloud.engine.processing_cache import save_depth_priors
+
+                    save_depth_priors(dense_dir.parent.parent, dense_dir)
+    labels_dir = dense_dir / "sam_labels"
+    fill_settings = _depth_fill_settings(args)
+    if fill_settings is not None and views is not None and priors is not None:
+        from samcloud.colmap.depth_fill import fill_classified_from_prior
+
+        if progress:
+            progress.begin("depth_fill", len(views))
+        started_at = time.perf_counter()
+        try:
+            class_names = json.loads((PROJECT_ROOT / "config" / "classes.json").read_text(encoding="utf-8"))[args.class_set]
+            report = fill_classified_from_prior(
+                dense_dir, classified_raw, views, priors, fill_settings, scores_path=scores,
+                labels_dir=labels_dir, progress=_estimator_progress(progress), class_names=class_names,
+            )
+        except Exception as error:  # noqa: BLE001 - the unfilled classification stays valid
+            print(f"WARNING: Depth-Anything fill was skipped: {error}")
+            report = {"enabled": True, "added_points": 0, "error": str(error)}
+        else:
+            summary.record_stage("Depth fill", time.perf_counter() - started_at)
+            print(f"Depth-Anything fill added {report.get('added_points', 0):,} points confirmed by several views.")
+        summary.settings["depth_fill"] = report
+    cleaning = _cleaning_settings(args)
+    if cleaning is not None and views is not None:
+        if progress:
+            progress.begin("point_cleaning")
+        started_at = time.perf_counter()
+        try:
+            report = clean_classified_cloud(dense_dir, classified_raw, cleaning, scores_path=scores,
+                                            views=views, prior_reader=priors)
+        except Exception as error:  # noqa: BLE001 - the uncleaned cloud stays valid
+            print(f"WARNING: Point cleaning was skipped: {error}")
+            report = {"enabled": True, "removed_points": 0, "error": str(error)}
+        else:
+            summary.record_stage("Point cleaning", time.perf_counter() - started_at)
+            print(f"Point cleaning removed {report.get('removed_points', 0):,} floating points.")
+        summary.settings["point_cleaning"] = report
+    fusion = _surface_fusion_settings(args)
+    if fusion is not None and views is not None:
+        from samcloud.colmap.surface_fusion import consolidate_classified_cloud
+
+        if progress:
+            progress.begin("surface_fusion", len(views))
+        started_at = time.perf_counter()
+        try:
+            class_names = json.loads((PROJECT_ROOT / "config" / "classes.json").read_text(encoding="utf-8"))[args.class_set]
+            report = consolidate_classified_cloud(
+                dense_dir, classified_raw, views, priors, fusion, scores_path=scores,
+                labels_dir=labels_dir, class_names=class_names, progress=_estimator_progress(progress),
+            )
+        except Exception as error:  # noqa: BLE001 - the unfused cloud stays valid
+            print(f"WARNING: Surface fusion was skipped: {error}")
+            report = {"enabled": True, "error": str(error)}
+        else:
+            summary.record_stage("Surface fusion", time.perf_counter() - started_at)
+            print(f"Surface fusion moved {report.get('snapped', 0):,} points onto the fused surface, "
+                  f"{report.get('final_points', 0):,} points remain.")
+        summary.settings["surface_fusion"] = report
+    settings = _plane_fill_settings(args)
+    if settings is not None and views is not None:
+        if progress:
+            progress.begin("plane_fill")
+        started_at = time.perf_counter()
+        try:
+            class_names = json.loads((PROJECT_ROOT / "config" / "classes.json").read_text(encoding="utf-8"))[args.class_set]
+            report = fill_classified_cloud(
+                dense_dir, classified_raw, labels_dir, class_names, settings,
+                scores_path=scores, views=views, prior_reader=priors,
+            )
+        except Exception as error:  # noqa: BLE001 - the unfilled classification stays valid
+            print(f"WARNING: Plane filling was skipped: {error}")
+            report = {"enabled": True, "added_points": 0, "error": str(error)}
+        else:
+            summary.record_stage("Plane filling", time.perf_counter() - started_at)
+            print(f"Plane filling added {report.get('added_points', 0):,} points (SAM + plane + free space).")
+        summary.settings["plane_fill"] = report
+    if keep_caches:  # running on the processing cache itself: never delete it
+        return
+    if (dense_dir.parent.parent / "project.samcloud.yml").is_file():
+        for generated in (labels_dir, dense_dir / "depth_prior"):
+            if generated.exists():
+                remove_generated(generated, dense_dir.parent)
+    _release_fusion_cache(dense_dir, summary)
+
+
+def _cache_after_sam(args, dense_dir: Path, classified_raw: Path, classified_scores: Path) -> None:
+    """Keep the SAM result and dense workspace when the project wants a processing cache."""
+    if str(getattr(args, "keep_processing_cache", "0")) != "1":
+        return
+    from samcloud.engine.processing_cache import save_after_sam
+
+    try:
+        manifest = save_after_sam(
+            dense_dir.parent.parent, dense_dir, classified_raw, classified_scores,
+            class_set=args.class_set, capture_type=getattr(args, "capture_type", None),
+        )
+    except OSError as error:
+        print(f"WARNING: Processing cache was not saved: {error}")
+    else:
+        print(f"Processing cache saved for step 6 re-runs: {manifest['files']}")
+
+
+def _refine_from_cache(
+    args, outdir: Path, report_dir: Path, summary: RunSummary, progress: "ProgressTracker | None",
+    classified_output: Path,
+) -> None:
+    """Re-run workflow step 6 from the processing cache (no COLMAP, no SAM)."""
+    from samcloud.engine.processing_cache import SAM_CLOUD, SAM_SCORES, cache_directory, load_manifest
+
+    project_directory = outdir.parent
+    manifest = load_manifest(project_directory)
+    if manifest is None:
+        sys.exit("No usable processing cache: enable 'Schritt 6 schnell neu rechnen' and process the project once.")
+    if manifest.get("class_set") != args.class_set:
+        sys.exit(f"The processing cache was made with class set {manifest.get('class_set')}, not {args.class_set}.")
+    cache = cache_directory(project_directory)
+    dense_dir = cache / "dense"
+    geometry_enabled = args.geometry_refinement == "1"
+    classified_raw = classified_output.with_name("classified_raw.ply") if geometry_enabled else classified_output
+    classified_scores = classified_output.parent / "classified_scores.npz"
+    classified_output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(cache / SAM_CLOUD, classified_raw)
+    if (cache / SAM_SCORES).is_file():
+        shutil.copy2(cache / SAM_SCORES, classified_scores)
+    elif classified_scores.exists():
+        classified_scores.unlink()
+    views = int(manifest.get("files", {}).get("images", 0)) or 1
+    if progress:
+        plan = []
+        if _depth_prior_settings(args) is not None and not manifest.get("depth_prior"):
+            plan.append(("depth_prior", views))
+        if _depth_fill_settings(args) is not None:
+            plan.append(("depth_fill", views))
+        if _cleaning_settings(args) is not None:
+            plan.append(("point_cleaning", views))
+        if _surface_fusion_settings(args) is not None:
+            plan.append(("surface_fusion", views))
+        if _plane_fill_settings(args) is not None:
+            plan.append(("plane_fill", views))
+        if geometry_enabled:
+            plan.append(("geometry_refinement", views))
+        progress.estimator = ProgressEstimator(
+            plan, RateStore(PROJECT_ROOT / "projects" / ".samcloud_stage_rates.json",
+                            profile=getattr(args, "capture_type", None)),
+        )
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = progress
+    summary.settings["refined_from_cache"] = manifest.get("created_at")
+    print(f"Re-running step 6 from the processing cache of {manifest.get('created_at')}.")
+    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
+                                 keep_caches=True, reuse_priors=True)
+    georeferenced = (outdir / "georeference.json").is_file()
+    _finish_classification(args, outdir, report_dir, summary, progress, classified_raw, classified_scores,
+                           classified_output, georeferenced)
+
+
 def _classify_and_finish(
     args, outdir: Path, dense_dir: Path, dense_sparse_txt: Path, report_dir: Path,
     summary: RunSummary, progress: ProgressTracker | None, classified_output: Path, georeferenced: bool,
@@ -799,7 +1487,8 @@ def _classify_and_finish(
         "--min-votes", str(args.min_votes), "--tile-size", str(args.sam_tile_size),
         "--tile-min-overlap", str(args.sam_tile_min_overlap), "--mode", args.classification_mode,
         "--background-threshold", str(args.background_threshold), "--query-threshold", str(args.query_threshold),
-        "--summary-file", str(report_dir / "classification_summary.json"), "--out", str(classified_raw)]
+        "--summary-file", str(report_dir / "classification_summary.json"), "--out", str(classified_raw),
+        *_labels_arguments(args, dense_dir)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
     if geometry_enabled and args.classification_mode == "segearth_ov3":
@@ -807,18 +1496,34 @@ def _classify_and_finish(
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
     run(classify_command, summary=summary, stage="SAM3 classification")
+    _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
+    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress)
+    _finish_classification(args, outdir, report_dir, summary, progress, classified_raw, classified_scores,
+                           classified_output, georeferenced)
+
+
+def _finish_classification(
+    args, outdir: Path, report_dir: Path, summary: RunSummary, progress: "ProgressTracker | None",
+    classified_raw: Path, classified_scores: Path, classified_output: Path, georeferenced: bool,
+) -> None:
+    """Geometric refinement (end of step 6), optional LAS export, compaction and summary."""
+    geometry_enabled = args.geometry_refinement == "1"
     if geometry_enabled and georeferenced:
         refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
         _ensure_if_compressed(classified_raw)
-        if args.classification_mode == "segearth_ov3":
+        with_scores = args.classification_mode == "segearth_ov3" and (
+            classified_scores.is_file() or Path(f"{classified_scores}.zst").is_file())
+        if with_scores:
             _ensure_if_compressed(classified_scores)
         if progress:
             progress.begin("geometry_refinement")
         run([sys.executable, str(refine_script), "--input", str(classified_raw), "--output", str(classified_output),
             "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"), "--class-set", args.class_set,
             "--config", str(PROJECT_ROOT / "config" / "geometry.yml"), "--summary-file", str(report_dir / "geometry_summary.json"),
-            *(["--scores", str(classified_scores)] if args.classification_mode == "segearth_ov3" else [])], summary=summary, stage="Geometric refinement")
+            *(["--scores", str(classified_scores)] if with_scores else [])], summary=summary, stage="Geometric refinement")
     elif geometry_enabled:
+        if progress and progress.estimator is not None:
+            progress.estimator.skip_stage("geometry_refinement")
         shutil.copy2(classified_raw, classified_output)
     if args.skip_export:
         if progress:
@@ -846,8 +1551,8 @@ def main():
     ap.add_argument("--panorama-workdir", help="project-owned directory for frames, cubemaps, and manifest")
     ap.add_argument("--frame-interval", type=float, default=1.0,
                     help="fixed 360 degree video frame interval in seconds")
-    ap.add_argument("--cubemap-face-size", type=int, default=1024,
-                    help="side length in pixels for generated cubemap faces")
+    ap.add_argument("--cubemap-face-size", type=int, default=0,
+                    help="side length in pixels for generated cubemap faces; 0 = native (panorama width / 4)")
     ap.add_argument("--outdir", required=True, help="project/output folder")
     ap.add_argument("--min-votes", type=int, default=1,
                     help="minimum agreeing images per point; default 1 keeps single-view classifications")
@@ -865,6 +1570,16 @@ def main():
                     help="optional comma-separated SegEarth-OV3 background thresholds")
     ap.add_argument("--class-set", choices=("outdoor", "indoor"), default="outdoor",
                     help="semantic class set used for SAM3 classification")
+    ap.add_argument("--keep-processing-cache", choices=("0", "1"), default="0",
+                    help="keep SAM result and dense workspace so step 6 can be re-run quickly")
+    ap.add_argument("--refine-from-cache", action="store_true",
+                    help="only re-run step 6 (improve & filter) from the project's processing cache")
+    ap.add_argument("--depth-fill", choices=("0", "1"), default="1",
+                    help="indoor step 6: 1 = use Depth-Anything-V2 to fill textureless gaps (only where it agrees with COLMAP)")
+    ap.add_argument("--surface-fusion", choices=("0", "1"), default="1",
+                    help="indoor step 6: 1 = merge all depth maps into one surface layer (TSDF)")
+    ap.add_argument("--depth-model", choices=("large", "small", "base", "off"), default="large",
+                    help="Depth-Anything-V2 model for the indoor step 6 (default large; off disables it)")
     ap.add_argument("--geometry-refinement", choices=("0", "1"), default="1",
                     help="1 = apply post-classification height and flatness checks to georeferenced outdoor clouds (default on; skipped for non-georeferenced projects)")
     ap.add_argument("--colmap-bin", default=None)
@@ -905,6 +1620,11 @@ def main():
         action="store_true",
         help="reuse the undistorted dense workspace and continue from marked control points",
     )
+    ap.add_argument(
+        "--resume-dense-stereo",
+        action="store_true",
+        help="reuse the undistorted dense workspace and continue from dense stereo",
+    )
     ap.add_argument("--control-points-dir", default=None, help="project control_points directory")
     ap.add_argument("--control-points-crs", default="EPSG:2056+5728")
     ap.add_argument(
@@ -918,6 +1638,10 @@ def main():
         args.stop_after_alignment = True
     if args.resume_after_control_points and args.stop_after_alignment:
         ap.error("--resume-after-control-points cannot be combined with --stop-after-alignment")
+    if args.resume_dense_stereo and args.stop_after_alignment:
+        ap.error("--resume-dense-stereo cannot be combined with --stop-after-alignment")
+    if args.resume_dense_stereo and args.resume_after_control_points:
+        ap.error("--resume-dense-stereo cannot be combined with --resume-after-control-points")
 
     progress = ProgressTracker(Path(args.progress_file)) if args.progress_file else None
     if progress:
@@ -927,8 +1651,8 @@ def main():
         ap.error("--gps-max-error must be greater than zero")
     if args.frame_interval <= 0:
         ap.error("--frame-interval must be greater than zero")
-    if args.cubemap_face_size <= 0:
-        ap.error("--cubemap-face-size must be greater than zero")
+    if args.cubemap_face_size < 0:
+        ap.error("--cubemap-face-size must be 0 (native) or greater")
     if args.sam_tile_size not in {768, 1008, 1280}:
         ap.error("--sam-tile-size must be 768, 1008, or 1280")
     if not 0.0 <= args.sam_tile_min_overlap <= 0.8:
@@ -997,6 +1721,9 @@ def main():
         "classified_output": str(classified_output),
         "classification_summary": str(report_dir / "classification_summary.json"),
     })
+    if args.refine_from_cache:
+        _refine_from_cache(args, outdir, report_dir, summary, progress, classified_output)
+        return
     if args.resume_after_control_points:
         resume_images = Path(args.images).resolve() if args.images else outdir / "dense" / "images"
         dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, resume_images)
@@ -1009,7 +1736,18 @@ def main():
             dense_num_iterations, dense_gpu_index, classified_output,
         )
         return
-    images_dir, is_panorama = resolve_input_images(args, outdir, ap)
+    if args.resume_dense_stereo:
+        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images")
+        if dense_reason:
+            print(dense_reason)
+        summary.settings["dense_max_image_size"] = dense_max_image_size
+        summary.settings["dense_size_reason"] = dense_reason
+        _resume_dense_stereo(
+            args, outdir, report_dir, summary, progress, colmap_config, dense_max_image_size,
+            dense_num_iterations, dense_gpu_index, classified_output,
+        )
+        return
+    images_dir, is_panorama, cubemap_face_size = resolve_input_images(args, outdir, ap)
 
     db_path = outdir / "database.db"
     sparse_dir = outdir / "sparse"
@@ -1017,7 +1755,8 @@ def main():
     sparse_dir.mkdir(parents=True, exist_ok=True)
     dense_dir.mkdir(parents=True, exist_ok=True)
     image_list_path = outdir / "image_list.txt"
-    num_images = write_image_list(images_dir, image_list_path)
+    panorama_face_roots = ("front", "right", "back", "left", "up", "down") if is_panorama else None
+    num_images = write_image_list(images_dir, image_list_path, include_roots=panorama_face_roots)
     dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, images_dir)
     if dense_reason:
         print(dense_reason)
@@ -1060,6 +1799,9 @@ def main():
     camera_model = resolve_camera_model(camera_config.get("camera_model"), is_panorama)
     summary.settings["alignment_quality"]["camera_model"] = camera_model
     if is_panorama:
+        if cubemap_face_size is None:
+            raise RuntimeError("Panorama cubemap face size is missing")
+        cubemap_focal_length = cubemap_face_size / 2
         feature_command = feature_extractor_command(
             colmap, db_path, images_dir, image_list_path,
             gpu=args.gpu == "1",
@@ -1068,7 +1810,15 @@ def main():
             max_num_features=int(features_config.get("max_num_features", 16384)),
             estimate_affine_shape=bool(features_config.get("estimate_affine_shape", False)),
             domain_size_pooling=bool(features_config.get("domain_size_pooling", True)),
-            single_camera=True,
+            capture_type=getattr(args, "capture_type", None),
+            panorama_peak_threshold=float(features_config.get("panorama_peak_threshold", 0.003)),
+            panorama_edge_threshold=int(features_config.get("panorama_edge_threshold", 20)),
+            single_camera=False,
+            single_camera_per_folder=True,
+            camera_params=(
+                f"{cubemap_focal_length:g},{cubemap_focal_length:g},"
+                f"{cubemap_focal_length:g},{cubemap_focal_length:g}"
+            ),
         )
         feature_result = run(
             feature_command, summary=summary, stage="Feature extraction",
@@ -1078,6 +1828,12 @@ def main():
             print("WARNING: COLMAP rejected domain-size pooling; retrying feature extraction without it.")
             feature_command[feature_command.index("--SiftExtraction.domain_size_pooling") + 1] = "0"
             run(feature_command, summary=summary, stage="Feature extraction")
+        rig_config_path = write_panorama_rig_config(outdir / "rig_config.json", cubemap_face_size)
+        run(
+            [colmap, "rig_configurator", "--database_path", str(db_path),
+             "--rig_config_path", str(rig_config_path)],
+            summary=summary, stage="Configuring panorama rig",
+        )
     else:
         grouping = str(camera_config.get("grouping", "sequence_number"))
         names = [line.strip() for line in image_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -1116,25 +1872,26 @@ def main():
     if progress:
         progress.update(18, "Extracting features")
 
-    # 2) Video panoramas use sequential matching. A photo directory additionally
-    # uses exhaustive matching so it can connect to the video frames as well.
+    # 2) Cubemap faces need matching across multiple neighbouring panoramas.
     if progress:
         progress.begin("matching")
-    if is_panorama and args.panorama_video:
+    if is_panorama:
         if progress:
             progress.update(18, "Matching images")
-        run([colmap, "sequential_matcher",
-             "--database_path", str(db_path),
-             "--FeatureMatching.use_gpu", args.gpu,
-             "--SequentialMatching.overlap", "10"], summary=summary, stage="Image matching")
+        panorama_strategy = select_panorama_matching_strategy(num_images)
+        summary.settings["alignment_quality"]["matching_strategy"] = f"panorama_{panorama_strategy}"
+        run(
+            panorama_matching_command(colmap, db_path, gpu=args.gpu == "1", image_count=num_images),
+            summary=summary, stage="Image matching",
+        )
         if progress:
-            progress.update(25, "Matching images")
-    if not is_panorama or args.panorama_images:
+            progress.update(32, "Matching images")
+    else:
         if progress:
-            progress.update(18 if not is_panorama else 25, "Matching images")
+            progress.update(18, "Matching images")
         matching_strategy = select_matching_strategy(
             str(alignment_config.get("matching_strategy", "auto")), num_images, has_pose_priors,
-        ) if args.capture_type == "drone_gps" and not is_panorama else "exhaustive"
+        ) if args.capture_type == "drone_gps" else "exhaustive"
         summary.settings["alignment_quality"]["matching_strategy"] = matching_strategy
         run(matching_command(
             colmap, db_path, gpu=args.gpu == "1", strategy=matching_strategy,
@@ -1168,6 +1925,9 @@ def main():
             "standard_gps_prior_std_z_m": float(georeferencing_config.get("standard_gps_prior_std_z_m", 5.0)),
         },
         per_image_covariances=pose_prior_covariance_count(db_path) == num_images,
+        fixed_intrinsics=is_panorama,
+        fixed_rig_sensors=is_panorama,
+        init_min_num_inliers=30 if is_panorama else None,
     ), summary=summary, stage="Sparse reconstruction")
     if progress:
         progress.update(52, "Aligning cameras")
@@ -1175,6 +1935,7 @@ def main():
     model0 = sparse_dir / "0"
     if not model0.exists():
         sys.exit("colmap mapper did not produce a reconstruction (sparse/0 missing). Check image overlap/quality.")
+    _require_usable_sparse_model(model0, num_images)
 
     # Keep GPS priors active during every filtering-pass adjustment. Otherwise
     # ordinary BA can reintroduce the drift that the pose-prior mapper removed.
@@ -1262,6 +2023,9 @@ def main():
             model0 = automatic_model
 
     _release_sparse_intermediates(sparse_dir, model0)
+    if args.capture_type == "panorama_360" and bool(alignment_config.get("gravity_align_panorama", True)):
+        model0, gravity_report = _align_panorama_gravity(sparse_dir, model0, report_dir)
+        summary.settings["gravity_alignment"] = gravity_report
     _write_final_model(sparse_dir, model0)
 
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model
@@ -1310,12 +2074,11 @@ def main():
     if progress:
         progress.begin("dense_stereo")
         progress.update(62, "Building dense cloud")
-    run([colmap, "patch_match_stereo",
-         "--workspace_path", str(dense_dir),
-         "--PatchMatchStereo.geom_consistency", "1" if dense_config.get("use_geometric_consistency", True) else "0",
-         "--PatchMatchStereo.gpu_index", str(dense_gpu_index),
-         "--PatchMatchStereo.num_iterations", str(dense_num_iterations),
-         "--PatchMatchStereo.max_image_size", str(dense_max_image_size)], summary=summary, stage="Dense stereo")
+    excluded_stereo_images = _run_dense_stereo(
+        colmap, dense_dir, dense_config, dense_gpu_index, dense_num_iterations,
+        dense_max_image_size, summary, capture_type=getattr(args, "capture_type", None),
+    )
+    summary.settings["dense_stereo_excluded_images"] = excluded_stereo_images
     if progress:
         progress.update(78, "Building dense cloud")
 
@@ -1324,10 +2087,8 @@ def main():
         progress.begin("dense_fusion")
         progress.update(78, "Fusing dense cloud")
     dense_dir.mkdir(parents=True, exist_ok=True)
-    run(stereo_fusion_command(
-        colmap, dense_dir, dense_dir / "fused.ply", dense_config.get("fusion", {})
-    ), summary=summary, stage="Dense fusion")
-    _release_fusion_cache(dense_dir, summary)
+    _fuse_dense(colmap, dense_dir, dense_config, getattr(args, "capture_type", None), summary,
+        keep_depth_maps=_needs_depth_maps(args))
     if progress:
         progress.update(84, "Fusing dense cloud")
 
@@ -1380,7 +2141,8 @@ def main():
          "--background-threshold", str(args.background_threshold),
          "--query-threshold", str(args.query_threshold),
          "--summary-file", str(report_dir / "classification_summary.json"),
-         "--out", str(classified_raw)]
+         "--out", str(classified_raw),
+         *_labels_arguments(args, dense_dir)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
     if geometry_enabled and args.classification_mode == "segearth_ov3":
@@ -1388,8 +2150,10 @@ def main():
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
     run(classify_command, summary=summary, stage="SAM3 classification")
+    _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
+    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress)
     if progress:
-        progress.update(98, "Classifying point cloud")
+        progress.update(97, "Improving and filtering")
 
     if geometry_enabled:
         geometry_summary = report_dir / "geometry_summary.json"
@@ -1415,6 +2179,8 @@ def main():
             ], summary=summary, stage="Geometric refinement")
         else:
             print("Geometric refinement skipped: reconstruction is not georeferenced.")
+            if progress and progress.estimator is not None:
+                progress.estimator.skip_stage("geometry_refinement")
             shutil.copy2(classified_raw, classified_output)
             geometry_summary.parent.mkdir(parents=True, exist_ok=True)
             geometry_summary.write_text(json.dumps({"skipped": "not georeferenced"}, indent=2), encoding="utf-8")

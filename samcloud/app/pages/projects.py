@@ -9,12 +9,14 @@ from samcloud.app.layout import render_page
 from samcloud.app.state import state
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_deletion import delete_project
-
+from samcloud.core.storage import DEFAULT_STORAGE
 
 STORAGE_OPTIONS = {
     "keep_control_point_inputs": "Passpunkte später neu optimieren können",
     "keep_classification_inputs": "Klassifizierung später neu rechnen können",
     "keep_refinement_inputs": "Geometrie-Verfeinerung später neu rechnen können",
+    "keep_processing_cache": "Schritt 6 (Verbessern & filtern) später schnell neu rechnen können – "
+                             "behält Tiefenkarten, SAM-Bilder und Depth-Anything (braucht viel Speicher)",
 }
 
 
@@ -50,7 +52,7 @@ def render() -> None:
             with ui.card().classes("w-full"):
                 ui.label("Speicher").classes("text-base font-medium")
                 storage_switches = {
-                    key: ui.switch(label, value=True)
+                    key: ui.switch(label, value=DEFAULT_STORAGE[key])
                     for key, label in STORAGE_OPTIONS.items()
                 }
 

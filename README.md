@@ -68,20 +68,70 @@ dashboard and written to `reports/`.
 | – | *Optional pause for control points* | SAMcloud UI | control point observations; GCP georeferencing is applied on resume |
 | 6 | Dense stereo, fusion | COLMAP | `products/dense/fused.ply` and visibility file `fused.ply.vis` |
 | 7 | SAM3 classification | Ultralytics SAM3 | `classified_raw.ply`, `classified_scores.npz` |
-| 8 | Geometric refinement | `samcloud/engine/geometry` | `classified.ply`, `reports/geometry_summary.json` |
-| 9 | LAS export (manual) | laspy, PyProj | LAS 1.4 with CRS WKT, class mapping, and CRS-appropriate scale |
+| 8 | Improve & filter (workflow step 6, see below) | Depth-Anything-V2, depth maps, SAM labels | cleaned and filled `classified_raw.ply` |
+| 9 | Geometric refinement (part of step 6) | `samcloud/engine/geometry` | `classified.ply`, `reports/geometry_summary.json` |
+| 10 | LAS export (manual, workflow step 7) | laspy, PyProj | LAS 1.4 with CRS WKT, class mapping, and CRS-appropriate scale |
+
+The dashboard shows seven workflow steps (imagery, alignment, control points,
+dense cloud, SAM3, **improve & filter**, export), each with its own progress
+and remaining time. Remaining times are learned separately per capture type
+(drone, camera, 360°) in `projects/.samcloud_stage_rates.json`, so 360 runs
+never distort the drone estimate.
+
+### Improve & filter (step 6)
+
+COLMAP's depth maps (and indoors the Depth-Anything-V2 depth) are kept until
+this step has finished:
+
+1. **Depth-Anything-V2 (indoor only).** A metric indoor depth is predicted for
+   every dense view and aligned to COLMAP's own depth map per view
+   (`colmap ≈ scale·DA + shift`, robust fit). Views without enough COLMAP depth
+   (white walls) use the median fit of all good views, unless that contradicts
+   the COLMAP pixels they do have (`samcloud/colmap/depth_prior.py`).
+2. **Floating points removed (all capture types).** A point is removed when at
+   least three cameras reliably measure a surface *behind* it and they
+   outnumber the cameras that measure the point itself. Indoors the aligned
+   Depth-Anything depth fills the pixels COLMAP left empty
+   (`samcloud/colmap/point_cleaning.py`).
+3. **Floors, ceilings and walls filled (indoor only).** Planes are fitted to
+   the points SAM labelled floor, ceiling or wall. Gaps of up to 1.5 m inside a
+   plane are filled on a 1 cm grid where at least three cameras see the spot
+   unoccluded with that SAM class, they are at least 60 % of all cameras seeing
+   it, and neither COLMAP nor Depth-Anything measures a surface behind it, so
+   doors, windows and openings stay open (`samcloud/colmap/plane_fill.py`).
+4. **Geometric refinement** as described below.
+
+Settings live in `config/colmap.yml` (`point_cleaning`, `plane_fill`, with a
+separate profile per capture type) and on the project settings page (depth
+model Large / Small / Off).
 
 ## Semantic classification
 
 ### Classes
 
-The prompts and their order are defined in `config/classes.json`. ID 0 is
-always *Unknown/noise*.
+The classes follow the Nomivox preset (`presets/default.json`) and are stored
+in `config/classes.json`: per class set the class order, the prompt list of
+every class, its LAS code, colour and German label. ID 0 is always
+*Unknown/noise* (LAS code 1, unclassified). Indoor uses the Nomivox classes of
+scene `indoor` or `both`, outdoor those of scene `outdoor` or `both`.
 
 | Class set | Classes |
 |---|---|
-| `outdoor` | ground, road, sidewalk, curb, low vegetation, tree, building, vehicle, construction machinery, utility pole, traffic sign, fence, overhead power line, scaffolding, construction container, water |
-| `indoor` | floor, ceiling, wall, door, window, stairs, column/beam, pipe, electrical installation, furniture |
+| `outdoor` (23) | ground, road, sidewalk, curb, low vegetation, tree, building, vehicle, construction machinery, utility pole, traffic sign, fence, outdoor wall, power line, construction material, water, window, stairs, column, beam, steel structure, manhole, tree trunk |
+| `indoor` (19) | construction material, wall, ceiling, floor, door, window, stairs, railing, column, beam, steel structure, pipe, cable, electrical, HVAC, ceiling equipment, furniture, appliances, sanitary fixtures |
+
+Every prompt is sent to SAM3 on its own and a class keeps the best of its
+prompts. Synonyms must never be joined into one long comma-separated prompt:
+that drives SAM3's presence score towards zero (walls and ceilings were lost).
+The image backbone runs once per tile and the prompts run in batches of 32.
+To update the classes from a newer Nomivox preset:
+
+```bat
+venv\Scripts\python -m samcloud.tools.import_nomivox_classes D:\Nomivox\presets\default.json
+```
+
+More prompts cost time: indoor 360 runs take about 2 s per cubemap face
+(one SAM pass per 1024 px face); large drone photos are tiled and take longer.
 
 ### Step 1: SAM3 per image (SegEarth-OV3)
 
@@ -390,10 +440,22 @@ with the `nocuda` archive, because dense reconstruction requires CUDA.
    print `COLMAP 4.2.0 ... with CUDA` for `colmap\COLMAP.bat --help`.
 4. Request SAM3 model access at <https://huggingface.co/facebook/sam3>.
 5. Store the downloaded checkpoint as `models/sam3.pt`.
-6. Run `setup.bat` once from the repository root. It creates the Python 3.13
+6. **Depth-Anything-V2 (indoor step 6), added by hand like SAM3:**
+   - Code: `git clone https://github.com/DepthAnything/Depth-Anything-V2 third_party/Depth-Anything-V2`
+     (Apache-2.0; only `metric_depth/depth_anything_v2` is used, no extra packages).
+   - Weights (metric indoor / Hypersim) into `models/depth_anything_v2/`:
+     `depth_anything_v2_metric_hypersim_vitl.pth` (Large, default, ~1.3 GB) from
+     <https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Hypersim-Large>
+     and/or `depth_anything_v2_metric_hypersim_vits.pth` (Small, ~100 MB) from
+     <https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Hypersim-Small>.
+   - **Licence:** the Large and Base weights are CC-BY-NC-4.0 (non-commercial
+     use only); Small is Apache-2.0. Choose the model per project on the
+     settings page (Large / Small / Off). Without code or weights the step is
+     skipped with a warning and the rest of the pipeline runs normally.
+7. Run `setup.bat` once from the repository root. It creates the Python 3.13
    `venv`, checks COLMAP, and installs the pinned CUDA/Python dependencies,
    with retry-friendly pip timeouts for the large CUDA packages.
-7. Run `start.bat`. Keep its console window open and open
+8. Run `start.bat`. Keep its console window open and open
    `http://127.0.0.1:8080` if the browser does not open automatically.
 
 To verify the installation before starting the UI:
@@ -463,7 +525,10 @@ third-party information.
 - **Network use:** anyone who lets other people use a modified version over a
   network must offer them its source code (AGPL section 13).
 - **Third-party components:** COLMAP, Ultralytics, the SAM 3 model weights,
-  PyTorch, geodetic grids, and the other dependencies are not part of SAMcloud.
+  Depth-Anything-V2 (code Apache-2.0; Large/Base weights CC-BY-NC-4.0, Small
+  weights Apache-2.0), PyTorch, geodetic grids, and the other dependencies are
+  not part of SAMcloud. The AGPL licence of SAMcloud does not change their
+  terms: the CC-BY-NC weights must not be used commercially.
   Each has its own license and terms, and every user is responsible for
   complying with them. The copyright holder accepts no responsibility for
   third-party licenses.

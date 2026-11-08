@@ -15,6 +15,7 @@ CAPTURE_TYPES = ("drone_gps", "camera", "panorama_360")
 PANORAMA_IMAGE_EXTENSIONS = (".jpg", ".jpeg")
 PANORAMA_VIDEO_EXTENSIONS = (".mp4",)
 CUBEMAP_FACE_NAMES = ("front", "right", "back", "left", "up", "down")
+CUBEMAP_LAYOUT_VERSION = 2
 
 
 class CaptureValidationError(ValueError):
@@ -30,6 +31,7 @@ class PreparedPanoramaInputs:
     panorama_count: int
     video_frame_count: int
     cubemap_image_count: int
+    face_size: int
 
 
 def validate_capture_configuration(
@@ -131,6 +133,20 @@ def extract_video_frames(video_path: Path, output_directory: Path, interval_seco
     return extracted
 
 
+def cubemap_face_directions(
+    horizontal: np.ndarray, vertical: np.ndarray,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Return unnormalised equirectangular directions for cubemap pixels."""
+    return {
+        "front": (horizontal, -vertical, np.ones_like(horizontal)),
+        "right": (np.ones_like(horizontal), -vertical, -horizontal),
+        "back": (-horizontal, -vertical, -np.ones_like(horizontal)),
+        "left": (-np.ones_like(horizontal), -vertical, horizontal),
+        "up": (horizontal, np.ones_like(horizontal), vertical),
+        "down": (horizontal, -np.ones_like(horizontal), -vertical),
+    }
+
+
 def equirectangular_to_cubemap(image: np.ndarray, face_size: int) -> dict[str, np.ndarray]:
     """Render six 90 degree perspective views from a 2:1 panorama."""
     if face_size <= 0:
@@ -141,14 +157,7 @@ def equirectangular_to_cubemap(image: np.ndarray, face_size: int) -> dict[str, n
 
     coordinates = np.linspace(-1.0, 1.0, face_size, dtype=np.float32)
     horizontal, vertical = np.meshgrid(coordinates, coordinates)
-    directions = {
-        "front": (horizontal, -vertical, np.ones_like(horizontal)),
-        "right": (np.ones_like(horizontal), -vertical, -horizontal),
-        "back": (-horizontal, -vertical, -np.ones_like(horizontal)),
-        "left": (-np.ones_like(horizontal), -vertical, horizontal),
-        "up": (horizontal, np.ones_like(horizontal), vertical),
-        "down": (horizontal, -np.ones_like(horizontal), -vertical),
-    }
+    directions = cubemap_face_directions(horizontal, vertical)
     faces: dict[str, np.ndarray] = {}
     for face_name, (x_axis, y_axis, z_axis) in directions.items():
         norm = np.sqrt(x_axis**2 + y_axis**2 + z_axis**2)
@@ -167,14 +176,26 @@ def equirectangular_to_cubemap(image: np.ndarray, face_size: int) -> dict[str, n
     return faces
 
 
+def native_face_size(panorama_width: int) -> int:
+    """Cubemap face side matching the equirectangular resolution (width / 4, multiple of 8)."""
+    return max(8, int(round(panorama_width / 4 / 8)) * 8)
+
+
 def prepare_panorama_inputs(
     panorama_image_directory: str,
     panorama_video_path: str,
     project_inputs_directory: Path,
     frame_interval_seconds: float = 1.0,
-    face_size: int = 1024,
+    face_size: int = 0,
 ) -> PreparedPanoramaInputs:
-    """Create video frames, cubemap images, and an origin manifest for COLMAP."""
+    """Create video frames, cubemap images, and an origin manifest for COLMAP.
+
+    ``face_size`` 0 means native: a quarter of the first panorama's width
+    (5760 px -> 1440 px), the resolution a 90 degree face really contains.
+    Larger values are capped at native. The default (1232 px) sits between
+    1024 and native: about 25 % fewer pixels than native for dense matching
+    and SAM, with nearly the same detail.
+    """
     validate_capture_configuration(
         "panorama_360",
         panorama_image_directory=panorama_image_directory,
@@ -202,18 +223,30 @@ def prepare_panorama_inputs(
         source_kind.update({path: "video_frame" for path in extracted_frames})
 
     cubemap_directory.mkdir(parents=True, exist_ok=True)
+    # COLMAP groups matching image suffixes after an image prefix into one
+    # frame. The per-face folders provide those prefixes without touching a
+    # legacy flat cubemap that may still be present in an existing project.
+    for face_name in CUBEMAP_FACE_NAMES:
+        (cubemap_directory / face_name).mkdir(parents=True, exist_ok=True)
     manifest_entries: list[dict[str, object]] = []
     for source_index, image_path in enumerate(image_paths):
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
             raise CaptureValidationError(f"Panorama image cannot be read: {image_path.name}")
+        if source_index == 0:
+            # 0 = native; larger requests are capped at native (upscaling adds no detail)
+            native = native_face_size(image.shape[1])
+            face_size = native if face_size <= 0 else min(face_size, native)
         source_id = f"panorama_{source_index:06d}"
         face_records = []
         for face_name, face_image in equirectangular_to_cubemap(image, face_size).items():
-            face_path = cubemap_directory / f"{source_id}_{face_name}.jpg"
+            face_path = cubemap_directory / face_name / f"{source_id}.jpg"
             if not cv2.imwrite(str(face_path), face_image):
                 raise CaptureValidationError(f"Cubemap face could not be written: {face_path.name}")
-            face_records.append({"name": face_name, "path": str(face_path)})
+            face_records.append({
+                "name": face_name,
+                "path": face_path.relative_to(cubemap_directory).as_posix(),
+            })
         manifest_entries.append(
             {
                 "source_id": source_id,
@@ -225,6 +258,8 @@ def prepare_panorama_inputs(
     manifest_path.write_text(
         json.dumps(
             {
+                "cubemap_layout_version": CUBEMAP_LAYOUT_VERSION,
+                "cubemap_layout": "face_subdirectories",
                 "frame_interval_seconds": frame_interval_seconds,
                 "face_size": face_size,
                 "panoramas": manifest_entries,
@@ -239,4 +274,5 @@ def prepare_panorama_inputs(
         panorama_count=len(image_paths),
         video_frame_count=len(extracted_frames),
         cubemap_image_count=len(manifest_entries) * len(CUBEMAP_FACE_NAMES),
+        face_size=face_size,
     )

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from samcloud.core.sparse_model import sparse_points_path
+
 
 PREVIEW_MAGIC = b"SAMV"
 PREVIEW_VERSION = 1
@@ -41,6 +43,10 @@ def ensure_preview(project_directory: Path, kind: str, *, max_points: int = 300_
         "mtime_ns": source.stat().st_mtime_ns,
         "max_points": max_points,
     }
+    if kind == "sparse":
+        from samcloud.viewer.sparse_filter import FILTER_VERSION, sparse_cleaning_settings
+
+        signature["sparse_filter"] = {"version": FILTER_VERSION, **sparse_cleaning_settings()}
     if output.exists() and metadata_path.exists():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -64,11 +70,7 @@ def ensure_preview(project_directory: Path, kind: str, *, max_points: int = 300_
 def _source_path(project_directory: Path, kind: str) -> Path | None:
     products = project_directory / "products"
     if kind == "sparse":
-        candidates = (
-            products / "sparse" / "gcp_adjusted" / "points3D.bin",
-            products / "sparse" / "0_geo" / "points3D.bin",
-            products / "sparse" / "0" / "points3D.bin",
-        )
+        return sparse_points_path(products / "sparse")
     else:
         candidates = (
             products / "classified" / "classified.ply",
@@ -84,23 +86,17 @@ def _write_header(file, point_count: int) -> None:
 
 
 def _write_sparse_preview(source: Path, output: Path, max_points: int) -> int:
-    with source.open("rb") as source_file:
-        total = struct.unpack("<Q", source_file.read(8))[0]
-        step = max(1, math.ceil(total / max_points))
-        selected = math.ceil(total / step)
-        with output.open("wb") as output_file:
-            _write_header(output_file, selected)
-            for index in range(total):
-                point_id, x, y, z, red, green, blue, _error = struct.unpack(
-                    "<QdddBBBd", source_file.read(43)
-                )
-                track_length = struct.unpack("<Q", source_file.read(8))[0]
-                source_file.seek(track_length * 8, 1)
-                if index % step == 0:
-                    output_file.write(
-                        struct.pack("<fffBBBB", x, y, z, red, green, blue, 0)
-                    )
-    return selected
+    from samcloud.viewer.sparse_filter import load_clean_sparse_points
+
+    xyz, rgb = load_clean_sparse_points(source)
+    step = max(1, math.ceil(len(xyz) / max_points))
+    records = np.zeros(len(xyz[::step]), dtype=PREVIEW_RECORD)
+    records["x"], records["y"], records["z"] = xyz[::step, 0], xyz[::step, 1], xyz[::step, 2]
+    records["red"], records["green"], records["blue"] = rgb[::step, 0], rgb[::step, 1], rgb[::step, 2]
+    with output.open("wb") as output_file:
+        _write_header(output_file, len(records))
+        output_file.write(records.tobytes())
+    return len(records)
 
 
 def _read_ply_header(source: Path) -> tuple[int, int, np.dtype, dict[str, int]]:

@@ -16,28 +16,36 @@ _WORKFLOW = (
     ("Add control points", "control_points"),
     ("Build dense cloud", "dense_cloud"),
     ("Classify with SAM3", "classification"),
+    ("Improve & filter", "refinement"),
     ("Export LAS / PLY", "export"),
 )
 
 _PHASE_RANGES = {
     "alignment": (0.0, 57.0),
     "dense_cloud": (57.0, 84.0),
-    "classification": (87.0, 98.0),
+    "classification": (87.0, 93.0),
+    "refinement": (93.0, 98.0),
 }
 
 _PHASE_STAGES = {
     "alignment": ("feature_extraction", "matching", "mapping", "tiepoint_filtering"),
     "control_points": ("control_points",),
     "dense_cloud": ("undistortion", "dense_stereo", "dense_fusion"),
-    "classification": ("classification", "geometry_refinement"),
+    "classification": ("classification",),
+    "refinement": ("depth_prior", "point_cleaning", "depth_fill", "surface_fusion", "plane_fill",
+                   "geometry_refinement"),
 }
+
+# Order of the processing phases; the live status follows the estimator's running stage.
+_PHASE_ORDER = ("alignment", "control_points", "dense_cloud", "classification", "refinement")
 
 _TIME_GROUPS = (
     ("Ausrichtung", ("Preparing GPS references", "Feature extraction", "Image matching", "Sparse reconstruction",
                      "Tie point analysis", "GPS alignment")),
     ("Passpunkte", ("Preparing automatic control points", "Applying control points", "Preparing control points")),
     ("Dichte Punktwolke", ("Preparing dense reconstruction", "Dense stereo", "Dense fusion")),
-    ("Klassifizierung", ("Preparing classification", "SAM3 classification", "Geometric refinement", "Georeference")),
+    ("Klassifizierung", ("Preparing classification", "SAM3 classification", "Georeference")),
+    ("Verbessern & filtern", ("Depth prior", "Point cleaning", "Depth fill", "Plane filling", "Geometric refinement")),
     ("Export", ("LAS export",)),
 )
 
@@ -163,6 +171,14 @@ def _render_project_workspace(project: dict | None) -> None:
             ui.button(action_label, icon="play_arrow", on_click=lambda: _start_processing()).classes("sam-button-primary q-mt-md")
         elif workflow.get("export") != "completed":
             ui.button("Export LAS manually", icon="file_download", on_click=lambda: _export_las()).classes("sam-button-primary q-mt-md")
+        if not processing_active and not _workflow_is_active(workflow) and _cache_available():
+            ui.button(
+                "Schritt 6 neu rechnen (aus Zwischenstand)",
+                icon="refresh",
+                on_click=lambda: _refine_from_cache(),
+            ).props("outline").classes("sam-button-secondary q-mt-md").tooltip(
+                "Verbessern & filtern mit den aktuellen Einstellungen wiederholen – ohne COLMAP und SAM neu zu rechnen"
+            )
         if project.get("processing", {}).get("last_error"):
             ui.label(project["processing"]["last_error"]).classes("text-red-4 text-sm q-mt-md")
 
@@ -194,12 +210,57 @@ def _live_workflow(project: dict | None) -> dict:
             "classification": "not_started",
         })
     else:
+        running_phase = _phase_of_stage(snapshot.get("stage_key"))
+        if running_phase is not None:
+            position = _PHASE_ORDER.index(running_phase)
+            for phase in _PHASE_ORDER[:position]:
+                if statuses.get(phase) not in {"skipped", "waiting"}:
+                    statuses[phase] = "completed"
+            statuses[running_phase] = "running"
+            return statuses
         if percent >= 57:
             statuses["alignment"] = "completed"
             statuses["dense_cloud"] = "completed" if percent >= 87 else "running"
         if percent >= 87:
-            statuses["classification"] = "completed" if percent >= 100 else "running"
+            statuses["classification"] = "completed" if percent >= 93 else "running"
+        if percent >= 93:
+            statuses["refinement"] = "completed" if percent >= 100 else "running"
     return statuses
+
+
+def _phase_of_stage(stage_key) -> str | None:
+    """Workflow phase that contains an estimator stage key."""
+    for phase, members in _PHASE_STAGES.items():
+        if stage_key in members:
+            return phase
+    return None
+
+
+def _phase_eta(stage: str, statuses: dict, progress: dict) -> float | None:
+    """Remaining seconds of one workflow phase from the estimator snapshot."""
+    if statuses.get(stage) in {"completed", "skipped"}:
+        return None
+    members = _PHASE_STAGES.get(stage, ())
+    remaining = 0.0
+    found = False
+    for item in progress.get("stages", []):
+        if item.get("key") not in members or item.get("status") in {"done", "skipped"}:
+            continue
+        found = True
+        if item.get("status") == "running" and progress.get("stage_eta_seconds") is not None:
+            remaining += float(progress["stage_eta_seconds"])
+        else:
+            remaining += float(item.get("expected_seconds") or 0.0)
+    return remaining if found else None
+
+
+def _phase_text(stage: str, statuses: dict, progress: dict) -> str:
+    percent = _phase_percent(stage, statuses, progress)
+    # A remaining time only belongs to a phase of a run that is actually going on.
+    eta = _phase_eta(stage, statuses, progress) if statuses.get(stage) in {"running", "queued"} else None
+    if eta is None or percent >= 100.0:
+        return f"{percent:.0f}%"
+    return f"{percent:.0f}% · {_format_duration(eta).removesuffix(' remaining')}"
 
 
 def _read_progress(project: dict, project_directory: Path | None) -> dict:
@@ -361,7 +422,7 @@ def _render_workflow(project: dict | None) -> None:
                         value=phase_percent / 100.0,
                         show_value=False,
                     ).classes("flex-1")
-                    phase_label = ui.label(f"{phase_percent:.0f}%").classes("text-xs sam-muted")
+                    phase_label = ui.label(_phase_text(key, statuses, progress)).classes("text-xs sam-muted")
                 phase_bars[key] = phase_bar
                 phase_labels[key] = phase_label
 
@@ -390,7 +451,7 @@ def _render_workflow(project: dict | None) -> None:
             for stage, bar in phase_bars.items():
                 value = _phase_percent(stage, current_statuses, current_progress)
                 bar.set_value(value / 100.0)
-                phase_labels[stage].set_text(f"{value:.0f}%")
+                phase_labels[stage].set_text(_phase_text(stage, current_statuses, current_progress))
             for stage, label in status_labels.items():
                 if stage in current_statuses:
                     label.set_text(str(current_statuses[stage]).replace("_", " "))
@@ -460,6 +521,23 @@ def _continue_after_control_points() -> None:
     try:
         state.processing.continue_after_control_points(state.active_project_directory)
         ui.notify("Control-point georeferencing and processing started.")
+        ui.navigate.to("/")
+    except (OSError, ValueError) as error:
+        ui.notify(str(error), type="negative")
+
+
+def _cache_available() -> bool:
+    from samcloud.engine.processing_cache import load_manifest
+
+    return state.active_project_directory is not None and load_manifest(state.active_project_directory) is not None
+
+
+def _refine_from_cache() -> None:
+    if state.active_project_directory is None:
+        return
+    try:
+        state.processing.refine_from_cache(state.active_project_directory)
+        ui.notify("Schritt 6 wird aus dem Zwischenstand neu gerechnet.")
         ui.navigate.to("/")
     except (OSError, ValueError) as error:
         ui.notify(str(error), type="negative")

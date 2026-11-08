@@ -9,11 +9,16 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from samcloud.core.sparse_model import resolve_sparse_model
+
 
 DEFAULT_STORAGE = {
     "keep_control_point_inputs": True,
     "keep_classification_inputs": True,
     "keep_refinement_inputs": True,
+    # Keeps depth maps, images, SAM label rasters and Depth-Anything priors
+    # (~40-60 GB for an indoor 360 project) so step 6 can be re-run in minutes.
+    "keep_processing_cache": False,
 }
 
 
@@ -181,18 +186,7 @@ def compact_project(products_dir: Path, settings: dict) -> dict:
     for path in dense.glob("run-colmap-*.sh"):
         freed += _remove(path, products, deleted)
 
-    final_model = sparse / "gcp_adjusted" if (sparse / "gcp_adjusted").is_dir() else None
-    final_model_file = sparse / "final_model.txt"
-    if final_model is None and final_model_file.is_file():
-        try:
-            configured_final = final_model_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            configured_final = ""
-        candidate = sparse / configured_final
-        if configured_final and candidate.is_dir():
-            final_model = candidate
-    if final_model is None:
-        final_model = next((sparse / name for name in ("0_geo", "0") if (sparse / name).is_dir()), None)
+    final_model = resolve_sparse_model(sparse)
     for path in sparse.iterdir() if sparse.is_dir() else ():
         if path.is_dir() and path != final_model and path.name != "pre_gcp":
             freed += _remove(path, products, deleted)

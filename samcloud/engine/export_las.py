@@ -34,7 +34,7 @@ PLY_DTYPE = np.dtype(
 # LAS class codes used by Cyclone 3DR. Standard ASPRS classes are used whenever
 # one describes the semantic class. The remaining classes use the Cyclone
 # recommended user-defined range starting at 66.
-CLASSIFICATION_CODE_SETS = {
+LEGACY_CLASSIFICATION_CODE_SETS = {
     "outdoor": np.array(
         [
             0, 2, 11, 66, 67, 3, 5, 6, 68, 69, 70, 71, 72, 14, 73, 74, 9,
@@ -80,14 +80,26 @@ def read_ply_header(path: Path) -> tuple[int, int]:
         return source.tell(), vertex_count
 
 
+def classification_codes(config: dict, class_set: str) -> np.ndarray:
+    """LAS code per class id: ``las_codes`` of classes.json (Nomivox) or the legacy Cyclone table."""
+    if class_set not in config or class_set not in LEGACY_CLASSIFICATION_CODE_SETS:
+        raise ValueError(f"Unsupported class set: {class_set}")
+    codes = config.get("las_codes", {}).get(class_set)
+    if codes is None:
+        return LEGACY_CLASSIFICATION_CODE_SETS[class_set]
+    if len(codes) != len(config[class_set]) + 1:
+        raise ValueError(f"classes.json: las_codes.{class_set} needs one code per class plus unknown")
+    return np.asarray(codes, dtype=np.uint8)
+
+
 def load_class_mapping(path: Path, target_crs: str, class_set: str) -> dict[str, object]:
     """Build human-readable metadata from the pipeline class configuration."""
     config = json.loads(path.read_text(encoding="utf-8"))
-    class_names = config[class_set]
+    class_names = [name.split(",", 1)[0].strip() for name in config[class_set]]
     source_names = [config.get("unknown_class_name", "Unknown/noise"), *class_names]
     mapping = {
-        str(las_code): source_names[source_id]
-        for source_id, las_code in enumerate(CLASSIFICATION_CODE_SETS[class_set])
+        str(int(las_code)): source_names[source_id]
+        for source_id, las_code in enumerate(classification_codes(config, class_set))
     }
     return {
         "classification_field": "classification",
@@ -114,9 +126,7 @@ def export_las(
     require_export_grids(target_crs)
     georeference = _load_georeference_for_export(source_crs, target_crs, georeference_path)
     transformer = _create_transformer(source_crs, output_crs, georeference is not None)
-    if class_set not in CLASSIFICATION_CODE_SETS:
-        raise ValueError(f"Unsupported class set: {class_set}")
-    classification_codes = CLASSIFICATION_CODE_SETS[class_set]
+    codes = classification_codes(json.loads(Path(classes_path).read_text(encoding="utf-8")), class_set)
     metadata = json.dumps(
         load_class_mapping(classes_path, target_crs, class_set), separators=(",", ":")
     ).encode("utf-8")
@@ -151,9 +161,9 @@ def export_las(
             las_points.red = points["red"].astype(np.uint16) * 257
             las_points.green = points["green"].astype(np.uint16) * 257
             las_points.blue = points["blue"].astype(np.uint16) * 257
-            if points["scalar_class"].max(initial=0) >= len(classification_codes):
+            if points["scalar_class"].max(initial=0) >= len(codes):
                 raise ValueError("PLY contains a class ID not defined by this export")
-            las_points.classification = classification_codes[points["scalar_class"]]
+            las_points.classification = codes[points["scalar_class"]]
             las_points.return_number = np.ones(count, dtype=np.uint8)
             las_points.number_of_returns = np.ones(count, dtype=np.uint8)
             destination.write_points(las_points)

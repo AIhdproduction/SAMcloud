@@ -21,7 +21,38 @@ DEFAULT_RATES: dict[str, float] = {
     "dense_stereo": 15.4,          # per image and pass at 3200 px / 3 iterations
     "dense_fusion": 1.45,          # per image
     "classification": 4.6,         # per image
+    "depth_prior": 0.6,            # per image (Depth-Anything-V2, indoor only)
+    "point_cleaning": 0.4,         # per image (free-space check over all views)
+    "plane_fill": 0.2,             # per image (indoor only)
+    "depth_fill": 0.6,             # per image (indoor only, Depth-Anything multi-view fill)
+    "surface_fusion": 0.2,         # per image (indoor only, TSDF of all depth maps on the GPU)
     "geometry_refinement": 0.47,   # per image
+}
+
+# Separate starting rates and separately learned rates per capture type: a
+# 360 run (1024 px cubemap faces, exhaustive rig matching, ~160 indoor SAM
+# prompts) must never overwrite the drone rates or vice versa.
+# panorama_360 measured on test_home (1350 faces, RTX 4090, 2026-11-06/07).
+PANORAMA_RATES: dict[str, float] = {
+    **DEFAULT_RATES,
+    "feature_extraction": 0.018,
+    "matching": 0.0019,            # per verified pair (exhaustive minus same-panorama pairs)
+    "mapping": 0.2,
+    "tiepoint_filtering": 0.135,
+    "undistortion": 0.004,
+    "dense_stereo": 38.0,          # per unit; small faces have a high per-view overhead
+    "dense_fusion": 0.17,
+    "classification": 1.7,         # Nomivox prompts, one SAM pass per face (~2.1 s), ~78 % of faces carry points
+    "depth_prior": 0.15,
+    "point_cleaning": 0.1,
+    "plane_fill": 0.05,
+    "depth_fill": 0.4,
+    "surface_fusion": 0.15,
+}
+CAPTURE_DEFAULT_RATES: dict[str, dict[str, float]] = {
+    "drone_gps": {**DEFAULT_RATES, "classification": 30.0},  # Nomivox outdoor prompts on ~20 tiles per photo
+    "camera": {**DEFAULT_RATES, "classification": 30.0},
+    "panorama_360": PANORAMA_RATES,
 }
 
 STAGE_LABELS: dict[str, str] = {
@@ -34,6 +65,11 @@ STAGE_LABELS: dict[str, str] = {
     "dense_stereo": "Tiefenkarten",
     "dense_fusion": "Dichte Punktwolke fusionieren",
     "classification": "SAM-Klassifizierung",
+    "depth_prior": "Tiefenschätzung (Depth-Anything-V2)",
+    "point_cleaning": "Streupunkte entfernen",
+    "plane_fill": "Flächen auffüllen",
+    "depth_fill": "Auffüllen mit Depth-Anything",
+    "surface_fusion": "Oberflächen zusammenführen",
     "geometry_refinement": "Geometrische Verfeinerung",
 }
 
@@ -52,12 +88,22 @@ _PATTERNS: dict[str, re.Pattern[str]] = {
 def stage_units(
     stage: str, *, images: int, max_image_size: int = 3200, num_iterations: int = 3,
     geometric_consistency: bool = True, matching: str = "exhaustive", spatial_neighbors: int = 50,
+    faces_per_frame: int = 1, sequential_overlap: int = 60,
 ) -> float:
-    """Work units of a stage, matching the unit of DEFAULT_RATES."""
+    """Work units of a stage, matching the unit of DEFAULT_RATES.
+
+    ``faces_per_frame`` > 1 describes a rig (360 cubemaps): exhaustive matching
+    skips the pairs inside one panorama, exactly like the real matcher.
+    """
     images = max(int(images), 1)
     if stage == "matching":
         if matching == "exhaustive":
-            return images * (images - 1) / 2.0
+            pairs = images * (images - 1) / 2.0
+            if faces_per_frame > 1:
+                pairs -= (images / faces_per_frame) * faces_per_frame * (faces_per_frame - 1) / 2.0
+            return max(pairs, 1.0)
+        if matching == "sequential":
+            return float(images * min(sequential_overlap, images - 1))
         return images * min(spatial_neighbors, images - 1) / 2.0
     if stage == "dense_stereo":
         passes = 2 if geometric_consistency else 1
@@ -66,19 +112,27 @@ def stage_units(
 
 
 class RateStore:
-    """Self-learning seconds-per-unit rates, persisted as JSON (exponential moving average)."""
+    """Self-learning seconds-per-unit rates, persisted as JSON (exponential moving average).
 
-    def __init__(self, path: Path | None, alpha: float = 0.4) -> None:
+    With ``profile`` (the capture type) rates start from that capture type's
+    defaults and are stored under ``profiles.<capture type>``; the old shared
+    ``rates`` block mixed drone and 360 runs and is not used for profiles.
+    """
+
+    def __init__(self, path: Path | None, alpha: float = 0.4, profile: str | None = None) -> None:
         self.path = path
         self.alpha = alpha
-        self.rates: dict[str, float] = dict(DEFAULT_RATES)
+        self.profile = profile
+        defaults = CAPTURE_DEFAULT_RATES.get(profile, DEFAULT_RATES) if profile else DEFAULT_RATES
+        self.rates: dict[str, float] = dict(defaults)
         if path is not None and path.is_file():
             try:
                 stored = json.loads(path.read_text(encoding="utf-8"))
-                for key, value in stored.get("rates", {}).items():
+                learned = stored.get("profiles", {}).get(profile, {}) if profile else stored.get("rates", {})
+                for key, value in learned.items():
                     if key in self.rates and float(value) > 0:
                         self.rates[key] = float(value)
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 pass
 
     def rate(self, stage: str) -> float:
@@ -94,7 +148,15 @@ class RateStore:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"rates": self.rates}, indent=2), encoding="utf-8")
+        if self.profile is None:
+            self.path.write_text(json.dumps({"rates": self.rates}, indent=2), encoding="utf-8")
+            return
+        try:
+            stored = json.loads(self.path.read_text(encoding="utf-8")) if self.path.is_file() else {}
+        except (OSError, ValueError):
+            stored = {}
+        stored.setdefault("profiles", {})[self.profile] = self.rates
+        self.path.write_text(json.dumps(stored, indent=2), encoding="utf-8")
 
 
 @dataclass

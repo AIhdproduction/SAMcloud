@@ -8,13 +8,10 @@ from nicegui import ui
 from samcloud.app.layout import render_page
 from samcloud.app.pointcloud_viewer import default_class_colors, render_pointcloud_viewer
 from samcloud.app.state import state
+from samcloud.classification.service import class_default_colors, class_las_codes
 from samcloud.core.paths import CONFIG_DIRECTORY
 
 
-LAS_CODES = {
-    "outdoor": (0, 2, 11, 66, 67, 3, 5, 6, 68, 69, 70, 71, 72, 14, 73, 74, 9),
-    "indoor": (0, 2, 75, 6, 76, 77, 78, 79, 80, 81, 82),
-}
 
 _COLOR_INPUT_STYLE = """
 <style>
@@ -33,7 +30,8 @@ def render() -> None:
             return
         class_set = project["settings"].get("classification", {}).get("class_set", "outdoor")
         classes = _load_classes(class_set)
-        color_hexes = _class_color_hexes(project, len(classes) + 1)
+        color_hexes = _class_color_hexes(project, len(classes) + 1, class_set)
+        las_codes = class_las_codes(class_set)
         labels = ["Unknown / noise", *[name.split(",")[0].title() for name in classes]]
         with ui.column().classes("w-full gap-4"):
             with ui.card().classes("w-full"):
@@ -42,7 +40,7 @@ def render() -> None:
                     title="Dense point cloud",
                     class_colors=[_hex_to_rgb(color) for color in color_hexes],
                     class_labels=[
-                        f"{LAS_CODES[class_set][class_id]}: {label}"
+                        f"{las_codes[class_id]}: {label}"
                         for class_id, label in enumerate(labels)
                     ],
                 )
@@ -71,7 +69,7 @@ def render() -> None:
                     for class_id, label in enumerate(labels):
                         with ui.row().classes("items-center w-full gap-3"):
                             visibility_control = ui.checkbox(
-                                f"{LAS_CODES[class_set][class_id]}: {label}",
+                                f"{las_codes[class_id]}: {label}",
                                 value=True,
                                 on_change=lambda event, index=class_id: _set_class_visibility(
                                     visibility, index, event.value, apply_visibility
@@ -118,9 +116,17 @@ def _set_class_visibility(
     apply_visibility()
 
 
-def _class_color_hexes(project: dict, count: int) -> list[str]:
-    """Return saved class colors or the default Cyclone-style palette."""
-    defaults = [_rgb_to_hex(color) for color in default_class_colors(count)]
+def _default_color_hexes(count: int, class_set: str | None = None) -> list[str]:
+    """classes.json colours (Nomivox) when defined, else the Cyclone-style palette."""
+    configured = class_default_colors(class_set) if class_set else None
+    if configured is not None and len(configured) == count:
+        return configured
+    return [_rgb_to_hex(color) for color in default_class_colors(count)]
+
+
+def _class_color_hexes(project: dict, count: int, class_set: str | None = None) -> list[str]:
+    """Return saved class colors or the default palette."""
+    defaults = _default_color_hexes(count, class_set)
     saved = project.get("settings", {}).get("classification", {}).get("class_colors", {})
     if not isinstance(saved, dict):
         return defaults
@@ -145,7 +151,7 @@ def _save_class_color(class_id: int, color: str | None, class_set: str, count: i
     colors = classification.setdefault("class_colors", {})
     colors[str(class_id)] = color.upper()
     state.projects.save(project_directory, project)
-    palette = [_hex_to_rgb(value) for value in _class_color_hexes(project, count)]
+    palette = [_hex_to_rgb(value) for value in _class_color_hexes(project, count, class_set)]
     ui.run_javascript(
         "window.samcloudPointCloudViewers?.['sam-cloud-dense']?.setClassColors("
         + json.dumps(palette)
@@ -161,7 +167,7 @@ def _restore_default_colors(class_set: str, count: int) -> None:
     project = state.projects.load(project_directory)
     project.setdefault("settings", {}).setdefault("classification", {}).pop("class_colors", None)
     state.projects.save(project_directory, project)
-    palette = default_class_colors(count)
+    palette = [_hex_to_rgb(value) for value in _default_color_hexes(count, class_set)]
     ui.run_javascript(
         "window.samcloudPointCloudViewers?.['sam-cloud-dense']?.setClassColors("
         + json.dumps(palette)

@@ -59,7 +59,8 @@ def test_chain_alignment_and_resume_run(tmp_path: Path) -> None:
     assert groups["Ausrichtung"] == 706.0
     assert groups["Passpunkte"] == 7.0
     assert groups["Dichte Punktwolke"] == 9370.0
-    assert groups["Klassifizierung"] == 1468.0
+    assert groups["Klassifizierung"] == 1332.0
+    assert groups["Verbessern & filtern"] == 136.0  # geometric refinement is workflow step 6
     assert "Übrige Schritte" in groups
     assert groups["Übrige Schritte"] == 523.0
 

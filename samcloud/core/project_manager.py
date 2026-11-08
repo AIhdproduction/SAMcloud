@@ -177,7 +177,7 @@ class ProjectManager:
                 },
                 "panorama": {
                     "frame_interval_seconds": frame_interval_seconds,
-                    "cubemap_face_size": int(panorama_defaults.get("cubemap_face_size", 1024)),
+                    "cubemap_face_size": int(panorama_defaults.get("cubemap_face_size", 0) or 0),
                     "frame_directory": "inputs/panorama_frames",
                     "cubemap_directory": "inputs/cubemap",
                     "manifest_path": "inputs/panorama_manifest.json",
@@ -198,6 +198,7 @@ class ProjectManager:
                 "control_points": "not_started" if control_points_mode in {"after_alignment", "automatic"} else "skipped",
                 "dense_cloud": "not_started",
                 "classification": "not_started",
+                "refinement": "not_started",
                 "export": "not_started",
                 "control_points_mode": control_points_mode,
             },

@@ -23,7 +23,7 @@ def prepare_project_panorama(project_directory: Path, project: dict[str, Any]) -
         sources.get("panorama_video_path", ""),
         project_directory / "inputs",
         float(panorama.get("frame_interval_seconds", 1.0)),
-        int(panorama.get("cubemap_face_size", 1024)),
+        int(panorama.get("cubemap_face_size", 0) or 0),
     )
     panorama["prepared"] = {
         "panorama_count": prepared.panorama_count,

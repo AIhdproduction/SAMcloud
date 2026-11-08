@@ -17,6 +17,7 @@ from samcloud.control_points.repository import (
 )
 from samcloud.viewer.preview import ensure_preview
 from samcloud.viewer.potree import ensure_potree, potree_status, start_potree_build
+from samcloud.viewer.cameras import camera_payload, camera_thumbnail
 
 
 @app.get("/api/pointcloud/{kind}")
@@ -37,6 +38,35 @@ def pointcloud_preview(kind: str):
             "X-SAMcloud-Point-Count": str(point_count),
         },
     )
+
+
+@app.get("/api/cameras/sparse")
+def sparse_cameras():
+    """Serve final-model camera centres for the sparse-cloud inspector."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    try:
+        return JSONResponse(camera_payload(project_directory))
+    except (FileNotFoundError, OSError, ValueError) as error:
+        return JSONResponse({"error": str(error)}, status_code=404)
+
+
+@app.get("/api/camera-thumbnail/{camera_id}")
+def sparse_camera_thumbnail(camera_id: str, size: str = "320"):
+    """Serve a downscaled, ID-addressed source image for a sparse camera."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    try:
+        encoded = camera_thumbnail(project_directory, camera_id, size)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+    except FileNotFoundError as error:
+        return JSONResponse({"error": str(error)}, status_code=404)
+    except OSError as error:
+        return JSONResponse({"error": str(error)}, status_code=500)
+    return Response(encoded, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
 @app.get("/api/potree/{kind}/status")

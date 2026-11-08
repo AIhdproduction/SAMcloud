@@ -29,6 +29,18 @@ This file defines camera assumptions, matching, RTK/GPS accuracy, control-point
 requirements, and dense reconstruction settings. `control_point_minimum_observations`
 is set to two because a point must be marked in at least two images.
 
+The `features` section controls COLMAP SIFT extraction. `max_num_features` remains
+the limit for every capture type. For `panorama_360` only,
+`panorama_peak_threshold` (default `0.003`) and `panorama_edge_threshold` (default
+`20`) are passed to COLMAP to retain sufficient cubemap-face features; they do not
+affect `drone_gps` or `camera` projects.
+
+`alignment.gravity_align_panorama` defaults to `true`. For horizon-levelled
+`panorama_360` inputs, SAMcloud derives gravity from the calibrated cubemap rig,
+rotates the final sparse model so the up face points to `+Z`, and uses that model
+for dense reconstruction. The resulting report records the arbitrary scale,
+rig-pose spread, and sparse horizontal-plane cross-check.
+
 ## `export_crs.yml`
 
 This file defines the LAS export CRS choices shown in the settings page. Each

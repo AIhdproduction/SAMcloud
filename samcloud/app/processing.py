@@ -10,7 +10,7 @@ from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any
 
 from samcloud.core.configuration import load_global_config
-from samcloud.core.storage import ensure_text_model
+from samcloud.core.storage import ensure_text_model, storage_settings
 from samcloud.pointcloud.georeference import fit_enu_to_ecef, save_georeference
 
 if TYPE_CHECKING:
@@ -143,6 +143,7 @@ class ProcessingManager:
         workflow["control_points"] = "not_started" if mode in {"after_alignment", "automatic"} else "skipped"
         workflow["dense_cloud"] = "queued"
         workflow["classification"] = "queued"
+        workflow["refinement"] = "queued"
         workflow["export"] = "not_started"
         project.setdefault("acquisition", {})["locked"] = True
         project.setdefault("processing", {}).update({
@@ -226,6 +227,35 @@ class ProcessingManager:
             self._jobs[project_directory] = process
         Thread(target=self._watch_export, args=(project_directory, process), daemon=True).start()
 
+    def refine_from_cache(self, project_directory: Path) -> None:
+        """Re-run only workflow step 6 from the project's processing cache."""
+        from samcloud.engine.processing_cache import load_manifest
+
+        project_directory = project_directory.resolve()
+        if self.is_running(project_directory):
+            raise ValueError("Processing is already running for this project")
+        if load_manifest(project_directory) is None:
+            raise ValueError("No processing cache: enable it in the settings and process the project once")
+        project = self._state.projects.load(project_directory)
+        workflow = project.setdefault("workflow", {})
+        workflow["refinement"] = "running"
+        project.setdefault("processing", {}).update({
+            "last_error": "", "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": "",
+            "progress": {"percent": 93, "stage": "Improving and filtering", "detail": ""},
+        })
+        self._state.projects.save(project_directory, project)
+        command = [*self._pipeline_command(project_directory, project, "none"), "--refine-from-cache"]
+        try:
+            process = self._launch(command, project_directory / "reports" / "pipeline.log")
+        except OSError as error:
+            workflow["refinement"] = "failed"
+            project["processing"]["last_error"] = str(error)
+            self._state.projects.save(project_directory, project)
+            raise
+        with self._lock:
+            self._jobs[project_directory] = process
+        Thread(target=self._watch_pipeline, args=(project_directory, "refine", process), daemon=True).start()
+
     def continue_after_control_points(self, project_directory: Path) -> None:
         """Start Phase B after validating that enough GCP clicks are available."""
         project_directory = project_directory.resolve()
@@ -251,7 +281,7 @@ class ProcessingManager:
         if usable < minimum_points:
             raise ValueError(f"At least {minimum_points} control points with {minimum_observations} observations are required")
         workflow = project.setdefault("workflow", {})
-        workflow.update({"control_points": "running", "dense_cloud": "running", "classification": "queued"})
+        workflow.update({"control_points": "running", "dense_cloud": "running", "classification": "queued", "refinement": "queued"})
         project.setdefault("processing", {}).update({"last_error": "", "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": "", "progress": {"percent": 57, "stage": "Applying control points", "detail": ""}})
         self._state.projects.save(project_directory, project)
         command = self._pipeline_command(project_directory, project, "none", resume_after_control_points=True)
@@ -320,6 +350,14 @@ class ProcessingManager:
             str(classification.get("query_threshold", 0.4)),
             "--geometry-refinement",
             "1" if classification.get("geometry_refinement", True) else "0",
+            "--depth-model",
+            str(settings.get("refinement", {}).get("depth_model", "large")),
+            "--depth-fill",
+            "1" if settings.get("refinement", {}).get("depth_fill", True) else "0",
+            "--surface-fusion",
+            "1" if settings.get("refinement", {}).get("surface_fusion", True) else "0",
+            "--keep-processing-cache",
+            "1" if storage_settings(settings).get("keep_processing_cache") else "0",
             "--control-points-mode",
             mode,
             "--skip-export",
@@ -350,7 +388,7 @@ class ProcessingManager:
                 "--frame-interval",
                 str(acquisition.get("panorama", {}).get("frame_interval_seconds", 1.0)),
                 "--cubemap-face-size",
-                str(acquisition.get("panorama", {}).get("cubemap_face_size", 1024)),
+                str(acquisition.get("panorama", {}).get("cubemap_face_size", 0) or 0),
             ])
         else:
             image_directory = sources.get("image_directory") or project.get("paths", {}).get("image_directory", "")
@@ -384,7 +422,13 @@ class ProcessingManager:
         return_code = process.wait()
         project = self._state.projects.load(project_directory)
         workflow = project.setdefault("workflow", {})
-        if return_code == 0:
+        if return_code == 0 and mode == "refine":
+            workflow["refinement"] = "completed"
+            project.setdefault("processing", {}).update({
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "progress": {"percent": 100, "stage": "Complete", "detail": ""},
+            })
+        elif return_code == 0:
             workflow["alignment"] = "completed"
             if mode == "after_alignment":
                 workflow["control_points"] = "waiting"
@@ -399,22 +443,25 @@ class ProcessingManager:
                     workflow["control_points"] = "completed"
                     workflow["dense_cloud"] = "completed"
                     workflow["classification"] = "completed"
+                    workflow["refinement"] = "completed"
                 else:
                     workflow["control_points"] = "waiting"
             elif mode == "resume":
                 workflow["control_points"] = "completed"
                 workflow["dense_cloud"] = "completed"
                 workflow["classification"] = "completed"
+                workflow["refinement"] = "completed"
             else:
                 workflow["control_points"] = "skipped"
                 workflow["dense_cloud"] = "completed"
                 workflow["classification"] = "completed"
+                workflow["refinement"] = "completed"
             project.setdefault("processing", {}).update({
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "progress": {"percent": 100, "stage": "Complete", "detail": ""},
             })
         else:
-            current = "alignment" if workflow.get("dense_cloud") == "queued" else "dense_cloud"
+            current = "refinement" if mode == "refine" else "alignment" if workflow.get("dense_cloud") == "queued" else "dense_cloud"
             workflow[current] = "failed"
             project.setdefault("processing", {})["last_error"] = (
                 f"Pipeline ended with exit code {return_code}. See reports/pipeline.log."

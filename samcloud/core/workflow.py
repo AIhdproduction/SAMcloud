@@ -10,6 +10,7 @@ class WorkflowStage(str, Enum):
     CONTROL_POINTS = "control_points"
     DENSE_CLOUD = "dense_cloud"
     CLASSIFICATION = "classification"
+    REFINEMENT = "refinement"
     EXPORT = "export"
 
 
@@ -18,5 +19,6 @@ STAGE_LABELS = {
     WorkflowStage.CONTROL_POINTS: "Control points",
     WorkflowStage.DENSE_CLOUD: "Dense point cloud",
     WorkflowStage.CLASSIFICATION: "Semantic classification",
+    WorkflowStage.REFINEMENT: "Improve and filter",
     WorkflowStage.EXPORT: "Export",
 }

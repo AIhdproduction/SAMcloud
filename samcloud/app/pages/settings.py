@@ -12,6 +12,7 @@ from samcloud.app.state import state
 from samcloud.core.configuration import load_export_crs_presets
 from samcloud.core.storage import storage_settings
 from samcloud.app.pages.projects import STORAGE_OPTIONS
+from samcloud.core.storage import DEFAULT_STORAGE
 
 
 CONTROL_POINTS_MODE_OPTIONS = {
@@ -47,6 +48,10 @@ def render() -> None:
         classification.setdefault("background_threshold", 0.4)
         classification.setdefault("query_threshold", 0.4)
         classification.setdefault("threshold_sweep", [])
+        refinement = settings.setdefault("refinement", {})
+        refinement.setdefault("depth_model", "large")
+        refinement.setdefault("depth_fill", True)
+        refinement.setdefault("surface_fusion", True)
         storage = settings.setdefault("storage", storage_settings(settings))
         acquisition = project.setdefault(
             "acquisition",
@@ -135,7 +140,7 @@ def render() -> None:
         with ui.card().classes("w-full"):
             ui.label("Speicher").classes("text-lg font-medium")
             storage_switches = {
-                key: ui.switch(label, value=bool(storage.get(key, True)))
+                key: ui.switch(label, value=bool(storage.get(key, DEFAULT_STORAGE.get(key, True))))
                 for key, label in STORAGE_OPTIONS.items()
             }
         with ui.card().classes("w-full"):
@@ -190,6 +195,28 @@ def render() -> None:
                 "Geometric refinement (height & flatness check)",
                 value=bool(classification["geometry_refinement"]),
             )
+            ui.label("Improve & filter (step 6)").classes("text-lg font-medium q-mt-md")
+            ui.label(
+                "Indoor only: Depth-Anything-V2 predicts depth where COLMAP finds no texture (white walls) "
+                "and helps to remove floating points and to fill floors, ceilings and walls."
+            ).classes("text-sm")
+            depth_model = ui.select(
+                {
+                    "large": "Depth-Anything-V2 Large (best, CC-BY-NC-4.0 weights)",
+                    "small": "Depth-Anything-V2 Small (faster, Apache-2.0 weights)",
+                    "off": "Off",
+                },
+                label="Depth model",
+                value=str(refinement.get("depth_model", "large")),
+            ).classes("w-full")
+            depth_fill = ui.switch(
+                "Lücken mit Depth-Anything füllen (nur wo es mit den COLMAP-Tiefenkarten übereinstimmt)",
+                value=bool(refinement.get("depth_fill", True)),
+            )
+            surface_fusion = ui.switch(
+                "Oberflächen zusammenführen: alle Tiefenkarten zu einer Punktlage (Wand, Decke, Boden je eine Ebene)",
+                value=bool(refinement.get("surface_fusion", True)),
+            )
 
         def save_settings() -> None:
             try:
@@ -222,6 +249,11 @@ def render() -> None:
                 classification["tile_size"] = int(tile_size.value or 0)
                 classification["tile_min_overlap"] = float(tile_min_overlap.value or 0)
                 classification["geometry_refinement"] = bool(geometry_refinement.value)
+                if depth_model.value not in {"large", "small", "off"}:
+                    raise ValueError("Select a supported depth model")
+                refinement["depth_model"] = depth_model.value
+                refinement["depth_fill"] = bool(depth_fill.value)
+                refinement["surface_fusion"] = bool(surface_fusion.value)
                 storage.update({key: bool(control.value) for key, control in storage_switches.items()})
                 if classification["min_votes"] < 1:
                     raise ValueError("Minimum agreeing images must be at least 1")

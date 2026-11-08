@@ -30,6 +30,18 @@ _HEAD = f"""
 .sam-potree-toolbar button {{ border:1px solid #47718a; border-radius:5px; padding:6px 10px; background:#102131; color:#dcecf6; cursor:pointer; }}
 .sam-potree-toolbar button.is-selected {{ border-color:#26b7ef; background:#16516c; }}
 .sam-potree-toolbar label {{ display:flex; align-items:center; gap:6px; padding:5px 9px; border:1px solid #28475b; border-radius:5px; background:rgba(9,19,29,.86); color:#b9ccda; font-size:12px; }}
+.sam-potree-clip-value {{ min-width:46px; text-align:right; font-variant-numeric:tabular-nums; color:#dcecf6; }}
+.sam-potree-clip-value[data-clip-label="min"] {{ text-align:left; }}
+.sam-potree-height {{ display:flex; align-items:center; gap:6px; padding:5px 9px; border:1px solid #28475b; border-radius:5px; background:rgba(9,19,29,.86); color:#b9ccda; font-size:12px; }}
+.sam-potree-range {{ position:relative; width:180px; height:18px; }}
+.sam-potree-range::before {{ content:""; position:absolute; left:0; right:0; top:7px; height:4px; border-radius:2px; background:#28475b; }}
+.sam-potree-range-fill {{ position:absolute; top:7px; height:4px; border-radius:2px; background:#26b7ef; }}
+.sam-potree-range input {{ position:absolute; left:0; top:0; width:100%; height:18px; margin:0; padding:0; background:none; pointer-events:none; -webkit-appearance:none; appearance:none; }}
+.sam-potree-range input:focus {{ outline:none; }}
+.sam-potree-range input::-webkit-slider-runnable-track {{ height:18px; background:transparent; border:0; }}
+.sam-potree-range input::-moz-range-track {{ background:transparent; border:0; }}
+.sam-potree-range input::-webkit-slider-thumb {{ -webkit-appearance:none; appearance:none; pointer-events:auto; width:14px; height:14px; margin-top:2px; border-radius:50%; background:#dcecf6; border:2px solid #26b7ef; cursor:ew-resize; }}
+.sam-potree-range input::-moz-range-thumb {{ pointer-events:auto; width:10px; height:10px; border-radius:50%; background:#dcecf6; border:2px solid #26b7ef; cursor:ew-resize; }}
 .sam-potree-status {{ position:absolute; z-index:20; left:12px; bottom:12px; padding:6px 9px; border-radius:5px; background:rgba(9,19,29,.86); color:#b9ccda; font-size:12px; }}
 .sam-potree-classes {{ position:absolute; z-index:20; top:64px; right:12px; max-height:calc(100% - 90px); overflow:auto; width:min(300px,32vw); padding:10px; border:1px solid #365c74; border-radius:8px; background:rgba(9,19,29,.94); color:#eaf2f8; font-size:12px; display:none; }}
 .sam-potree-classes.is-open {{ display:block; }}
@@ -39,6 +51,10 @@ _HEAD = f"""
 .sam-potree .annotation {{ opacity:1 !important; }}
 .sam-potree .annotation-titlebar {{ color:#06202f !important; }}
 .sam-potree .annotation.is-hidden {{ display:none !important; }}
+.sam-potree-camera-card {{ position:absolute; z-index:25; right:12px; bottom:12px; width:min(320px,42vw); padding:10px; border:1px solid #47718a; border-radius:7px; background:rgba(9,19,29,.94); color:#eaf2f8; font-size:12px; display:none; }}
+.sam-potree-camera-card.is-open {{ display:block; }}
+.sam-potree-camera-card img {{ display:block; width:100%; max-height:210px; margin-top:8px; object-fit:contain; background:#050b12; cursor:zoom-in; }}
+.sam-potree-camera-card a {{ color:#59c8f3; display:inline-block; margin-top:7px; }}
 </style>
 """
 
@@ -50,9 +66,10 @@ def render_potree_viewer(
     class_colors: list[list[int]],
     class_labels: list[str] | None = None,
     marker_endpoint: str | None = None,
+    camera_endpoint: str | None = None,
 ) -> None:
     """Render a Potree viewer for the active project's sparse or dense cloud."""
-    config = _viewer_config(kind, title, class_colors, class_labels, marker_endpoint)
+    config = _viewer_config(kind, title, class_colors, class_labels, marker_endpoint, camera_endpoint)
     element_id = config["element_id"]
     ui.add_head_html(_HEAD)
     ui.html(
@@ -60,6 +77,7 @@ def render_potree_viewer(
             element_id,
             show_classes=config["show_classes"],
             show_markers=config["show_markers"],
+            show_cameras=config["show_cameras"],
         ),
         sanitize=False,
     ).classes("w-full")
@@ -72,6 +90,7 @@ def _viewer_config(
     class_colors: list[list[int]],
     class_labels: list[str] | None = None,
     marker_endpoint: str | None = None,
+    camera_endpoint: str | None = None,
 ) -> dict:
     """Build the browser configuration for one Potree cloud."""
     return {
@@ -83,8 +102,10 @@ def _viewer_config(
         "class_colors": class_colors,
         "class_labels": class_labels or [],
         "marker_endpoint": marker_endpoint,
+        "camera_endpoint": camera_endpoint,
         "show_classes": kind == "dense",
         "show_markers": bool(marker_endpoint),
+        "show_cameras": bool(camera_endpoint),
     }
 
 
@@ -93,6 +114,7 @@ def _html(
     *,
     show_classes: bool = True,
     show_markers: bool = False,
+    show_cameras: bool = False,
 ) -> str:
     markers_btn = (
         '    <button data-action="markers" class="is-selected">Passpunkte</button>\n'
@@ -106,18 +128,33 @@ def _html(
         if show_classes
         else ""
     )
+    cameras_btns = (
+        '    <button data-action="cameras" class="is-selected">Kamerapositionen</button>\n'
+        '    <button data-action="camera-colour">Reprojektionsfehler</button>\n'
+        '    <button data-action="camera-sphere-texture" style="display:none">Panorama auf Kugel</button>\n'
+        if show_cameras
+        else ""
+    )
+    camera_sliders = (
+        '    <label>Kameragrösse <input data-action="camera-size" type="range" min="0.25" max="0.75" step="0.25" value="0.5"></label>\n'
+        if show_cameras
+        else ""
+    )
     return f"""
 <div id="{element_id}" class="sam-potree">
   <div class="sam-potree-area"></div>
   <div class="sam-potree-toolbar">
     <button data-action="fit">Alles zeigen</button>
-{markers_btn}{classes_btns}    <button data-action="earth" class="is-selected">Terrain</button>
+{markers_btn}{cameras_btns}{classes_btns}    <button data-action="earth" class="is-selected">Terrain</button>
     <button data-action="orbit">Orbit</button>
     <button data-action="edl" class="is-selected">Schattierung</button>
     <button data-action="fullscreen">Vollbild</button>
     <label>Punktgrösse <input data-action="size" type="range" min="0.5" max="6" step="0.25" value="1.5"></label>
+    <div class="sam-potree-height" title="Höhenfilter: linker Knopf blendet Punkte unten aus, rechter Knopf oben">Höhe <span class="sam-potree-clip-value" data-clip-label="min">–</span><span class="sam-potree-range"><span class="sam-potree-range-fill"></span><input data-action="clip-min" type="range" min="0" max="1000" step="1" value="0" aria-label="Höhe unten"><input data-action="clip-max" type="range" min="0" max="1000" step="1" value="1000" aria-label="Höhe oben"></span><span class="sam-potree-clip-value" data-clip-label="max">–</span></div>
+{camera_sliders}
   </div>
   <div class="sam-potree-classes"></div>
+  <aside class="sam-potree-camera-card"></aside>
   <div class="sam-potree-status">Punktwolke wird vorbereitet …</div>
 </div>
 """
@@ -169,7 +206,9 @@ const start = () => {
     scheme[key].visible = event.target.checked;
     viewer.setClassifications(scheme);
   });
-  let cloud = null;
+   let cloud = null;
+   const cameraSettingsKey = "samcloud:sparse-camera-settings:v1";
+   const savedCameraSettings = (() => { try { return JSON.parse(localStorage.getItem(cameraSettingsKey) || "{}"); } catch (_error) { return {}; } })();
   const select = (actions, active) => actions.forEach(name => { const button = root.querySelector(`[data-action="${name}"]`); if (button) button.classList.toggle("is-selected", name === active); });
   root.querySelector(".sam-potree-toolbar").addEventListener("click", event => {
     const action = event.target.dataset && event.target.dataset.action;
@@ -184,6 +223,23 @@ const start = () => {
       }
       event.target.classList.toggle("is-selected", markersVisible);
     }
+    if (action === "cameras") {
+      camerasVisible = !camerasVisible;
+      syncCameraSettings();
+      saveCameraSettings();
+    }
+    if (action === "camera-sphere-texture") {
+      cameraSphereTextures = !cameraSphereTextures;
+      event.target.classList.toggle("is-selected", cameraSphereTextures);
+      saveCameraSettings();
+      syncSphereTextures();
+      return;
+    }
+    if (action === "camera-colour") {
+      cameraErrorColours = !cameraErrorColours;
+      updateCameraColours();
+      event.target.classList.toggle("is-selected", cameraErrorColours);
+    }
     if ((action === "rgb" || action === "classification") && cloud) {
       cloud.material.activeAttributeName = action === "rgb" ? "rgba" : "classification";
       select(["rgb", "classification"], action);
@@ -193,8 +249,68 @@ const start = () => {
     if (action === "orbit") { viewer.setControls(viewer.orbitControls); select(["earth", "orbit"], "orbit"); }
     if (action === "edl") { viewer.setEDLEnabled(!viewer.getEDLEnabled()); event.target.classList.toggle("is-selected", viewer.getEDLEnabled()); }
     if (action === "fullscreen") { document.fullscreenElement ? document.exitFullscreen() : root.requestFullscreen(); }
-  });
-  root.querySelector('[data-action="size"]').addEventListener("input", event => { if (cloud) cloud.material.size = Number(event.target.value); });
+   });
+   root.querySelector('[data-action="size"]').addEventListener("input", event => { if (cloud) cloud.material.size = Number(event.target.value); });
+   /* Höhenfilter: ein Regler mit zwei Knöpfen (unten/oben) von tiefstem bis höchstem Punkt; alles ausserhalb wird über eine
+      unsichtbare Potree-Clipbox ausgeblendet. Die Box wird nur in scene.volumes geführt (nicht in
+      der three.js-Szene), damit sie weder sichtbar noch per Maus verschiebbar ist. */
+   const clipMin = root.querySelector('[data-action="clip-min"]');
+   const clipMax = root.querySelector('[data-action="clip-max"]');
+   const clipFill = root.querySelector('.sam-potree-range-fill');
+   let heightBounds = null;
+   let clipVolume = null;
+   const sliderHeight = value => heightBounds.min[2] + (heightBounds.max[2] - heightBounds.min[2]) * Number(value) / 1000;
+   const applyHeightClip = changed => {
+     if (!heightBounds) return;
+     let low = Number(clipMin.value);
+     let high = Number(clipMax.value);
+     /* Die Knöpfe dürfen sich nicht überholen: der bewegte Knopf bleibt am anderen stehen. */
+     if (low > high) {
+       if (changed === clipMax) { clipMax.value = low; high = low; } else { clipMin.value = high; low = high; }
+     }
+     clipFill.style.left = `calc(7px + (100% - 14px) * ${low / 1000})`;
+     clipFill.style.width = `calc((100% - 14px) * ${(high - low) / 1000})`;
+     /* Liegen beide Knöpfe ganz rechts, muss der untere greifbar bleiben. */
+     clipMin.style.zIndex = low > 990 ? "2" : "1";
+     clipMax.style.zIndex = low > 990 ? "1" : "2";
+     const zLow = sliderHeight(low);
+     const zHigh = sliderHeight(high);
+     root.querySelector('[data-clip-label="min"]').textContent = zLow.toFixed(2);
+     root.querySelector('[data-clip-label="max"]').textContent = zHigh.toFixed(2);
+     const active = low > 0 || high < 1000;
+     if (!clipVolume) {
+       clipVolume = new Potree.BoxVolume();
+       clipVolume.visible = false;
+       viewer.scene.volumes.push(clipVolume);
+     }
+     const [minX, minY] = heightBounds.min;
+     const [maxX, maxY] = heightBounds.max;
+     const margin = Math.max(maxX - minX, maxY - minY, 1);
+     clipVolume.position.set((minX + maxX) / 2, (minY + maxY) / 2, (zLow + zHigh) / 2);
+     clipVolume.scale.set(maxX - minX + margin, maxY - minY + margin, Math.max(zHigh - zLow, 1e-4));
+     clipVolume.updateMatrixWorld();
+     clipVolume.clip = active;
+     viewer.setClipTask(active ? Potree.ClipTask.SHOW_INSIDE : Potree.ClipTask.NONE);
+   };
+   const initHeightClip = metadata => {
+     const position = (metadata.attributes || []).find(attribute => attribute.name === "position");
+     const bounds = position && Array.isArray(position.min) && Array.isArray(position.max) ? position : metadata.boundingBox;
+     if (!bounds || !Array.isArray(bounds.min) || !Array.isArray(bounds.max)) return;
+     heightBounds = { min: bounds.min.map(Number), max: bounds.max.map(Number) };
+     applyHeightClip(null);
+   };
+   [clipMin, clipMax].forEach(control => control.addEventListener("input", event => applyHeightClip(event.target)));
+   [["camera-size", "cameraSize"]].forEach(([action, key]) => {
+     const control = root.querySelector(`[data-action="${action}"]`);
+     if (control) control.addEventListener("input", event => {
+       if (key === "cameraSize") cameraSize = Number(event.target.value);
+       if (key === "cameraPathWidth") cameraPathWidth = Number(event.target.value);
+       if (key === "cameraPhotoSize") cameraPhotoSize = Number(event.target.value);
+       if (cameraPath) cameraPath.material.linewidth = cameraPathWidth;
+       saveCameraSettings();
+       syncCameraBillboards();
+     });
+   });
   const pageStarted = Date.now();
   let loadAttempts = 0;
   const formatElapsed = seconds => {
@@ -222,10 +338,12 @@ const start = () => {
       viewer.fitToScreen(0.55);
       setTimeout(() => viewer.fitToScreen(0.55), 1500);
       fetch(config.metadata_url, { cache: "no-store" }).then(response => response.json()).then(metadata => {
+        initHeightClip(metadata);
         const count = Number(metadata.points || 0).toLocaleString("de-CH");
         status.textContent = `${config.title}: ${count} Punkte. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`;
       }).catch(() => { status.textContent = `${config.title}. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`; });
       loadMarkers();
+      loadCameras();
     }).catch(error => {
       loadAttempts += 1;
       if (loadAttempts < 3) { setTimeout(pollStatus, 2000); return; }
@@ -255,13 +373,90 @@ const start = () => {
   const colours = { pass: "#26b7ef", control: "#ffb020", disabled: "#6b7c8a", needs_review: "#ff5a5a" };
   const markerObjects = [];
   let markersVisible = true;
-  viewer.addEventListener("update", () => {
-    const camera = viewer.scene.getActiveCamera();
+   const cameraCard = root.querySelector(".sam-potree-camera-card");
+   const cameraLayer = new THREE.Group();
+   const cameraMarkerLayer = new THREE.Group();
+   const cameraPhotoLayer = new THREE.Group();
+   const cameraObjects = [];
+   const cameraPhotos = new Map();
+   const cameraPhotoLoads = new Set();
+   const maxCameraPhotos = 72;
+   let cameraPath = null;
+   let camerasVisible = savedCameraSettings.positions !== false;
+   let cameraPathVisible = false; /* Kamerapfad entfernt */
+   let cameraPhotosVisible = true; /* Foto-Ansicht (Info-Karte) immer verfügbar */
+   let cameraSize = Math.min(.75, Math.max(.25, Math.round((Number(savedCameraSettings.size) || .5) * 4) / 4));
+   let cameraPathWidth = Number(savedCameraSettings.pathWidth) || 1.5;
+   let cameraPhotoSize = Number(savedCameraSettings.photoSize) || 1;
+   let cameraErrorColours = false;
+   let cameraPanorama = false;
+   let cameraSphereTextures = savedCameraSettings.sphereTextures === true;
+   const sphereTextures = new Map();
+   const sphereTextureLoads = new Set();
+   const maxSphereTextures = 48;
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2();
+   cameraLayer.add(cameraMarkerLayer);
+   cameraLayer.add(cameraPhotoLayer);
+   viewer.scene.scene.add(cameraLayer);
+   const saveCameraSettings = () => {
+     try { localStorage.setItem(cameraSettingsKey, JSON.stringify({ positions: camerasVisible, path: cameraPathVisible, photos: cameraPhotosVisible, size: cameraSize, pathWidth: cameraPathWidth, photoSize: cameraPhotoSize, sphereTextures: cameraSphereTextures })); } catch (_error) {}
+   };
+   const syncCameraSettings = () => {
+     cameraMarkerLayer.visible = camerasVisible;
+     cameraPhotoLayer.visible = cameraPhotosVisible;
+     if (cameraPath) cameraPath.visible = cameraPathVisible;
+     [["cameras", camerasVisible], ["camera-path", cameraPathVisible], ["camera-photos", cameraPhotosVisible]].forEach(([action, selected]) => { const control = root.querySelector(`[data-action="${action}"]`); if (control) control.classList.toggle("is-selected", selected); });
+     [["camera-size", cameraSize], ["camera-path-width", cameraPathWidth], ["camera-photo-size", cameraPhotoSize]].forEach(([action, value]) => { const control = root.querySelector(`[data-action="${action}"]`); if (control) control.value = value; });
+   };
+   const textureLoader = new THREE.TextureLoader();
+   const syncCameraBillboards = () => {};
+   const syncSphereTextures = () => {
+     if (!cameraPanorama || !cameraObjects.length) return;
+     const activeCamera = viewer.scene.getActiveCamera();
+     if (!cameraSphereTextures) {
+       for (const item of cameraObjects) {
+         if (item.marker.material.map) { item.marker.material.map = null; item.marker.material.needsUpdate = true; }
+       }
+       return;
+     }
+     const nearest = cameraObjects.map(item => ({ item, distance: activeCamera.position.distanceTo(item.marker.position) }))
+       .sort((a, b) => a.distance - b.distance).slice(0, maxSphereTextures);
+     const wanted = new Set(nearest.map(entry => entry.item.camera.id));
+     for (const item of cameraObjects) {
+       if (!wanted.has(item.camera.id) && item.marker.material.map) {
+         const texture = sphereTextures.get(item.camera.id);
+         item.marker.material.map = null; item.marker.material.needsUpdate = true;
+         if (texture) { texture.dispose(); sphereTextures.delete(item.camera.id); }
+       }
+     }
+     for (const { item } of nearest) {
+       const id = item.camera.id;
+       if (sphereTextures.has(id)) { if (item.marker.material.map !== sphereTextures.get(id)) { item.marker.material.map = sphereTextures.get(id); item.marker.material.color.set(0xffffff); item.marker.material.needsUpdate = true; } continue; }
+       if (sphereTextureLoads.has(id)) continue;
+       sphereTextureLoads.add(id);
+       textureLoader.load(`/api/camera-thumbnail/${encodeURIComponent(id)}?size=640`, texture => {
+         sphereTextureLoads.delete(id);
+         if (!cameraSphereTextures) { texture.dispose(); return; }
+         sphereTextures.set(id, texture);
+         item.marker.material.map = texture; item.marker.material.color.set(0xffffff); item.marker.material.needsUpdate = true;
+       }, undefined, () => sphereTextureLoads.delete(id));
+     }
+   };
+   syncCameraSettings();
+   viewer.addEventListener("update", () => {
+     const camera = viewer.scene.getActiveCamera();
     for (const item of markerObjects) {
       const distance = camera.position.distanceTo(item.sphere.position);
       item.sphere.scale.setScalar(Math.max(0.5, distance * 0.012 / 0.18));
     }
-  });
+     for (const item of cameraObjects) {
+       const distance = camera.position.distanceTo(item.marker.position);
+       item.marker.scale.setScalar(Math.max(0.35 * cameraSize, distance * 0.012 * cameraSize));
+     }
+     syncCameraBillboards();
+     syncSphereTextures();
+   });
   const loadMarkers = async () => {
     if (!config.marker_endpoint) return;
     try {
@@ -296,6 +491,128 @@ const start = () => {
         }
       }
     } catch (error) { console.warn("Marker konnten nicht geladen werden", error); }
+  };
+  const cameraColour = camera => {
+    if (cameraErrorColours && Number.isFinite(camera.mean_reprojection_error)) {
+      const error = Math.min(4, Math.max(0, Number(camera.mean_reprojection_error)));
+      return new THREE.Color().setHSL((1 - error / 4) * .34, .86, .55);
+    }
+    const count = Math.max(1, cameraObjects.length - 1);
+    return new THREE.Color().setHSL((Number(camera.index || 0) / count) * .72, .86, .55);
+  };
+  const updateCameraColours = () => {
+    const pathColours = [];
+    for (const item of cameraObjects) {
+      const colour = cameraColour(item.camera);
+      item.marker.material.color.copy(colour);
+      pathColours.push(colour.r, colour.g, colour.b);
+    }
+    if (cameraPath && cameraPath.geometry.getAttribute("color")) {
+      cameraPath.geometry.setAttribute("color", new THREE.Float32BufferAttribute(pathColours, 3));
+    }
+  };
+   let cameraCardTimer = null;
+   let cameraCardPinned = false;
+   let cameraCardHovered = false;
+   const cameraCardHoldMs = 5000;
+   const armCameraCardTimer = () => {
+     clearTimeout(cameraCardTimer);
+     cameraCardTimer = setTimeout(() => {
+       if (cameraCardHovered) return;
+       cameraCardPinned = false;
+       if (cameraCard) cameraCard.classList.remove("is-open");
+     }, cameraCardHoldMs);
+   };
+   if (cameraCard) {
+     cameraCard.addEventListener("mouseenter", () => { cameraCardHovered = true; clearTimeout(cameraCardTimer); });
+     cameraCard.addEventListener("mouseleave", () => { cameraCardHovered = false; armCameraCardTimer(); });
+   }
+   const showCamera = (camera, includeImage) => {
+     if (!cameraCard || !cameraPhotosVisible) return;
+     /* Ein angeklicktes Foto bleibt 5 s unten rechts stehen; Hover auf andere Marker ersetzt es nicht. */
+     if (!includeImage && cameraCardPinned) return;
+     if (includeImage) cameraCardPinned = true;
+    cameraCard.innerHTML = "";
+    const title = document.createElement("strong");
+    title.textContent = camera.source_name || camera.image_name || "Kamera";
+    cameraCard.append(title);
+    const details = document.createElement("div");
+    const error = Number.isFinite(camera.mean_reprojection_error) ? `${Number(camera.mean_reprojection_error).toFixed(2)} px` : "–";
+    details.textContent = `Aufnahme ${Number(camera.index) + 1} · ${camera.points3d || 0} 3D-Punkte · Reprojektionsfehler ${error}`;
+    cameraCard.append(details);
+    if (includeImage && camera.id) {
+      const imageUrl = `/api/camera-thumbnail/${encodeURIComponent(camera.id)}?size=320`;
+      const image = document.createElement("img");
+      image.alt = camera.source_name || camera.image_name || "Kamerafoto";
+      image.src = imageUrl;
+      image.title = "Klicken: Foto gross öffnen";
+      image.addEventListener("click", () => window.open(imageUrl.replace("size=320", "size=1024"), "_blank", "noopener"));
+      cameraCard.append(image);
+      const link = document.createElement("a");
+      link.href = imageUrl;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = "Foto anzeigen";
+      cameraCard.append(link);
+    }
+    cameraCard.classList.add("is-open");
+    armCameraCardTimer();
+  };
+   const pickCamera = (event, includeImage) => {
+     if (!cameraObjects.length || !camerasVisible || !cameraPhotosVisible) return;
+    const rect = root.getBoundingClientRect();
+    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, viewer.scene.getActiveCamera());
+    const hit = raycaster.intersectObjects(cameraObjects.map(item => item.marker), false)[0];
+    if (hit && hit.object.userData.camera) showCamera(hit.object.userData.camera, includeImage);
+  };
+  const cameraAt = event => {
+    if (!cameraObjects.length || !camerasVisible) return null;
+    const rect = root.getBoundingClientRect();
+    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, viewer.scene.getActiveCamera());
+    const hit = raycaster.intersectObjects(cameraObjects.map(item => item.marker), false)[0];
+    return hit && hit.object.userData.camera ? hit.object.userData.camera : null;
+  };
+  /* Doppelklick auf eine Kameraposition öffnet direkt das zugehörige Foto. */
+  root.querySelector(".sam-potree-area").addEventListener("dblclick", event => {
+    const camera = cameraAt(event);
+    if (!camera || !camera.id) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.open(`/api/camera-thumbnail/${encodeURIComponent(camera.id)}?size=1024`, "_blank", "noopener");
+  }, true);
+  root.querySelector(".sam-potree-area").addEventListener("pointermove", event => pickCamera(event, false));
+  root.querySelector(".sam-potree-area").addEventListener("click", event => pickCamera(event, true));
+  const loadCameras = async () => {
+    if (!config.camera_endpoint || cameraObjects.length) return;
+    try {
+      const response = await fetch(config.camera_endpoint, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const cameras = (payload.cameras || []).filter(camera => Array.isArray(camera.position) && camera.position.length === 3);
+      cameraPanorama = payload.is_panorama === true;
+      const cone = new THREE.ConeGeometry(.65, 1.5, 4);
+      const ball = new THREE.SphereGeometry(.7, 24, 16);
+      const sphereButton = root.querySelector('[data-action="camera-sphere-texture"]');
+      if (sphereButton) sphereButton.style.display = cameraPanorama ? "" : "none";
+      for (const camera of cameras) {
+        const marker = new THREE.Mesh(cameraPanorama ? ball : cone, new THREE.MeshBasicMaterial({ depthTest: true, depthWrite: true }));
+        marker.position.set(...camera.position);
+        const direction = new THREE.Vector3(...(camera.direction || [0, 0, 1]));
+        if (!cameraPanorama && direction.lengthSq() > 0) marker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+        marker.userData.camera = camera;
+         cameraMarkerLayer.add(marker);
+        cameraObjects.push({ camera, marker });
+      }
+       updateCameraColours();
+       const sphereToggle = root.querySelector('[data-action="camera-sphere-texture"]');
+       if (sphereToggle) sphereToggle.classList.toggle("is-selected", cameraSphereTextures);
+       syncCameraSettings();
+       syncCameraBillboards();
+    } catch (error) { console.warn("Kamerapositionen konnten nicht geladen werden", error); }
   };
 };
 start();

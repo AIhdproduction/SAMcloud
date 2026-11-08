@@ -60,9 +60,24 @@ classification:
 acquisition:
   panorama:
     frame_interval_seconds: 1.0
-    cubemap_face_size: 1024
+    # Cubemap face side in px. 1232 = between 1024 and native 1440 (5760 px video):
+    # ~25 % less dense-matching and SAM time than native with similar results.
+    # 0 = native (panorama width / 4); larger values are capped at native.
+    cubemap_face_size: 1232
     supported_image_extensions:
       - .jpg
       - .jpeg
     supported_video_extensions:
       - .mp4
+
+viewer:
+  # Display-only clean-up of the sparse (tie point) cloud; the COLMAP model is not changed.
+  sparse_cleaning:
+    enabled: true
+    min_track_length: 3            # seen in at least 3 images
+    max_reprojection_error: 1.5    # pixels
+    min_triangulation_angle_deg: 3.0
+    max_camera_distance_factor: 2.0  # x 95th percentile of the nearest-camera distance
+    min_neighbors: 4
+    min_points: 1000               # smaller clouds are shown unfiltered
+    min_keep_ratio: 0.2            # never hide more than 80 % (misconfiguration guard)

@@ -19,6 +19,7 @@ from samcloud.app.pages import settings as settings_page
 from samcloud.control_points.repository import save_detections, write_control_points
 from samcloud.engine import pipeline
 from samcloud.engine.run_summary import RunSummary
+from colmap_test_model import write_usable_sparse_model
 from synthetic_scene import clone_detections, make_scene
 
 
@@ -46,7 +47,7 @@ def _fake_run(commands: list[list[str]], cache_states: list[bool] | None = None)
         commands.append(command)
         action = command[1]
         if action == "mapper":
-            _write_text_model(Path(command[command.index("--output_path") + 1]) / "0")
+            write_usable_sparse_model(Path(command[command.index("--output_path") + 1]) / "0")
         elif action == "image_undistorter":
             output = Path(command[command.index("--output_path") + 1])
             (output / "images").mkdir(parents=True, exist_ok=True)

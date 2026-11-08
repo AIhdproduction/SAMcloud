@@ -170,3 +170,58 @@ def test_rate_store_learns_and_persists(tmp_path: Path) -> None:
     assert "foreign_stage" not in clean_store.rates
     assert clean_store.rate("foreign_stage") == 1.0
     assert clean_store.rate("mapping") == pytest.approx(2.45)
+
+
+def test_rate_profiles_are_kept_apart_per_capture_type(tmp_path: Path) -> None:
+    from samcloud.engine.eta import CAPTURE_DEFAULT_RATES
+
+    store_file = tmp_path / "rates.json"
+    store_file.write_text(json.dumps({"rates": {"dense_stereo": 28.8}}), encoding="utf-8")  # old mixed block
+    drone = RateStore(store_file, alpha=0.5, profile="drone_gps")
+    pano = RateStore(store_file, alpha=0.5, profile="panorama_360")
+    assert drone.rate("dense_stereo") == CAPTURE_DEFAULT_RATES["drone_gps"]["dense_stereo"]
+    assert pano.rate("dense_stereo") == CAPTURE_DEFAULT_RATES["panorama_360"]["dense_stereo"]
+
+    pano.update("dense_stereo", 100.0, 1.0)
+    pano.save()
+    drone.save()
+
+    data = json.loads(store_file.read_text(encoding="utf-8"))
+    assert data["profiles"]["panorama_360"]["dense_stereo"] == pytest.approx((38.0 + 100.0) / 2)
+    assert data["profiles"]["drone_gps"]["dense_stereo"] == CAPTURE_DEFAULT_RATES["drone_gps"]["dense_stereo"]
+    assert RateStore(store_file, profile="drone_gps").rate("dense_stereo") == CAPTURE_DEFAULT_RATES["drone_gps"]["dense_stereo"]
+    assert RateStore(store_file, profile="panorama_360").rate("dense_stereo") == pytest.approx(69.0)
+
+
+def test_panorama_matching_units_skip_pairs_inside_one_panorama() -> None:
+    assert stage_units("matching", images=1350, matching="exhaustive", faces_per_frame=6) == 1350 * 1349 / 2 - 225 * 15
+    assert stage_units("matching", images=3000, matching="sequential", sequential_overlap=60) == 3000 * 60
+
+
+def test_estimator_plan_follows_capture_type_and_class_set() -> None:
+    from argparse import Namespace
+
+    from samcloud.engine.pipeline import _build_estimator
+
+    config = {"dense_reconstruction": {"max_image_size": 1024}, "alignment": {"matching_strategy": "auto"}}
+    common = dict(control_points_mode="none", stop_after_alignment=False, geometry_refinement="1")
+    indoor = _build_estimator(Namespace(capture_type="panorama_360", class_set="indoor", depth_model="large", **common),
+                              1350, config, resume=False)
+    drone = _build_estimator(Namespace(capture_type="drone_gps", class_set="outdoor", depth_model="large", **common),
+                             291, config, resume=False)
+
+    indoor_keys = [stage.name for stage in indoor.stages]
+    drone_keys = [stage.name for stage in drone.stages]
+    assert {"depth_prior", "surface_fusion"} <= set(indoor_keys) and "plane_fill" not in indoor_keys
+    from samcloud.engine.pipeline import _fusion_rebuilds_cloud
+
+    replaced = _fusion_rebuilds_cloud(Namespace(capture_type="panorama_360", class_set="indoor", depth_model="large"))
+    # extract mode replaces fill and cleaning; snap mode (default) needs both before fusion
+    assert bool({"depth_fill", "point_cleaning"} & set(indoor_keys)) is not replaced
+    classic = _build_estimator(Namespace(capture_type="panorama_360", class_set="indoor", depth_model="large",
+                                         surface_fusion="0", **common), 1350, config, resume=False)
+    assert {"depth_prior", "point_cleaning", "depth_fill"} <= {stage.name for stage in classic.stages}
+    assert "point_cleaning" in drone_keys and not {"depth_prior", "depth_fill", "plane_fill"} & set(drone_keys)
+    assert indoor.rates.profile == "panorama_360" and drone.rates.profile == "drone_gps"
+    matching_units = next(stage.units for stage in indoor.stages if stage.name == "matching")
+    assert matching_units == 1350 * 1349 / 2 - 225 * 15

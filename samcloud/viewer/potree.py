@@ -16,6 +16,7 @@ import numpy as np
 
 from samcloud.core.paths import PROJECT_ROOT
 from samcloud.viewer.preview import _ply_header_size, _read_ply_header, _source_path
+from samcloud.viewer.sparse_filter import FILTER_VERSION, load_clean_sparse_points, sparse_cleaning_settings
 
 POTREE_CONVERTER = PROJECT_ROOT / "tools" / "PotreeConverter" / "PotreeConverter.exe"
 POTREE_LIBRARY = PROJECT_ROOT / "assets" / "potree" / "build" / "potree" / "potree.js"
@@ -58,12 +59,8 @@ def write_viewer_las(path: Path, xyz: np.ndarray, rgb: np.ndarray, classes: np.n
 
 
 def _sparse_points(source: Path) -> tuple[np.ndarray, np.ndarray, None]:
-    import pycolmap
-
-    reconstruction = pycolmap.Reconstruction(source.parent)
-    points = list(reconstruction.points3D.values())
-    xyz = np.asarray([point.xyz for point in points], dtype=float).reshape(-1, 3)
-    rgb = np.asarray([point.color for point in points], dtype=np.uint8).reshape(-1, 3)
+    """Sparse tie points for display, with stray points removed (model stays untouched)."""
+    xyz, rgb = load_clean_sparse_points(source)
     return xyz, rgb, None
 
 
@@ -106,6 +103,8 @@ def _potree_paths(project_directory: Path, kind: str) -> tuple[Path, Path, Path,
         "source": str(source), "size": source.stat().st_size, "mtime_ns": source.stat().st_mtime_ns,
         "encoding": "BROTLI",
     }
+    if kind == "sparse":
+        signature["sparse_filter"] = {"version": FILTER_VERSION, **sparse_cleaning_settings()}
     return source, output, viewer_root / f"{kind}.json", signature
 
 

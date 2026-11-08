@@ -7,8 +7,11 @@ features:
   max_num_features: 16384
   estimate_affine_shape: false
   domain_size_pooling: false
+  panorama_peak_threshold: 0.003
+  panorama_edge_threshold: 20
 
 alignment:
+  gravity_align_panorama: true
   matching_strategy: auto
   spatial_max_num_neighbors: 50
   spatial_max_distance_m: 200
@@ -45,8 +48,141 @@ dense_reconstruction:
   num_iterations: 3
   gpu_index: 0
   output: fused.ply
+  # PatchMatch overrides (empty = COLMAP defaults). Loosening window_radius /
+  # filter_min_ncc / min_num_pixels produced many stray points on test_home
+  # (2026-11-06); textureless walls are filled by plane_fill below instead.
+  patch_match: {}
   fusion:
     min_num_pixels: 5
     max_reproj_error: 1.0
     max_depth_error: 0.005
     max_normal_error: 10
+  # Remove points the depth maps prove to float in free space (all capture
+  # types, before SAM): removed when >= min_free_views cameras reliably see a
+  # surface behind the point and they outnumber the cameras measuring it.
+  point_cleaning:
+    enabled: true
+    free_space_margin: 0.05
+    support_tolerance: 0.01
+    min_free_views: 3
+    free_ratio: 1.0
+  # Indoor class set only (never outdoor/drone), needs the Depth-Anything-V2
+  # prior: pixels COLMAP left empty are back-projected with the aligned prior
+  # and kept only when >= min_agreeing_views neighbouring views agree within
+  # tolerance and no COLMAP depth sees a surface behind them (depth_fill.py).
+  # Replaces the plane grid fill below (Domenic, 2026-11-07).
+  depth_fill:
+    enabled: true
+    stride: 2
+    neighbors: 8
+    tolerance: 0.03
+    min_baseline_m: 0.3     # confirming views stand >= 30 cm away (real parallax, not the next video frame)
+    max_depth: 4.0          # Depth-Anything gets less exact with distance; far areas come from closer views
+    max_incidence_deg: 65   # skip surfaces seen at a grazing angle (tilted wedges near floor and ceiling)
+    min_agreeing_views: 2
+    min_agree_ratio: 0.6
+    edge_tolerance: 0.02
+    spacing_m: 0.01
+    exclude_classes: [window]
+  # Surface fusion (indoor, step 6, switchable per project): all depth maps go into
+  # one truncated signed distance field (TSDF) on the GPU. COLMAP depth weighs
+  # geometric_weight; Depth-Anything fills textureless gaps only where, fitted per
+  # image tile, it agrees with COLMAP (prior_agree_tolerance) and near measured
+  # tiles (prior_reach_tiles). Space a camera looks through is carved empty.
+  # mode extract: the cloud is rebuilt from the field's zero level - one point
+  # layer like a mesh, spacing ~voxel_m; colour and SAM class are voted per voxel.
+  # This replaces depth_fill and point_cleaning for indoor runs.
+  # plane_classes are then fitted with planes (ceiling/floor horizontal, walls
+  # vertical) and points within plane_snap_m put onto them: one ceiling height.
+  surface_fusion:
+    enabled: true
+    mode: snap              # snap: keep the filled points and pull them onto the merged surface (extract: rebuild from the field, experimental)
+    voxel_m: 0.015
+    truncation_m: 0.20      # wider than the spread between views on textureless walls (Depth-Anything only)
+    geometric_weight: 10.0
+    prior_weight: 1.0
+    min_weight: 2.0         # 2 Depth-Anything views or 1 measured view
+    max_prior_depth: 4.0
+    prior_tiles: 8
+    prior_agree_tolerance: 0.02
+    prior_reach_tiles: 3
+    max_incidence_deg: 70
+    exclude_classes: [window]
+    plane_classes: [ceiling, floor, wall]
+    plane_snap_m: 0.04
+    plane_merge_m: {ceiling: 0.25, floor: 0.10}  # several ceiling levels closer than this become one height
+    clip_to_levels: true    # with one floor and one ceiling height: remove points below the floor or above the ceiling
+    plane_min_points: 5000  # about 0.5 m2 of surface at 1 cm spacing
+    min_neighbors: 30       # remove haze: fewer than 30 points in the surrounding 9 cm cube (1 cm spacing)
+    neighbor_cell_m: 0.03
+    neighbor_passes: 2
+    # Visibility (GPU, COLMAP depth only; replaces point_cleaning while fusion is on):
+    # a point that >= 2 cameras look through more often than cameras confirm it is removed.
+    visibility_check: true
+    visibility_margin_m: 0.03
+    visibility_margin_rel: 0.01
+    visibility_min_through: 2
+    wall_min_seen_views: 3    # a wall plane whose points (median) fewer views see is a wall behind a wall -> removed
+    point_min_seen_views: 2   # a point fewer cameras see ...
+    point_hidden_views: 10    # ... but hidden behind a nearer surface in 10+ views (behind wall/ceiling) is removed
+    # Walls: only the building's two main directions, snapped along their measured length;
+    # parallel copies facing the same way within 20 cm become one wall.
+    plane_manhattan: true
+    plane_manhattan_deg: 4.0
+    plane_duplicate_m: 0.20
+    # Class coherence for the large classes (no wall points on the sofa and vice versa).
+    class_coherence: true
+    class_coherence_classes: [wall, ceiling, floor, furniture, door, window, unknown]
+    class_min_share: 0.2
+    class_majority_share: 0.5
+  # Grid fill of floor/ceiling/wall planes, disabled: looked artificial.
+  # floor/ceiling/wall planes (fitted to measured points of that class) are
+  # filled on a fill_spacing_m grid. rule sam_plane_free_space (Domenic,
+  # 2026-11-07): a 3 cm cell is filled when >= min_support_views cameras see
+  # it unoccluded with the plane's SAM class, those are >= min_class_ratio of
+  # all cameras seeing it, and no camera measures a surface behind it. Gaps
+  # up to max_gap_m inside a plane are candidates. rule depth instead also
+  # requires depth hits (almost nothing on white walls).
+  plane_fill:
+    enabled: false
+    rule: sam_plane_free_space
+    classes: [floor, ceiling, wall]
+    fill_spacing_m: 0.01
+    verify_cell_m: 0.03
+    region_cell_m: 0.05
+    max_gap_m: 1.5
+    min_class_ratio: 0.6
+    max_planes: 24
+    min_plane_share: 0.01
+    min_support_views: 3
+    max_depth_error: 0.02
+    free_space_margin: 0.05
+    max_free_space_violations: 0
+    max_view_angle_deg: 75
+    max_normal_error_deg: 25
+    max_candidates: 6000000
+  # Separate settings per capture type; never shared implicitly.
+  capture_profiles:
+    drone_gps:
+      patch_match: {}
+      fusion: {}
+      point_cleaning: {}
+      depth_fill: {}
+      surface_fusion: {}
+      plane_fill: {}
+    camera:
+      patch_match: {}
+      fusion: {}
+      point_cleaning: {}
+      depth_fill: {}
+      surface_fusion: {}
+      plane_fill: {}
+    panorama_360:
+      # window_step 2: 2.1x faster PatchMatch, depth within 0.16 % (median) of step 1 and
+      # 3 % more measured pixels (test_home bench 2026-11-08, 40 views, 1440 px)
+      patch_match: {window_step: 2}
+      fusion: {}
+      point_cleaning: {}
+      depth_fill: {}
+      surface_fusion: {}
+      plane_fill: {}

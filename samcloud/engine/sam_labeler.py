@@ -131,6 +131,36 @@ class RawHeadSAM3SemanticPredictor(SAM3SemanticPredictor):
     """Return SAM3's raw semantic heads at the original tile resolution."""
 
     mask_query_chunk_size = 32
+    # False: return the heads at mask resolution; the caller fuses prompts into
+    # classes there and upsamples only the class maps (much less GPU memory/time).
+    full_resolution = True
+    # Text prompts per grounding pass. The image backbone runs once per tile;
+    # many prompts (Nomivox presets: ~160) in one pass exhaust a 24 GB GPU.
+    prompt_batch = 32
+
+    def _inference_features(self, features, bboxes=None, labels=None, text: list[str] | None = None):
+        if bboxes is not None or text is None or len(text) <= self.prompt_batch:
+            return super()._inference_features(features, bboxes, labels, text=text)
+        if self.model.names != text:
+            self.model.set_classes(text=text)
+        keys = ("pred_logits", "pred_masks", "semantic_seg", "presence_logit_dec", "pred_boxes")
+        chunks = []
+        for start in range(0, len(text), self.prompt_batch):
+            stop = min(start + self.prompt_batch, len(text))
+            outputs = self.model.forward_grounding(
+                backbone_out=features,
+                text_ids=torch.arange(start, stop, device=self.device, dtype=torch.long),
+                geometric_prompt=self._get_dummy_prompt(stop - start),
+            )
+            chunks.append({key: outputs[key] for key in keys if key in outputs})
+        merged = {}
+        for key in chunks[0]:
+            parts = [chunk[key] for chunk in chunks]
+            if key == "presence_logit_dec":
+                merged[key] = torch.cat([part.reshape(-1) for part in parts])
+            else:
+                merged[key] = torch.cat(parts, dim=0)
+        return merged
 
     def postprocess(self, preds, img, orig_imgs):
         required_keys = ("pred_logits", "pred_masks", "semantic_seg", "presence_logit_dec")
@@ -169,30 +199,27 @@ class RawHeadSAM3SemanticPredictor(SAM3SemanticPredictor):
         if not isinstance(orig_imgs, list):
             raise RuntimeError("SAM3 raw-head predictor expected a list of original tile images")
         tile_h, tile_w = orig_imgs[0].shape[:2]
+        if not self.full_resolution:
+            tile_h, tile_w = mask_h, mask_w
         query_threshold = self.query_threshold
         conf_scores = pred_logits.sigmoid().squeeze(-1)
+        retained = conf_scores >= query_threshold
+        retained_query_counts = [int(count) for count in retained.sum(dim=1).tolist()]
         inst_agg = torch.zeros((nc, tile_h, tile_w), dtype=torch.float32, device=pred_masks.device)
-        retained_query_counts = []
-        for class_index in range(nc):
-            retained = conf_scores[class_index] >= query_threshold
-            retained_scores = conf_scores[class_index, retained]
-            retained_query_counts.append(int(retained_scores.numel()))
-            class_agg = inst_agg[class_index]
-            for start in range(0, retained_scores.numel(), self.mask_query_chunk_size):
-                stop = start + self.mask_query_chunk_size
-                mask_logits = pred_masks[class_index, retained][start:stop]
-                mask_probs_chunk = F.interpolate(
-                    mask_logits[:, None].float(),
-                    (tile_h, tile_w),
-                    mode="bilinear",
-                ).sigmoid()[:, 0]
-                chunk_agg = aggregate_instances(
-                    mask_probs_chunk[None],
-                    retained_scores[start:stop][None],
-                    query_threshold,
-                )[0]
-                class_agg = torch.maximum(class_agg, chunk_agg)
-            inst_agg[class_index] = class_agg
+        # Equation 1 of SegEarth-OV3 (max over retained, score-weighted query masks)
+        # is evaluated at mask resolution and upsampled once per prompt. Upsampling
+        # every retained query first costs minutes per tile with ~160 prompts.
+        for start in range(0, nc, self.mask_query_chunk_size):
+            stop = min(start + self.mask_query_chunk_size, nc)
+            keep = retained[start:stop]
+            weighted = pred_masks[start:stop].float().sigmoid() * conf_scores[start:stop, :, None, None]
+            weighted = weighted.masked_fill(~keep[..., None, None], 0.0)
+            low_res = weighted.max(dim=1).values
+            if (tile_h, tile_w) == (mask_h, mask_w):
+                inst_agg[start:stop] = low_res
+            else:
+                inst_agg[start:stop] = F.interpolate(low_res[:, None], (tile_h, tile_w), mode="bilinear")[:, 0]
+            del weighted, low_res
         semantic = F.interpolate(semantic_seg.float(), (tile_h, tile_w), mode="bilinear").squeeze(1)
         return [_RawHeadResult(
             inst_agg,
@@ -203,15 +230,68 @@ class RawHeadSAM3SemanticPredictor(SAM3SemanticPredictor):
         )]
 
 
+def effective_tile_size(width, height, tile_size):
+    """Use one tile for images up to 1.5x a tile (1024 or 1440 px cubemap faces).
+
+    SAM3 runs at a 644 px canvas anyway; splitting a 1024 px face into four
+    1008 px tiles costs four passes for almost identical content.
+    """
+    longest = max(int(width), int(height))
+    return longest if longest <= 1.5 * int(tile_size) else int(tile_size)
+
+
+def resolve_prompts(class_names, prompts=None):
+    """Return the SAM3 text prompts per class, in class-id order.
+
+    Class names stay the identity of a class (summaries, LAS export); prompts
+    are only what SAM3 reads. An entry is either one prompt string or a list
+    of prompts (Nomivox style); each prompt is sent to SAM3 on its own and the
+    class keeps the best of them. Never join synonyms into one long
+    comma-separated prompt: that pushes SAM3's presence score towards zero.
+    """
+    if prompts is None:
+        return list(class_names)
+    prompts = list(prompts)
+    if len(prompts) != len(class_names):
+        raise ValueError(
+            f"{len(prompts)} prompts for {len(class_names)} classes; both lists must have the same order and length"
+        )
+    for entry in prompts:
+        if not isinstance(entry, str) and (not entry or not all(isinstance(item, str) for item in entry)):
+            raise ValueError("every class needs a prompt string or a non-empty list of prompt strings")
+    return prompts
+
+
+def flatten_prompts(prompts):
+    """Flatten per-class prompts; returns (flat prompt list, owning class index per prompt)."""
+    flat, owner = [], []
+    for class_index, entry in enumerate(prompts):
+        items = [entry] if isinstance(entry, str) else list(entry)
+        flat.extend(items)
+        owner.extend([class_index] * len(items))
+    return flat, np.asarray(owner, dtype=np.int64)
+
+
+def reduce_prompt_scores(scores, owner, num_classes):
+    """Max-pool per-prompt score maps (P, H, W) into per-class maps (C, H, W)."""
+    if scores.shape[0] == num_classes and np.array_equal(owner, np.arange(num_classes)):
+        return scores
+    index = torch.as_tensor(owner, device=scores.device)
+    return torch.stack([scores[index == class_index].amax(dim=0) for class_index in range(num_classes)])
+
+
 class SemanticLabeler:
     def __init__(self, class_names, unknown_id=0,
                  model_path=Path(__file__).resolve().parents[2] / "models" / "sam3.pt", conf=0.4,
-                 tile_size=1008, min_overlap_frac=0.2):
+                 tile_size=1008, min_overlap_frac=0.2, prompts=None):
         """
         class_names: list of class names in class-id order, class-id 0 is
         reserved for "unknown/background" and must NOT be in this list.
+        prompts: optional SAM3 text prompts, same order and length as class_names.
         """
         self.class_names = class_names
+        self.prompts = resolve_prompts(class_names, prompts)
+        self._flat_prompts, self._prompt_owner = flatten_prompts(self.prompts)
         self.unknown_id = unknown_id
         self.conf = conf
         self.tile_size = tile_size
@@ -237,7 +317,7 @@ class SemanticLabeler:
         # SAM3SemanticPredictor accepts text, not prompt. A single inference
         # preserves the prompt-to-class mapping in result.boxes.cls and avoids
         # re-encoding the tile once per class.
-        result = self.predictor(source=tile_img, text=self.class_names, verbose=False)[0]
+        result = self.predictor(source=tile_img, text=self._flat_prompts, verbose=False)[0]
         if result.masks is None or len(result.masks) == 0:
             return raster, best_conf
 
@@ -246,7 +326,10 @@ class SemanticLabeler:
 
         masks = result.masks.data.cpu().numpy()
         confs = result.boxes.conf.cpu().numpy()
-        class_ids = result.boxes.cls.cpu().numpy().astype(np.int64) + 1
+        prompt_ids = result.boxes.cls.cpu().numpy().astype(np.int64)
+        valid = (prompt_ids >= 0) & (prompt_ids < len(self._prompt_owner))
+        class_ids = np.zeros_like(prompt_ids)
+        class_ids[valid] = self._prompt_owner[prompt_ids[valid]] + 1
 
         for mask, conf, class_idx in zip(masks, confs, class_ids):
             if not 1 <= class_idx <= len(self.class_names):
@@ -272,7 +355,7 @@ class SemanticLabeler:
 
         raster = np.zeros((height, width), dtype=np.uint8)
         best_conf = np.zeros((height, width), dtype=np.float32)
-        for x0, y0, x1, y1 in iter_tiles(width, height, self.tile_size, self.min_overlap_frac):
+        for x0, y0, x1, y1 in iter_tiles(width, height, effective_tile_size(width, height, self.tile_size), self.min_overlap_frac):
             tile_img = img[y0:y1, x0:x1]
             tile_raster, tile_conf = self._label_tile(tile_img)
 
@@ -294,8 +377,17 @@ class HeadFusionLabeler:
 
     def __init__(self, class_names, unknown_id=0,
                  model_path=Path(__file__).resolve().parents[2] / "models" / "sam3.pt", conf=0.4,
-                 tile_size=1008, min_overlap_frac=0.2, query_threshold=0.4):
+                 tile_size=1008, min_overlap_frac=0.2, query_threshold=0.4, prompts=None,
+                 fuse_at_mask_resolution=True):
         self.class_names = class_names
+        self.prompts = resolve_prompts(class_names, prompts)
+        self._flat_prompts, self._prompt_owner = flatten_prompts(self.prompts)
+        # Fuse heads and pool prompts into classes at SAM3's mask resolution and
+        # upsample only the class maps. The full-resolution path upsamples every
+        # prompt first (~160 x tile pixels, several GB): on an RTX 4090 that took
+        # 6.5 s instead of 2.0 s per 1440 px image and fragmented GPU memory so
+        # later images got slower still; classes agree to 99.85 %.
+        self.fuse_at_mask_resolution = bool(fuse_at_mask_resolution)
         self.unknown_id = unknown_id
         self.conf = conf
         self.tile_size = tile_size
@@ -311,6 +403,7 @@ class HeadFusionLabeler:
         )
         self.predictor = RawHeadSAM3SemanticPredictor(overrides=overrides)
         self.predictor.query_threshold = query_threshold
+        self.predictor.full_resolution = not self.fuse_at_mask_resolution
         # A raw-head result is intentionally not a rendered Ultralytics Results
         # object, so prediction output must remain disabled even if user settings enable it.
         self.predictor.args.save = False
@@ -321,10 +414,15 @@ class HeadFusionLabeler:
 
     def _score_tile(self, tile_img):
         """Run SAM3 once and return final per-class probabilities for one tile."""
-        result = self.predictor(source=tile_img, text=self.class_names, verbose=False)[0]
+        result = self.predictor(source=tile_img, text=self._flat_prompts, verbose=False)[0]
         sem_probs = result.semantic_seg.sigmoid()
         fused = fuse_heads(sem_probs, result.inst_agg)
-        final_probs = apply_presence_gate(fused, result.presence_scores)
+        final_probs = reduce_prompt_scores(
+            apply_presence_gate(fused, result.presence_scores), self._prompt_owner, len(self.class_names)
+        )
+        tile_h, tile_w = tile_img.shape[:2]
+        if tuple(final_probs.shape[1:]) != (tile_h, tile_w):
+            final_probs = F.interpolate(final_probs[None].float(), (tile_h, tile_w), mode="bilinear")[0]
         self.last_tile_diagnostics = {
             "raw_shapes": result.raw_shapes,
             "presence_scores": result.presence_scores.detach().float().cpu().numpy(),
@@ -346,8 +444,14 @@ class HeadFusionLabeler:
         height, width = img.shape[:2]
         return img, width, height
 
-    def score_points(self, image_path, u, v, image=None):
-        """Return final probabilities for in-bounds integer (u, v) image coordinates."""
+    def score_points(self, image_path, u, v, image=None, label_threshold=None):
+        """Return final probabilities for in-bounds integer (u, v) image coordinates.
+
+        With ``label_threshold`` a per-pixel label raster is returned as well:
+        ``(scores, labels)`` where ``labels`` holds the winning 1-based class id
+        wherever its probability reaches the threshold and 0 elsewhere (also in
+        tiles without projected points, which are not run through SAM3).
+        """
         if image is None:
             image, width, height = self.load_image(image_path)
         else:
@@ -360,7 +464,11 @@ class HeadFusionLabeler:
             raise ValueError("score_points requires in-bounds pixel coordinates")
 
         scores = np.zeros((u.size, len(self.class_names)), dtype=np.float32)
-        for x0, y0, x1, y1 in iter_tiles(width, height, self.tile_size, self.min_overlap_frac):
+        labels = best = None
+        if label_threshold is not None:
+            labels = np.zeros((height, width), dtype=np.uint8)
+            best = np.zeros((height, width), dtype=np.float32)
+        for x0, y0, x1, y1 in iter_tiles(width, height, effective_tile_size(width, height, self.tile_size), self.min_overlap_frac):
             selected = (u >= x0) & (u < x1) & (v >= y0) & (v < y1)
             if not np.any(selected):
                 continue
@@ -369,4 +477,15 @@ class HeadFusionLabeler:
             local_v = torch.from_numpy(v[selected] - y0).to(final_probs.device)
             sampled = final_probs[:, local_v, local_u].transpose(0, 1)
             scores[selected] = np.maximum(scores[selected], sampled.detach().float().cpu().numpy())
+            if labels is not None:
+                tile_best, tile_class = final_probs.max(dim=0)
+                tile_best = tile_best.detach().float().cpu().numpy()
+                tile_class = tile_class.detach().cpu().numpy().astype(np.uint8) + 1
+                tile_class[tile_best < float(label_threshold)] = 0
+                region_best = best[y0:y1, x0:x1]
+                better = tile_best > region_best
+                labels[y0:y1, x0:x1][better] = tile_class[better]
+                region_best[better] = tile_best[better]
+        if labels is not None:
+            return scores, labels
         return scores

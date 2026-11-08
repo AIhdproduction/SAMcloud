@@ -72,6 +72,7 @@ def test_build_estimator_plan_for_automatic_full_run() -> None:
         "dense_stereo",
         "dense_fusion",
         "classification",
+        "point_cleaning",
         "geometry_refinement",
     ]
     assert [name for name, _ in estimator.plan] == expected_full
@@ -83,6 +84,7 @@ def test_build_estimator_plan_for_automatic_full_run() -> None:
         "dense_stereo",
         "dense_fusion",
         "classification",
+        "point_cleaning",
         "geometry_refinement",
     ]
     assert [name for name, _ in estimator_resumed.plan] == expected_resumed
@@ -117,3 +119,12 @@ def test_tracker_finish_persists_learned_rates(tmp_path: Path) -> None:
     data = json.loads(rates_file.read_text(encoding="utf-8"))
     expected_rate = (1 - 0.4) * 1.9 + 0.4 * 4.0
     assert data["rates"]["mapping"] == pytest.approx(expected_rate)
+
+
+def test_idle_phase_shows_no_remaining_time() -> None:
+    progress = {
+        "stage_eta_seconds": 300.0,
+        "stages": [{"key": "plane_fill", "status": "pending", "percent": 0, "expected_seconds": 700}],
+    }
+    assert home._phase_text("refinement", {"refinement": "not_started"}, progress) == "0%"
+    assert home._phase_text("refinement", {"refinement": "running"}, progress).startswith("0% · ")

@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from samcloud.core.sparse_model import sparse_points_path
+
 
 def _format_duration(seconds: float | None) -> str:
     if seconds is None:
@@ -100,9 +102,7 @@ class RunSummary:
         classified_path = Path(self.settings["classified_output"])
         classification_data = _read_json(Path(self.settings["classification_summary"]))
         dense_path = self.outdir / "dense" / "fused.ply"
-        sparse_path = self.outdir / "sparse" / "0_geo" / "points3D.bin"
-        if not sparse_path.exists():
-            sparse_path = self.outdir / "sparse" / "0" / "points3D.bin"
+        sparse_path = sparse_points_path(self.outdir / "sparse") or self.outdir / "sparse" / "0_geo" / "points3D.bin"
         dense_points = _point_count_from_ply(dense_path)
         classified_points = _point_count_from_ply(classified_path)
         class_counts = classification_data.get("class_counts", {})

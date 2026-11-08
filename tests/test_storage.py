@@ -24,6 +24,7 @@ from samcloud.core.storage import (
 )
 from samcloud.engine import pipeline
 from samcloud.viewer import potree
+from colmap_test_model import write_usable_sparse_model
 from synthetic_scene import make_scene
 
 
@@ -197,7 +198,7 @@ def test_pipeline_compacts_only_after_completion(tmp_path: Path, monkeypatch: py
     def fake_run(command, **_kwargs):
         action = command[1]
         if action == "mapper":
-            _model(Path(command[command.index("--output_path") + 1]) / "0")
+            write_usable_sparse_model(Path(command[command.index("--output_path") + 1]) / "0")
         elif action == "image_undistorter":
             output = Path(command[command.index("--output_path") + 1])
             (output / "images").mkdir(parents=True, exist_ok=True)
@@ -263,6 +264,7 @@ def test_storage_settings_accepts_flat_project_and_settings_forms() -> None:
         "keep_control_point_inputs": True,
         "keep_classification_inputs": False,
         "keep_refinement_inputs": True,
+        "keep_processing_cache": False,  # default off: the cache needs a lot of disk space
     }
     flat = {
         "keep_control_point_inputs": 1,
@@ -272,3 +274,72 @@ def test_storage_settings_accepts_flat_project_and_settings_forms() -> None:
     assert storage_settings(flat) == expected
     assert storage_settings({"storage": expected}) == expected
     assert storage_settings({"settings": {"storage": expected}}) == expected
+
+
+def test_processing_cache_keeps_sam_result_and_links_dense_workspace(tmp_path: Path) -> None:
+    from samcloud.engine.processing_cache import (
+        SAM_CLOUD, SAM_SCORES, cache_directory, load_manifest, save_after_sam, save_depth_priors,
+    )
+
+    project = tmp_path / "project"
+    dense = project / "products" / "dense"
+    for relative in ("stereo/depth_maps/front/a.jpg.geometric.bin", "images/front/a.jpg", "sparse/cameras.bin",
+                     "sam_labels/front/a.jpg.png", "fused.ply", "fused.ply.vis"):
+        (dense / relative).parent.mkdir(parents=True, exist_ok=True)
+        (dense / relative).write_bytes(b"data")
+    raw = project / "products" / "classified" / "classified_raw.ply"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"sam result")
+    scores = raw.with_name("classified_scores.npz")
+    scores.write_bytes(b"scores")
+
+    manifest = save_after_sam(project, dense, raw, scores, class_set="indoor", capture_type="panorama_360")
+    raw.write_bytes(b"rewritten by step 6")  # step 6 rewrites in place; the cache keeps the SAM state
+    for relative in ("stereo", "sam_labels"):
+        import shutil
+        shutil.rmtree(dense / relative)  # normal clean-up after step 6
+
+    cache = cache_directory(project)
+    assert (cache / SAM_CLOUD).read_bytes() == b"sam result"
+    assert (cache / SAM_SCORES).read_bytes() == b"scores"
+    assert (cache / "dense" / "stereo" / "depth_maps" / "front" / "a.jpg.geometric.bin").read_bytes() == b"data"
+    assert (cache / "dense" / "sam_labels" / "front" / "a.jpg.png").is_file()
+    assert manifest["class_set"] == "indoor" and load_manifest(project) is not None
+
+    (dense / "depth_prior" / "front").mkdir(parents=True)
+    (dense / "depth_prior" / "front" / "a.jpg.npy").write_bytes(b"prior")
+    assert save_depth_priors(project, dense) == 1
+    assert load_manifest(project)["depth_prior"] is True
+
+
+def test_processing_cache_is_not_usable_without_depth_maps(tmp_path: Path) -> None:
+    from samcloud.engine.processing_cache import load_manifest, save_after_sam
+
+    project = tmp_path / "project"
+    dense = project / "products" / "dense"
+    (dense / "sparse").mkdir(parents=True)
+    raw = tmp_path / "raw.ply"
+    raw.write_bytes(b"x")
+    save_after_sam(project, dense, raw, None, class_set="indoor", capture_type="panorama_360")
+
+    assert load_manifest(project) is None
+
+
+def test_fast_vertex_reader_matches_plyfile(tmp_path) -> None:
+    import numpy as np
+    from plyfile import PlyData, PlyElement
+
+    from samcloud.engine.ply_io import read_vertex_array
+
+    data = np.zeros(1234, dtype=[("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"), ("green", "u1"),
+                                 ("blue", "u1"), ("scalar_class", "u1")])
+    data["x"] = np.linspace(-3.3, 7.1, 1234)
+    data["scalar_class"] = np.arange(1234) % 20
+    path = tmp_path / "cloud.ply"
+    PlyData([PlyElement.describe(data, "vertex")], text=False).write(str(path))
+    fast = read_vertex_array(path)
+    assert fast.dtype.names == data.dtype.names
+    assert all((fast[name] == data[name]).all() for name in data.dtype.names)
+    path.write_bytes(path.read_bytes())  # file not held open: can be rewritten in place
+    PlyData([PlyElement.describe(data, "vertex")], text=True).write(str(tmp_path / "ascii.ply"))
+    assert (read_vertex_array(tmp_path / "ascii.ply")["x"] == data["x"]).all()  # plyfile fallback

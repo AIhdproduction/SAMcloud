@@ -17,12 +17,42 @@ else:
     from sam_labeler import HeadFusionLabeler, SemanticLabeler
 
 
-def build_image_to_points_index(vis_list):
-    """Invert the per-point visibility list into image_id -> [point_idx, ...]."""
+def mvs_image_order(sparse_dir, image_ids=None):
+    """Image ids in the order COLMAP's MVS model indexes them in fused.ply.vis.
+
+    COLMAP numbers dense views by ``Reconstruction::RegImageIds()``: frame by
+    frame, and inside a frame sensor by sensor. For rigs (360 cubemaps: six
+    faces per panorama) that is NOT ascending image id; for plain photo and
+    drone projects (one image per frame) both orders coincide. Falls back to
+    sorted ids when the binary model cannot be read.
+    """
+    try:
+        import pycolmap
+
+        order = [int(image_id) for image_id in pycolmap.Reconstruction(str(sparse_dir)).reg_image_ids()]
+        if order:
+            return order
+    except Exception as error:  # noqa: BLE001 - fall back, but say so
+        print(f"WARNING: could not read MVS image order from {sparse_dir}: {error}; using sorted image ids")
+    return sorted(int(image_id) for image_id in (image_ids or []))
+
+
+def build_image_to_points_index(vis_list, image_order=None):
+    """Invert the per-point visibility list into image_id -> [point_idx, ...].
+
+    COLMAP's fused.ply.vis stores image *indices* of its MVS model, i.e.
+    positions in ``mvs_image_order`` - not image ids. Pass that order to
+    translate them; without it the raw indices are returned unchanged.
+    """
+    lookup = [int(image_id) for image_id in image_order] if image_order is not None else None
     index = defaultdict(list)
-    for point_idx, image_ids in enumerate(vis_list):
-        for img_id in image_ids:
-            index[int(img_id)].append(point_idx)
+    for point_idx, image_indices in enumerate(vis_list):
+        for image_index in image_indices:
+            image_index = int(image_index)
+            if lookup is None:
+                index[image_index].append(point_idx)
+            elif image_index < len(lookup):
+                index[lookup[image_index]].append(point_idx)
     return index
 
 
@@ -125,7 +155,116 @@ def save_score_summary(path, scores, view_counts, final_class):
     )
 
 
-def project_points(xyz, point_indices, image, camera, image_size):
+DEPTH_CHECK_DEFAULTS = {"radius": 16, "step": 4, "abs_tol": 0.05, "rel_tol": 0.03, "min_neighbors": 3}
+
+
+def depth_consistent_probs(point_probs, ui, vi, z, labels, depth, background_threshold, settings=None):
+    """Remove class votes that the view's depth map contradicts (in place); returns stats.
+
+    For every point the winning class ``c`` of this view is checked against the
+    depth of the surrounding pixels that SAM labels ``c`` (a (2r+1)^2 window,
+    every ``step`` pixels). When the point lies clearly in front of or behind
+    that region (``abs_tol`` + ``rel_tol`` x depth), the mask belongs to another
+    surface - e.g. a sofa mask that spills over the wall behind it - and ``c`` is
+    removed from this view's vote, so the next class can win. A point the depth
+    map shows hidden behind a nearer surface in this view gets no vote at all.
+    Pixels without measured depth (textureless walls) are not judged.
+    """
+    settings = {**DEPTH_CHECK_DEFAULTS, **(settings or {})}
+    stats = {"checked": 0, "class_removed": 0, "occluded": 0}
+    if depth is None or labels is None or not len(ui):
+        return stats
+    height, width = labels.shape[:2]
+    dh, dw = depth.shape[:2]
+    sx, sy = dw / width, dh / height
+    tol = float(settings["abs_tol"]) + float(settings["rel_tol"]) * z
+    own = depth[np.clip((vi * sy).astype(np.int64), 0, dh - 1), np.clip((ui * sx).astype(np.int64), 0, dw - 1)]
+    occluded = (own > 0) & (own < z - tol)
+    point_probs[occluded] = 0.0
+    stats["occluded"] = int(occluded.sum())
+    best = point_probs.argmax(axis=1)
+    active = np.flatnonzero(~occluded & (point_probs.max(axis=1) >= background_threshold))
+    if not len(active):
+        return stats
+    r, step = int(settings["radius"]), max(1, int(settings["step"]))
+    offsets = np.arange(-r, r + 1, step)
+    dx, dy = np.meshgrid(offsets, offsets)
+    dx, dy = dx.ravel(), dy.ravel()
+    for start in range(0, len(active), 200_000):
+        idx = active[start:start + 200_000]
+        nu = np.clip(ui[idx, None] + dx[None, :], 0, width - 1)
+        nv = np.clip(vi[idx, None] + dy[None, :], 0, height - 1)
+        same = labels[nv, nu] == (best[idx, None] + 1)
+        nd = depth[np.clip((nv * sy).astype(np.int64), 0, dh - 1), np.clip((nu * sx).astype(np.int64), 0, dw - 1)]
+        same &= nd > 0
+        count = same.sum(axis=1)
+        judged = count >= int(settings["min_neighbors"])
+        if not judged.any():
+            continue
+        values = np.where(same[judged], nd[judged], np.nan)
+        reference = np.nanmedian(values, axis=1)
+        wrong = np.abs(z[idx[judged]] - reference) > tol[idx[judged]]
+        rows = idx[judged][wrong]
+        point_probs[rows, best[rows]] = 0.0
+        stats["checked"] += int(judged.sum())
+        stats["class_removed"] += int(wrong.sum())
+    return stats
+
+
+def refine_labels_with_depth(labels, depth, settings=None, num_classes=None, device=None):
+    """Move SAM class edges onto the depth edges of the view's depth map; returns (labels, changed pixels).
+
+    A labelled pixel whose depth does not match the depth of the surrounding
+    pixels of its own class (window and tolerances as in
+    :func:`depth_consistent_probs`) belongs to another surface: it takes the
+    majority class of the neighbours at its own depth (at least
+    ``min_neighbors`` of them), otherwise it keeps its label. Pixels without
+    depth are left as SAM labelled them.
+    """
+    import torch
+
+    settings = {**DEPTH_CHECK_DEFAULTS, **(settings or {})}
+    if depth is None or labels is None:
+        return labels, 0
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    lab = torch.as_tensor(np.asarray(labels).astype(np.int64), device=device)
+    height, width = lab.shape
+    d = torch.as_tensor(np.asarray(depth, dtype=np.float32), device=device)
+    if d.shape != lab.shape:
+        d = torch.nn.functional.interpolate(d[None, None], size=(height, width), mode="nearest")[0, 0]
+    classes = int(num_classes or int(lab.max()) + 1)
+    r, step = int(settings["radius"]), max(1, int(settings["step"]))
+    offsets = [(dy, dx) for dy in range(-r, r + 1, step) for dx in range(-r, r + 1, step)]
+    lab_p = torch.nn.functional.pad(lab[None, None].float(), (r, r, r, r), mode="replicate")[0, 0].long()
+    d_p = torch.nn.functional.pad(d[None, None], (r, r, r, r), mode="replicate")[0, 0]
+    out = lab.clone()
+    changed = 0
+    minimum = int(settings["min_neighbors"])
+    band = max(16, int(2_000_000 // max(width * len(offsets) // 64, 1)))
+    for y0 in range(0, height, band):
+        y1 = min(height, y0 + band)
+        own_l, own_d = lab[y0:y1], d[y0:y1]
+        tol = float(settings["abs_tol"]) + float(settings["rel_tol"]) * own_d
+        nl = torch.stack([lab_p[y0 + r + dy:y1 + r + dy, r + dx:r + dx + width] for dy, dx in offsets])
+        nd = torch.stack([d_p[y0 + r + dy:y1 + r + dy, r + dx:r + dx + width] for dy, dx in offsets])
+        same = (nl == own_l[None]) & (nd > 0)
+        count = same.sum(dim=0)
+        reference = torch.nanmedian(torch.where(same, nd, torch.full_like(nd, float("nan"))), dim=0).values
+        wrong = (own_l > 0) & (own_d > 0) & (count >= minimum) & ((own_d - reference).abs() > tol)
+        if not bool(wrong.any()):
+            continue
+        at_depth = (nd - own_d[None]).abs() <= tol[None]
+        at_depth &= (nd > 0) & (nl > 0)
+        votes = torch.zeros((classes, y1 - y0, width), dtype=torch.int16, device=device)
+        votes.scatter_add_(0, nl.clamp(0, classes - 1), at_depth.to(torch.int16))
+        best_count, best_class = votes.max(dim=0)
+        take = wrong & (best_count >= minimum) & (best_class != own_l)
+        out[y0:y1][take] = best_class[take]
+        changed += int(take.sum())
+    return out.cpu().numpy().astype(np.uint8), changed
+
+
+def project_points(xyz, point_indices, image, camera, image_size, return_depth=False):
     """Project COLMAP-visible points and retain those in front of the camera and image bounds."""
     fx, fy, cx, cy = camera.intrinsics()
     pts_world = xyz[point_indices]
@@ -140,7 +279,39 @@ def project_points(xyz, point_indices, image, camera, image_size):
     ui = np.round(u).astype(np.int64)
     vi = np.round(v).astype(np.int64)
     in_bounds = valid & (ui >= 0) & (ui < width) & (vi >= 0) & (vi < height)
+    if return_depth:
+        return point_indices[in_bounds], ui[in_bounds], vi[in_bounds], z[in_bounds]
     return point_indices[in_bounds], ui[in_bounds], vi[in_bounds]
+
+
+def read_depth_map(dense_dir, image_name):
+    """COLMAP geometric depth map of one dense view (0 = no depth) or None."""
+    if not dense_dir:
+        return None
+    path = Path(dense_dir) / "stereo" / "depth_maps" / f"{image_name}.geometric.bin"
+    if not path.is_file():
+        return None
+    try:
+        from samcloud.colmap.plane_fill import read_colmap_array
+    except ImportError:  # run as a plain script
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from samcloud.colmap.plane_fill import read_colmap_array
+    return read_colmap_array(path)
+
+
+def label_raster_path(labels_dir, image_name):
+    """Path of the stored SAM label raster for one dense view (PNG, 0 = no class)."""
+    return Path(labels_dir) / f"{image_name}.png"
+
+
+def save_label_raster(labels_dir, image_name, labels):
+    """Store one view's per-pixel SAM class ids for the class-confirmed plane fill."""
+    import cv2
+
+    path = label_raster_path(labels_dir, image_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), np.asarray(labels, dtype=np.uint8)):
+        raise RuntimeError(f"Could not write label raster {path}")
 
 
 def parse_threshold_sweep(value):
@@ -163,7 +334,8 @@ def _class_counts(final_class, class_names):
     }
 
 
-def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path):
+def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
+                     prompts=None):
     """Classify with SegEarth-OV3 fusion and class-weighted 3D voting."""
     thresholds = [args.background_threshold]
     for threshold in parse_threshold_sweep(args.threshold_sweep):
@@ -189,23 +361,48 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         tile_size=args.tile_size,
         min_overlap_frac=args.tile_min_overlap,
         query_threshold=args.query_threshold,
+        prompts=prompts,
     )
 
+    depth_check = bool(getattr(args, "depth_check", 1))
+    depth_stats = {"checked": 0, "class_removed": 0, "occluded": 0, "raster_pixels_moved": 0}
+    depth_settings = {"abs_tol": getattr(args, "depth_check_abs", 0.05), "rel_tol": getattr(args, "depth_check_rel", 0.03)}
     write_progress(progress_path, 0, len(image_items))
     for processed, (img_id, listed_points) in enumerate(tqdm(image_items, desc="images"), start=1):
         image = images[img_id]
         image_path = Path(args.images_dir) / image.name
         image_pixels, width, height = labeler.load_image(image_path)
         point_indices = np.array(listed_points, dtype=np.int64)
-        sel_points, ui, vi = project_points(
-            xyz, point_indices, image, cameras[image.camera_id], (width, height)
+        sel_points, ui, vi, z = project_points(
+            xyz, point_indices, image, cameras[image.camera_id], (width, height), return_depth=True
         )
         if len(sel_points):
-            point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels)
+            depth = read_depth_map(args.dense_dir, image.name) if depth_check else None
+            if args.labels_dir or depth is not None:
+                point_probs, labels = labeler.score_points(
+                    image_path, ui, vi, image=image_pixels, label_threshold=args.background_threshold
+                )
+                if depth is not None:  # class edges onto the depth edges (raster, then the points)
+                    labels, changed = refine_labels_with_depth(labels, depth, depth_settings, len(class_names) + 1)
+                    depth_stats["raster_pixels_moved"] += changed
+                if args.labels_dir:
+                    save_label_raster(args.labels_dir, image.name, labels)
+                if depth is not None:
+                    view_stats = depth_consistent_probs(point_probs, ui, vi, z, labels, depth,
+                                                        args.background_threshold, depth_settings)
+                    for key, value in view_stats.items():
+                        depth_stats[key] += value
+            else:
+                point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels)
             for threshold, (scores, view_counts) in vote_states.items():
                 accumulate_weighted_votes(scores, view_counts, sel_points, point_probs, threshold)
         write_progress(progress_path, processed, len(image_items))
 
+    if depth_check:
+        print("      Depth check: "
+              f"{depth_stats['checked']:,} point views judged, {depth_stats['class_removed']:,} class votes removed "
+              f"(mask of another surface), {depth_stats['occluded']:,} hidden point views skipped, "
+              f"{depth_stats['raster_pixels_moved']:,} label pixels moved onto depth edges")
     output_path = Path(args.out)
     threshold_summary = {}
     main_final_class = None
@@ -243,6 +440,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                     "background_threshold": args.background_threshold,
                     "query_threshold": args.query_threshold,
                     "threshold_sweep": threshold_summary,
+                    "depth_check": depth_stats if depth_check else None,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -277,8 +475,14 @@ def main():
     ap.add_argument("--threshold-sweep", default="",
                     help="optional comma-separated SegEarth-OV3 background thresholds")
     ap.add_argument("--out", required=True, help="output PLY path")
+    ap.add_argument("--labels-dir", default=None,
+                    help="optional folder for per-view SAM label rasters (PNG), used by the indoor plane fill")
     ap.add_argument("--progress-file", default=None, help="dashboard progress JSON path")
     ap.add_argument("--summary-file", default=None, help="JSON file for the processing summary")
+    ap.add_argument("--depth-check", type=int, choices=(0, 1), default=1,
+                    help="drop class votes the view's COLMAP depth map contradicts (mask of another surface)")
+    ap.add_argument("--depth-check-abs", type=float, default=0.05, help="depth check tolerance, absolute part")
+    ap.add_argument("--depth-check-rel", type=float, default=0.03, help="depth check tolerance, relative part")
     ap.add_argument("--scores-out", default=None,
                     help="optional NPZ output with SegEarth-OV3 top-two confidence scores")
     args = ap.parse_args()
@@ -296,6 +500,10 @@ def main():
     with open(args.classes_json, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     class_names = cfg[args.class_set]
+    # Optional short SAM3 prompts per class set (same order as the class names).
+    prompts = cfg.get("prompts", {}).get(args.class_set) or None
+    if prompts is not None and len(prompts) != len(class_names):
+        sys.exit(f"classes.json: prompts.{args.class_set} must list one prompt per class ({len(class_names)})")
     unknown_id = cfg.get("unknown_class_id", 0)
 
     print(f"[1/5] Loading dense point cloud from {dense_dir / 'fused.ply'}")
@@ -314,7 +522,8 @@ def main():
     cameras, images = load_model(model_dir)
 
     print("[4/5] Building image -> point index and running SAM3 per image")
-    img_to_points = build_image_to_points_index(vis_list)
+    image_order = mvs_image_order(dense_dir / "sparse", images.keys())
+    img_to_points = build_image_to_points_index(vis_list, image_order)
     num_classes = len(class_names)
     progress_path = Path(args.progress_file) if args.progress_file else None
     image_items = [
@@ -324,7 +533,8 @@ def main():
     ]
     if args.mode == "segearth_ov3":
         run_segearth_ov3(
-            args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path
+            args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
+            prompts=prompts,
         )
         return
 
@@ -335,7 +545,8 @@ def main():
     vote_counts = np.zeros((xyz.shape[0], num_classes), dtype=np.uint16)
 
     labeler = SemanticLabeler(class_names, unknown_id=unknown_id,
-                               tile_size=args.tile_size, min_overlap_frac=args.tile_min_overlap)
+                               tile_size=args.tile_size, min_overlap_frac=args.tile_min_overlap,
+                               prompts=prompts)
 
     write_progress(progress_path, 0, len(image_items))
 
@@ -346,6 +557,8 @@ def main():
 
         image_path = Path(args.images_dir) / image.name
         raster = labeler.label_image(image_path)  # (H, W) uint8, 0 = unknown
+        if args.labels_dir:
+            save_label_raster(args.labels_dir, image.name, raster)
 
         point_indices = np.array(point_indices, dtype=np.int64)
         pts_world = xyz[point_indices]
