@@ -116,6 +116,30 @@ def save_georeference(path: Path, georeference: dict[str, Any]) -> None:
     destination.write_text(json.dumps(georeference, indent=2) + "\n", encoding="utf-8")
 
 
+def ensure_project_georeference(project_directory: Path) -> Path | None:
+    """Return products/georeference.json, creating it from the GPS reference for projects processed before it existed.
+
+    Shared by the LAS export and the DXF point source so both place a LOCAL GPS-aligned cloud identically.
+    """
+    from samcloud.core.storage import ensure_text_model
+
+    products = Path(project_directory) / "products"
+    georeference = products / "georeference.json"
+    if georeference.is_file():
+        return georeference
+    gps_ref = products / "gps_ref.txt"
+    model_dir = products / "dense" / "sparse_txt"
+    binary_model = products / "dense" / "sparse"
+    if not gps_ref.is_file() or not binary_model.is_dir():
+        return None
+    ensure_text_model(binary_model, model_dir)
+    try:
+        save_georeference(georeference, fit_enu_to_ecef(model_dir, gps_ref))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Could not create GPS georeference for LAS export: {error}") from error
+    return georeference
+
+
 def load_georeference(path: Path) -> dict[str, Any]:
     """Load and minimally validate a saved ENU-to-ECEF georeference."""
     source = Path(path)

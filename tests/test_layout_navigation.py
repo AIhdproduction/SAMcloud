@@ -32,7 +32,7 @@ from nicegui import ui
 from nicegui.testing.user import User
 from nicegui.testing.user_simulation import user_simulation
 
-from samcloud.app.dxf_controller import DXF_NO_LAS_HINT, DXF_NO_PROJECT_HINT, dxf_unavailable_reason
+from samcloud.app.dxf_controller import DXF_NOT_CLASSIFIED_HINT, DXF_NO_PROJECT_HINT, dxf_unavailable_reason
 from samcloud.app.pages import home as home_page
 from samcloud.app.state import state as app_state
 from samcloud.dxf.state import DxfProjectState, save_state
@@ -53,6 +53,14 @@ def _write_classified_las(project: Path) -> Path:
     las.parent.mkdir(parents=True, exist_ok=True)
     las.write_bytes(b"")
     return las
+
+
+def _write_classified_ply(project: Path) -> Path:
+    # Classification writes classified.ply; readiness only checks that it exists.
+    ply = project / "products" / "classified" / "classified.ply"
+    ply.parent.mkdir(parents=True, exist_ok=True)
+    ply.write_bytes(b"")
+    return ply
 
 
 def _shell_route() -> None:
@@ -85,13 +93,21 @@ def _tooltip_text(element: Any) -> str | None:
     return texts[0] if texts else None
 
 
-def test_dxf_readiness_requires_project_and_las(tmp_path: Path) -> None:
+def test_dxf_readiness_requires_project_and_classified_cloud(tmp_path: Path) -> None:
     assert dxf_unavailable_reason(None) == DXF_NO_PROJECT_HINT
     project = _make_project(tmp_path)
-    assert dxf_unavailable_reason(project) == DXF_NO_LAS_HINT
-    assert layout._navigation_disabled_reason("/dxf", project) == DXF_NO_LAS_HINT
+    assert dxf_unavailable_reason(project) == DXF_NOT_CLASSIFIED_HINT
+    assert layout._navigation_disabled_reason("/dxf", project) == DXF_NOT_CLASSIFIED_HINT
     assert layout._navigation_disabled_reason("/dense", project) is None
     _write_classified_las(project)
+    assert dxf_unavailable_reason(project) is None
+    assert layout._navigation_disabled_reason("/dxf", project) is None
+
+
+def test_dxf_readiness_accepts_classified_ply_without_las(tmp_path: Path) -> None:
+    project = _make_project(tmp_path)
+    _write_classified_ply(project)
+    assert not (project / "products" / "classified" / "classified.las").exists()
     assert dxf_unavailable_reason(project) is None
     assert layout._navigation_disabled_reason("/dxf", project) is None
 
@@ -102,7 +118,7 @@ def test_dxf_readiness_accepts_existing_chosen_las(tmp_path: Path) -> None:
     dxf_state = DxfProjectState()
     dxf_state.view["las_path"] = str(external)
     save_state(project, dxf_state)
-    assert dxf_unavailable_reason(project) == DXF_NO_LAS_HINT, "a chosen LAS that does not exist must not count"
+    assert dxf_unavailable_reason(project) == DXF_NOT_CLASSIFIED_HINT, "a chosen LAS that does not exist must not count"
     external.parent.mkdir(parents=True)
     external.write_bytes(b"")
     assert dxf_unavailable_reason(project) is None
@@ -119,7 +135,7 @@ async def test_dxf_nav_hidden_without_project(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.anyio
-async def test_dxf_nav_disabled_without_classified_las(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_dxf_nav_disabled_without_classified_cloud(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = _make_project(tmp_path)
     monkeypatch.setattr(app_state, "active_project_directory", project)
     async with user_simulation(root=lambda: None) as user:
@@ -128,7 +144,7 @@ async def test_dxf_nav_disabled_without_classified_las(tmp_path: Path, monkeypat
         button = _single(user, "nav-dxf")
         assert button.props.get("disable") is True
         assert "sam-nav-disabled" in button.classes
-        assert _tooltip_text(button) == DXF_NO_LAS_HINT
+        assert _tooltip_text(button) == DXF_NOT_CLASSIFIED_HINT
         dense = _single(user, "nav-dense")
         assert not dense.props.get("disable")
         user.find(marker="nav-dxf").click()
@@ -150,7 +166,7 @@ async def test_dxf_nav_enabled_with_classified_las(tmp_path: Path, monkeypatch: 
 
 
 @pytest.mark.anyio
-async def test_home_dxf_button_disabled_without_classified_las(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_home_dxf_button_disabled_without_classified_cloud(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = _make_project(tmp_path)
     monkeypatch.setattr(app_state, "active_project_directory", project)
     async with user_simulation(root=lambda: None) as user:
@@ -158,14 +174,42 @@ async def test_home_dxf_button_disabled_without_classified_las(tmp_path: Path, m
         await user.open("/workflow")
         button = _single(user, "home-open-dxf")
         assert button.props.get("disable") is True
-        assert _tooltip_text(button) == DXF_NO_LAS_HINT
-        await user.should_see(DXF_NO_LAS_HINT, marker="home-dxf-status")
+        assert _tooltip_text(button) == DXF_NOT_CLASSIFIED_HINT
+        await user.should_see(DXF_NOT_CLASSIFIED_HINT, marker="home-dxf-status")
 
 
 @pytest.mark.anyio
 async def test_home_dxf_button_enabled_with_classified_las(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = _make_project(tmp_path)
     _write_classified_las(project)
+    monkeypatch.setattr(app_state, "active_project_directory", project)
+    async with user_simulation(root=lambda: None) as user:
+        ui.page("/workflow")(_workflow_route)
+        await user.open("/workflow")
+        button = _single(user, "home-open-dxf")
+        assert not button.props.get("disable")
+        await user.should_not_see(marker="home-dxf-status")
+        await user.should_see("optional")
+
+
+@pytest.mark.anyio
+async def test_dxf_nav_enabled_with_only_classified_ply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = _make_project(tmp_path)
+    _write_classified_ply(project)
+    monkeypatch.setattr(app_state, "active_project_directory", project)
+    async with user_simulation(root=lambda: None) as user:
+        ui.page("/shell")(_shell_route)
+        await user.open("/shell")
+        button = _single(user, "nav-dxf")
+        assert not button.props.get("disable")
+        assert "sam-nav-disabled" not in button.classes
+        assert _tooltip_text(button) is None
+
+
+@pytest.mark.anyio
+async def test_home_dxf_button_enabled_with_only_classified_ply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = _make_project(tmp_path)
+    _write_classified_ply(project)
     monkeypatch.setattr(app_state, "active_project_directory", project)
     async with user_simulation(root=lambda: None) as user:
         ui.page("/workflow")(_workflow_route)

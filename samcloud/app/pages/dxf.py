@@ -58,10 +58,9 @@ def render() -> None:
             ui.label("Open a project before exporting DXF plans.").classes("sam-muted")
             return
         if dxf_unavailable_reason(project_directory) is not None:
-            expected = Path(project_directory) / "products" / "classified" / "classified.las"
             ui.label(
-                "DXF export needs a classified LAS file, but this project has none yet. "
-                f"Export a classified LAS first (expected at {expected}), then open this page again."
+                "DXF export needs a classified point cloud, but this project has none yet. "
+                "Classify the point cloud first, then open this page again."
             ).classes("sam-muted").mark("dxf-not-ready")
             return
         controller = DxfPageController(project_directory, runner=runner_for(project_directory))
@@ -147,12 +146,15 @@ class DxfPage:
                 ui.label(f"Mode: {controller.mode}").classes("sam-muted").props("data-testid=mode")
                 ui.label(f"Model profile: {controller.profile or 'not set'}").classes("sam-muted")
                 ui.label(f"Scale: {controller.scale_status}").classes("sam-muted")
+            ui.label(f"Point source: {controller.source_label}").classes("sam-muted text-sm").mark("point-source")
             with ui.row().classes("items-end w-full gap-3"):
                 current = controller.las_path
-                las_input = ui.input("LAS file", value=str(current) if current else "").classes("flex-1").props("outlined dense").mark("las-path")
+                # The classified PLY is used automatically; the field is only for choosing another LAS file.
+                shown = "" if current is None or controller.source_is_ply else str(current)
+                las_input = ui.input("LAS file", value=shown, placeholder="Optional: another classified .las file").classes("flex-1").props("outlined dense").mark("las-path")
                 ui.button("Use this LAS", icon="check", on_click=lambda: self.choose_las(las_input.value)).props("flat no-caps")
                 if controller.las_is_custom:
-                    ui.button("Project LAS", icon="restart_alt", on_click=lambda: self.choose_las(None)).props("flat no-caps")
+                    ui.button("Project point cloud", icon="restart_alt", on_click=lambda: self.choose_las(None)).props("flat no-caps")
                 mode_options = {"auto": "Automatic", "indoor": "Indoor", "outdoor": "Outdoor"}
                 ui.select(mode_options, label="Mode", value=controller.state.mode_override or "auto",
                           on_change=lambda event: self.set_mode(event.value)).classes("w-40").props("outlined dense").mark("mode-select")
@@ -160,7 +162,7 @@ class DxfPage:
                     ui.select(list(MODEL_PROFILES), label="Model profile", value=controller.state.profile_name,
                               on_change=lambda event: self.set_profile(event.value)).classes("w-48").props("outlined dense").mark("profile-change")
             if current is None or not current.is_file():
-                _banner("No LAS file found. Export a classified LAS first or choose an existing .las file.", "warning")
+                _banner("No classified point cloud found. Classify the point cloud first or choose an existing .las file.", "warning")
 
     def build_profile_required(self) -> None:
         with ui.card().classes("w-full"):

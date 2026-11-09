@@ -17,7 +17,7 @@ from samcloud.core.configuration import load_yaml
 from samcloud.dxf.config import load_dxf_config
 from samcloud.dxf.job_runner import DxfJobRunner
 from samcloud.dxf.jobs import export_manifest_path
-from samcloud.dxf.las_source import Frame, read_las_header_origin, read_las_header_profile
+from samcloud.dxf.las_source import Frame, is_ply_source, read_las_header_origin, read_las_header_profile
 from samcloud.dxf.layers import load_layer_config
 from samcloud.dxf.levels import Level
 from samcloud.dxf.overlay import composite, render_dxf_rgba
@@ -56,8 +56,8 @@ def _level_from_dict(item: dict[str, Any]) -> Level:
 DXF_NO_PROJECT_HINT = "Open a project first"
 """Shown on disabled DXF entry points while no project is open."""
 
-DXF_NO_LAS_HINT = "Export a classified LAS first"
-"""Shown on disabled DXF entry points while the project has no usable LAS file."""
+DXF_NOT_CLASSIFIED_HINT = "Classify the point cloud first"
+"""Shown on disabled DXF entry points while the project has no classified point cloud (PLY or LAS)."""
 
 
 def classified_las_path(project_dir: Path | str) -> Path | None:
@@ -73,25 +73,44 @@ def classified_las_path(project_dir: Path | str) -> Path | None:
     return None
 
 
+def classified_ply_path(project_dir: Path | str) -> Path | None:
+    """Return products/classified/classified.ply written by the classification step, if it exists."""
+    classified_ply = Path(project_dir) / "products" / "classified" / "classified.ply"
+    return classified_ply if classified_ply.is_file() else None
+
+
 def chosen_las_path(project_dir: Path | str) -> Path | None:
     """Return the LAS file previously chosen on the DXF page (stored in the DXF state), if any."""
     stored = load_state(project_dir).view.get("las_path")
     return Path(str(stored)).resolve() if stored else None
 
 
-def dxf_unavailable_reason(project_dir: Path | str | None) -> str | None:
-    """Explain why DXF export cannot be used yet, or return None when a project and a LAS file are available.
+def project_point_source(project_dir: Path | str) -> Path | None:
+    """Return the project's classified point cloud for DXF: the classified LAS when it exists and is not older than
+    classified.ply, otherwise classified.ply (read directly, no LAS export needed). Existence and mtime checks only.
+    """
+    las = classified_las_path(project_dir)
+    ply = classified_ply_path(project_dir)
+    if las is not None and ply is not None:
+        return las if las.stat().st_mtime_ns >= ply.stat().st_mtime_ns else ply
+    return las or ply
 
-    Cheap by design: only file existence and the small DXF state.json are checked, no LAS data is read.
+
+def dxf_unavailable_reason(project_dir: Path | str | None) -> str | None:
+    """Explain why DXF export cannot be opened yet, or return None once the project has a classified point cloud.
+
+    The DXF entry points become usable as soon as classification produced classified.ply; the LAS export is not
+    needed because the DXF jobs read the PLY directly. Cheap by design: only file existence and the small DXF
+    state.json are checked, no point data is read.
     """
     if project_dir is None:
         return DXF_NO_PROJECT_HINT
     chosen = chosen_las_path(project_dir)
     if chosen is not None and chosen.is_file():
         return None
-    if classified_las_path(project_dir) is not None:
+    if project_point_source(project_dir) is not None:
         return None
-    return DXF_NO_LAS_HINT
+    return DXF_NOT_CLASSIFIED_HINT
 
 
 class DxfPageController:
@@ -173,10 +192,10 @@ class DxfPageController:
 
     @property
     def las_path(self) -> Path | None:
-        """Return the active LAS file path, defaulting to standard project outputs."""
+        """Return the active point source (chosen LAS, classified LAS or classified PLY), defaulting to project outputs."""
         if self._las_path is not None:
             return self._las_path
-        classified = classified_las_path(self.project_dir)
+        classified = project_point_source(self.project_dir)
         if classified is not None:
             return classified
         inputs_dir = self.project_dir / "inputs"
@@ -209,6 +228,24 @@ class DxfPageController:
     def las_is_custom(self) -> bool:
         """True when an explicitly chosen LAS file replaces the project default."""
         return self._las_path is not None
+
+    @property
+    def source_is_ply(self) -> bool:
+        """True when the DXF jobs read the project's classified PLY directly (no LAS export available or newer)."""
+        current = self.las_path
+        return current is not None and is_ply_source(current)
+
+    @property
+    def source_label(self) -> str:
+        """Human-readable description of the point source the DXF jobs read."""
+        current = self.las_path
+        if current is None or not current.is_file():
+            return "no point cloud found"
+        if is_ply_source(current):
+            return f"classified point cloud (PLY, read directly): {current.name}"
+        if self.las_is_custom:
+            return f"chosen LAS: {current.name}"
+        return f"classified LAS: {current.name}"
 
     @property
     def profile(self) -> str | None:

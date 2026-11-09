@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import json
 import logging
+import os
 from pathlib import Path
 import time
 from typing import Any, AsyncIterator
@@ -18,7 +19,7 @@ from nicegui import ui
 from nicegui.testing.user import User
 from nicegui.testing.user_simulation import user_simulation
 
-from dxf_synthetic import write_indoor_building, write_outdoor_scene
+from dxf_synthetic import write_classified_ply_from_las, write_indoor_building, write_outdoor_scene
 from samcloud.app import dxf_controller as controller_module
 from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.pages import dxf as dxf_page
@@ -26,7 +27,10 @@ from samcloud.app.state import state as app_state
 from samcloud.dxf import jobs, pipeline, preview, writer
 from samcloud.dxf.cancel import CancelToken
 from samcloud.dxf.job_runner import DxfJobRunner
-from samcloud.dxf.las_source import Frame
+from samcloud.dxf.las_source import Frame, classified_ply_source, iter_source_chunks, read_las_header_origin, read_las_info
+from samcloud.classification.custom import project_classes_path
+from samcloud.engine.export_las import export_las as export_classified_las
+from samcloud.engine.ply_io import write_classified_ply
 from samcloud.dxf.overlay import composite
 from samcloud.dxf.result import BackgroundImage, DxfPlanResult, LayerStatus, vector_payload, visible_cells, visible_entity_indices
 
@@ -418,20 +422,159 @@ async def test_flurseg_indoor_is_blocked(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 @pytest.mark.anyio
-async def test_dxf_page_without_classified_las_explains_and_starts_nothing(
+async def test_dxf_page_without_classified_cloud_explains_and_starts_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, heavy_calls: list[str]
 ) -> None:
     project = (tmp_path / "NoLas").resolve()
     project.mkdir()
     document = {"project": {"name": "NoLas"}, "workflow": {}}
     (project / "project.samcloud.yml").write_text(yaml.safe_dump(document), encoding="utf-8")
-    assert controller_module.dxf_unavailable_reason(project) == controller_module.DXF_NO_LAS_HINT
+    assert controller_module.dxf_unavailable_reason(project) == controller_module.DXF_NOT_CLASSIFIED_HINT
     async with _dxf_user(project, monkeypatch) as user:
-        await user.should_see("Export a classified LAS first", marker="dxf-not-ready")
+        await user.should_see("Classify the point cloud first", marker="dxf-not-ready")
         await user.should_not_see("Preparation")
         await user.should_not_see(marker="las-path")
+        await user.should_not_see(marker="dxf-export-las")
     assert heavy_calls == []
     assert not (project / "products" / "dxf").exists(), "the not-ready page must not create DXF state or caches"
+    _no_error_logs(caplog)
+
+
+def _make_ply_project(root: Path, name: str, kind: str) -> tuple[Path, Path]:
+    """Create a project holding only products/classified/classified.ply (classification done, LAS never exported).
+
+    The PLY carries exactly the points of the matching LAS fixture, which is written outside the project.
+    """
+    reference = (root / f"{name}_reference" / "classified.las").resolve()
+    mode = "indoor" if kind == "indoor" else "outdoor"
+    if kind == "indoor":
+        write_indoor_building(reference)
+    elif kind == "outdoor":
+        write_outdoor_scene(reference)
+    else:
+        raise ValueError(kind)
+    project = (root / name).resolve()
+    ply = write_classified_ply_from_las(reference, project / "products" / "classified" / "classified.ply", mode=mode, strict=False)
+    document = {"project": {"name": name}, "settings": {"classification": {"class_set": mode, "engine": "sam3"}}, "workflow": {}}
+    (project / "project.samcloud.yml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    return project, ply
+
+
+def _export_las_project(root: Path, name: str, ply: Path, kind: str) -> tuple[Path, Path]:
+    """Create a second project whose classified LAS is written from the PLY by the real LAS export (no PLY kept)."""
+    mode = "indoor" if kind == "indoor" else "outdoor"
+    project = (root / name).resolve()
+    las = project / "products" / "classified" / "classified.las"
+    export_classified_las(ply, las, project_classes_path(project), 100_000, "LOCAL", "LOCAL", mode, None, "sam3")
+    document = {"project": {"name": name}, "settings": {"classification": {"class_set": mode, "engine": "sam3"}}, "workflow": {}}
+    (project / "project.samcloud.yml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    return project, las
+
+
+def _layer_summary(project: Path, level_id: str | None) -> dict[str, tuple[str, int]]:
+    result = DxfPageController(project).cached_result(level_id)
+    assert result is not None
+    return {name: (status.state, status.entity_count) for name, status in result.statuses.items()}
+
+
+@pytest.mark.parametrize("kind", ["outdoor", "indoor"])
+def test_classified_ply_source_matches_las(tmp_path: Path, kind: str) -> None:
+    ply_project, ply = _make_ply_project(tmp_path, f"Ply_{kind}", kind)
+    las_project, las = _export_las_project(tmp_path, f"Las_{kind}", ply, kind)
+    assert not (ply_project / "products" / "classified" / "classified.las").exists()
+
+    las_info = read_las_info(las)
+    ply_info = read_las_info(ply)
+    assert ply_info.point_count == las_info.point_count
+    assert ply_info.class_histogram == las_info.class_histogram
+    assert ply_info.mode == las_info.mode == kind
+    assert ply_info.profile is not None and las_info.profile is not None
+    assert ply_info.profile.profile_name == las_info.profile.profile_name == f"sam3_{kind}"
+    assert ply_info.has_rgb
+    np.testing.assert_allclose(ply_info.bounds_min, las_info.bounds_min, atol=2e-3)
+    np.testing.assert_allclose(ply_info.bounds_max, las_info.bounds_max, atol=2e-3)
+    np.testing.assert_allclose(ply_info.frame.origin, las_info.frame.origin)
+    np.testing.assert_allclose(read_las_header_origin(ply), read_las_header_origin(las))
+
+    las_chunk = next(iter_source_chunks(las, 10_000_000))
+    ply_chunk = next(iter_source_chunks(ply, 10_000_000))
+    np.testing.assert_allclose(np.column_stack((ply_chunk.x, ply_chunk.y, ply_chunk.z)),
+                               np.column_stack((las_chunk.x, las_chunk.y, las_chunk.z)), atol=2e-3)
+    np.testing.assert_array_equal(np.asarray(ply_chunk.classification), np.asarray(las_chunk.classification))
+    np.testing.assert_array_equal(np.asarray(ply_chunk.red), np.asarray(las_chunk.red) // 257 * 257)
+
+    controller = DxfPageController(ply_project)
+    assert controller.las_path == ply.resolve()
+    assert controller.source_is_ply and "PLY" in controller.source_label
+    assert not controller.profile_required and controller.profile == f"sam3_{kind}" and controller.mode == kind
+
+    if kind == "indoor":
+        las_levels = _prepare_indoor(las_project, las)
+        ply_levels = _prepare_indoor(ply_project, ply)
+        assert len(ply_levels) == len(las_levels) == 2
+        _generate(las_project, las, las_levels, kind)
+        _generate(ply_project, ply, ply_levels, kind)
+        pairs = list(zip(las_levels, ply_levels))
+    else:
+        _generate(las_project, las, [None], kind)
+        _generate(ply_project, ply, [None], kind)
+        pairs = [(None, None)]
+    for las_level, ply_level in pairs:
+        las_layers = _layer_summary(las_project, las_level)
+        ply_layers = _layer_summary(ply_project, ply_level)
+        assert ply_layers == las_layers
+        assert any(count > 0 for _state, count in ply_layers.values())
+    assert not DxfPageController(ply_project).is_stale(pairs[0][1])
+
+    target = pairs[0][1]
+    jobs.run_export(ply_project, ply, target, _no_progress, CancelToken(), _LOGGER, mode=kind)
+    manifest = DxfPageController(ply_project).last_export()
+    assert manifest is not None and manifest["audit"] == "passed" and manifest["files"]
+    assert not (ply_project / "products" / "classified" / "classified.las").exists(), "no LAS export may be needed"
+
+
+def test_project_point_source_prefers_newer_las(tmp_path: Path) -> None:
+    project, ply = _make_ply_project(tmp_path, "Choice", "outdoor")
+    assert controller_module.project_point_source(project) == ply
+    las = write_outdoor_scene(project / "products" / "classified" / "classified.las")
+    ply_time = ply.stat().st_mtime_ns
+    os.utime(las, ns=(ply_time + 5_000_000_000, ply_time + 5_000_000_000))
+    assert controller_module.project_point_source(project) == las
+    assert DxfPageController(project).source_label.startswith("classified LAS")
+    os.utime(las, ns=(ply_time - 5_000_000_000, ply_time - 5_000_000_000))
+    assert controller_module.project_point_source(project) == ply
+    assert DxfPageController(project).source_is_ply
+
+
+def test_classified_ply_maps_sentinel_and_unknown_like_las_export(tmp_path: Path) -> None:
+    project = (tmp_path / "Codes").resolve()
+    ply = project / "products" / "classified" / "classified.ply"
+    ply.parent.mkdir(parents=True)
+    xyz = np.column_stack((np.linspace(0.13, 4.71, 4), np.linspace(0.27, 2.93, 4), np.linspace(0.011, 0.093, 4)))
+    write_classified_ply(ply, xyz, np.full((4, 3), 120, dtype=np.uint8), np.array([255, 0, 1, 2], dtype=np.uint8))
+    document = {"project": {"name": "Codes"}, "settings": {"classification": {"class_set": "outdoor", "engine": "sam3"}}, "workflow": {}}
+    (project / "project.samcloud.yml").write_text(yaml.safe_dump(document), encoding="utf-8")
+    source = classified_ply_source(ply)
+    codes = source.profile.codes_for_scalar_classes()
+    chunk = next(iter_source_chunks(ply, 100))
+    assert np.asarray(chunk.classification).tolist() == [0, 1, int(codes[1]), int(codes[2])]
+    np.testing.assert_allclose(np.column_stack((chunk.x, chunk.y, chunk.z)), xyz, atol=1e-6)
+
+
+@pytest.mark.anyio
+async def test_dxf_page_with_only_classified_ply_uses_it_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, heavy_calls: list[str]
+) -> None:
+    project, _ply = _make_ply_project(tmp_path, "PlyOnly", "outdoor")
+    assert controller_module.dxf_unavailable_reason(project) is None
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see("Preparation")
+        await user.should_see("classified point cloud (PLY, read directly)", marker="point-source")
+        await user.should_not_see(marker="profile-required")
+        await user.should_not_see("Export LAS")
+        await user.should_not_see("No classified point cloud found")
+    assert heavy_calls == []
+    assert not (project / "products" / "classified" / "classified.las").exists()
     _no_error_logs(caplog)
 
 

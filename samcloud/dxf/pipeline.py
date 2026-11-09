@@ -15,7 +15,7 @@ import numpy as np
 from samcloud.dxf.cancel import CancelToken, ProgressCallback, check_cancel, report_progress
 from samcloud.dxf.config import DxfExportConfig, load_dxf_config
 from samcloud.dxf.geometry import bridge_collinear, circles_from_clusters, furniture_inserts, opening_entities, opening_specs, points_from_cluster, polygons_from_points, skeleton_lines, tree_entities, wall_lines, wall_polygons
-from samcloud.dxf.las_source import Frame, iter_las_chunks, read_las_header_profile, read_las_info
+from samcloud.dxf.las_source import Frame, iter_source_chunks, read_las_header_profile, read_las_info
 from samcloud.dxf.layers import LayerConfig, LayerDefinition, load_layer_config
 from samcloud.dxf.levels import Level
 from samcloud.dxf.result import BackgroundImage, DxfPlanResult, LayerStatus, result_from_dict, result_to_dict
@@ -364,7 +364,7 @@ def _stream_local_points(
     accumulator = _PointAccumulator(cell_size)
     low, high = _transformed_bounds(frame, bounds_min, bounds_max)
     background = _BackgroundAccumulator(low, high, cell_size)
-    for chunk in iter_las_chunks(path, config.loading.chunk_size, progress=progress, cancel=cancel):
+    for chunk in iter_source_chunks(path, config.loading.chunk_size, progress=progress, cancel=cancel):
         check_cancel(cancel)
         local = frame.to_local(np.column_stack((chunk.x, chunk.y, chunk.z)))
         codes = np.asarray(chunk.classification, dtype=np.uint8)

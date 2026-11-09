@@ -1,4 +1,4 @@
-"""Streaming voxel preview generation for classified LAS files."""
+"""Streaming voxel preview generation for classified LAS files or a project's classified PLY."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import numpy as np
 
 from samcloud.dxf.cancel import CancelToken, ProgressCallback, check_cancel, report_progress
 from samcloud.dxf.config import DxfExportConfig, load_dxf_config
-from samcloud.dxf.las_source import Frame, LasInfo, iter_las_chunks
+from samcloud.dxf.las_source import Frame, LasInfo, is_ply_source, iter_source_chunks, read_las_info
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +52,9 @@ def create_preview(
         raise ValueError("Maximum preview point count must be at least 1")
     source_path = Path(path)
     check_cancel(cancel)
+    if info is None and is_ply_source(source_path):
+        # A classified PLY has no header bounds; they come from one bounded scan.
+        info = read_las_info(source_path, config=settings, cancel=cancel)
     if info is None:
         with laspy.open(source_path) as reader:
             header = reader.header
@@ -86,7 +89,7 @@ def _voxel_samples(
     cancel: CancelToken | None,
 ) -> _VoxelSamples:
     samples = _empty_samples(has_rgb)
-    for chunk in iter_las_chunks(path, chunk_size, progress=progress, cancel=cancel, stage="Voxel-downsampling preview"):
+    for chunk in iter_source_chunks(path, chunk_size, progress=progress, cancel=cancel, stage="Voxel-downsampling preview"):
         check_cancel(cancel)
         original = np.column_stack((chunk.x, chunk.y, chunk.z))
         local = frame.to_local(original)

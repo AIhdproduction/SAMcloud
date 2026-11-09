@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from samcloud.classification.custom import project_classes_path
 from samcloud.core.configuration import load_global_config
 from samcloud.core.storage import ensure_text_model, storage_settings
-from samcloud.pointcloud.georeference import fit_enu_to_ecef, save_georeference
+from samcloud.pointcloud.georeference import ensure_project_georeference
 
 if TYPE_CHECKING:
     from samcloud.app.state import ApplicationState
@@ -330,21 +330,7 @@ class ProcessingManager:
     @staticmethod
     def _ensure_georeference(project_directory: Path) -> Path | None:
         """Create a reusable GPS georeference for projects processed before this feature."""
-        products = project_directory / "products"
-        georeference = products / "georeference.json"
-        if georeference.is_file():
-            return georeference
-        gps_ref = products / "gps_ref.txt"
-        model_dir = products / "dense" / "sparse_txt"
-        binary_model = products / "dense" / "sparse"
-        if not gps_ref.is_file() or not binary_model.is_dir():
-            return None
-        ensure_text_model(binary_model, model_dir)
-        try:
-            save_georeference(georeference, fit_enu_to_ecef(model_dir, gps_ref))
-        except (OSError, ValueError) as error:
-            raise ValueError(f"Could not create GPS georeference for LAS export: {error}") from error
-        return georeference
+        return ensure_project_georeference(project_directory)
 
     def _pipeline_command(self, project_directory: Path, project: dict, mode: str, *, resume_after_control_points: bool = False) -> list[str]:
         settings = project.get("settings", {})

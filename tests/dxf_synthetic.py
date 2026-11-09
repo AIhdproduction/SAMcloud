@@ -112,6 +112,40 @@ def write_classified_las(
     return _write_las(path, np.asarray(xyz, dtype=np.float64), np.asarray(classification, dtype=np.uint8), mode, profile_name)
 
 
+def write_classified_ply_from_las(
+    las_path: Path,
+    ply_path: Path,
+    *,
+    mode: Literal["indoor", "outdoor"] = "outdoor",
+    profile_name: str = "sam3",
+    strict: bool = True,
+) -> Path:
+    """Write the classification step's classified.ply holding the same points, colours and classes as a fixture LAS.
+
+    Cyclone codes are mapped back to scalar class ids of the profile (code 0 -> sentinel 255, code 1 -> unknown 0).
+    With strict=False, codes the profile does not know become unknown (scalar 0) instead of raising.
+    """
+    from samcloud.engine.ply_io import write_classified_ply
+
+    cloud = laspy.read(las_path)
+    classes = json.loads((Path(__file__).parents[1] / "config" / "classes.json").read_text(encoding="utf-8"))
+    profile = flurseg_profile("outdoor") if profile_name == "flurseg" else sam3_profile(mode, classes)
+    codes = profile.codes_for_scalar_classes()
+    scalar_for_code = {int(code): index for index, code in reversed(list(enumerate(codes)))}
+    scalar_for_code[int(profile.point_states["never_classified"])] = 255
+    las_codes = np.asarray(cloud.classification, dtype=np.uint8)
+    missing = sorted(set(np.unique(las_codes).tolist()) - set(scalar_for_code))
+    if missing and strict:
+        raise ValueError(f"Cyclone codes {missing} are not part of the {profile.name} profile")
+    scalar = np.asarray([scalar_for_code.get(int(code), 0) for code in las_codes], dtype=np.uint8)
+    xyz = np.column_stack((cloud.x, cloud.y, cloud.z)).astype(np.float64)
+    rgb = (np.column_stack((cloud.red, cloud.green, cloud.blue)) // 257).astype(np.uint8)
+    destination = Path(ply_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    write_classified_ply(destination, xyz, rgb, scalar)
+    return destination
+
+
 def _write_las(path: Path, xyz: np.ndarray, classification: np.ndarray, mode: str, profile_name: str = "sam3") -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
