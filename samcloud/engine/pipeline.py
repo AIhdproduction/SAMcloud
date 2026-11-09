@@ -1602,7 +1602,7 @@ def _finish_classification(
         if progress:
             progress.begin("geometry_refinement")
         run([sys.executable, str(refine_script), "--input", str(classified_raw), "--output", str(classified_output),
-            "--classes-json", str(args.classes_json), "--class-set", args.class_set,
+            "--classes-json", str(args.classes_json), "--class-set", args.class_set, "--engine", _classification_engine(args),
             "--config", str(PROJECT_ROOT / "config" / "geometry.yml"), "--summary-file", str(report_dir / "geometry_summary.json"),
             *(["--scores", str(classified_scores)] if with_scores else [])], summary=summary, stage="Geometric refinement")
     elif geometry_enabled:
@@ -1618,7 +1618,7 @@ def _finish_classification(
         return
     run([sys.executable, str(Path(__file__).resolve().parent / "export_las.py"), "--input", str(classified_output),
          "--output", str(outdir / "classified.las"), "--classes-json", str(args.classes_json),
-         "--class-set", args.class_set, "--source-crs", args.source_crs, "--target-crs", args.export_crs,
+         "--class-set", args.class_set, "--engine", _classification_engine(args), "--source-crs", args.source_crs, "--target-crs", args.export_crs,
          "--georeference", str(outdir / "georeference.json")], summary=summary, stage="LAS export")
     if progress:
         progress.finish()
@@ -2269,6 +2269,7 @@ def main():
                 "--output", str(classified_output),
                 "--classes-json", str(args.classes_json),
                 "--class-set", args.class_set,
+                "--engine", _classification_engine(args),
                 "--config", str(PROJECT_ROOT / "config" / "geometry.yml"),
                 "--summary-file", str(geometry_summary),
                 *(["--scores", str(classified_scores)]

@@ -693,7 +693,8 @@ def fill_classified_cloud(
     # No memory-mapping: the same file is rewritten below (Windows Errno 22).
     vertex = read_vertex_array(classified_ply)
     points = np.column_stack((vertex["x"], vertex["y"], vertex["z"])).astype(np.float64)
-    classes = np.asarray(vertex["scalar_class"], dtype=np.uint8)
+    classes = np.asarray(vertex["scalar_class"], dtype=np.uint8).copy()
+    classes[classes == 255] = 0
     if views is None:
         views = load_views(dense_dir / "sparse")
     if settings.get("rule") == "sam_plane_free_space":

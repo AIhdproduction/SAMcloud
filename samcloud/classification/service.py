@@ -24,9 +24,9 @@ def class_las_codes(class_set: str, config: dict | None = None) -> list[int]:
     config = config if config is not None else _class_configuration()
     codes = config.get("las_codes", {}).get(class_set)
     if codes is None:
-        from samcloud.engine.export_las import LEGACY_CLASSIFICATION_CODE_SETS
+        from samcloud.engine.export_las import LIVE_FALLBACK_CODE_SETS
 
-        codes = [int(code) for code in LEGACY_CLASSIFICATION_CODE_SETS[class_set]]
+        codes = [int(code) for code in LIVE_FALLBACK_CODE_SETS[class_set]]
     if len(codes) != len(config[class_set]) + 1:
         raise ValueError(f"classes.json: las_codes.{class_set} needs one code per class plus unknown")
     return [int(code) for code in codes]

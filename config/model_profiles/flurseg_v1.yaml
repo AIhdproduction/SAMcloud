@@ -1,0 +1,17 @@
+name: flurseg_v1
+supported_modes: [outdoor]
+point_states:
+  never_classified: 0
+  unclassified: 1
+entries:
+  - {model_id: 0, model_name: other, cyclone_code: 64, cyclone_name: Other}
+  - {model_id: 1, model_name: ground, cyclone_code: 2, cyclone_name: Ground}
+  - {model_id: 2, model_name: paved_surface, cyclone_code: 71, cyclone_name: Sealed terrain}
+  - {model_id: 3, model_name: low_vegetation, cyclone_code: 3, cyclone_name: Low Vegetation}
+  - {model_id: 4, model_name: tree, cyclone_code: 5, cyclone_name: High Vegetation}
+  - {model_id: 5, model_name: building, cyclone_code: 6, cyclone_name: Building}
+  - {model_id: 6, model_name: vehicle, cyclone_code: 91, cyclone_name: Vehicle}
+  - {model_id: 7, model_name: construction, cyclone_code: 151, cyclone_name: Worksite equipment}
+  - {model_id: 8, model_name: curb, cyclone_code: 74, cyclone_name: Curbstone}
+  - {model_id: 9, model_name: road_marking, cyclone_code: 82, cyclone_name: Custom 82}
+  - {model_id: 10, model_name: utility_cover, cyclone_code: 75, cyclone_name: Manhole}

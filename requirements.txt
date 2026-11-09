@@ -20,3 +20,7 @@ pyproj==3.7.1
 nicegui==3.17.1
 pytest==8.4.2
 pycolmap==4.2.1
+ezdxf==1.4.5
+shapely==2.2.0
+scikit-image==0.26.0
+scikit-learn==1.9.1

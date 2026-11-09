@@ -1,0 +1,257 @@
+codes:
+  0: {name: "Created, never classified"}
+  1: {name: Unclassified}
+  2: {name: Ground}
+  3: {name: Low Vegetation}
+  4: {name: Medium Vegetation}
+  5: {name: High Vegetation}
+  6: {name: Building}
+  7: {name: "Low Point (Noise)"}
+  8: {name: Reserved, reserved: true}
+  9: {name: Water}
+  10: {name: Rail}
+  11: {name: Road Surface}
+  12: {name: Reserved, reserved: true}
+  13: {name: "Wire - Guard"}
+  14: {name: "Wire - Conductor"}
+  15: {name: "Transmission Tower"}
+  16: {name: "Wire-structure Connector"}
+  17: {name: "Bridge Deck"}
+  18: {name: "High Noise"}
+  19: {name: "Overhead Structure"}
+  20: {name: "Ignored Ground"}
+  21: {name: Snow}
+  22: {name: "Temporal Exclusion"}
+  23: {name: Reserved, reserved: true}
+  24: {name: Reserved, reserved: true}
+  25: {name: Reserved, reserved: true}
+  26: {name: Reserved, reserved: true}
+  27: {name: Reserved, reserved: true}
+  28: {name: Reserved, reserved: true}
+  29: {name: Reserved, reserved: true}
+  30: {name: Reserved, reserved: true}
+  31: {name: Reserved, reserved: true}
+  32: {name: Reserved, reserved: true}
+  33: {name: Reserved, reserved: true}
+  34: {name: Reserved, reserved: true}
+  35: {name: Reserved, reserved: true}
+  36: {name: Reserved, reserved: true}
+  37: {name: Reserved, reserved: true}
+  38: {name: Reserved, reserved: true}
+  39: {name: Reserved, reserved: true}
+  40: {name: Reserved, reserved: true}
+  41: {name: Reserved, reserved: true}
+  42: {name: Reserved, reserved: true}
+  43: {name: Reserved, reserved: true}
+  44: {name: Reserved, reserved: true}
+  45: {name: Reserved, reserved: true}
+  46: {name: Reserved, reserved: true}
+  47: {name: Reserved, reserved: true}
+  48: {name: Reserved, reserved: true}
+  49: {name: Reserved, reserved: true}
+  50: {name: Reserved, reserved: true}
+  51: {name: Reserved, reserved: true}
+  52: {name: Reserved, reserved: true}
+  53: {name: Reserved, reserved: true}
+  54: {name: Reserved, reserved: true}
+  55: {name: Reserved, reserved: true}
+  56: {name: Reserved, reserved: true}
+  57: {name: Reserved, reserved: true}
+  58: {name: Reserved, reserved: true}
+  59: {name: Reserved, reserved: true}
+  60: {name: Reserved, reserved: true}
+  61: {name: Reserved, reserved: true}
+  62: {name: Reserved, reserved: true}
+  63: {name: Reserved, reserved: true}
+  64: {name: Other}
+  65: {name: Artifact}
+  66: {name: Hardscape}
+  67: {name: "Moving object"}
+  68: {name: Reflection}
+  69: {name: "Interior points"}
+  70: {name: "Natural terrain"}
+  71: {name: "Sealed terrain"}
+  72: {name: "Retaining wall"}
+  73: {name: "Side walk"}
+  74: {name: Curbstone}
+  75: {name: Manhole}
+  76: {name: "Manmade object"}
+  77: {name: "Guard rails"}
+  78: {name: "Street furniture"}
+  79: {name: "Traffic light"}
+  80: {name: "Street lamp"}
+  81: {name: "Rail/Road sign"}
+  82: {name: "Custom 82", custom: true}
+  83: {name: "Custom 83", custom: true}
+  84: {name: Pole}
+  85: {name: Tunnel}
+  86: {name: Bridge}
+  87: {name: Trackbed}
+  88: {name: Platform}
+  89: {name: Sleeper}
+  90: {name: "Level crossing"}
+  91: {name: Vehicle}
+  92: {name: Vegetation}
+  93: {name: Tree}
+  94: {name: Shrub}
+  95: {name: Trunk}
+  96: {name: Roof}
+  97: {name: "Roof structures"}
+  98: {name: Facades}
+  99: {name: Balcony}
+  100: {name: Wall}
+  101: {name: Ceiling}
+  102: {name: Floor}
+  103: {name: Door}
+  104: {name: Window}
+  105: {name: Stairs}
+  106: {name: Ramp}
+  107: {name: Railing}
+  108: {name: Column}
+  109: {name: Beam}
+  110: {name: "Steel structure"}
+  111: {name: Pipe}
+  112: {name: Wire}
+  113: {name: Electrical}
+  114: {name: HVAC}
+  115: {name: Plumbing}
+  116: {name: "Ceiling structures"}
+  117: {name: Furniture}
+  118: {name: Chair}
+  119: {name: "Table (Desk)"}
+  120: {name: "Custom 120", custom: true}
+  121: {name: "Custom 121", custom: true}
+  122: {name: "Custom 122", custom: true}
+  123: {name: "Custom 123", custom: true}
+  124: {name: "Custom 124", custom: true}
+  125: {name: "Custom 125", custom: true}
+  126: {name: "Stairs wall"}
+  127: {name: "Custom 127", custom: true}
+  128: {name: "Custom 128", custom: true}
+  129: {name: "Custom 129", custom: true}
+  130: {name: "Steel structure vertical"}
+  131: {name: "Steel structure horizontal"}
+  132: {name: "Steel structure diagonal"}
+  133: {name: "Steel connection element"}
+  134: {name: "Custom 134", custom: true}
+  135: {name: "Custom 135", custom: true}
+  136: {name: "Custom 136", custom: true}
+  137: {name: "Custom 137", custom: true}
+  138: {name: Footing}
+  139: {name: Radiator}
+  140: {name: "Custom 140", custom: true}
+  141: {name: "Custom 141", custom: true}
+  142: {name: "Custom 142", custom: true}
+  143: {name: "Custom 143", custom: true}
+  144: {name: "Inclined roof"}
+  145: {name: "Flat roof"}
+  146: {name: "Custom 146", custom: true}
+  147: {name: "Custom 147", custom: true}
+  148: {name: "Valve handle"}
+  149: {name: "Valve body"}
+  150: {name: "Indoor vegetation"}
+  151: {name: "Worksite equipment"}
+  152: {name: "Noise indoor"}
+  153: {name: "Noise outside"}
+  154: {name: "Window sill"}
+  155: {name: "Window blinds"}
+  156: {name: "Inclined ceiling"}
+  157: {name: "Outside wall"}
+  158: {name: "Custom 158", custom: true}
+  159: {name: "Wire installation"}
+  160: {name: "Pipe installation"}
+  161: {name: "Window noise"}
+  162: {name: "Custom 162", custom: true}
+  163: {name: "Air duct"}
+  164: {name: "Custom 164", custom: true}
+  165: {name: "Wall Skeleton"}
+  166: {name: "Custom 166", custom: true}
+  167: {name: "Custom 167", custom: true}
+  168: {name: "Custom 168", custom: true}
+  169: {name: "Custom 169", custom: true}
+  170: {name: "HCS vegetation"}
+  171: {name: "HCS manmade object"}
+  172: {name: "HCS asphalt road"}
+  173: {name: "HCS asphalt hardscape"}
+  174: {name: "HCS concrete road"}
+  175: {name: "HCS concrete hardscape"}
+  176: {name: "HCS street furniture"}
+  177: {name: "HCS fencing"}
+  178: {name: "HCS trenching"}
+  179: {name: "HCS underground utilities"}
+  180: {name: "HCS construction material"}
+  181: {name: "HCS construction vehicle"}
+  182: {name: "HCS manhole"}
+  183: {name: "HCS erosion control"}
+  184: {name: "HCS curb"}
+  185: {name: "HCS foundation"}
+  186: {name: "HCS material stockpile"}
+  187: {name: "Custom 187", custom: true}
+  188: {name: "Custom 188", custom: true}
+  189: {name: "Custom 189", custom: true}
+  190: {name: "Custom 190", custom: true}
+  191: {name: "Pipe Bend"}
+  192: {name: "Pipe Cylinder"}
+  193: {name: "Pipe Connection"}
+  194: {name: "Pipe Reducer"}
+  195: {name: "Cylinder Tee"}
+  196: {name: "Pipe flange"}
+  197: {name: "Pipe equipment"}
+  198: {name: "Pipe asset"}
+  199: {name: Tank}
+  200: {name: "Pipe instrument"}
+  201: {name: "Pipe special"}
+  202: {name: "Custom 202", custom: true}
+  203: {name: "Custom 203", custom: true}
+  204: {name: "Custom 204", custom: true}
+  205: {name: "Custom 205", custom: true}
+  206: {name: "Custom 206", custom: true}
+  207: {name: "Custom 207", custom: true}
+  208: {name: "Custom 208", custom: true}
+  209: {name: "Custom 209", custom: true}
+  210: {name: "Custom 210", custom: true}
+  211: {name: "Custom 211", custom: true}
+  212: {name: "Custom 212", custom: true}
+  213: {name: "Custom 213", custom: true}
+  214: {name: "Custom 214", custom: true}
+  215: {name: "Custom 215", custom: true}
+  216: {name: "Custom 216", custom: true}
+  217: {name: "Custom 217", custom: true}
+  218: {name: "Custom 218", custom: true}
+  219: {name: "Custom 219", custom: true}
+  220: {name: "Custom 220", custom: true}
+  221: {name: "Custom 221", custom: true}
+  222: {name: "Custom 222", custom: true}
+  223: {name: "Custom 223", custom: true}
+  224: {name: "Custom 224", custom: true}
+  225: {name: "Custom 225", custom: true}
+  226: {name: "Custom 226", custom: true}
+  227: {name: "Custom 227", custom: true}
+  228: {name: "Custom 228", custom: true}
+  229: {name: "Custom 229", custom: true}
+  230: {name: "Custom 230", custom: true}
+  231: {name: "Custom 231", custom: true}
+  232: {name: "Custom 232", custom: true}
+  233: {name: "Custom 233", custom: true}
+  234: {name: "Custom 234", custom: true}
+  235: {name: "Custom 235", custom: true}
+  236: {name: "Custom 236", custom: true}
+  237: {name: "Custom 237", custom: true}
+  238: {name: "Custom 238", custom: true}
+  239: {name: "Custom 239", custom: true}
+  240: {name: "Custom 240", custom: true}
+  241: {name: "Custom 241", custom: true}
+  242: {name: "Custom 242", custom: true}
+  243: {name: "Custom 243", custom: true}
+  244: {name: "Custom 244", custom: true}
+  245: {name: "Custom 245", custom: true}
+  246: {name: "Custom 246", custom: true}
+  247: {name: "Custom 247", custom: true}
+  248: {name: "Custom 248", custom: true}
+  249: {name: "Custom 249", custom: true}
+  250: {name: "Custom 250", custom: true}
+  251: {name: "Custom 251", custom: true}
+  252: {name: "Custom 252", custom: true}
+  253: {name: "Custom 253", custom: true}
+  254: {name: "Custom 254", custom: true}
+  255: {name: "Custom 255", custom: true}

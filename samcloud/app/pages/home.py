@@ -19,6 +19,7 @@ _WORKFLOW = (
     ("Classify", "classification"),
     ("Improve & filter", "refinement"),
     ("Export LAS / PLY", "export"),
+    ("DXF export (optional)", "dxf"),
 )
 
 _PHASE_RANGES = {
@@ -193,6 +194,13 @@ def _render_project_workspace(project: dict | None) -> None:
             )
         if project.get("processing", {}).get("last_error"):
             ui.label(project["processing"]["last_error"]).classes("text-red-4 text-sm q-mt-md")
+
+
+def _dxf_unavailable_reason(project: dict | None) -> str | None:
+    """Return why the optional DXF step cannot be opened yet, or None when it can (file existence checks only)."""
+    from samcloud.app.dxf_controller import dxf_unavailable_reason
+
+    return dxf_unavailable_reason(state.active_project_directory if project is not None else None)
 
 
 def _workflow_is_active(workflow: dict) -> bool:
@@ -413,8 +421,12 @@ def _render_workflow(project: dict | None) -> None:
     phase_bars = {}
     phase_labels = {}
     status_labels = {}
+    dxf_reason = _dxf_unavailable_reason(project)
     for index, (label, key) in enumerate(_WORKFLOW, start=1):
-        status = "ready" if key is None and project is not None else statuses.get(key, "not started")
+        if key == "dxf" and project is not None:
+            status = "optional" if dxf_reason is None else dxf_reason
+        else:
+            status = "ready" if key is None and project is not None else statuses.get(key, "not started")
         step_class = "sam-workflow-step"
         if index == 1 and project is None:
             step_class += " is-active"
@@ -426,7 +438,18 @@ def _render_workflow(project: dict | None) -> None:
             ui.label(str(index)).classes("sam-step-number")
             ui.label(label).classes("sam-step-label")
             status_label = ui.label(status.replace("_", " ")).classes("sam-step-status")
-            status_labels[key] = status_label
+            if key == "dxf" and project is not None and dxf_reason is not None:
+                status_label.style("text-transform:none").mark("home-dxf-status")
+            else:
+                status_labels[key] = status_label
+            if key == "dxf" and project is not None:
+                if dxf_reason is None:
+                    ui.button("Open DXF", icon="architecture", on_click=lambda: ui.navigate.to("/dxf")).props("flat dense no-caps").classes("text-cyan-4 text-xs q-mt-xs").mark("home-open-dxf")
+                else:
+                    # A disabled q-btn swallows hover events, so the tooltip lives on a wrapping element.
+                    with ui.element("div").classes("inline-block q-mt-xs") as dxf_slot:
+                        ui.button("Open DXF", icon="architecture").props("flat dense no-caps disable").classes("text-xs").mark("home-open-dxf")
+                    dxf_slot.tooltip(dxf_reason)
             if key in _PHASE_RANGES and project is not None:
                 phase_percent = _phase_percent(key, statuses, progress)
                 with ui.row().classes("items-center gap-2 w-full q-mt-xs"):
@@ -450,8 +473,7 @@ def _render_workflow(project: dict | None) -> None:
         storage = _storage_summary(state.active_project_directory)
         if storage is not None:
             after = float(storage.get("after_bytes", 0)) / 1024 ** 3
-            freed = float(storage.get("freed_bytes", 0)) / 1024 ** 3
-            ui.label(f"Speicher: {after:.1f} GB (gespart: {freed:.1f} GB)").classes("text-xs sam-muted")
+            ui.label(f"Speicher: {after:.1f} GB").classes("text-xs sam-muted")
 
     if project is not None and _workflow_is_active(project.get("workflow", {})):
         def refresh_workflow() -> None:

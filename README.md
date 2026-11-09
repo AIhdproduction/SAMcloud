@@ -14,15 +14,16 @@ module at HSLU.
 2. [Processing pipeline](#processing-pipeline)
 3. [Semantic classification](#semantic-classification)
 4. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
-5. [User interface](#user-interface)
-6. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
-7. [Architecture](#architecture)
-8. [Configuration](#configuration)
-9. [Project files](#project-files)
-10. [Installation and start on Windows](#installation-and-start-on-windows)
-11. [Tests](#tests)
-12. [Scope and independent work](#scope-and-independent-work)
-13. [Author and license](#author-and-license)
+5. [DXF export](#dxf-export)
+6. [User interface](#user-interface)
+7. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
+8. [Architecture](#architecture)
+9. [Configuration](#configuration)
+10. [Project files](#project-files)
+11. [Installation and start on Windows](#installation-and-start-on-windows)
+12. [Tests](#tests)
+13. [Scope and independent work](#scope-and-independent-work)
+14. [Author and license](#author-and-license)
 
 ## Overview
 
@@ -146,6 +147,8 @@ get free LAS codes from 64.
 
 ### FlurSeg (outdoor alternative to SAM3)
 
+The trained model is available on [Hugging Face](https://huggingface.co/AIhdproduction/Flurseg). Use it for outdoor projects to classify about 15x faster than SAM3 (~2 s vs ~30 s per photo; 18.5 min vs ~2.5 h for a full run). Its 11 FlurSeg classes are fixed and cannot be customised.
+
 FlurSeg is an EoMT-DINOv3-L model trained on SAM3 pseudo-labels with 11 classes:
 other, ground, paved surface, low vegetation, tree, building, vehicle,
 construction, curb, road marking and utility cover. `config/flurseg.yml` maps them
@@ -168,8 +171,7 @@ Ground, low vegetation, vehicle, paved surface and building agree closely
 (IoU 0.79–0.98). Tree, manhole, construction and curb are weaker, and FlurSeg
 cannot separate sidewalk from road or detect fences, poles, signs, walls and
 other fine classes. The model folder (`models/flurseg_eomt_dinov3l_*`) is not
-part of the repository; it will be published on Hugging Face together with its
-`EVALUATION.md`.
+part of the repository; download it from [Hugging Face](https://huggingface.co/AIhdproduction/Flurseg) (includes `EVALUATION.md`) and place it under `models/` (e.g. `models/flurseg_eomt_dinov3l_<timestamp>/`).
 
 The dashboard button **Klassifizierung neu rechnen** (pipeline `--reclassify`)
 re-runs only classification, step 6 and geometry on the kept dense cloud, so
@@ -322,6 +324,79 @@ and list every required geoid or transformation grid. Install those grids
 yourself into the PyProj data directory, then restart SAMcloud. The exporter
 never uses approximate, ballpark transformations.
 
+## DXF export
+
+The optional **DXF** page (`/dxf`, also reachable from the "DXF export (optional)"
+step on the overview) turns a classified LAS file into 2D CAD plans: one DXF per
+storey for indoor projects, one site plan for outdoor projects. Nothing on this
+page runs by itself. Opening the page, switching level or changing a setting
+only reads cached results from `products/dxf/`; every heavy step starts with a
+button and runs as a background job (`python -m samcloud.dxf.jobs …`) with a
+progress bar and **Cancel**. A cancelled or failed job keeps the previous cache
+and shows the end of `products/dxf/job.log`. Only one DXF job runs per project.
+
+### Workflow
+
+1. **LAS file and profile.** The page uses `products/classified/classified.las`
+   by default; any other uncompressed `.las` file (for example scanner data) can
+   be entered instead. The model profile and indoor/outdoor mode come from the
+   LAS sidecar (`*.las.profile.json`) or its `colmap_sam` VLR. A LAS without
+   provenance must get a profile first (`sam3_outdoor`, `sam3_indoor`,
+   `flurseg_v1`, `legacy_v1`); the page is blocked until one is chosen. FlurSeg
+   is outdoor only, so `flurseg_v1` with indoor mode is blocked with a message.
+2. **Create preview.** Builds a voxel preview (`preview.npz`) and LAS summary
+   (`las_info.json`) and lists plausibility warnings, for example an implausible
+   extent that hints at a missing metric scale.
+3. **Scale.** Type a factor and press **Apply**, or use the **Measure** tool in
+   the side view or the DXF review: click two points, type the real distance,
+   and SAMcloud computes the factor. Stored level heights are rescaled with it.
+4. **Align to gravity** (indoor). Estimates tilt from the floor plane and,
+   optionally, the yaw that puts walls on the X/Y axes (switch
+   "Align walls to X/Y"). The rotation is stored per project and used by every
+   later step.
+5. **Detect levels** (indoor). Finds floors and ceilings. Levels are numbered
+   from the bottom: the lowest level is `1`, then `2`, `3` and so on. Names can
+   be edited; files are named `<project>_<level name>.dxf`.
+6. **Side view** (indoor). **Render side view** draws the preview cloud from the
+   side, coloured by class, along X or Y, optionally limited to a slab (centre
+   and thickness) so rooms do not overlap. Level bands are shown on top: drag a
+   floor (solid) or ceiling (dashed) line, add a level by clicking in
+   "Add level" mode, rename, uncheck or delete levels in the list. Only checked
+   levels are reviewed and exported.
+7. **DXF review.** Pick a level (indoor) and press **Generate DXF preview**; the
+   result is cached in `products/dxf/<level id>/` (`site/` outdoors). The canvas
+   shows the cached top view (RGB or class colours) and the DXF vectors in the
+   same coordinates: mouse wheel zooms at the cursor, drag pans, the cursor
+   position is shown in metres, holding **H** hides the DXF layer. "Image
+   opacity" and "DXF opacity" blend both layers (0–100 %). The layer list shows
+   colour, entity count, visibility and why a layer is empty. Generation
+   settings (cell size, per-layer mode and z band, wall centre-lines or polygons,
+   door swing arc) are stored per project; changing them, the levels, the scale,
+   the alignment or the profile marks the preview as out of date. It is never
+   regenerated automatically. **Save snapshot PNG** writes the current view to
+   `products/dxf/snapshots/`.
+8. **Export.** **Export DXF** (or **Export all checked levels**) is enabled only
+   for current previews. It writes R2018 DXF files in metres, in local or
+   original coordinates, to `products/dxf/export/`, re-reads each file with the
+   ezdxf auditor before it is moved into place, and shows the paths and audit
+   result. Indoor exports are named `<project>_1.dxf`, `<project>_2.dxf`, …;
+   outdoor exports `<project>_site.dxf`.
+
+### Profiles and Cyclone codes
+
+Classes are written with Cyclone 3DR classification codes (see
+[`docs/cyclone_classes.md`](docs/cyclone_classes.md)); `config/dxf_layers.yaml`
+maps codes to DXF layers. FlurSeg's road marking uses code 82, which Cyclone 3DR
+lists as "Custom 82": rename that class to **Road marking** in Cyclone 3DR once.
+
+### Known limits
+
+- Wall thickness is an estimate from the point cloud, not a measured value.
+- Door swing arcs are off by default.
+- COLMAP reconstructions without GPS or control points have no metric scale;
+  set the scale before generating plans.
+- Only uncompressed LAS files are read; LAZ is not supported.
+
 ## User interface
 
 The UI is built with NiceGUI and opens at `http://127.0.0.1:8080`.
@@ -333,6 +408,7 @@ The UI is built with NiceGUI and opens at `http://127.0.0.1:8080`.
 | Sparse cloud | inspect the aligned sparse model |
 | Control points | mark ground control points in the images after alignment |
 | Dense cloud | 3D viewer of the classified cloud in RGB or class mode, with class filters and colours |
+| DXF | optional CAD export: preview, scale, alignment, levels, side view, DXF review and export |
 | Settings | coordinate systems, GPU, capture options, classification settings |
 
 The classification settings per project are:

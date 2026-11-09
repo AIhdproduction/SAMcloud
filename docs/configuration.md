@@ -123,6 +123,64 @@ This file contains the Potree point budget, default display mode, and enabled
 viewer features. Class colors and class visibility will be written to a
 project-specific viewer manifest when viewer data is generated.
 
+## `dxf_export.yaml`
+
+Global defaults for the DXF export (`samcloud/dxf/config.py` validates every
+key). Project-specific choices made on the DXF page (mode, profile, scale,
+alignment, levels, cell size, layer overrides, view options) are stored in
+`<project>/products/dxf/state.json` and never change this file.
+
+| Key | Meaning |
+|---|---|
+| `mode_detection.indoor_share` | Share of wall/ceiling/floor points (codes 100–102) above which a LAS without provenance counts as indoor. |
+| `loading.chunk_size` | Points read per LAS chunk; bounds memory use for large files. |
+| `preview.max_points` | Maximum points kept in the voxel preview (`preview.npz`). |
+| `preview.voxel_size` | Fixed preview voxel size in metres; `null` derives it from extent and `max_points`. |
+| `plausibility.indoor_min_extent`, `indoor_max_extent` | Indoor extent range in metres; outside it the preview shows a scale warning. |
+| `plausibility.outdoor_min_extent`, `outdoor_max_extent` | The same range for outdoor projects. |
+| `alignment.ransac_iterations`, `ransac_distance` | RANSAC iterations and inlier distance (m) for the floor plane used to estimate gravity. |
+| `alignment.min_floor_points` | Floor points needed for the RANSAC path; otherwise surface normals are used. |
+| `alignment.normal_sample_size`, `normal_neighbors` | Sample size and neighbourhood for the normal-based fallback and wall yaw. |
+| `alignment.align_wall_yaw` | Also estimate the yaw that puts walls on the X/Y axes (can be switched off per project on the DXF page). |
+| `levels.bin_size`, `gaussian_sigma` | Height histogram bin (m) and smoothing used to find floor and ceiling peaks. |
+| `levels.min_point_count`, `min_prominence` | Minimum support and peak prominence for a detected surface. |
+| `levels.floor_point_tolerance` | Height tolerance (m) when counting points that support a floor. |
+| `levels.min_floor_to_ceiling`, `max_floor_to_ceiling` | Accepted storey height range in metres. |
+| `levels.stair_cluster_eps`, `stair_cluster_min_samples` | DBSCAN settings that group stair points before assigning them to a level. |
+| `geometry.indoor_cell_size`, `outdoor_cell_size` | Raster cell size (m) for plan extraction; a project can override it on the DXF page. |
+| `geometry.closing_kernel` | Morphological closing kernel (cells) before polygons are traced. |
+| `geometry.simplify_tolerance` | Default polygon/line simplification tolerance (m). |
+| `geometry.wall_direction_tolerance_degrees` | Angle tolerance for treating wall pieces as parallel/collinear. |
+| `geometry.wall_min_thickness`, `wall_max_thickness` | Wall thickness range (m); two faces closer than the maximum become one wall. |
+| `geometry.wall_merge_gap`, `wall_corner_distance` | Gaps (m) closed between wall pieces and at corners. |
+| `geometry.wall_min_length` | Shortest wall segment kept (m). |
+| `geometry.wall_opening_bridge` | Largest gap (m) bridged between collinear wall pieces when looking for openings. |
+| `geometry.opening_max_distance`, `opening_cluster_eps` | Maximum door/window distance to a wall and clustering radius (m). |
+| `geometry.skeleton_min_length` | Shortest centre-line kept for skeleton layers such as road markings and fences (m). |
+| `geometry.indoor_default_height` | Storey height (m) used when a level has no ceiling. |
+| `geometry.vector_grid_size` | Cells per side of the spatial grid that the review canvas uses to cull DXF entities. |
+| `geometry.fill_under_canopy` | Fill ground below tree canopies in outdoor plans. |
+
+## `dxf_layers.yaml`
+
+`layers` is a list; each entry maps Cyclone classification codes to one DXF
+layer. Layer names must be unique (except `IGNORE`). Per-layer `mode` and
+`z_band` can be overridden per project on the DXF page.
+
+| Key | Meaning |
+|---|---|
+| `project_mode` | `indoor` or `outdoor`: the projects this layer applies to. Older entries write the project mode into `mode` instead; they are mapped automatically. |
+| `mode` | Extraction mode: `cut_band` (points within `z_band` above the level floor), `footprint` (all points projected), `top_surface`, `ground_surface`, or `ignore`. |
+| `codes` | Cyclone classification codes collected into this layer (must exist in `config/cyclone_codes.yaml`). |
+| `name` | DXF layer name, for example `A-WALL` or `S-GRND`. |
+| `color` | AutoCAD colour index (ACI, 1–255). |
+| `linetype` | DXF linetype, normally `CONTINUOUS`. |
+| `geometry` | Vectorisation: `wall`, `opening`, `polygon`, `line`, `furniture`, `skeleton`, `circle`, `tree`, `point` or `ignore`. |
+| `z_band` | `[low, high]` in metres above the level floor; required for `cut_band`. |
+| `min_area` | Smallest polygon kept (m²). |
+| `simplify_tolerance` | Simplification tolerance for this layer (m). |
+| `hatch` | Add a solid hatch to closed polygons. |
+
 ## Capture settings stored per project
 
 Every new project stores an `acquisition` section. It contains the selected

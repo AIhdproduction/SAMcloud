@@ -1,0 +1,135 @@
+# Flurseg class definition (copy for SAMcloud).
+# Source: Flurseg build specification, section 3.
+# Masks are single-channel 8-bit PNGs. ID 255 (ignore) is never trained and never exported.
+# Display colors are fixed here and may be changed in the Flurseg repository.
+# Cyclone codes refer to cyclone_classes.md. Code 82 is "Custom 82" in Cyclone and is renamed to "Road marking" by the user.
+
+version: 1
+
+# Overlap priority, highest first. Objects beat surfaces.
+priority:
+  - vehicle
+  - construction
+  - other
+  - building
+  - tree
+  - utility_cover
+  - curb
+  - road_marking
+  - low_vegetation
+  - paved_surface
+  - ground
+
+classes:
+  - id: 0
+    name: other
+    color: [128, 128, 128]
+    cyclone_code: 64
+    cyclone_name: Other
+    prompts: [person, pole, street lamp, traffic sign, fence, wall, water, swimming pool, bench, power line, hydrant]
+    includes: everything not covered by another class
+    excludes: ""
+
+  - id: 1
+    name: ground
+    color: [160, 110, 60]
+    cyclone_code: 2
+    cyclone_name: Ground
+    prompts: [bare soil, dirt, gravel, sand, mud, dirt road, excavation pit, soil pile]
+    includes: unsealed terrain, gravel, dirt roads, excavation pits, soil piles
+    excludes: paving, lawn
+
+  - id: 2
+    name: paved_surface
+    color: [90, 90, 100]
+    cyclone_code: 71
+    cyclone_name: Sealed terrain
+    prompts: [asphalt road, sidewalk, parking lot, concrete pavement, paving stones]
+    includes: "sealed surfaces: asphalt, concrete, paving stones, slabs"
+    excludes: gravel, curb, covers
+
+  - id: 3
+    name: low_vegetation
+    color: [120, 200, 80]
+    cyclone_code: 3
+    cyclone_name: Low Vegetation
+    prompts: [grass, lawn, meadow, shrub, hedge, crop field, flower bed]
+    includes: plants below about 3 m incl. hedges
+    excludes: tree canopy
+
+  - id: 4
+    name: tree
+    color: [20, 110, 40]
+    cyclone_code: 5
+    cyclone_name: High Vegetation
+    prompts: [tree, tree canopy, forest]
+    includes: trees and forest incl. trunk
+    excludes: hedges
+
+  - id: 5
+    name: building
+    color: [200, 60, 50]
+    cyclone_code: 6
+    cyclone_name: Building
+    prompts: [roof, building, house, facade, garage, solar panel, chimney]
+    includes: permanent buildings with roof and roof structures
+    excludes: containers, scaffolding
+
+  - id: 6
+    name: vehicle
+    color: [60, 120, 230]
+    cyclone_code: 91
+    cyclone_name: Vehicle
+    prompts: [car, truck, van, bus, trailer, motorcycle]
+    includes: road vehicles incl. trucks on construction sites
+    excludes: excavators, cranes
+
+  - id: 7
+    name: construction
+    color: [240, 170, 30]
+    cyclone_code: 151
+    cyclone_name: Worksite equipment
+    prompts: [excavator, crane, construction machine, scaffolding, site container, shipping container, building materials, formwork]
+    includes: construction machines, scaffolding, containers, building material
+    excludes: soil piles, excavation pits
+
+  - id: 8
+    name: curb
+    color: [230, 230, 60]
+    cyclone_code: 74
+    cyclone_name: Curbstone
+    prompts: [curb, curbstone, kerb]
+    includes: top and front face of curbstones
+    excludes: gutters made of paving stones
+
+  - id: 9
+    name: road_marking
+    color: [255, 255, 255]
+    cyclone_code: 82
+    cyclone_name: Custom 82 (rename to "Road marking")
+    prompts: [road marking, lane marking, crosswalk, painted line, parking space marking]
+    includes: paint on the pavement
+    excludes: covers, curbs
+
+  - id: 10
+    name: utility_cover
+    color: [200, 60, 200]
+    cyclone_code: 75
+    cyclone_name: Manhole
+    prompts: [manhole cover, storm drain, drain grate, gully grate, valve cover, cable pit cover, utility cover]
+    includes: manhole covers, gullies, valve caps, cable pits, flush hydrant covers
+    excludes: standing hydrants (other)
+
+  - id: 255
+    name: ignore
+    color: [0, 0, 0]
+    cyclone_code: null   # never exported
+    cyclone_name: ""
+    prompts: []
+    includes: uncertain or not checked, never trained
+    excludes: ""
+
+# Point states in the SAMcloud export
+point_states:
+  never_classified: 0    # Created, never classified (no image saw the point)
+  unclassified: 1        # Model below confidence threshold or model output 255

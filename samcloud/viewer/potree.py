@@ -17,6 +17,7 @@ import numpy as np
 from samcloud.core.paths import PROJECT_ROOT
 from samcloud.viewer.preview import _ply_header_size, _read_ply_header, _source_path
 from samcloud.viewer.sparse_filter import FILTER_VERSION, load_clean_sparse_points, sparse_cleaning_settings
+from samcloud.classification.profiles import NEVER_CLASSIFIED_ID
 
 POTREE_CONVERTER = PROJECT_ROOT / "tools" / "PotreeConverter" / "PotreeConverter.exe"
 POTREE_LIBRARY = PROJECT_ROOT / "assets" / "potree" / "build" / "potree" / "potree.js"
@@ -73,6 +74,8 @@ def _ply_points(source: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray | None
     else:
         rgb = np.full((count, 3), 200, np.uint8)
     classes = data["scalar_class"].astype(np.int64) if "scalar_class" in offsets else None
+    if classes is not None:
+        classes[classes == NEVER_CLASSIFIED_ID] = 0
     return xyz, rgb, classes
 
 

@@ -173,9 +173,14 @@ class FlurSegLabeler:
             mean, std = values.get("image_mean", mean), values.get("image_std", std)
         self.mean = torch.tensor(mean, dtype=torch.float32, device=self.device).view(3, 1, 1)
         self.std = torch.tensor(std, dtype=torch.float32, device=self.device).view(3, 1, 1)
-        mapping = build_mapping(labels, self.class_names, config.get("class_mapping", {}))
-        self.target_columns = np.flatnonzero(mapping.any(axis=1))
-        self.mapping = torch.from_numpy(mapping[self.target_columns]).to(self.device)
+        normalise = lambda value: str(value).split(",", 1)[0].strip().lower().replace(" ", "_")
+        if [normalise(label) for label in labels[:len(self.class_names)]] == [normalise(name) for name in self.class_names]:
+            self.target_columns = np.arange(len(self.class_names), dtype=np.int64)
+            self.mapping = torch.eye(len(self.class_names), dtype=torch.float32, device=self.device)
+        else:
+            mapping = build_mapping(labels, self.class_names, config.get("class_mapping", {}))
+            self.target_columns = np.flatnonzero(mapping.any(axis=1))
+            self.mapping = torch.from_numpy(mapping[self.target_columns]).to(self.device)
 
     @staticmethod
     def load_image(image_path):

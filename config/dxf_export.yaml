@@ -1,0 +1,49 @@
+mode_detection:
+  indoor_share: 0.15
+loading:
+  chunk_size: 1000000
+preview:
+  max_points: 5000000
+  voxel_size: null
+plausibility:
+  indoor_min_extent: 2.0
+  indoor_max_extent: 500.0
+  outdoor_min_extent: 2.0
+  outdoor_max_extent: 20000.0
+alignment:
+  ransac_iterations: 600
+  ransac_distance: 0.03
+  min_floor_points: 100
+  normal_sample_size: 20000
+  normal_neighbors: 16
+  align_wall_yaw: true
+levels:
+  bin_size: 0.05
+  gaussian_sigma: 1.0
+  min_point_count: 30
+  min_prominence: 10.0
+  floor_point_tolerance: 0.05
+  min_floor_to_ceiling: 2.0
+  max_floor_to_ceiling: 6.0
+  stair_cluster_eps: 0.35
+  stair_cluster_min_samples: 8
+geometry:
+  indoor_cell_size: 0.02
+  outdoor_cell_size: 0.05
+  closing_kernel: 3
+  simplify_tolerance: 0.03
+  wall_direction_tolerance_degrees: 5.0
+  wall_min_thickness: 0.08
+  wall_merge_gap: 0.15
+  wall_corner_distance: 0.2
+  # Two parallel wall faces closer than this are merged into one centre-line.
+  wall_max_thickness: 0.5
+  wall_min_length: 0.5
+  # Collinear wall pieces separated by at most this gap are joined for opening detection.
+  wall_opening_bridge: 3.0
+  opening_max_distance: 0.5
+  opening_cluster_eps: 0.35
+  skeleton_min_length: 0.2
+  indoor_default_height: 6.0
+  vector_grid_size: 64
+  fill_under_canopy: false

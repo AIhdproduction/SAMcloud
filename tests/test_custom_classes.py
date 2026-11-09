@@ -13,7 +13,10 @@ from samcloud.classification.custom import (
     normalize_customization,
     project_classes_path,
     standard_classes,
+    migrate_classes_config,
+    write_project_classes,
 )
+from samcloud.classification.profiles import load_cyclone_codes
 from samcloud.classification.service import class_default_colors, class_las_codes
 from samcloud.core.project_manager import ProjectManager
 from samcloud.engine import pipeline
@@ -150,3 +153,40 @@ def test_pipeline_cli_accepts_classes_json(monkeypatch, tmp_path):
                                      "--classes-json", str(tmp_path / "c.json")])
     pipeline.main()
     assert seen == {"path": str(tmp_path / "c.json")}
+
+
+def test_legacy_project_codes_migrate_only_in_memory(tmp_path):
+    project = tmp_path / "project"
+    path = project / "config" / "classes.json"
+    path.parent.mkdir(parents=True)
+    legacy = json.loads(Path("config/classes.json").read_text(encoding="utf-8"))
+    legacy["las_codes"]["outdoor"][9] = 67
+    legacy["las_codes"]["indoor"][1] = 76
+    legacy["las_codes"]["indoor"][-2] = 118
+    legacy["outdoor"].append("solar panel, solar panel")
+    legacy["las_codes"]["outdoor"].append(64)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    migrated = migrate_classes_config(legacy)
+    codes = migrated["las_codes"]["outdoor"]
+    custom_codes = {code for code, entry in load_cyclone_codes().items() if entry.get("custom")}
+    assert codes[9] == 151 and migrated["las_codes"]["indoor"][1] == 180
+    assert codes[-1] in custom_codes and codes[-1] != 82
+    assert json.loads(path.read_text(encoding="utf-8"))["las_codes"]["outdoor"][-1] == 64
+
+
+def test_explicit_rebuild_allocates_only_free_custom_codes_atomically(tmp_path):
+    added = [
+        {"name": "solar panel"}, {"name": "bench"}, {"name": "barrier"}, {"name": "survey marker"},
+    ]
+
+    path = write_project_classes(tmp_path, "outdoor", {"added": added})
+    assert path == tmp_path / "config" / "classes.json"
+    written = json.loads(path.read_text(encoding="utf-8"))
+    codes = class_las_codes("outdoor", written)
+    own_codes = codes[-len(added):]
+    registry = load_cyclone_codes()
+
+    assert all(registry[code].get("custom") for code in own_codes)
+    assert 82 not in own_codes
+    assert not set(own_codes) & set(codes[:-len(added)])
+    assert not path.with_suffix(path.suffix + ".tmp").exists()

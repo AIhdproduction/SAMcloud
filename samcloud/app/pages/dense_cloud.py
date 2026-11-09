@@ -8,7 +8,7 @@ from nicegui import ui
 from samcloud.app.layout import render_page
 from samcloud.app.pointcloud_viewer import default_class_colors, render_pointcloud_viewer
 from samcloud.app.state import state
-from samcloud.classification.custom import project_classes_path
+from samcloud.classification.custom import load_project_classes, project_classes_path
 from samcloud.classification.service import class_default_colors, class_las_codes
 
 
@@ -105,7 +105,7 @@ def render() -> None:
 
 def _class_config() -> dict:
     """classes.json of the open project (its own when customised, else the global one)."""
-    return json.loads(project_classes_path(state.active_project_directory).read_text(encoding="utf-8"))
+    return load_project_classes(state.active_project_directory)
 
 
 def _load_classes(class_set: str) -> list[str]:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
+from samcloud.classification.profiles import NEVER_CLASSIFIED_ID
 
 if __package__:
     from .colmap_model import load_model
@@ -73,11 +74,16 @@ def write_progress(path: Path | None, processed: int, total: int) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def accumulate_weighted_votes(scores, view_counts, point_indices, point_probs, background_threshold):
+def accumulate_weighted_votes(scores, view_counts, point_indices, point_probs, background_threshold, seen_counts=None):
     """Accumulate one SegEarth-OV3 view using presence-filtered probabilities."""
     if point_probs.ndim != 2 or point_probs.shape[0] != len(point_indices):
         raise ValueError("point_probs must have one row per point index")
     visible = point_probs.max(axis=1) >= background_threshold
+    if seen_counts is not None:
+        if len(point_indices) < 2 or bool(np.all(point_indices[1:] > point_indices[:-1])):
+            seen_counts[point_indices] += 1
+        else:
+            np.add.at(seen_counts, point_indices, 1)
     rows = point_indices[visible]
     if len(rows) < 2 or bool(np.all(rows[1:] > rows[:-1])):
         # Strictly increasing = unique (the visibility index lists each point once per view):
@@ -89,15 +95,18 @@ def accumulate_weighted_votes(scores, view_counts, point_indices, point_probs, b
         np.add.at(view_counts, rows, 1)
 
 
-def resolve_weighted_votes(scores, view_counts, min_votes, unknown_id):
+def resolve_weighted_votes(scores, view_counts, min_votes, unknown_id, seen_counts=None, never_classified_id=NEVER_CLASSIFIED_ID):
     """Resolve SegEarth-OV3 class-weighted multi-view votes to class IDs."""
     best_class = np.argmax(scores, axis=1)
     has_score = np.any(scores != 0, axis=1)
-    return np.where(
+    resolved = np.where(
         (view_counts >= min_votes) & has_score,
         best_class + 1,
         unknown_id,
     ).astype(np.uint8)
+    if seen_counts is None:
+        return resolved
+    return np.where(seen_counts == 0, never_classified_id, resolved).astype(np.uint8)
 
 
 def extract_top2_confidences(scores, view_counts, final_class, chunk_size=1_000_000):
@@ -378,6 +387,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         threshold: (
             np.zeros((xyz.shape[0], num_classes), dtype=np.float32),
             np.zeros(xyz.shape[0], dtype=np.uint16),
+            np.zeros(xyz.shape[0], dtype=np.uint16),
         )
         for threshold in thresholds
     }
@@ -413,8 +423,8 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                         depth_stats[key] += value
             else:
                 point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels)
-            for threshold, (scores, view_counts) in vote_states.items():
-                accumulate_weighted_votes(scores, view_counts, sel_points, point_probs, threshold)
+            for threshold, (scores, view_counts, seen_counts) in vote_states.items():
+                accumulate_weighted_votes(scores, view_counts, sel_points, point_probs, threshold, seen_counts)
         write_progress(progress_path, processed, len(image_items))
 
     if depth_check:
@@ -425,8 +435,8 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
     output_path = Path(args.out)
     threshold_summary = {}
     main_final_class = None
-    for threshold, (scores, view_counts) in vote_states.items():
-        final_class = resolve_weighted_votes(scores, view_counts, args.min_votes, unknown_id)
+    for threshold, (scores, view_counts, seen_counts) in vote_states.items():
+        final_class = resolve_weighted_votes(scores, view_counts, args.min_votes, unknown_id, seen_counts, NEVER_CLASSIFIED_ID)
         if threshold == args.background_threshold:
             destination = output_path
             main_final_class = final_class
@@ -436,15 +446,17 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         threshold_summary[f"{threshold:.2f}"] = {
             "class_counts": _class_counts(final_class, class_names),
             "unknown_points": int((final_class == unknown_id).sum()),
+            "never_classified_points": int((final_class == NEVER_CLASSIFIED_ID).sum()),
         }
 
     if args.scores_out:
-        main_scores, main_view_counts = vote_states[args.background_threshold]
+        main_scores, main_view_counts, _main_seen_counts = vote_states[args.background_threshold]
         save_score_summary(args.scores_out, main_scores, main_view_counts, main_final_class)
         print(f"SAM confidence scores written to {args.scores_out}")
 
     class_counts = _class_counts(main_final_class, class_names)
     unknown_points = int((main_final_class == unknown_id).sum())
+    never_classified_points = int((main_final_class == NEVER_CLASSIFIED_ID).sum())
     if args.summary_file:
         summary_path = Path(args.summary_file)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,6 +465,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                 {
                     "point_count": int(main_final_class.shape[0]),
                     "unknown_points": unknown_points,
+                    "never_classified_points": never_classified_points,
                     "images_processed": len(image_items),
                     "class_counts": class_counts,
                     "mode": args.mode,
@@ -525,8 +538,11 @@ def main():
     with open(args.classes_json, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     class_names = cfg[args.class_set]
+    if args.engine == "flurseg":
+        from samcloud.classification.profiles import flurseg_profile
+        class_names = [entry.model_name for entry in flurseg_profile("outdoor").entries]
     # Optional short SAM3 prompts per class set (same order as the class names).
-    prompts = cfg.get("prompts", {}).get(args.class_set) or None
+    prompts = None if args.engine == "flurseg" else cfg.get("prompts", {}).get(args.class_set) or None
     if prompts is not None and len(prompts) != len(class_names):
         sys.exit(f"classes.json: prompts.{args.class_set} must list one prompt per class ({len(class_names)})")
     unknown_id = cfg.get("unknown_class_id", 0)

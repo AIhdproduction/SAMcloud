@@ -24,15 +24,31 @@ from samcloud.engine.geometry.support import build_local_support, height_above_s
 from samcloud.engine.geometry.surface import apply_surface_rule, neighbourhood_majority
 from samcloud.engine.geometry.terrain import build_dtm, height_above_ground, populated_terrain_cells
 from samcloud.engine.ply_io import read_classified_ply, write_classified_ply
+from samcloud.classification.profiles import NEVER_CLASSIFIED_ID, flurseg_profile
 
 
-def class_name_mapping(classes_json: Path, class_set: str) -> tuple[dict[int, str], dict[str, int]]:
+def class_name_mapping(classes_json: Path, class_set: str, engine: str = "sam3") -> tuple[dict[int, str], dict[str, int]]:
     """Map configured class IDs by their stable first-token names."""
     data = json.loads(classes_json.read_text(encoding="utf-8"))
     if class_set not in data:
         raise ValueError(f"Class set not found in {classes_json}: {class_set}")
-    names = {index: str(label).split(",", 1)[0].strip() for index, label in enumerate(data[class_set], start=1)}
-    return names, {name: index for index, name in names.items()}
+    if engine != "flurseg":
+        names = {index: str(label).split(",", 1)[0].strip() for index, label in enumerate(data[class_set], start=1)}
+        return names, {name: index for index, name in names.items()}
+    aliases = load_flurseg_aliases()
+    entries = flurseg_profile("outdoor").entries
+    names = {entry.model_id + 1: aliases.get(entry.model_name, entry.model_name) or entry.model_name for entry in entries}
+    name_to_id: dict[str, int] = {}
+    for class_id, name in names.items():
+        name_to_id.setdefault(name, class_id)
+    return names, name_to_id
+
+
+def load_flurseg_aliases() -> dict[str, str | None]:
+    """Return FlurSeg-to-SAM names used solely for geometry-rule lookup."""
+    path = Path(__file__).resolve().parents[3] / "config" / "flurseg.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return {str(name): target for name, target in data.get("class_mapping", {}).items()}
 
 
 def load_config(path: Path) -> dict:
@@ -314,6 +330,9 @@ def refine_classification(
     rgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Run the complete geometry refinement on in-memory points and labels."""
+    unseen = class_ids == NEVER_CLASSIFIED_ID
+    class_ids = class_ids.copy()
+    class_ids[unseen] = 0
     started = time.perf_counter()
     terrain_config = config["terrain"]
     ground_ids = [name_to_id[name] for name in terrain_config.get("ground_classes", []) if name in name_to_id]
@@ -377,6 +396,9 @@ def refine_classification(
     for _ in range(iterations):
         protect_above = float(confidence_config.get("protect_above", np.inf))
         protected = np.isfinite(confidence) & (confidence >= protect_above)
+        alias_ids = [class_id for class_id, name in id_to_name.items() if list(id_to_name.values()).count(name) > 1]
+        if alias_ids:
+            protected |= np.isin(refined, alias_ids)
         passed = evaluate_rules(
             refined, features, id_to_name, config.get("rules", {}), voxel_coords, name_to_id, protected
         )
@@ -398,7 +420,7 @@ def refine_classification(
     smoothing = config.get("smoothing", {})
     smoothed_count = 0
     if smoothing.get("enabled", True):
-        protected_ids = tuple(name_to_id[name] for name in smoothing.get("protected_classes", []) if name in name_to_id)
+        protected_ids = tuple({*([name_to_id[name] for name in smoothing.get("protected_classes", []) if name in name_to_id]), *alias_ids})
         before_smoothing = refined
         refined = neighbourhood_majority(
             xyz, refined, max(int(refined.max(initial=0)), max(id_to_name, default=0)) + 1,
@@ -409,6 +431,7 @@ def refine_classification(
         smoothed_count = int(np.count_nonzero(before_smoothing != refined))
     changed = np.flatnonzero(class_ids != refined)
     final_transitions = Counter(zip(map(int, class_ids[changed]), map(int, refined[changed])))
+    refined[unseen] = NEVER_CLASSIFIED_ID
     return refined, {
         "flat_roof_conversions": flat_roof_count,
         "failures_per_class": dict(failures),
@@ -466,6 +489,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--classes-json", required=True, type=Path)
     parser.add_argument("--class-set", required=True)
+    parser.add_argument("--engine", choices=("sam3", "flurseg"), default="sam3")
     parser.add_argument("--config", type=Path, default=Path("config/geometry.yml"))
     parser.add_argument("--summary-file", required=True, type=Path)
     parser.add_argument("--progress-file", type=Path)
@@ -483,7 +507,7 @@ def main() -> None:
         return
     _write_progress(args.progress_file, "Reading classified point cloud")
     xyz, rgb, class_ids = read_classified_ply(args.input)
-    id_to_name, name_to_id = class_name_mapping(args.classes_json, args.class_set)
+    id_to_name, name_to_id = class_name_mapping(args.classes_json, args.class_set, args.engine)
     scores = load_scores(args.scores, len(xyz)) if args.scores else None
     _write_progress(args.progress_file, "Estimating terrain and local geometry")
     refined, summary = refine_classification(xyz, class_ids, config, id_to_name, name_to_id, scores, rgb=rgb)

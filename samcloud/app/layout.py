@@ -1,6 +1,7 @@
 """Shared page frame and navigation."""
 
 from collections.abc import Callable
+from pathlib import Path
 
 from nicegui import ui
 
@@ -11,16 +12,26 @@ _NAVIGATION = (
     ("Sparse cloud", "/sparse", "hub"),
     ("Control points", "/control-points", "my_location"),
     ("Dense cloud", "/dense", "view_in_ar"),
+    ("DXF", "/dxf", "architecture"),
     ("Settings", "/settings", "tune"),
 )
 
 
-_PROJECT_PAGES = {"/sparse", "/control-points", "/dense"}
+_PROJECT_PAGES = {"/sparse", "/control-points", "/dense", "/dxf"}
 
 
 def _visible_navigation(project_open: bool) -> list[tuple[str, str, str]]:
     """Hide project-specific pages until a project is open."""
     return [item for item in _NAVIGATION if project_open or item[1] not in _PROJECT_PAGES]
+
+
+def _navigation_disabled_reason(path: str, project_directory: Path | None) -> str | None:
+    """Return a tooltip explaining why a navigation entry is not usable yet, or None when it is usable."""
+    if path == "/dxf":
+        from samcloud.app.dxf_controller import dxf_unavailable_reason
+
+        return dxf_unavailable_reason(project_directory)
+    return None
 
 
 _STYLE = """
@@ -32,6 +43,7 @@ body { background:var(--sam-bg)!important; color:var(--sam-text); }
 .sam-wordmark { margin:0 14px 38px; display:flex; align-items:center; gap:10px; font-size:32px; line-height:1; letter-spacing:-1.4px; color:var(--sam-text); }.sam-wordmark-logo { width:34px; height:34px; flex:none; object-fit:contain; }.sam-wordmark strong { color:var(--sam-accent); font-weight:800; }
 .sam-nav { width:100%; min-height:52px; padding:0 14px; margin:3px 0; justify-content:flex-start; color:#d5e1eb!important; border-radius:8px; font-size:15px; }.sam-nav .q-icon { margin-right:13px; font-size:21px; color:#a8bfd1; }.sam-nav:hover { background:rgba(55,137,182,.14); }
 .sam-nav-active { color:#effbff!important; background:rgba(36,150,207,.22); border-left:3px solid var(--sam-accent); border-radius:0 8px 8px 0; padding-left:11px; }.sam-nav-active .q-icon { color:var(--sam-accent); }
+.sam-nav-slot { width:100%; }.sam-nav-disabled { opacity:.42!important; cursor:not-allowed!important; }.sam-nav-disabled:hover { background:transparent; }
 .sam-sidebar-footer { margin:auto 11px 0; padding-top:24px; color:#7890a5; font-size:10px; letter-spacing:1.5px; }
 .sam-main { min-width:0; flex:1 1 auto; }.sam-topbar { height:32px; border-bottom:1px solid var(--sam-line-soft); }.sam-page { width:min(1220px,100%); margin:0 auto; padding:46px clamp(22px,4vw,58px) 64px; }
 .sam-page-wide { width:100%; max-width:none; padding:18px clamp(12px,1.6vw,26px) 24px; }.sam-page-wide .sam-page-title { margin:0 0 10px; font-size:clamp(24px,2.2vw,32px); }
@@ -66,9 +78,18 @@ def render_page(
     with ui.element("div").classes("sam-shell row no-wrap"):
         with ui.element("aside").classes("sam-sidebar column"):
             ui.html('<div class="sam-wordmark"><img class="sam-wordmark-logo" src="/assets-static/samcloud-logo-96.png" alt="SAMcloud logo"><span class="sam-wordmark-text"><strong>SAM</strong>cloud</span></div>')
+            project_directory = state.active_project_directory if project_open else None
             for label, path, icon in _visible_navigation(project_open):
                 classes = "sam-nav sam-nav-active" if path == current_path else "sam-nav"
-                ui.button(label, icon=icon, on_click=lambda destination=path: ui.navigate.to(destination)).props("flat no-caps").classes(classes)
+                marker = f"nav-{path.strip('/') or 'overview'}"
+                reason = _navigation_disabled_reason(path, project_directory)
+                if reason is None:
+                    ui.button(label, icon=icon, on_click=lambda destination=path: ui.navigate.to(destination)).props("flat no-caps").classes(classes).mark(marker)
+                    continue
+                # A disabled q-btn swallows hover events, so the tooltip lives on a wrapping slot.
+                with ui.element("div").classes("sam-nav-slot") as slot:
+                    ui.button(label, icon=icon).props("flat no-caps disable").classes(f"{classes} sam-nav-disabled").mark(marker)
+                slot.tooltip(reason)
             ui.label("COLMAP · SAM3").classes("sam-sidebar-footer")
         with ui.element("main").classes("sam-main"):
             ui.element("div").classes("sam-topbar")

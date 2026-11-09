@@ -74,7 +74,8 @@ def plot_view(points, class_ids, x_axis, y_axis, title, output_path):
     ax.set_aspect("equal", adjustable="box")
     ax.grid(alpha=0.22, linewidth=0.5)
 
-    present = np.unique(class_ids)
+    present = [int(class_id) for class_id in np.unique(class_ids)
+               if 0 <= int(class_id) < len(CLASS_NAMES) and int(class_id) < len(CLASS_COLORS)]
     legend = [
         Line2D([0], [0], marker="o", color="w", label=CLASS_NAMES[class_id],
                markerfacecolor=CLASS_COLORS[class_id], markersize=7)

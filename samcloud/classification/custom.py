@@ -10,14 +10,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
 
 from samcloud.core.paths import CONFIG_DIRECTORY
+from samcloud.classification.profiles import load_cyclone_codes
 
 PROJECT_CLASSES_RELATIVE = Path("config") / "classes.json"
-CUSTOM_LAS_CODE_START = 64  # first LAS 1.4 user-definable class code
+CUSTOM_LAS_CODE_START = 82
 CUSTOM_CLASS_LIMIT = 255
 _HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
@@ -33,6 +35,57 @@ def project_classes_path(project_directory: Path | str | None) -> Path:
         if candidate.is_file():
             return candidate
     return global_classes_path()
+
+
+def migrate_classes_config(config: dict) -> dict:
+    """Return an in-memory Cyclone-safe migration of a legacy project class configuration."""
+    config = deepcopy(config)
+    global_config = json.loads(global_classes_path().read_text(encoding="utf-8"))
+    custom_codes = [code for code, entry in load_cyclone_codes().items() if entry.get("custom") and code != 82]
+    for class_set in ("outdoor", "indoor"):
+        codes = config.get("las_codes", {}).get(class_set)
+        entries = config.get(class_set)
+        if not isinstance(codes, list) or not isinstance(entries, list):
+            continue
+        global_codes = global_config["las_codes"][class_set]
+        standard_codes = {
+            class_name(entry): global_codes[index]
+            for index, entry in enumerate(global_config[class_set], start=1)
+        }
+        migrated = [global_codes[0]]
+        used = {global_codes[0]}
+        for index, entry in enumerate(entries, start=1):
+            name = class_name(entry)
+            if name in standard_codes:
+                migrated.append(standard_codes[name])
+                used.add(standard_codes[name])
+                continue
+            current = codes[index] if index < len(codes) else None
+            if current not in custom_codes or current in used:
+                current = next((code for code in custom_codes if code not in used), None)
+                if current is None:
+                    raise ValueError("Keine freien LAS-Klassencodes mehr")
+            migrated.append(current)
+            used.add(current)
+        config.setdefault("las_codes", {})[class_set] = migrated
+    return config
+
+
+def load_project_classes(project_directory: Path | str | None) -> dict:
+    """Load effective project classes and migrate legacy codes in memory only."""
+    return migrate_classes_config(json.loads(project_classes_path(project_directory).read_text(encoding="utf-8")))
+
+
+def _migrate_custom_codes(path: Path) -> dict:
+    """Compatibility wrapper returning the in-memory migration without writing it."""
+    return migrate_classes_config(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _atomic_write_classes(path: Path, config: dict) -> None:
+    """Persist an explicitly rebuilt project class configuration atomically."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def class_name(entry: str) -> str:
@@ -113,7 +166,7 @@ def is_customized(customization: dict | None) -> bool:
 
 def build_custom_classes(class_set: str, customization: dict | None, config: dict | None = None) -> dict:
     """Return a full classes.json with the customisation applied to ``class_set``."""
-    base = deepcopy(config if config is not None else json.loads(global_classes_path().read_text(encoding="utf-8")))
+    base = migrate_classes_config(config if config is not None else json.loads(global_classes_path().read_text(encoding="utf-8")))
     custom = normalize_customization(customization, class_set, base)
     standard = standard_classes(class_set, base)
     prompts = [custom["prompts"].get(item["name"], item["prompts"]) for item in standard]
@@ -122,14 +175,14 @@ def build_custom_classes(class_set: str, customization: dict | None, config: dic
     colors = list(base.get("colors", {}).get(class_set) or [])
     labels = list(base.get("labels_de", {}).get(class_set) or [])
     used_codes = set(las_codes)
-    next_code = CUSTOM_LAS_CODE_START
+    custom_codes = [code for code, entry in load_cyclone_codes().items() if entry.get("custom") and code != 82]
+    available_codes = [code for code in custom_codes if code not in used_codes]
     for item in custom["added"]:
         entries.append(", ".join([item["name"], *item["prompts"]]))
         prompts.append(item["prompts"])
-        while next_code in used_codes:
-            next_code += 1
-        if next_code > 255:
+        if not available_codes:
             raise ValueError("Keine freien LAS-Klassencodes mehr")
+        next_code = available_codes.pop(0)
         used_codes.add(next_code)
         if las_codes:
             las_codes.append(next_code)
@@ -155,6 +208,5 @@ def write_project_classes(project_directory: Path, class_set: str, customization
         return None
     path = Path(project_directory) / PROJECT_CLASSES_RELATIVE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(build_custom_classes(class_set, customization), indent=2, ensure_ascii=False),
-                    encoding="utf-8")
+    _atomic_write_classes(path, build_custom_classes(class_set, customization))
     return path

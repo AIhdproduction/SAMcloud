@@ -3,8 +3,9 @@
 from nicegui import app, ui
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from samcloud.app.pages import control_points, dense_cloud, home, projects, settings, sparse_cloud
+from samcloud.app.pages import control_points, dense_cloud, dxf, home, projects, settings, sparse_cloud
 from samcloud.app.state import state
+from samcloud.app.dxf_review_canvas import review_background, review_payload
 from samcloud.app.gcp_review import image_crop, marker_payload, resolve_project_image
 from samcloud.core.paths import ASSETS_DIRECTORY
 from samcloud.control_points.repository import (
@@ -239,6 +240,36 @@ def continue_reviewed_control_points(payload: dict[str, object] | None = None):
     return JSONResponse({"status": "started"}, status_code=202)
 
 
+@app.get("/api/dxf/payload/{level_key}")
+def dxf_review_payload(level_key: str):
+    """Serve the cached DXF vector payload of a level ('site' for outdoor); never generates."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    try:
+        payload = review_payload(project_directory, level_key)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+    if payload is None:
+        return JSONResponse({"error": "No cached DXF preview for this level"}, status_code=404)
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/dxf/background/{level_key}/{source}")
+def dxf_review_background(level_key: str, source: str):
+    """Serve the cached north-up background PNG ('rgb' or 'classes') of a level; never generates."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    try:
+        path = review_background(project_directory, level_key, source)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+    if path is None:
+        return JSONResponse({"error": "No cached background image"}, status_code=404)
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
 def _review_action(payload: dict[str, object], action):
     project_directory = state.active_project_directory
     if project_directory is None:
@@ -267,4 +298,5 @@ def create_application() -> None:
     ui.page("/sparse")(sparse_cloud.render)
     ui.page("/control-points")(control_points.render)
     ui.page("/dense")(dense_cloud.render)
+    ui.page("/dxf")(dxf.render)
     ui.page("/settings")(settings.render)

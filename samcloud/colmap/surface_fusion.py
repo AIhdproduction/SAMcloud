@@ -702,6 +702,8 @@ def class_coherence(points: np.ndarray, labels: np.ndarray, class_ids: dict[str,
     import torch.nn.functional as F
 
     labels = np.asarray(labels).copy()
+    never_classified = labels == 255
+    labels[never_classified] = 0
     keep = np.ones(len(points), dtype=bool)
     stats = {"relabelled": 0, "removed_fragments": 0}
     group = []
@@ -712,6 +714,7 @@ def class_coherence(points: np.ndarray, labels: np.ndarray, class_ids: dict[str,
             group.append(class_ids[name])
     present = [c for c in group if np.any(labels == c)]
     if len(points) < 2 or len(present) < 2:
+        labels[never_classified] = 255
         return labels, keep, stats
     cell = float(settings["class_cell_m"])
     lo = points.min(axis=0)
@@ -748,6 +751,7 @@ def class_coherence(points: np.ndarray, labels: np.ndarray, class_ids: dict[str,
     fragment = in_group & (own < float(settings["class_min_points"])) & (best == 0) & (lab != 0)
     lab = torch.where(relabel, best_class, lab)
     labels = lab.cpu().numpy().astype(labels.dtype)
+    labels[never_classified] = 255
     keep = ~fragment.cpu().numpy()
     stats["relabelled"] = int(relabel.sum())
     stats["removed_fragments"] = int((~keep).sum())

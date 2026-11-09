@@ -187,6 +187,7 @@ class ProcessingManager:
         classification = settings.get("classification", {})
         coordinates = settings.get("coordinate_systems", {})
         class_set = classification.get("class_set", "outdoor")
+        engine = classification.get("engine", "sam3")
         output = classified.with_suffix(".las")
         georeference = self._ensure_georeference(project_directory)
         command = [
@@ -201,6 +202,8 @@ class ProcessingManager:
             str(project_classes_path(project_directory)),
             "--class-set",
             class_set,
+            "--engine",
+            engine,
             "--source-crs",
             coordinates.get("working_crs", "LOCAL"),
             "--target-crs",
@@ -520,6 +523,10 @@ class ProcessingManager:
         workflow = project.setdefault("workflow", {})
         if return_code == 0:
             workflow["export"] = "completed"
+            classification = project.setdefault("settings", {}).setdefault("classification", {})
+            classification["model_profile"] = (
+                "flurseg_v1" if classification.get("engine") == "flurseg" else f"sam3_{classification.get('class_set', 'outdoor')}"
+            )
             project.setdefault("processing", {}).update({
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "progress": {"percent": 100, "stage": "Complete", "detail": ""},

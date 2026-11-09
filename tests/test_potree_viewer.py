@@ -103,6 +103,9 @@ def test_wide_page_layout_class(monkeypatch) -> None:
         def props(self, *args, **kwargs) -> _FakeElement:
             return self
 
+        def mark(self, *markers: str) -> _FakeElement:
+            return self
+
         def __enter__(self) -> _FakeElement:
             return self
 

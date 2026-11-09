@@ -26,6 +26,11 @@ def load_global_config(name: str) -> dict[str, Any]:
     return load_yaml(CONFIG_DIRECTORY / name)
 
 
+def load_dxf_export_config() -> dict[str, Any]:
+    """Load DXF export defaults, including automatic project-mode detection."""
+    return load_global_config("dxf_export.yaml")
+
+
 def load_export_crs_presets() -> dict[str, dict[str, Any]]:
     """Load and validate ordered LAS export CRS presets."""
     configuration = load_global_config("export_crs.yml")

@@ -17,6 +17,8 @@ from samcloud.pointcloud.georeference import (
     require_export_grids,
     strict_transformer,
 )
+from samcloud.classification.profiles import NEVER_CLASSIFIED_ID, profile_for_engine, write_profile_sidecar
+from samcloud.classification.custom import migrate_classes_config
 
 
 PLY_DTYPE = np.dtype(
@@ -47,6 +49,11 @@ LEGACY_CLASSIFICATION_CODE_SETS = {
         ],
         dtype=np.uint8,
     ),
+}
+
+LIVE_FALLBACK_CODE_SETS = {
+    "outdoor": np.array([1, 2, 11, 73, 74, 3, 5, 6, 91, 151, 84, 81, 77, 72, 14, 180, 9, 104, 105, 108, 109, 110, 75, 95], dtype=np.uint8),
+    "indoor": np.array([1, 180, 100, 101, 102, 103, 104, 105, 107, 108, 109, 110, 111, 112, 113, 114, 116, 117, 120, 121], dtype=np.uint8),
 }
 
 
@@ -86,27 +93,25 @@ def classification_codes(config: dict, class_set: str) -> np.ndarray:
         raise ValueError(f"Unsupported class set: {class_set}")
     codes = config.get("las_codes", {}).get(class_set)
     if codes is None:
-        return LEGACY_CLASSIFICATION_CODE_SETS[class_set]
+        codes = LIVE_FALLBACK_CODE_SETS[class_set]
     if len(codes) != len(config[class_set]) + 1:
         raise ValueError(f"classes.json: las_codes.{class_set} needs one code per class plus unknown")
     return np.asarray(codes, dtype=np.uint8)
 
 
-def load_class_mapping(path: Path, target_crs: str, class_set: str) -> dict[str, object]:
+def load_class_mapping(path: Path, target_crs: str, class_set: str, engine: str = "sam3") -> dict[str, object]:
     """Build human-readable metadata from the pipeline class configuration."""
-    config = json.loads(path.read_text(encoding="utf-8"))
-    class_names = [name.split(",", 1)[0].strip() for name in config[class_set]]
-    source_names = [config.get("unknown_class_name", "Unknown/noise"), *class_names]
-    mapping = {
-        str(int(las_code)): source_names[source_id]
-        for source_id, las_code in enumerate(classification_codes(config, class_set))
-    }
+    config = migrate_classes_config(json.loads(path.read_text(encoding="utf-8")))
+    profile = profile_for_engine(engine, class_set, config)
+    mapping = profile.code_to_name()
     return {
         "classification_field": "classification",
         "coordinate_reference": export_target_crs(target_crs),
         "height_system": export_height_system(target_crs),
         "classification_scheme": "Cyclone 3DR / ASPRS LAS 1.4",
         "semantic_class_set": class_set,
+        "model_profile": profile.name,
+        "mode": class_set,
         "class_mapping": mapping,
     }
 
@@ -120,15 +125,18 @@ def export_las(
     target_crs: str,
     class_set: str,
     georeference_path: Path | None = None,
+    engine: str = "sam3",
 ) -> int:
     payload_offset, vertex_count = read_ply_header(input_path)
     output_crs = export_target_crs(target_crs)
     require_export_grids(target_crs)
     georeference = _load_georeference_for_export(source_crs, target_crs, georeference_path)
     transformer = _create_transformer(source_crs, output_crs, georeference is not None)
-    codes = classification_codes(json.loads(Path(classes_path).read_text(encoding="utf-8")), class_set)
+    config = migrate_classes_config(json.loads(Path(classes_path).read_text(encoding="utf-8")))
+    profile = profile_for_engine(engine, class_set, config)
+    codes = profile.codes_for_scalar_classes()
     metadata = json.dumps(
-        load_class_mapping(classes_path, target_crs, class_set), separators=(",", ":")
+        load_class_mapping(classes_path, target_crs, class_set, engine), separators=(",", ":")
     ).encode("utf-8")
 
     header = laspy.LasHeader(point_format=7, version="1.4")
@@ -161,12 +169,18 @@ def export_las(
             las_points.red = points["red"].astype(np.uint16) * 257
             las_points.green = points["green"].astype(np.uint16) * 257
             las_points.blue = points["blue"].astype(np.uint16) * 257
-            if points["scalar_class"].max(initial=0) >= len(codes):
+            scalar_classes = points["scalar_class"]
+            non_sentinel = scalar_classes != NEVER_CLASSIFIED_ID
+            if scalar_classes[non_sentinel].max(initial=0) >= len(codes):
                 raise ValueError("PLY contains a class ID not defined by this export")
-            las_points.classification = codes[points["scalar_class"]]
+            classifications = np.full(count, profile.point_states["never_classified"], dtype=np.uint8)
+            classifications[non_sentinel] = codes[scalar_classes[non_sentinel]]
+            las_points.classification = classifications
             las_points.return_number = np.ones(count, dtype=np.uint8)
             las_points.number_of_returns = np.ones(count, dtype=np.uint8)
             destination.write_points(las_points)
+
+    write_profile_sidecar(output_path, profile, class_set, class_set)
 
     if georeference is not None:
         print(f"Georeference residuals: {format_residuals(georeference)}")
@@ -277,6 +291,7 @@ def main() -> None:
     parser.add_argument("--classes-json", required=True, type=Path, help="pipeline class configuration")
     parser.add_argument("--class-set", choices=("outdoor", "indoor"), default="outdoor",
                         help="semantic class set used in the PLY")
+    parser.add_argument("--engine", choices=("sam3", "flurseg"), default="sam3", help="model profile used for the PLY")
     parser.add_argument("--source-crs", default="LOCAL", help="CRS of the input point cloud, for example EPSG:2056")
     parser.add_argument("--target-crs", default="LOCAL", help="CRS written to LAS, for example EPSG:2056")
     parser.add_argument("--georeference", type=Path, default=None,
@@ -295,6 +310,7 @@ def main() -> None:
         args.target_crs,
         args.class_set,
         args.georeference,
+        args.engine,
     )
     print(f"Wrote {count:,} classified points to {args.output}")
 

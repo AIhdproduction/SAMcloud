@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+from samcloud.classification.profiles import NEVER_CLASSIFIED_ID
 from pathlib import Path
 
 import numpy as np
@@ -152,6 +153,8 @@ def _write_ply_preview(source: Path, output: Path, max_points: int) -> int:
                 green = int(point["green"]) if "green" in offsets else 200
                 blue = int(point["blue"]) if "blue" in offsets else 200
                 class_id = int(point["scalar_class"]) if "scalar_class" in offsets else 0
+                if class_id == NEVER_CLASSIFIED_ID:
+                    class_id = 0
                 output_file.write(
                     struct.pack(
                         "<fffBBBB",

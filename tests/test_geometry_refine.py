@@ -287,3 +287,33 @@ def test_pipeline_command_enables_geometry_refinement_by_default():
     }, "none")
     position = command.index("--geometry-refinement")
     assert command[position + 1] == "1"
+
+
+def test_flurseg_refinement_keeps_road_marking_distinct_from_paved_surface():
+    from samcloud.engine.geometry.refine import refine_classification
+
+    id_to_name, name_to_id = class_name_mapping(Path("config/classes.json"), "outdoor", engine="flurseg")
+    paved_surface_id = next(class_id for class_id, name in id_to_name.items() if class_id == 3 and name == "road")
+    road_marking_id = next(class_id for class_id, name in id_to_name.items() if class_id == 10 and name == "road")
+    xy = _grid(0.0, 1.0, 0.0, 1.0, 0.2)
+    xyz = np.column_stack((xy, np.zeros(len(xy))))
+    classes = np.full(len(xyz), paved_surface_id, dtype=np.uint8)
+    marked = np.arange(0, len(xyz), 3)
+    classes[marked] = road_marking_id
+    config = {
+        "terrain": {"cell_size": 0.5, "percentile": 5, "min_points": 1, "opening_window_m": 1.0,
+                    "ground_classes": ["road"]},
+        "features": {"voxel_size": 0.5, "min_points": 1},
+        "support": {"cell_size": 1.0, "percentile": 5, "min_points": 1, "window_m": 1.0},
+        "confidence": {"protect_above": 1.0, "dtm_min_confidence": 0.0, "second_best_min": 0.2},
+        "neighbors": {"iterations": 1, "voxel_radius": 1, "min_share": 0.05},
+        "flat_roof": {"source_classes": [], "min_hag": 2.5, "min_normal_z": 0.9, "min_planarity": 0.3},
+        "surface": {"enabled": False},
+        "rules": {"road": {"max_hag": 1.0}},
+        "smoothing": {"enabled": True, "voxel_size": 0.3, "iterations": 1, "own_max_share": 0.25,
+                      "majority_min_share": 0.6, "protected_classes": []},
+    }
+
+    refined, _summary = refine_classification(xyz, classes, config, id_to_name, name_to_id)
+
+    assert np.all(refined[marked] == road_marking_id)
