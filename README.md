@@ -44,7 +44,10 @@ Main features:
 - **Reconstruction** with COLMAP 4.2.0 (CUDA): sparse model, GPS/RTK alignment,
   dense stereo, and fusion.
 - **Semantic classification** with SAM3 and the SegEarth-OV3 method: three SAM3
-  heads are fused and the results are voted across all camera views.
+  heads are fused and the results are voted across all camera views. Outdoor
+  projects can use **FlurSeg** instead, the project's own segmentation model
+  (about 15x faster, fixed classes). SAM3 projects can edit and extend their
+  classes when the project is created.
 - **Geometric refinement:** height above ground, flatness, and neighbourhood
   checks. They use the SAM3 confidence, for example to turn flat roofs that
   SAM3 labels as ground into building.
@@ -67,7 +70,7 @@ dashboard and written to `reports/`.
 | 5 | Dense preparation (undistortion) | COLMAP | undistorted images and PINHOLE TXT model in `products/dense/` |
 | – | *Optional pause for control points* | SAMcloud UI | control point observations; GCP georeferencing is applied on resume |
 | 6 | Dense stereo, fusion | COLMAP | `products/dense/fused.ply` and visibility file `fused.ply.vis` |
-| 7 | SAM3 classification | Ultralytics SAM3 | `classified_raw.ply`, `classified_scores.npz` |
+| 7 | Classification | Ultralytics SAM3 or FlurSeg (outdoor) | `classified_raw.ply`, `classified_scores.npz` |
 | 8 | Improve & filter (workflow step 6, see below) | Depth-Anything-V2, depth maps, SAM labels | cleaned and filled `classified_raw.ply` |
 | 9 | Geometric refinement (part of step 6) | `samcloud/engine/geometry` | `classified.ply`, `reports/geometry_summary.json` |
 | 10 | LAS export (manual, workflow step 7) | laspy, PyProj | LAS 1.4 with CRS WKT, class mapping, and CRS-appropriate scale |
@@ -123,12 +126,54 @@ scene `indoor` or `both`, outdoor those of scene `outdoor` or `both`.
 Every prompt is sent to SAM3 on its own and a class keeps the best of its
 prompts. Synonyms must never be joined into one long comma-separated prompt:
 that drives SAM3's presence score towards zero (walls and ceilings were lost).
-The image backbone runs once per tile and the prompts run in batches of 32.
+The image backbone runs once per tile and the prompts run in batches of 8
+(larger batches overflow 24 GB of VRAM on 3200 px drone photos and get about 10x slower).
 To update the classes from a newer Nomivox preset:
 
 ```bat
 venv\Scripts\python -m samcloud.tools.import_nomivox_classes D:\Nomivox\presets\default.json
 ```
+
+### Own classes per project (SAM3)
+
+When creating a project with SAM3 (outdoor, and always for indoor), the panel
+**Klassen anpassen (SAM3)** lets you change the prompts of every standard class
+and add own classes (English name, German label, prompts, colour). The project
+then gets its own `config/classes.json`, which the pipeline, the LAS export and
+the dense viewer use instead of the global file. Standard classes keep their ids
+and names (step 6 and the geometry rules use them); own classes are appended and
+get free LAS codes from 64.
+
+### FlurSeg (outdoor alternative to SAM3)
+
+FlurSeg is an EoMT-DINOv3-L model trained on SAM3 pseudo-labels with 11 classes:
+other, ground, paved surface, low vegetation, tree, building, vehicle,
+construction, curb, road marking and utility cover. `config/flurseg.yml` maps them
+to the SAMcloud outdoor classes (paved surface and road marking to road,
+construction to construction machinery, utility cover to manhole, other to
+unknown). Inference uses a 768 px sliding window (stride 384) in fp16; the
+multi-view voting, step 6 and geometric refinement are the same as for SAM3.
+Its classes are fixed by the training and cannot be customised.
+
+Grütistrasse test (291 drone photos, same dense cloud with 65 M points, SAM3 as
+reference):
+
+| | SAM3 | FlurSeg |
+|---|---|---|
+| Classification per photo | ~30 s | ~2 s |
+| Full run incl. step 6 and geometry | ~2.5 h | 18.5 min |
+| Agreement with SAM3 (FlurSeg's 11-class taxonomy) | – | 93 %, kappa 0.88 |
+
+Ground, low vegetation, vehicle, paved surface and building agree closely
+(IoU 0.79–0.98). Tree, manhole, construction and curb are weaker, and FlurSeg
+cannot separate sidewalk from road or detect fences, poles, signs, walls and
+other fine classes. The model folder (`models/flurseg_eomt_dinov3l_*`) is not
+part of the repository; it will be published on Hugging Face together with its
+`EVALUATION.md`.
+
+The dashboard button **Klassifizierung neu rechnen** (pipeline `--reclassify`)
+re-runs only classification, step 6 and geometry on the kept dense cloud, so
+SAM3 and FlurSeg can be compared on exactly the same points.
 
 More prompts cost time: indoor 360 runs take about 2 s per cubemap face
 (one SAM pass per 1024 px face); large drone photos are tiled and take longer.
