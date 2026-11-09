@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any
 
+from samcloud.classification.custom import project_classes_path
 from samcloud.core.configuration import load_global_config
 from samcloud.core.storage import ensure_text_model, storage_settings
 from samcloud.pointcloud.georeference import fit_enu_to_ecef, save_georeference
@@ -197,7 +198,7 @@ class ProcessingManager:
             "--output",
             str(output),
             "--classes-json",
-            str(PROJECT_ROOT / "config" / "classes.json"),
+            str(project_classes_path(project_directory)),
             "--class-set",
             class_set,
             "--source-crs",
@@ -255,6 +256,33 @@ class ProcessingManager:
         with self._lock:
             self._jobs[project_directory] = process
         Thread(target=self._watch_pipeline, args=(project_directory, "refine", process), daemon=True).start()
+
+    def reclassify(self, project_directory: Path) -> None:
+        """Re-run only the classification (and step 6) on the finished dense cloud with the current settings."""
+        project_directory = project_directory.resolve()
+        if self.is_running(project_directory):
+            raise ValueError("Processing is already running for this project")
+        if not reclassification_available(project_directory):
+            raise ValueError("The dense cloud was not kept for this project; process it again from the start")
+        project = self._state.projects.load(project_directory)
+        workflow = project.setdefault("workflow", {})
+        workflow["classification"] = "running"
+        project.setdefault("processing", {}).update({
+            "last_error": "", "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": "",
+            "progress": {"percent": 87, "stage": "Reclassifying", "detail": ""},
+        })
+        self._state.projects.save(project_directory, project)
+        command = [*self._pipeline_command(project_directory, project, "none"), "--reclassify"]
+        try:
+            process = self._launch(command, project_directory / "reports" / "pipeline.log")
+        except OSError as error:
+            workflow["classification"] = "failed"
+            project["processing"]["last_error"] = str(error)
+            self._state.projects.save(project_directory, project)
+            raise
+        with self._lock:
+            self._jobs[project_directory] = process
+        Thread(target=self._watch_pipeline, args=(project_directory, "reclassify", process), daemon=True).start()
 
     def continue_after_control_points(self, project_directory: Path) -> None:
         """Start Phase B after validating that enough GCP clicks are available."""
@@ -334,6 +362,8 @@ class ProcessingManager:
             str(products),
             "--gpu",
             "1" if workflow_settings.get("use_gpu", True) else "0",
+            "--classes-json",
+            str(project_classes_path(project_directory)),
             "--class-set",
             classification.get("class_set", "outdoor"),
             "--min-votes",
@@ -344,6 +374,8 @@ class ProcessingManager:
             str(classification.get("tile_min_overlap", 0.2)),
             "--classification-mode",
             classification.get("mode", "segearth_ov3"),
+            "--classification-engine",
+            classification_engine(classification),
             "--background-threshold",
             str(classification.get("background_threshold", 0.4)),
             "--query-threshold",
@@ -428,6 +460,13 @@ class ProcessingManager:
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "progress": {"percent": 100, "stage": "Complete", "detail": ""},
             })
+        elif return_code == 0 and mode == "reclassify":
+            workflow["classification"] = "completed"
+            workflow["refinement"] = "completed"
+            project.setdefault("processing", {}).update({
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "progress": {"percent": 100, "stage": "Complete", "detail": ""},
+            })
         elif return_code == 0:
             workflow["alignment"] = "completed"
             if mode == "after_alignment":
@@ -461,7 +500,8 @@ class ProcessingManager:
                 "progress": {"percent": 100, "stage": "Complete", "detail": ""},
             })
         else:
-            current = "refinement" if mode == "refine" else "alignment" if workflow.get("dense_cloud") == "queued" else "dense_cloud"
+            current = ("refinement" if mode == "refine" else "classification" if mode == "reclassify"
+                       else "alignment" if workflow.get("dense_cloud") == "queued" else "dense_cloud")
             workflow[current] = "failed"
             project.setdefault("processing", {})["last_error"] = (
                 f"Pipeline ended with exit code {return_code}. See reports/pipeline.log."
@@ -496,3 +536,24 @@ class ProcessingManager:
         self._state.projects.save(project_directory, project)
         with self._lock:
             self._jobs.pop(project_directory, None)
+
+
+CLASSIFICATION_ENGINES = {"sam3", "flurseg"}
+
+
+def classification_engine(classification: dict) -> str:
+    """Engine stored in the project settings; FlurSeg only applies to the outdoor class set."""
+    engine = str(classification.get("engine", "sam3") or "sam3")
+    if engine not in CLASSIFICATION_ENGINES or classification.get("class_set", "outdoor") != "outdoor":
+        return "sam3"
+    return engine
+
+
+def reclassification_available(project_directory: Path) -> bool:
+    """Whether the finished dense cloud (fused.ply, visibility, dense cameras) was kept for a reclassification."""
+    dense = Path(project_directory) / "products" / "dense"
+
+    def kept(name: str) -> bool:
+        return (dense / name).is_file() or (dense / f"{name}.gz").is_file()
+
+    return kept("fused.ply") and kept("fused.ply.vis") and (dense / "sparse").is_dir()

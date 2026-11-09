@@ -7,6 +7,7 @@ from nicegui import ui
 
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
+from samcloud.classification.custom import standard_classes
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_deletion import delete_project
 from samcloud.core.storage import DEFAULT_STORAGE
@@ -18,6 +19,96 @@ STORAGE_OPTIONS = {
     "keep_processing_cache": "Schritt 6 (Verbessern & filtern) später schnell neu rechnen können – "
                              "behält Tiefenkarten, SAM-Bilder und Depth-Anything (braucht viel Speicher)",
 }
+
+
+ENGINE_OPTIONS = {
+    "sam3": "SAM3 – Klassen anpassbar und erweiterbar (Standard)",
+    "flurseg": "FlurSeg – ca. 15× schneller, 11 feste Klassen",
+}
+FLURSEG_CLASS_SUMMARY = (
+    "Boden, versiegelte Fläche (Strasse, Gehweg, Markierung → road), Randstein, niedrige Vegetation, "
+    "Baum, Gebäude, Fahrzeug, Baustelle (→ construction machinery), Schachtdeckel (→ manhole); "
+    "alles andere → unknown"
+)
+
+
+class _ClassEditor:
+    """SAM3 class editor on the create-project card: edit standard prompts, add own classes."""
+
+    def __init__(self) -> None:
+        self.class_set = ""
+        self.engine = ""
+        self.prompt_inputs: dict[str, tuple[ui.input, list[str]]] = {}
+        self.added: list[dict] = []
+        self.flurseg_note = ui.label(
+            "FlurSeg ist etwa 15× schneller als SAM3, die Klassen sind aber durch das Training fest "
+            f"und nicht anpassbar: {FLURSEG_CLASS_SUMMARY}."
+        ).classes("text-sm text-slate-400 max-w-[52rem]")
+        self.expansion = ui.expansion("Klassen anpassen (SAM3)", icon="tune").classes("w-full")
+        with self.expansion:
+            ui.label(
+                "Prompts sind englische Begriffe, mit Komma getrennt. Die Standardklassen bleiben erhalten "
+                "(Schritt 6 und die Geometrie-Regeln nutzen sie), eigene Klassen werden hinten angehängt "
+                "und bekommen LAS-Codes ab 64."
+            ).classes("text-sm text-slate-400")
+            self.standard_column = ui.column().classes("w-full gap-1")
+            ui.label("Eigene Klassen").classes("text-base font-medium q-mt-md")
+            self.added_column = ui.column().classes("w-full gap-2")
+            ui.button("Klasse hinzufügen", icon="add", on_click=self.add_class).props("outline")
+
+    def update(self, class_set: str, engine: str) -> None:
+        sam = class_set == "indoor" or engine == "sam3"
+        self.flurseg_note.set_visibility(not sam)
+        self.expansion.set_visibility(sam)
+        if sam and class_set != self.class_set:
+            self.class_set = class_set
+            self._render_standard()
+            self.added.clear()
+            self.added_column.clear()
+        self.engine = engine
+
+    def _render_standard(self) -> None:
+        self.prompt_inputs.clear()
+        self.standard_column.clear()
+        with self.standard_column:
+            for item in standard_classes(self.class_set):
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.label(f"{item['label']} ({item['name']})").classes("text-sm w-64 shrink-0")
+                    control = ui.input(value=", ".join(item["prompts"])).props("dense").classes("grow")
+                self.prompt_inputs[item["name"]] = (control, item["prompts"])
+
+    def add_class(self) -> None:
+        entry: dict = {}
+        with self.added_column:
+            with ui.row().classes("w-full items-center gap-2 no-wrap") as row:
+                entry["name"] = ui.input("Name (englisch)", placeholder="solar panel").props("dense").classes("w-44")
+                entry["label"] = ui.input("Bezeichnung", placeholder="Solaranlage").props("dense").classes("w-44")
+                entry["prompts"] = ui.input("Prompts", placeholder="solar panel, photovoltaic module").props(
+                    "dense").classes("grow")
+                entry["color"] = ui.color_input("Farbe", value="#FF00FF").props("dense").classes("w-36")
+                ui.button(icon="delete", on_click=lambda: self._remove(entry, row)).props("flat round dense")
+        self.added.append(entry)
+
+    def _remove(self, entry: dict, row) -> None:
+        self.added.remove(entry)
+        row.delete()
+
+    def customization(self) -> dict | None:
+        """Customisation for create_project; None for FlurSeg or when nothing changed."""
+        if self.class_set != "indoor" and self.engine != "sam3":
+            return None
+        prompts = {}
+        for name, (control, default) in self.prompt_inputs.items():
+            values = [part.strip() for part in (control.value or "").split(",") if part.strip()]
+            if values != default:
+                prompts[name] = values
+        added = [{
+            "name": entry["name"].value or "",
+            "label": entry["label"].value or "",
+            "prompts": entry["prompts"].value or entry["name"].value or "",
+            "color": entry["color"].value or "#FF00FF",
+        } for entry in self.added]
+        return {"prompts": prompts, "added": added} if prompts or added else None
 
 
 def render() -> None:
@@ -41,6 +132,19 @@ def render() -> None:
                 label="Semantic class set",
                 value="outdoor",
             )
+            classification_engine = ui.select(
+                ENGINE_OPTIONS,
+                label="Klassifizierungsmodell (Aussenbereich)",
+                value="sam3",
+            ).classes("min-w-[26rem]").bind_visibility_from(class_set, "value", lambda value: value == "outdoor")
+            class_editor = _ClassEditor()
+
+            def update_class_editor() -> None:
+                class_editor.update(class_set.value or "outdoor", classification_engine.value or "sam3")
+
+            class_set.on_value_change(lambda _: update_class_editor())
+            classification_engine.on_value_change(lambda _: update_class_editor())
+            update_class_editor()
             control_points_mode = ui.select(
                 {
                     "none": "No control points - continue automatically",
@@ -130,6 +234,9 @@ def render() -> None:
                         image_directory.value or "",
                         capture_type=capture_type.value,
                         class_set=class_set.value,
+                        classification_engine=(classification_engine.value or "sam3")
+                        if class_set.value == "outdoor" else "sam3",
+                        custom_classes=class_editor.customization(),
                         panorama_image_directory=panorama_image_directory.value or "",
                         panorama_video_path=panorama_video_path.value or "",
                         frame_interval_seconds=float(frame_interval_seconds.value or 0),

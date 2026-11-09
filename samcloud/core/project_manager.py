@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from samcloud.acquisition import validate_capture_configuration
+from samcloud.classification.custom import is_customized, normalize_customization, write_project_classes
 from samcloud.core.configuration import load_global_config, load_yaml
 from samcloud.core.paths import PROJECTS_DIRECTORY, ensure_workspace_directories
 from samcloud.core.storage import DEFAULT_STORAGE
@@ -41,6 +42,8 @@ class ProjectManager:
         *,
         capture_type: str = "drone_gps",
         class_set: str = "outdoor",
+        classification_engine: str = "sam3",
+        custom_classes: dict | None = None,
         panorama_image_directory: str = "",
         panorama_video_path: str = "",
         frame_interval_seconds: float | None = None,
@@ -59,6 +62,8 @@ class ProjectManager:
             image_directory,
             capture_type=capture_type,
             class_set=class_set,
+            classification_engine=classification_engine,
+            custom_classes=custom_classes,
             panorama_image_directory=panorama_image_directory,
             panorama_video_path=panorama_video_path,
             frame_interval_seconds=frame_interval_seconds,
@@ -72,6 +77,8 @@ class ProjectManager:
         for relative_directory in PROJECT_SUBDIRECTORIES:
             (project_directory / relative_directory).mkdir(parents=True, exist_ok=True)
 
+        write_project_classes(project_directory, class_set,
+                              project["settings"]["classification"].get("custom_classes"))
         self.save(project_directory, project)
         return project_directory
 
@@ -125,6 +132,8 @@ class ProjectManager:
         capture_type: str,
         class_set: str,
         panorama_image_directory: str,
+        classification_engine: str = "sam3",
+        custom_classes: dict | None = None,
         panorama_video_path: str,
         frame_interval_seconds: float | None,
         rtk_enabled: bool,
@@ -146,7 +155,14 @@ class ProjectManager:
             panorama_video_path=panorama_video_path,
             frame_interval_seconds=frame_interval_seconds,
         )
+        if classification_engine not in {"sam3", "flurseg"}:
+            raise ValueError("Select a supported classification model")
         defaults["classification"]["class_set"] = class_set
+        # FlurSeg is an outdoor model; indoor projects always classify with SAM3.
+        defaults["classification"]["engine"] = classification_engine if class_set == "outdoor" else "sam3"
+        # Only SAM3 classifies with text prompts; FlurSeg's 11 classes are fixed by its training.
+        if defaults["classification"]["engine"] == "sam3" and is_customized(custom_classes):
+            defaults["classification"]["custom_classes"] = normalize_customization(custom_classes, class_set)
         defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic"}
         defaults["storage"] = {**DEFAULT_STORAGE, **(storage or {})}
         coordinates = defaults["coordinate_systems"]

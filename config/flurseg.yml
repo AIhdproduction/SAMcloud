@@ -1,0 +1,26 @@
+# FlurSeg: own EoMT-DINOv3-L student model (trained on SAM3 pseudo-labels, see the model's INFO.md).
+# Selectable as the outdoor classification engine; indoor projects always use SAM3.
+model:
+  directory: models/flurseg_eomt_dinov3l_20261107-211214/best
+  # Sliding window as in training/flurseg predict: window = model image size, stride = half window.
+  window_size: 768
+  stride: 384
+  # Windows per forward pass (GPU memory vs. speed).
+  batch_size: 4
+  # fp16 = float16 autocast on CUDA (about 2x faster, 99.9 % identical labels); fp32 = exact.
+  precision: fp16
+
+# FlurSeg class -> SAMcloud outdoor class name (first token in config/classes.json).
+# null = no SAMcloud class: the probability counts as "no class" (point stays unknown when it wins).
+class_mapping:
+  other: null
+  ground: ground
+  paved_surface: road
+  low_vegetation: low vegetation
+  tree: tree
+  building: building
+  vehicle: vehicle
+  construction: construction machinery
+  curb: curb
+  road_marking: road
+  utility_cover: manhole

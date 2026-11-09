@@ -8,6 +8,7 @@ from samcloud.acquisition import (
     validate_capture_configuration,
 )
 from samcloud.app.layout import render_page
+from samcloud.app.pages.projects import ENGINE_OPTIONS
 from samcloud.app.state import state
 from samcloud.core.configuration import load_export_crs_presets
 from samcloud.core.storage import storage_settings
@@ -45,6 +46,7 @@ def render() -> None:
         classification.setdefault("tile_size", 1008)
         classification.setdefault("tile_min_overlap", 0.2)
         classification.setdefault("mode", "segearth_ov3")
+        classification.setdefault("engine", "sam3")
         classification.setdefault("background_threshold", 0.4)
         classification.setdefault("query_threshold", 0.4)
         classification.setdefault("threshold_sweep", [])
@@ -144,8 +146,8 @@ def render() -> None:
                 for key, label in STORAGE_OPTIONS.items()
             }
         with ui.card().classes("w-full"):
-            ui.label("SAM3 classification").classes("text-lg font-medium")
-            ui.label("These values apply to the next SAM3 classification run.").classes("text-sm")
+            ui.label("Classification").classes("text-lg font-medium")
+            ui.label("These values apply to the next classification run.").classes("text-sm")
             class_set = ui.select(
                 {"outdoor": "Outdoor", "indoor": "Indoor"},
                 value=classification["class_set"],
@@ -158,6 +160,20 @@ def render() -> None:
                 max=20,
                 step=1,
             )
+            engine = ui.select(
+                ENGINE_OPTIONS,
+                value=classification["engine"] if classification["engine"] in {"sam3", "flurseg"} else "sam3",
+                label="Klassifizierungsmodell (Aussenbereich)",
+            ).classes("w-full")
+            engine_hint = ui.label("Innenbereich wird immer mit SAM3 klassifiziert.").classes("text-sm")
+
+            def update_engine_visibility() -> None:
+                outdoor = class_set.value == "outdoor"
+                engine.set_visibility(outdoor)
+                engine_hint.set_visibility(not outdoor)
+
+            class_set.on_value_change(lambda _event: update_engine_visibility())
+            update_engine_visibility()
             classification_mode = ui.select(
                 {
                     "legacy": "Legacy (instance masks, majority vote)",
@@ -245,6 +261,9 @@ def render() -> None:
                 classification["class_set"] = class_set.value
                 classification["min_votes"] = int(min_votes.value or 0)
                 classification["mode"] = classification_mode.value
+                classification["engine"] = engine.value if class_set.value == "outdoor" else "sam3"
+                if classification["engine"] not in {"sam3", "flurseg"}:
+                    raise ValueError("Select a supported classification model")
                 classification["background_threshold"] = float(background_threshold.value or 0)
                 classification["tile_size"] = int(tile_size.value or 0)
                 classification["tile_min_overlap"] = float(tile_min_overlap.value or 0)

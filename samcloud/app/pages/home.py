@@ -7,6 +7,7 @@ from pathlib import Path
 from nicegui import ui
 
 from samcloud.app.layout import render_page
+from samcloud.app.processing import classification_engine, reclassification_available
 from samcloud.app.state import state
 
 
@@ -15,7 +16,7 @@ _WORKFLOW = (
     ("Align cameras", "alignment"),
     ("Add control points", "control_points"),
     ("Build dense cloud", "dense_cloud"),
-    ("Classify with SAM3", "classification"),
+    ("Classify", "classification"),
     ("Improve & filter", "refinement"),
     ("Export LAS / PLY", "export"),
 )
@@ -178,6 +179,17 @@ def _render_project_workspace(project: dict | None) -> None:
                 on_click=lambda: _refine_from_cache(),
             ).props("outline").classes("sam-button-secondary q-mt-md").tooltip(
                 "Verbessern & filtern mit den aktuellen Einstellungen wiederholen – ohne COLMAP und SAM neu zu rechnen"
+            )
+        if (not processing_active and not _workflow_is_active(workflow)
+                and workflow.get("classification") in {"completed", "failed"} and _reclassification_available()):
+            engine_name = "FlurSeg" if classification_engine(project.get("settings", {}).get("classification", {})) == "flurseg" else "SAM3"
+            ui.button(
+                f"Klassifizierung neu rechnen ({engine_name})",
+                icon="auto_awesome",
+                on_click=lambda: _reclassify(),
+            ).props("outline").classes("sam-button-secondary q-mt-md q-ml-sm").tooltip(
+                "Dieselbe Dense-Wolke mit dem in den Einstellungen gewählten Modell neu klassifizieren "
+                "(SAM3 oder FlurSeg) – ohne Ausrichtung und Dense-Rekonstruktion neu zu rechnen"
             )
         if project.get("processing", {}).get("last_error"):
             ui.label(project["processing"]["last_error"]).classes("text-red-4 text-sm q-mt-md")
@@ -509,7 +521,7 @@ def _start_processing() -> None:
         return
     try:
         state.processing.start_pipeline(state.active_project_directory)
-        ui.notify("Processing started. Keep SAMcloud open while COLMAP and SAM3 run.")
+        ui.notify("Processing started. Keep SAMcloud open while COLMAP and the classification run.")
         ui.navigate.to("/")
     except (OSError, ValueError) as error:
         ui.notify(str(error), type="negative")
@@ -530,6 +542,21 @@ def _cache_available() -> bool:
     from samcloud.engine.processing_cache import load_manifest
 
     return state.active_project_directory is not None and load_manifest(state.active_project_directory) is not None
+
+
+def _reclassification_available() -> bool:
+    return state.active_project_directory is not None and reclassification_available(state.active_project_directory)
+
+
+def _reclassify() -> None:
+    if state.active_project_directory is None:
+        return
+    try:
+        state.processing.reclassify(state.active_project_directory)
+        ui.notify("Klassifizierung wird neu gerechnet.")
+        ui.navigate.to("/")
+    except (OSError, ValueError) as error:
+        ui.notify(str(error), type="negative")
 
 
 def _refine_from_cache() -> None:

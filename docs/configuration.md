@@ -61,6 +61,36 @@ For SegEarth-OV3, `background_threshold` is the per-point background threshold,
 thresholds. The paper does not publish a fixed tau, so choose it per dataset.
 The local SAM3 checkpoint is stored at `models/sam3.pt` and is excluded from Git.
 
+## `flurseg.yml`
+
+FlurSeg is the project's own EoMT-DINOv3-L semantic segmentation model (trained on
+SAM3 pseudo-labels, folder `models/flurseg_eomt_dinov3l_*`, see its `INFO.md`). In
+the project settings it can replace SAM3 for the **outdoor** class set
+(`classification.engine: flurseg`); indoor projects always use SAM3. The file holds
+the model folder, the sliding window (768 px, stride 384) and the mapping of the 11
+FlurSeg classes to the SAMcloud outdoor classes (`other` maps to unknown). FlurSeg
+uses the same weighted multi-view voting, confidence scores and step 6 as SAM3.
+It needs `transformers` and `scipy` (in `requirements.txt`).
+
+"Reclassify" on the dashboard (pipeline `--reclassify`) re-runs only the
+classification and step 6 on the kept dense cloud, recreating the undistorted
+images if compaction released them. This allows a SAM3/FlurSeg comparison on
+exactly the same points.
+
+The FlurSeg model folder is not part of the repository (`models/` is ignored); it will be
+published on Hugging Face. Its `EVALUATION.md` holds the Grütistrasse comparison against SAM3
+(about 15x faster per image, 93 % agreement in FlurSeg's 11-class taxonomy).
+
+### Project class customisation (SAM3 only)
+
+When a project is created with SAM3 (outdoor or indoor), the "Klassen anpassen" panel lets you
+edit the prompts of the standard classes and add own classes (English name, German label,
+prompts, colour). The result is written to the project's own `config/classes.json`, which the
+pipeline (`--classes-json`), the LAS export and the dense viewer then use instead of the global
+file. Standard classes keep their ids and names because step 6 and the geometry rules address
+them by name; own classes are appended and get free LAS codes from 64. FlurSeg's classes are
+fixed by its training and cannot be customised.
+
 ## `classes.json`
 
 This file provides separate ordered prompt lists for `outdoor` and `indoor`

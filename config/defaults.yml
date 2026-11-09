@@ -53,6 +53,8 @@ classification:
   tile_size: 1008
   tile_min_overlap: 0.2
   mode: segearth_ov3
+  # Outdoor 2D model: sam3 or flurseg (own EoMT model, config/flurseg.yml). Indoor always uses sam3.
+  engine: sam3
   background_threshold: 0.4
   query_threshold: 0.4
   threshold_sweep: []

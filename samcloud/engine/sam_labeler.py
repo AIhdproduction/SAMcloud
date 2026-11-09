@@ -136,7 +136,11 @@ class RawHeadSAM3SemanticPredictor(SAM3SemanticPredictor):
     full_resolution = True
     # Text prompts per grounding pass. The image backbone runs once per tile;
     # many prompts (Nomivox presets: ~160) in one pass exhaust a 24 GB GPU.
-    prompt_batch = 32
+    # Measured 2026-11-09 on 3200 px drone images (12 tiles, 169 outdoor prompts,
+    # RTX 4090): 32 reserves 21.4 GB and spills into shared system memory under
+    # WDDM (250 s/image); 16 -> 18.9 GB, 27 s; 8 -> 15.7 GB, 29 s. 8 leaves room
+    # for other GPU applications at ~7 % cost.
+    prompt_batch = 8
 
     def _inference_features(self, features, bboxes=None, labels=None, text: list[str] | None = None):
         if bboxes is not None or text is None or len(text) <= self.prompt_batch:

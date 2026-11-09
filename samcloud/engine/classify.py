@@ -78,8 +78,15 @@ def accumulate_weighted_votes(scores, view_counts, point_indices, point_probs, b
     if point_probs.ndim != 2 or point_probs.shape[0] != len(point_indices):
         raise ValueError("point_probs must have one row per point index")
     visible = point_probs.max(axis=1) >= background_threshold
-    np.add.at(scores, point_indices[visible], point_probs[visible])
-    np.add.at(view_counts, point_indices[visible], 1)
+    rows = point_indices[visible]
+    if len(rows) < 2 or bool(np.all(rows[1:] > rows[:-1])):
+        # Strictly increasing = unique (the visibility index lists each point once per view):
+        # plain fancy-index addition is ~5x faster than np.add.at.
+        scores[rows] += point_probs[visible]
+        view_counts[rows] += 1
+    else:
+        np.add.at(scores, rows, point_probs[visible])
+        np.add.at(view_counts, rows, 1)
 
 
 def resolve_weighted_votes(scores, view_counts, min_votes, unknown_id):
@@ -334,6 +341,25 @@ def _class_counts(final_class, class_names):
     }
 
 
+def make_point_labeler(args, class_names, unknown_id, prompts=None):
+    """Point scorer of the selected engine: SAM3 head fusion or the FlurSeg model (outdoor only)."""
+    if getattr(args, "engine", "sam3") == "flurseg":
+        if __package__:
+            from .flurseg_labeler import FlurSegLabeler
+        else:
+            from flurseg_labeler import FlurSegLabeler
+        print("      Engine: FlurSeg (own EoMT-DINOv3 model, config/flurseg.yml)")
+        return FlurSegLabeler(class_names, unknown_id=unknown_id)
+    return HeadFusionLabeler(
+        class_names,
+        unknown_id=unknown_id,
+        tile_size=args.tile_size,
+        min_overlap_frac=args.tile_min_overlap,
+        query_threshold=args.query_threshold,
+        prompts=prompts,
+    )
+
+
 def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
                      prompts=None):
     """Classify with SegEarth-OV3 fusion and class-weighted 3D voting."""
@@ -355,14 +381,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         )
         for threshold in thresholds
     }
-    labeler = HeadFusionLabeler(
-        class_names,
-        unknown_id=unknown_id,
-        tile_size=args.tile_size,
-        min_overlap_frac=args.tile_min_overlap,
-        query_threshold=args.query_threshold,
-        prompts=prompts,
-    )
+    labeler = make_point_labeler(args, class_names, unknown_id, prompts)
 
     depth_check = bool(getattr(args, "depth_check", 1))
     depth_stats = {"checked": 0, "class_removed": 0, "occluded": 0, "raster_pixels_moved": 0}
@@ -437,6 +456,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                     "images_processed": len(image_items),
                     "class_counts": class_counts,
                     "mode": args.mode,
+                    "engine": getattr(args, "engine", "sam3"),
                     "background_threshold": args.background_threshold,
                     "query_threshold": args.query_threshold,
                     "threshold_sweep": threshold_summary,
@@ -468,6 +488,9 @@ def main():
     ap.add_argument("--tile-min-overlap", type=float, default=0.2, help="minimum overlap fraction between neighbouring tiles")
     ap.add_argument("--mode", choices=("legacy", "segearth_ov3"), default="segearth_ov3",
                     help="SAM3 classification path (default: segearth_ov3; legacy remains available for comparison)")
+    ap.add_argument("--engine", choices=("sam3", "flurseg"), default="sam3",
+                    help="2D model: sam3 (default) or flurseg (own EoMT model, outdoor class set only; "
+                         "always uses the weighted SegEarth-OV3 voting)")
     ap.add_argument("--background-threshold", type=float, default=0.4,
                     help="SegEarth-OV3 background threshold applied to every sampled point")
     ap.add_argument("--query-threshold", type=float, default=0.4,
@@ -494,6 +517,8 @@ def main():
         parse_threshold_sweep(args.threshold_sweep)
     except ValueError as error:
         ap.error(str(error))
+    if args.engine == "flurseg" and args.class_set != "outdoor":
+        ap.error("--engine flurseg is only available for the outdoor class set")
 
     dense_dir = Path(args.dense_dir)
     model_dir = Path(args.model_dir) if args.model_dir else dense_dir / "sparse"
@@ -531,7 +556,7 @@ def main():
         for img_id, point_indices in img_to_points.items()
         if img_id in images and (Path(args.images_dir) / images[img_id].name).exists()
     ]
-    if args.mode == "segearth_ov3":
+    if args.mode == "segearth_ov3" or args.engine == "flurseg":
         run_segearth_ov3(
             args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
             prompts=prompts,

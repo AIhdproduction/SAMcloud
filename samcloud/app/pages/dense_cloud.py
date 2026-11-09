@@ -8,8 +8,8 @@ from nicegui import ui
 from samcloud.app.layout import render_page
 from samcloud.app.pointcloud_viewer import default_class_colors, render_pointcloud_viewer
 from samcloud.app.state import state
+from samcloud.classification.custom import project_classes_path
 from samcloud.classification.service import class_default_colors, class_las_codes
-from samcloud.core.paths import CONFIG_DIRECTORY
 
 
 
@@ -31,7 +31,7 @@ def render() -> None:
         class_set = project["settings"].get("classification", {}).get("class_set", "outdoor")
         classes = _load_classes(class_set)
         color_hexes = _class_color_hexes(project, len(classes) + 1, class_set)
-        las_codes = class_las_codes(class_set)
+        las_codes = class_las_codes(class_set, _class_config())
         labels = ["Unknown / noise", *[name.split(",")[0].title() for name in classes]]
         with ui.column().classes("w-full gap-4"):
             with ui.card().classes("w-full"):
@@ -103,9 +103,13 @@ def render() -> None:
     render_page("Dense Cloud", content, current_path="/dense", wide=True)
 
 
+def _class_config() -> dict:
+    """classes.json of the open project (its own when customised, else the global one)."""
+    return json.loads(project_classes_path(state.active_project_directory).read_text(encoding="utf-8"))
+
+
 def _load_classes(class_set: str) -> list[str]:
-    data = json.loads((CONFIG_DIRECTORY / "classes.json").read_text(encoding="utf-8"))
-    return data[class_set]
+    return _class_config()[class_set]
 
 
 def _set_class_visibility(
@@ -118,7 +122,7 @@ def _set_class_visibility(
 
 def _default_color_hexes(count: int, class_set: str | None = None) -> list[str]:
     """classes.json colours (Nomivox) when defined, else the Cyclone-style palette."""
-    configured = class_default_colors(class_set) if class_set else None
+    configured = class_default_colors(class_set, _class_config()) if class_set else None
     if configured is not None and len(configured) == count:
         return configured
     return [_rgb_to_hex(color) for color in default_class_colors(count)]

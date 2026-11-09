@@ -1321,7 +1321,7 @@ def _refine_after_classification(
             progress.begin("depth_fill", len(views))
         started_at = time.perf_counter()
         try:
-            class_names = json.loads((PROJECT_ROOT / "config" / "classes.json").read_text(encoding="utf-8"))[args.class_set]
+            class_names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
             report = fill_classified_from_prior(
                 dense_dir, classified_raw, views, priors, fill_settings, scores_path=scores,
                 labels_dir=labels_dir, progress=_estimator_progress(progress), class_names=class_names,
@@ -1356,7 +1356,7 @@ def _refine_after_classification(
             progress.begin("surface_fusion", len(views))
         started_at = time.perf_counter()
         try:
-            class_names = json.loads((PROJECT_ROOT / "config" / "classes.json").read_text(encoding="utf-8"))[args.class_set]
+            class_names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
             report = consolidate_classified_cloud(
                 dense_dir, classified_raw, views, priors, fusion, scores_path=scores,
                 labels_dir=labels_dir, class_names=class_names, progress=_estimator_progress(progress),
@@ -1375,7 +1375,7 @@ def _refine_after_classification(
             progress.begin("plane_fill")
         started_at = time.perf_counter()
         try:
-            class_names = json.loads((PROJECT_ROOT / "config" / "classes.json").read_text(encoding="utf-8"))[args.class_set]
+            class_names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
             report = fill_classified_cloud(
                 dense_dir, classified_raw, labels_dir, class_names, settings,
                 scores_path=scores, views=views, prior_reader=priors,
@@ -1467,6 +1467,89 @@ def _refine_from_cache(
                            classified_output, georeferenced)
 
 
+def _classification_engine(args) -> str:
+    """2D model for classify.py: FlurSeg only for the outdoor class set, SAM3 otherwise."""
+    engine = getattr(args, "classification_engine", "sam3") or "sam3"
+    return engine if engine == "flurseg" and args.class_set == "outdoor" else "sam3"
+
+
+def _writes_scores(args) -> bool:
+    """Whether classify.py writes weighted-vote confidence scores (SegEarth-OV3 voting or FlurSeg)."""
+    return args.classification_mode == "segearth_ov3" or _classification_engine(args) == "flurseg"
+
+
+def _reclassify_project(
+    args, outdir: Path, report_dir: Path, summary: RunSummary, progress: "ProgressTracker | None",
+    classified_output: Path,
+) -> None:
+    """Re-run only classification and step 6 on the project's finished dense cloud.
+
+    Uses the kept classification inputs (fused.ply, fused.ply.vis, dense/sparse;
+    zstd-compressed after compaction). When the undistorted images were released,
+    they are recreated from the input photos with COLMAP's image_undistorter at
+    the resolution of the dense cameras, so every engine sees exactly the same
+    views and points. Depth maps are not recomputed: the per-view depth check and
+    the indoor depth steps are skipped when they are gone.
+    """
+    import pycolmap
+
+    from samcloud.core.sparse_model import resolve_sparse_model
+
+    dense_dir = outdir / "dense"
+    for name in ("fused.ply", "fused.ply.vis"):
+        _ensure_if_compressed(dense_dir / name)
+    missing = [str(path) for path in (dense_dir / "fused.ply", dense_dir / "fused.ply.vis", dense_dir / "sparse")
+               if not path.exists()]
+    if missing:
+        raise ValueError("Cannot reclassify; the dense cloud was not kept (storage option "
+                         "keep_classification_inputs): " + ", ".join(missing))
+    if progress:
+        progress.update(87, "Preparing images for reclassification")
+    images_dir = dense_dir / "images"
+    if not images_dir.is_dir() or not any(images_dir.iterdir()):
+        source_images = Path(args.images).resolve() if args.images else (
+            Path(args.panorama_workdir).resolve() / "cubemap" if args.panorama_workdir else None)
+        if source_images is None or not source_images.is_dir():
+            raise ValueError(f"Cannot reclassify; the input image folder is missing: {source_images}")
+        input_model = resolve_sparse_model(outdir / "sparse")
+        if input_model is None:
+            raise ValueError(f"Cannot reclassify; no sparse model found in {outdir / 'sparse'}")
+        dense_cameras = pycolmap.Reconstruction(str(dense_dir / "sparse")).cameras
+        max_size = max(max(int(camera.width), int(camera.height)) for camera in dense_cameras.values())
+        workspace = dense_dir / "_reclassify_undistort"
+        if workspace.exists():
+            remove_generated(workspace, outdir)
+        command = [find_colmap_exe(args.colmap_bin), "image_undistorter", "--image_path", str(source_images),
+                   "--input_path", str(input_model), "--output_path", str(workspace), "--output_type", "COLMAP",
+                   "--max_image_size", str(max_size)]
+        if (outdir / "image_list.txt").is_file():
+            command.extend(["--image_list_path", str(outdir / "image_list.txt")])
+        run(command, summary=summary, stage="Preparing images for reclassification")
+        new_cameras = pycolmap.Reconstruction(str(workspace / "sparse")).cameras
+        for camera_id, camera in dense_cameras.items():
+            other = new_cameras[camera_id] if camera_id in new_cameras else None
+            if other is None or (other.width, other.height) != (camera.width, camera.height) or not np.allclose(
+                    np.asarray(other.params), np.asarray(camera.params), rtol=1e-4, atol=1e-3):
+                raise ValueError(f"Recreated undistorted camera {camera_id} does not match the dense cloud camera; "
+                                 "the photos or the sparse model changed since the dense cloud was built")
+        if images_dir.exists():
+            remove_generated(images_dir, outdir)
+        shutil.move(str(workspace / "images"), str(images_dir))
+        remove_generated(workspace, outdir)
+    sparse_txt = ensure_text_model(dense_dir / "sparse", dense_dir / "sparse_txt")
+    georeferenced = (outdir / "georeference.json").is_file()
+    if not georeferenced and (outdir / "gps_ref.txt").is_file():
+        try:
+            save_georeference(outdir / "georeference.json", fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt"))
+            georeferenced = True
+        except Exception as error:  # noqa: BLE001
+            print(f"WARNING: Could not create GPS georeference: {error}")
+    summary.settings["reclassified"] = True
+    _classify_and_finish(
+        args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, georeferenced,
+    )
+
+
 def _classify_and_finish(
     args, outdir: Path, dense_dir: Path, dense_sparse_txt: Path, report_dir: Path,
     summary: RunSummary, progress: ProgressTracker | None, classified_output: Path, georeferenced: bool,
@@ -1483,15 +1566,16 @@ def _classify_and_finish(
         progress.begin("classification")
     classify_command = [sys.executable, str(classify_script), "--dense-dir", str(dense_dir),
         "--images-dir", str(dense_dir / "images"), "--model-dir", str(dense_sparse_txt),
-        "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"), "--class-set", args.class_set,
+        "--classes-json", str(args.classes_json), "--class-set", args.class_set,
         "--min-votes", str(args.min_votes), "--tile-size", str(args.sam_tile_size),
         "--tile-min-overlap", str(args.sam_tile_min_overlap), "--mode", args.classification_mode,
+        "--engine", _classification_engine(args),
         "--background-threshold", str(args.background_threshold), "--query-threshold", str(args.query_threshold),
         "--summary-file", str(report_dir / "classification_summary.json"), "--out", str(classified_raw),
         *_labels_arguments(args, dense_dir)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
-    if geometry_enabled and args.classification_mode == "segearth_ov3":
+    if geometry_enabled and _writes_scores(args):
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
@@ -1511,14 +1595,14 @@ def _finish_classification(
     if geometry_enabled and georeferenced:
         refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
         _ensure_if_compressed(classified_raw)
-        with_scores = args.classification_mode == "segearth_ov3" and (
+        with_scores = _writes_scores(args) and (
             classified_scores.is_file() or Path(f"{classified_scores}.zst").is_file())
         if with_scores:
             _ensure_if_compressed(classified_scores)
         if progress:
             progress.begin("geometry_refinement")
         run([sys.executable, str(refine_script), "--input", str(classified_raw), "--output", str(classified_output),
-            "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"), "--class-set", args.class_set,
+            "--classes-json", str(args.classes_json), "--class-set", args.class_set,
             "--config", str(PROJECT_ROOT / "config" / "geometry.yml"), "--summary-file", str(report_dir / "geometry_summary.json"),
             *(["--scores", str(classified_scores)] if with_scores else [])], summary=summary, stage="Geometric refinement")
     elif geometry_enabled:
@@ -1533,7 +1617,7 @@ def _finish_classification(
         summary.write("Completed")
         return
     run([sys.executable, str(Path(__file__).resolve().parent / "export_las.py"), "--input", str(classified_output),
-         "--output", str(outdir / "classified.las"), "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
+         "--output", str(outdir / "classified.las"), "--classes-json", str(args.classes_json),
          "--class-set", args.class_set, "--source-crs", args.source_crs, "--target-crs", args.export_crs,
          "--georeference", str(outdir / "georeference.json")], summary=summary, stage="LAS export")
     if progress:
@@ -1562,12 +1646,19 @@ def main():
                     help="SAM3 tile overlap fraction")
     ap.add_argument("--classification-mode", choices=("legacy", "segearth_ov3"), default="segearth_ov3",
                     help="SAM3 classification path (default: segearth_ov3; legacy remains available for comparison)")
+    ap.add_argument("--classification-engine", choices=("sam3", "flurseg"), default="sam3",
+                    help="2D model for the outdoor class set: sam3 (default) or flurseg (own EoMT model); "
+                         "indoor always uses sam3")
+    ap.add_argument("--reclassify", action="store_true",
+                    help="only re-run classification and step 6 on the project's finished dense cloud")
     ap.add_argument("--background-threshold", type=float, default=0.4,
                     help="SegEarth-OV3 background threshold")
     ap.add_argument("--query-threshold", type=float, default=0.4,
                     help="SegEarth-OV3 decoder query threshold")
     ap.add_argument("--threshold-sweep", default="",
                     help="optional comma-separated SegEarth-OV3 background thresholds")
+    ap.add_argument("--classes-json", default=str(PROJECT_ROOT / "config" / "classes.json"),
+                    help="class configuration (a project's own config/classes.json when its classes are customised)")
     ap.add_argument("--class-set", choices=("outdoor", "indoor"), default="outdoor",
                     help="semantic class set used for SAM3 classification")
     ap.add_argument("--keep-processing-cache", choices=("0", "1"), default="0",
@@ -1642,6 +1733,8 @@ def main():
         ap.error("--resume-dense-stereo cannot be combined with --stop-after-alignment")
     if args.resume_dense_stereo and args.resume_after_control_points:
         ap.error("--resume-dense-stereo cannot be combined with --resume-after-control-points")
+    if args.classification_engine == "flurseg" and args.class_set != "outdoor":
+        print("FlurSeg is outdoor only; the indoor class set is classified with SAM3.")
 
     progress = ProgressTracker(Path(args.progress_file)) if args.progress_file else None
     if progress:
@@ -1713,6 +1806,7 @@ def main():
         "sam_tile_size": args.sam_tile_size,
         "sam_tile_min_overlap": args.sam_tile_min_overlap,
         "classification_mode": args.classification_mode,
+        "classification_engine": _classification_engine(args),
         "background_threshold": args.background_threshold,
         "query_threshold": args.query_threshold,
         "geometry_refinement": args.geometry_refinement == "1",
@@ -1723,6 +1817,9 @@ def main():
     })
     if args.refine_from_cache:
         _refine_from_cache(args, outdir, report_dir, summary, progress, classified_output)
+        return
+    if args.reclassify:
+        _reclassify_project(args, outdir, report_dir, summary, progress, classified_output)
         return
     if args.resume_after_control_points:
         resume_images = Path(args.images).resolve() if args.images else outdir / "dense" / "images"
@@ -2132,12 +2229,13 @@ def main():
          "--dense-dir", str(dense_dir),
          "--images-dir", str(dense_dir / "images"),
          "--model-dir", str(dense_sparse_txt),
-         "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
+         "--classes-json", str(args.classes_json),
          "--class-set", args.class_set,
          "--min-votes", str(args.min_votes),
          "--tile-size", str(args.sam_tile_size),
          "--tile-min-overlap", str(args.sam_tile_min_overlap),
          "--mode", args.classification_mode,
+         "--engine", _classification_engine(args),
          "--background-threshold", str(args.background_threshold),
          "--query-threshold", str(args.query_threshold),
          "--summary-file", str(report_dir / "classification_summary.json"),
@@ -2145,7 +2243,7 @@ def main():
          *_labels_arguments(args, dense_dir)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
-    if geometry_enabled and args.classification_mode == "segearth_ov3":
+    if geometry_enabled and _writes_scores(args):
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
@@ -2160,7 +2258,7 @@ def main():
         if georeferenced:
             refine_script = Path(__file__).resolve().parent / "geometry" / "refine.py"
             _ensure_if_compressed(classified_raw)
-            if args.classification_mode == "segearth_ov3":
+            if _writes_scores(args):
                 _ensure_if_compressed(classified_scores)
             if progress:
                 progress.begin("geometry_refinement")
@@ -2169,12 +2267,12 @@ def main():
                 sys.executable, str(refine_script),
                 "--input", str(classified_raw),
                 "--output", str(classified_output),
-                "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
+                "--classes-json", str(args.classes_json),
                 "--class-set", args.class_set,
                 "--config", str(PROJECT_ROOT / "config" / "geometry.yml"),
                 "--summary-file", str(geometry_summary),
                 *(["--scores", str(classified_scores)]
-                  if args.classification_mode == "segearth_ov3" else []),
+                  if _writes_scores(args) else []),
                 *(["--progress-file", str(Path(args.progress_file).with_name("geometry_progress.json"))] if args.progress_file else []),
             ], summary=summary, stage="Geometric refinement")
         else:
@@ -2201,7 +2299,7 @@ def main():
     run([sys.executable, str(las_script),
          "--input", str(classified_output),
          "--output", str(outdir / "classified.las"),
-         "--classes-json", str(PROJECT_ROOT / "config" / "classes.json"),
+         "--classes-json", str(args.classes_json),
          "--class-set", args.class_set,
          "--source-crs", args.source_crs,
          "--target-crs", args.export_crs,
