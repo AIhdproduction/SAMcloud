@@ -284,3 +284,396 @@ def test_haze_filter_on_the_gpu_matches_numpy() -> None:
     pts = np.vstack((rng.uniform(0, 1, (20000, 3)) * [1, 1, 0.02], rng.uniform(-1, 2, (300, 3))))
     settings = {"min_neighbors": 30, "neighbor_cell_m": 0.03, "neighbor_passes": 2}
     assert (sparse_point_mask(pts, settings) == sparse_point_mask(pts, settings, device="cpu")).all()
+
+
+# ----------------------------------------------------------------------------- hidden_filter (points no camera can see)
+
+
+def _scaled(views, scale: float):
+    from samcloud.colmap.plane_fill import View
+
+    return [View(v.index, v.name, v.rotation, v.translation * scale, v.fx, v.fy, v.cx, v.cy, v.width, v.height) for v in views]
+
+
+def _rays(view):
+    v, u = np.mgrid[0:SIZE, 0:SIZE].astype(float) + 0.5
+    return np.stack(((u - view.cx) / view.fx, (v - view.cy) / view.fy, np.ones_like(u)), axis=-1) @ view.rotation
+
+
+def _write_maps(tmp_path: Path, views, depth_of) -> Path:
+    dense = tmp_path / "dense"
+    (dense / "stereo" / "depth_maps").mkdir(parents=True)
+    for view in views:
+        depth = depth_of(view) * (1 + np.random.default_rng(view.index + 50).normal(0, 0.002, (SIZE, SIZE)))
+        write_colmap_array(dense / "stereo" / "depth_maps" / f"{view.name}.geometric.bin", depth.astype(np.float32))
+    return dense
+
+
+def _hidden_settings(scale: float) -> dict:
+    # the older "seen < 2 and hidden" rule is switched off so only the new rule can remove anything
+    return {**DEFAULTS, "units_per_metre": scale, "point_hidden_views": 999,
+            "hidden_filter": {**DEFAULTS["hidden_filter"], "enabled": True, "min_closed_views": 2}}
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.8157])
+def test_floor_behind_wall_removed(tmp_path: Path, scale: float) -> None:
+    from samcloud.colmap.surface_fusion import visibility_mask
+
+    views = _scaled(_views(), scale)
+    wall_y = WALL_Y * scale
+
+    def depth_of(view):  # every camera measures the wall plane everywhere
+        return ((wall_y - view.center[1]) / _rays(view)[..., 1]).astype(np.float32)
+
+    dense = _write_maps(tmp_path, views, depth_of)
+    rng = np.random.default_rng(41)
+    wall = np.column_stack((rng.uniform(-1.0, 1.0, 500) * scale, wall_y + rng.normal(0, 0.002, 500),
+                            rng.uniform(0.2, 0.8, 500) * scale))
+    floor_behind = np.column_stack((rng.uniform(-0.9, 0.9, 400) * scale, wall_y + rng.uniform(0.25, 1.2, 400) * scale,
+                                    rng.normal(0.0, 0.003, 400)))  # beyond the wall, seen by no camera
+    evidence: dict = {}
+    keep, stats, _ = visibility_mask(np.vstack((wall, floor_behind)), views, dense / "stereo", _hidden_settings(scale),
+                                     count_seen=True, evidence=evidence)
+    assert keep[:500].mean() > 0.97
+    assert keep[500:].mean() < 0.03
+    assert stats["removed_unconfirmed"] >= 0.97 * 400 and stats["removed_hidden"] == 0
+    assert (evidence["window_closed"][500:] >= 2).mean() > 0.97  # the wall is the COLMAP surface in front, in 2+ views
+
+
+def test_textureless_ceiling_without_evidence_kept(tmp_path: Path) -> None:
+    from samcloud.colmap.surface_fusion import visibility_mask
+
+    views = _scaled(_views(), 0.8157)
+
+    def depth_of(view):  # no COLMAP depth in the upper half of every image: a textureless ceiling
+        depth = ((WALL_Y * 0.8157 - view.center[1]) / _rays(view)[..., 1]).astype(np.float32)
+        depth[: int(SIZE * 0.45)] = 0.0
+        return depth
+
+    dense = _write_maps(tmp_path, views, depth_of)
+    rng = np.random.default_rng(43)
+    ceiling = np.column_stack((rng.uniform(-0.8, 0.8, 600), rng.uniform(1.8, 2.6, 600), 2.2 + rng.normal(0, 0.003, 600))) * 0.8157
+    evidence: dict = {}
+    keep, stats, _ = visibility_mask(ceiling, views, dense / "stereo", _hidden_settings(0.8157), count_seen=True, evidence=evidence)
+    no_evidence = evidence["window_closed"] + evidence["window_open"] + evidence["support"] + evidence["through"] == 0
+    assert no_evidence.mean() > 0.97
+    assert keep.mean() > 0.99 and stats["removed_unconfirmed"] == 0
+
+
+def test_room_seen_through_open_door_kept(tmp_path: Path) -> None:
+    from samcloud.colmap.surface_fusion import visibility_mask
+
+    views = _views()
+    back_y = WALL_Y + 1.8
+    hole = np.asarray(HOLE)
+
+    def depth_of(view):  # wall with a door opening; through it the cameras measure the back wall of the next room
+        rays = _rays(view)
+        t_wall = (WALL_Y - view.center[1]) / rays[..., 1]
+        hit = view.center + rays * t_wall[..., None]
+        in_hole = (hit[..., 0] > hole[0]) & (hit[..., 0] < hole[1]) & (hit[..., 2] > hole[2]) & (hit[..., 2] < hole[3])
+        return np.where(in_hole, (back_y - view.center[1]) / rays[..., 1], t_wall).astype(np.float32)
+
+    dense = _write_maps(tmp_path, views, depth_of)
+    rng = np.random.default_rng(47)
+    room = np.column_stack((rng.uniform(-3.0, 3.0, 6000), back_y + rng.normal(0, 0.003, 6000), rng.uniform(-0.3, 2.9, 6000)))
+    # a point is directly visible when at least two cameras look at it through the opening
+    through = np.zeros(len(room), dtype=int)
+    for view in views:
+        ray = room - view.center
+        crossing = (WALL_Y - view.center[1]) / ray[:, 1]
+        at_wall = view.center + ray * crossing[:, None]
+        through += ((at_wall[:, 0] > hole[0] + 0.05) & (at_wall[:, 0] < hole[1] - 0.05)
+                    & (at_wall[:, 2] > hole[2] + 0.05) & (at_wall[:, 2] < hole[3] - 0.05)).astype(int)
+    visible, shut = room[through >= 2], room[through == 0]
+    assert len(visible) > 150 and len(shut) > 150
+    keep, stats, _ = visibility_mask(np.vstack((visible, shut)), views, dense / "stereo", _hidden_settings(1.0), count_seen=True)
+    assert keep[: len(visible)].mean() > 0.97  # directly visible through the door: stays
+    assert keep[len(visible):].mean() < 0.40  # the same room behind the closed part of the wall: gone
+
+
+# ----------------------------------------------------------------------------- raymarch_filter (every supporting view looks through a wall)
+
+
+def _evidence_for(points, views, dense, settings):
+    from samcloud.colmap.surface_fusion import visibility_mask
+
+    evidence: dict = {}
+    visibility_mask(points, views, dense / "stereo", settings, count_seen=True, evidence=evidence)
+    return evidence
+
+
+def test_raymarch_removes_floor_behind_wall_seen_by_grazing_view(tmp_path: Path) -> None:
+    from samcloud.colmap.surface_fusion import raymarch_mask
+
+    scale = 0.8157
+    views = _scaled(_views(), scale)
+    wall_y = WALL_Y * scale
+
+    def depth_of(view):  # COLMAP "measures" the floor plane z = 0 everywhere, also where the wall hides it
+        rays = _rays(view)
+        t = np.where(rays[..., 2] < -1e-3, (0.0 - view.center[2]) / rays[..., 2], 0.0)
+        return np.where((t > 0) & (t < 12), t, 0.0).astype(np.float32)
+
+    dense = _write_maps(tmp_path, views, depth_of)
+    rng = np.random.default_rng(61)
+    n = 60_000
+    wall = np.column_stack((rng.uniform(-3.0, 3.0, n) * scale, wall_y + rng.normal(0, 0.003, n), rng.uniform(-0.05, 2.9, n) * scale))
+    floor_front = np.column_stack((rng.uniform(-0.8, 0.8, 300) * scale, rng.uniform(1.5, 3.4, 300) * scale, rng.normal(0, 0.003, 300)))
+    floor_behind = np.column_stack((rng.uniform(-0.8, 0.8, 300) * scale, wall_y + rng.uniform(0.3, 1.4, 300) * scale,
+                                    rng.normal(0, 0.003, 300)))
+    points = np.vstack((wall, floor_front, floor_behind))
+    labels = np.concatenate((np.full(n, 1), np.zeros(600))).astype(np.uint8)
+    settings = {**DEFAULTS, "units_per_metre": scale}
+    evidence = _evidence_for(points, views, dense, settings)
+    assert (evidence["support"][n + 300:] >= 3).mean() > 0.9  # COLMAP supports the hidden floor in several views
+    remove, stats = raymarch_mask(points, labels, {"wall": 1}, views, dense / "stereo", settings, evidence)
+    assert remove[n + 300:].mean() > 0.9  # ... but every one of those views looks through the wall
+    assert remove[n:n + 300].mean() < 0.05  # the floor in front of the wall stays
+    assert remove[:n].mean() < 0.02
+
+
+def test_raymarch_keeps_room_through_door(tmp_path: Path) -> None:
+    from samcloud.colmap.surface_fusion import raymarch_mask
+
+    views = _views()
+    back_y = WALL_Y + 1.8
+    hole = np.asarray(HOLE)
+
+    def depth_of(view):
+        rays = _rays(view)
+        t_wall = (WALL_Y - view.center[1]) / rays[..., 1]
+        hit = view.center + rays * t_wall[..., None]
+        in_hole = (hit[..., 0] > hole[0]) & (hit[..., 0] < hole[1]) & (hit[..., 2] > hole[2]) & (hit[..., 2] < hole[3])
+        return np.where(in_hole, (back_y - view.center[1]) / rays[..., 1], t_wall).astype(np.float32)
+
+    dense = _write_maps(tmp_path, views, depth_of)
+    rng = np.random.default_rng(63)
+    x, z = rng.uniform(-3.0, 3.0, 70_000), rng.uniform(-0.05, 2.9, 70_000)
+    closed_wall = np.column_stack((x, WALL_Y + rng.normal(0, 0.003, x.shape), z))
+    in_opening = (x > hole[0]) & (x < hole[1]) & (z > hole[2]) & (z < hole[3])
+    wall_with_door = closed_wall[~in_opening]
+    room = np.column_stack((rng.uniform(-0.6, 0.7, 3000), back_y + rng.normal(0, 0.003, 3000), rng.uniform(0.8, 1.7, 3000)))
+    through = np.zeros(len(room), dtype=int)
+    for view in views:
+        ray = room - view.center
+        at_wall = view.center + ray * ((WALL_Y - view.center[1]) / ray[:, 1])[:, None]
+        through += ((at_wall[:, 0] > hole[0] + 0.05) & (at_wall[:, 0] < hole[1] - 0.05)
+                    & (at_wall[:, 2] > hole[2] + 0.05) & (at_wall[:, 2] < hole[3] - 0.05)).astype(int)
+    room = room[through >= 2]
+    assert len(room) > 100
+    settings = {**DEFAULTS}
+    for wall, expect_removed in ((wall_with_door, False), (closed_wall, True)):  # open door vs. a wall without the opening
+        points = np.vstack((wall, room))
+        labels = np.concatenate((np.full(len(wall), 1), np.zeros(len(room)))).astype(np.uint8)
+        evidence = _evidence_for(points, views, dense, settings)
+        remove, _ = raymarch_mask(points, labels, {"wall": 1}, views, dense / "stereo", settings, evidence)
+        rate = remove[len(wall):].mean()
+        assert (rate > 0.9) if expect_removed else (rate < 0.03)
+
+
+# ----------------------------------------------------------------------------- tall furniture as occluder (round 3)
+
+FLOOR_ID, FURNITURE_ID, WALL_ID = 1, 2, 3
+CLASS_IDS = {"floor": FLOOR_ID, "furniture": FURNITURE_ID, "wall": WALL_ID}
+
+
+def _floor_plane_maps(tmp_path: Path, views) -> Path:
+    def depth_of(view):  # COLMAP "measures" the floor plane z = 0 everywhere, also where furniture hides it
+        rays = _rays(view)
+        t = np.where(rays[..., 2] < -1e-3, (0.0 - view.center[2]) / rays[..., 2], 0.0)
+        return np.where((t > 0) & (t < 12), t, 0.0).astype(np.float32)
+
+    return _write_maps(tmp_path, views, depth_of)
+
+
+def _furniture_block(rng: np.random.Generator, scale: float, front_y: float, depth: float, height_m: float, count: int,
+                     half_width: float = 1.2) -> np.ndarray:
+    """Front face, top and both sides of a box standing on the floor (surface points with a few mm of noise)."""
+    n_front, n_top, n_side = int(count * 0.7), int(count * 0.2), int(count * 0.05)
+    top = height_m * scale
+    front = np.column_stack((rng.uniform(-half_width, half_width, n_front) * scale, front_y * scale + rng.normal(0, 0.003, n_front),
+                             rng.uniform(0.0, top, n_front)))
+    roof = np.column_stack((rng.uniform(-half_width, half_width, n_top) * scale, rng.uniform(front_y, front_y + depth, n_top) * scale,
+                            top + rng.normal(0, 0.003, n_top)))
+    sides = [np.column_stack((np.full(n_side, sign * half_width * scale) + rng.normal(0, 0.003, n_side),
+                              rng.uniform(front_y, front_y + depth, n_side) * scale, rng.uniform(0.0, top, n_side)))
+             for sign in (-1.0, 1.0)]
+    return np.vstack((front, roof, *sides))
+
+
+def _furniture_scene(tmp_path: Path, scale: float, height_m: float, front_y: float, behind: tuple[float, float], seed: int):
+    views = _scaled(_views(), scale)
+    dense = _floor_plane_maps(tmp_path, views)
+    rng = np.random.default_rng(seed)
+    block = _furniture_block(rng, scale, front_y, 0.5, height_m, 24_000)
+    floor_x = rng.uniform(-3.0, 3.0, 4000) * scale
+    floor_front = np.column_stack((floor_x, rng.uniform(0.4, 3.9, 4000) * scale, rng.normal(0, 0.003, 4000)))
+    floor_front = floor_front[(floor_front[:, 1] < front_y * scale) | (np.abs(floor_front[:, 0]) > 1.3 * scale)]
+    behind_pts = np.column_stack((rng.uniform(-0.5, 0.5, 500) * scale, rng.uniform(*behind, 500) * scale, rng.normal(0, 0.003, 500)))
+    points = np.vstack((block, floor_front, behind_pts))
+    labels = np.concatenate((np.full(len(block), FURNITURE_ID), np.full(len(floor_front), FLOOR_ID), np.zeros(len(behind_pts)))).astype(np.uint8)
+    settings = {**DEFAULTS, "units_per_metre": scale}
+    evidence = _evidence_for(points, views, dense, settings)
+    return views, dense, points, labels, settings, evidence, (len(block), len(floor_front), len(behind_pts))
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.8157])
+def test_raymarch_tall_furniture_occludes_points_behind(tmp_path: Path, scale: float) -> None:
+    from samcloud.colmap.surface_fusion import raymarch_mask
+
+    views, dense, points, labels, settings, evidence, (n_block, n_floor, n_behind) = _furniture_scene(
+        tmp_path, scale, height_m=2.0, front_y=2.0, behind=(2.6, 3.5), seed=71)
+    behind = slice(n_block + n_floor, None)
+    assert (evidence["support"][behind] >= 3).mean() > 0.9  # COLMAP supports the hidden points through the wardrobe
+    remove, stats = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo", settings, evidence)
+    assert stats["raymarch_tall_furniture_points"] > 0.75 * n_block  # front and sides are the vertical body; the roof is not
+    assert remove[behind].mean() > 0.9  # behind the 2 m wardrobe nobody could see them
+    assert remove[:n_block].mean() < 0.01  # the wardrobe itself stays (front, top and sides)
+    assert remove[n_block:n_block + n_floor].mean() < 0.02  # real floor in front stays
+    off, _ = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo",
+                           {**settings, "raymarch_filter": {"tall_furniture_enabled": False}}, evidence)
+    assert off[behind].mean() < 0.1  # without the rule the furniture is permeable (round 2 behaviour)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.8157])
+def test_raymarch_low_furniture_does_not_occlude(tmp_path: Path, scale: float) -> None:
+    from samcloud.colmap.surface_fusion import raymarch_mask
+
+    # a 0.75 m table close to the cameras: floor far behind is visible over it, floor right behind it is outside the
+    # line of sight, but low furniture must stay permeable either way
+    views, dense, points, labels, settings, evidence, (n_block, n_floor, n_behind) = _furniture_scene(
+        tmp_path, scale, height_m=0.75, front_y=0.7, behind=(2.2, 3.9), seed=73)
+    behind = slice(n_block + n_floor, None)
+    assert (evidence["support"][behind] >= 3).mean() > 0.9
+    remove, stats = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo", settings, evidence)
+    assert stats["raymarch_tall_furniture_points"] == 0
+    assert remove[behind].mean() < 0.05
+    assert remove[:n_block].mean() < 0.01
+
+
+def test_tall_furniture_ignores_floating_cabinet_and_thin_pole() -> None:
+    from samcloud.colmap.surface_fusion import tall_furniture_members
+
+    scale = 0.8157
+    rng = np.random.default_rng(79)
+    floor = np.column_stack((rng.uniform(-3, 3, 4000) * scale, rng.uniform(0, 4, 4000) * scale, rng.normal(0, 0.003, 4000)))
+    # upper kitchen cabinet: 1.4 m wide, hangs between 1.3 m and 2.1 m above the floor, nothing below it
+    upper = np.column_stack((rng.uniform(-0.7, 0.7, 6000) * scale, 3.0 * scale + rng.normal(0, 0.003, 6000), rng.uniform(1.3, 2.1, 6000) * scale))
+    pole = np.column_stack((1.9 * scale + rng.normal(0, 0.01, 800), 1.0 * scale + rng.normal(0, 0.01, 800), rng.uniform(0.0, 1.8, 800) * scale))
+    sparse = np.column_stack((rng.uniform(-1.0, 1.0, 120) * scale, 0.5 * scale + rng.normal(0, 0.003, 120), rng.uniform(0.0, 1.9, 120) * scale))
+    wardrobe = np.column_stack((rng.uniform(-0.9, 0.9, 9000) * scale + 0.013, 2.0 * scale + rng.normal(0, 0.003, 9000), rng.uniform(0.0, 2.0, 9000) * scale))
+    points = np.vstack((floor, upper, pole, sparse, wardrobe))
+    labels = np.concatenate((np.full(len(floor), FLOOR_ID), np.full(len(upper) + len(pole) + len(sparse) + len(wardrobe), FURNITURE_ID))).astype(np.uint8)
+    members = tall_furniture_members(points, labels, CLASS_IDS, scale, {**DEFAULTS["raymarch_filter"]})
+    parts = np.cumsum([0, len(upper), len(pole), len(sparse), len(wardrobe)]) + len(floor)
+    rates = [members[parts[i]:parts[i + 1]].mean() for i in range(4)]
+    assert rates[0] < 0.05 and rates[1] < 0.05 and rates[2] < 0.05  # floating cabinet, thin pole, sparse object
+    assert rates[3] > 0.95  # real wardrobe
+
+
+def test_hidden_filter_disabled_by_default(tmp_path: Path) -> None:
+    import yaml
+    from samcloud.colmap.surface_fusion import visibility_mask
+
+    assert DEFAULTS["hidden_filter"]["enabled"] is False
+    config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config" / "colmap.yml").read_text(encoding="utf-8"))
+    assert config["dense_reconstruction"]["surface_fusion"]["hidden_filter"]["enabled"] is False
+    scale = 0.8157
+    views = _scaled(_views(), scale)
+    wall_y = WALL_Y * scale
+    dense = _write_maps(tmp_path, views, lambda view: ((wall_y - view.center[1]) / _rays(view)[..., 1]).astype(np.float32))
+    rng = np.random.default_rng(83)
+    wall = np.column_stack((rng.uniform(-1.0, 1.0, 500) * scale, wall_y + rng.normal(0, 0.002, 500), rng.uniform(0.2, 0.8, 500) * scale))
+    behind = np.column_stack((rng.uniform(-0.9, 0.9, 400) * scale, wall_y + rng.uniform(0.25, 1.2, 400) * scale, rng.normal(0.0, 0.003, 400)))
+    defaults_only = {**DEFAULTS, "units_per_metre": scale, "point_hidden_views": 999, "hidden_filter": {"min_closed_views": 2}}
+    keep, stats, _ = visibility_mask(np.vstack((wall, behind)), views, dense / "stereo", defaults_only, count_seen=True)
+    assert stats["removed_unconfirmed"] == 0 and keep[500:].mean() > 0.97  # the default settings leave the rule off
+    enabled = {**defaults_only, "hidden_filter": {"enabled": True, "min_closed_views": 2}}
+    keep_on, stats_on, _ = visibility_mask(np.vstack((wall, behind)), views, dense / "stereo", enabled, count_seen=True)
+    assert keep_on[500:].mean() < 0.03 and stats_on["removed_unconfirmed"] > 300  # explicit opt-in still works
+
+
+# ----------------------------------------------------------------------------- holes in tall bodies / buried points (round 4)
+
+
+def _holey_wall_scene(tmp_path: Path, scale: float, slot: float, seed: int):
+    """A 2 m wall (class wall) with a full-height slot of width ``slot`` in the middle; floor points behind it that exactly
+    one camera sees through the slot while the other three look at the wall."""
+    views = _scaled(_views(), scale)
+    dense = _floor_plane_maps(tmp_path, views)
+    rng = np.random.default_rng(seed)
+    wall_y, n = 2.0, 40_000
+    x = rng.uniform(-1.8, 1.8, n)
+    x = x[np.abs(x - 0.013) > slot / 2]  # slot centre deliberately off the voxel grid
+    wall = np.column_stack((x * scale, wall_y * scale + rng.normal(0, 0.003, len(x)), rng.uniform(-0.02, 2.0, len(x)) * scale))
+    floor_front = np.column_stack((rng.uniform(-3.0, 3.0, 3000) * scale, rng.uniform(0.4, 1.9, 3000) * scale, rng.normal(0, 0.003, 3000)))
+    cand = np.column_stack((rng.uniform(-1.5, 1.5, 60_000), rng.uniform(2.5, 3.6, 60_000), np.zeros(60_000)))
+    crossing = []
+    for view in views:
+        center = view.center / scale
+        t = (wall_y - center[1]) / (cand[:, 1] - center[1])
+        crossing.append(center[0] + t * (cand[:, 0] - center[0]))
+    crossing = np.array(crossing)  # (cameras, points): where each camera's line of sight pierces the wall plane
+    through = np.abs(crossing - 0.013) < slot / 2 - 0.12  # clear of the dilated wall edges
+    return views, dense, wall, floor_front, cand, through, scale
+
+
+def _run_slot(tmp_path, scale, slot, seed, select, **config):
+    from samcloud.colmap.surface_fusion import raymarch_mask
+
+    views, dense, wall, floor_front, cand, through, scale = _holey_wall_scene(tmp_path, scale, slot, seed)
+    behind = cand[select(through)][:300] * scale
+    points = np.vstack((wall, floor_front, behind))
+    labels = np.concatenate((np.full(len(wall), WALL_ID), np.full(len(floor_front), FLOOR_ID), np.zeros(len(behind)))).astype(np.uint8)
+    settings = {**DEFAULTS, "units_per_metre": scale, "raymarch_filter": config}
+    evidence = _evidence_for(points, views, dense, settings)
+    remove, stats = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo", settings, evidence)
+    return remove, len(wall), len(floor_front), len(behind), stats
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.8157])
+def test_narrow_gap_in_tall_wall_is_closed(tmp_path: Path, scale: float) -> None:
+    only_one = lambda through: (through.sum(0) == 1) & through[0]  # noqa: E731 - exactly camera 0 looks through the 0.44 m slot
+    removed, n_wall, n_floor, n_behind, stats = _run_slot(tmp_path, scale, 0.44, 91, only_one)
+    assert n_behind > 100 and stats["raymarch_closed_columns"] > 0
+    assert removed[n_wall + n_floor:].mean() > 0.9  # one lucky line of sight through a 0.44 m slot is not a view of the room
+    assert removed[:n_wall].mean() < 0.01 and removed[n_wall:n_wall + n_floor].mean() < 0.02
+    open_, *_ = _run_slot(tmp_path / "off", scale, 0.44, 91, only_one, close_gaps_enabled=False)
+    assert open_[n_wall + n_floor:].mean() < 0.3  # without closing the slot leaves them visible (round 3 behaviour)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.8157])
+def test_wide_opening_is_not_closed(tmp_path: Path, scale: float) -> None:
+    two_through = lambda through: through.sum(0) >= 2  # noqa: E731 - two cameras look through a 1.1 m doorway
+    removed, n_wall, n_floor, n_behind, stats = _run_slot(tmp_path, scale, 1.1, 93, two_through)
+    assert n_behind > 100
+    assert removed[n_wall + n_floor:].mean() < 0.05  # a real doorway (wider than close_gap_m) keeps what is seen through it
+    assert removed[:n_wall].mean() < 0.01
+
+
+def test_buried_point_removed_and_surface_point_kept(tmp_path: Path) -> None:
+    from samcloud.colmap.surface_fusion import raymarch_mask
+
+    scale = 0.8157
+    views = _scaled(_views(), scale)
+    dense = _floor_plane_maps(tmp_path, views)
+    rng = np.random.default_rng(97)
+    layers = [np.column_stack((rng.uniform(-1.8, 1.8, 9000) * scale, (2.0 + 0.11 * k) * scale + rng.normal(0, 0.003, 9000),
+                               rng.uniform(-0.02, 2.0, 9000) * scale)) for k in range(5)]  # a 0.44 m thick solid mass
+    wall = np.vstack(layers)
+    floor_front = np.column_stack((rng.uniform(-3.0, 3.0, 3000) * scale, rng.uniform(0.4, 1.7, 3000) * scale, rng.normal(0, 0.003, 3000)))
+    buried = np.column_stack((rng.uniform(-1.0, 1.0, 300) * scale, rng.uniform(2.2, 2.35, 300) * scale, rng.normal(0, 0.003, 300)))
+    surface = np.column_stack((rng.uniform(-1.0, 1.0, 300) * scale, rng.uniform(1.75, 1.85, 300) * scale, rng.normal(0, 0.003, 300)))
+    points = np.vstack((wall, floor_front, buried, surface))
+    labels = np.concatenate((np.full(len(wall), WALL_ID), np.full(len(floor_front), FLOOR_ID), np.zeros(600))).astype(np.uint8)
+    settings = {**DEFAULTS, "units_per_metre": scale, "raymarch_filter": {"bury_depth_m": 0.25}}
+    evidence = _evidence_for(points, views, dense, settings)
+    n = len(wall) + len(floor_front)
+    remove, _ = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo", settings, evidence)
+    assert (evidence["support"][n:n + 300] >= 3).mean() > 0.9
+    assert remove[n:n + 300].mean() > 0.9  # deep inside the solid mass, every line of sight leaves through it
+    assert remove[n + 300:].mean() < 0.05  # floor right in front of the mass stays
+    assert remove[:n].mean() < 0.02
+    default, _ = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo", {**settings, "raymarch_filter": {}}, evidence)
+    assert default[n:n + 300].mean() < 0.1  # the rule is opt-in (bury_depth_m defaults to 0)

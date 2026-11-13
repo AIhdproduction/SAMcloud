@@ -5,6 +5,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 from samcloud.app.pages import control_points, dense_cloud, dxf, home, projects, settings, sparse_cloud
 from samcloud.app.state import state
+from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.dxf_review_canvas import review_background, review_payload
 from samcloud.app.gcp_review import image_crop, marker_payload, resolve_project_image
 from samcloud.core.paths import ASSETS_DIRECTORY
@@ -241,13 +242,15 @@ def continue_reviewed_control_points(payload: dict[str, object] | None = None):
 
 
 @app.get("/api/dxf/payload/{level_key}")
-def dxf_review_payload(level_key: str):
+def dxf_review_payload(level_key: str, variant: str = "pointcloud"):
     """Serve the cached DXF vector payload of a level ('site' for outdoor); never generates."""
     project_directory = state.active_project_directory
     if project_directory is None:
         return JSONResponse({"error": "No project is open"}, status_code=404)
     try:
-        payload = review_payload(project_directory, level_key)
+        if variant not in {"pointcloud", "ortho"}:
+            raise ValueError("Invalid plan variant")
+        payload = review_payload(project_directory, level_key, variant)
     except ValueError as error:
         return JSONResponse({"error": str(error)}, status_code=400)
     if payload is None:
@@ -268,6 +271,37 @@ def dxf_review_background(level_key: str, source: str):
     if path is None:
         return JSONResponse({"error": "No cached background image"}, status_code=404)
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
+ORTHO_MEDIA_TYPES: dict[str, str] = {
+    "preview": "image/jpeg",
+    "jpg8000": "image/jpeg",
+    "jpg4096": "image/jpeg",
+    "png": "image/png",
+    "pgw": "text/plain",
+    "json": "application/json",
+}
+
+
+@app.get("/api/dxf/ortho/{level_key}/{kind}")
+def dxf_ortho_file(level_key: str, kind: str, v: str | None = None):
+    """Serve a cached orthophoto artifact; reads only the cache (never creates or generates)."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    if kind not in ORTHO_MEDIA_TYPES:
+        return JSONResponse({"error": f"Invalid ortho kind '{kind}'"}, status_code=400)
+    try:
+        controller = DxfPageController(project_directory)
+        level_id = None if level_key == "site" else level_key
+        path = controller.ortho_file(level_id, kind)
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+    except Exception as error:
+        return JSONResponse({"error": str(error)}, status_code=500)
+    if path is None or not path.is_file():
+        return JSONResponse({"error": f"No cached orthophoto artifact '{kind}' for level '{level_key}'"}, status_code=404)
+    return FileResponse(path, media_type=ORTHO_MEDIA_TYPES[kind], headers={"Cache-Control": "private, max-age=3600"})
 
 
 def _review_action(payload: dict[str, object], action):

@@ -84,6 +84,21 @@ dense_reconstruction:
     edge_tolerance: 0.02
     spacing_m: 0.01
     exclude_classes: [window]
+    # Round 5 (2026-11-13): local re-alignment of the prior against COLMAP depth and reliable sparse points
+    # (reprojection error <= 1.5 px, track >= 3 views) per image tile; distrusted where no anchor is in reach or the
+    # residual stays above tolerance. Proxy on 60 views (test_home_v8): entrance fill points -53 %, inside the outline +-0.
+    # Measured and left OFF (no entrance gain, 5-7 % fewer real points): use_edges (regions bounded by strong image
+    # lines), halo_filter, anchor_rule (>= min_anchor_views confirming views near a COLMAP/sparse anchor), plane_completion.
+    # units_per_metre auto: storey height of the floor/ceiling classes vs nominal_storey_height_m (1.0 when georeferenced).
+    units_per_metre: auto
+    nominal_storey_height_m: 2.5
+    local_alignment: true
+    use_sparse: true
+    use_edges: false
+    halo_filter: false
+    anchor_rule: false
+    min_anchor_views: 1
+    plane_completion: false
   # Surface fusion (indoor, step 6, switchable per project): all depth maps go into
   # one truncated signed distance field (TSDF) on the GPU. COLMAP depth weighs
   # geometric_weight; Depth-Anything fills textureless gaps only where, fitted per
@@ -97,6 +112,8 @@ dense_reconstruction:
   surface_fusion:
     enabled: true
     mode: snap              # snap: keep the filled points and pull them onto the merged surface (extract: rebuild from the field, experimental)
+    units_per_metre: auto   # storey-height scale of unscaled indoor projects (see depth_fill)
+    nominal_storey_height_m: 2.5
     voxel_m: 0.015
     truncation_m: 0.20      # wider than the spread between views on textureless walls (Depth-Anything only)
     geometric_weight: 10.0
@@ -122,6 +139,10 @@ dense_reconstruction:
     visibility_margin_m: 0.03
     visibility_margin_rel: 0.01
     visibility_min_through: 2
+    depth_edge_filter: {enabled: true, max_incidence_deg: 80, edge_px: 1, edge_jump_rel: 0.05, edge_jump_m: 0.03}
+    hidden_filter: {enabled: false}   # off since round 3: the ray-march filter with tall-furniture occluders replaces it (class-17 real loss 1.6 % with it on)
+    mirror_filter: {enabled: true, ring_inner_px: 4, ring_outer_px: 12, min_depth_jump_m: 0.25, merge_angle_deg: 3, merge_offset_m: 0.03, merge_gap_m: 0.10, min_views: 2, min_baseline_m: 0.3, min_mask_share: 0.002, mirror_dilate_px: 6, through_share: 0.8, prior_tolerance: 0.03, prior_edge_tolerance: 0.02, prior_trust_window_frac: 0.04, prior_trust_min_valid: 0.05, fill_plane: false, ring_label_ids: [2, 5, 17]}
+    behind_wall_filter: {enabled: false, keep_depth_m: 1.0, cell_m: 0.05, floor_band_m: 0.15, extent_margin_m: 0.25, blocked_share: 0.9, min_support_views: 2, mirror_image: {enabled: false, search_front_m: 1.2, search_back_m: 0.2, step_m: 0.01, match_m: 0.04, min_score: 0.35, min_points: 2000}}
     wall_min_seen_views: 3    # a wall plane whose points (median) fewer views see is a wall behind a wall -> removed
     point_min_seen_views: 2   # a point fewer cameras see ...
     point_hidden_views: 10    # ... but hidden behind a nearer surface in 10+ views (behind wall/ceiling) is removed
@@ -135,6 +156,21 @@ dense_reconstruction:
     class_coherence_classes: [wall, ceiling, floor, furniture, door, window, unknown]
     class_min_share: 0.2
     class_majority_share: 0.5
+  # Final indoor-only semantic cleanup. Geometry and RGB form superpoints;
+  # broad classes vote inside them while fine classes remain protected.
+  superpoint_vote:
+    enabled: true
+    normal_k: 16
+    graph_k: 10
+    max_edge_m: 0.06
+    color_weight: 0.5
+    k_thresh: 0.05
+    min_segment: 30
+    min_vote_points: 30
+    majority_share: 0.6
+    protect_min_points: 200
+    relabel_classes: [unknown, construction material, wall, ceiling, floor, door, window, furniture]
+    chunk_size: 100000
   # Grid fill of floor/ceiling/wall planes, disabled: looked artificial.
   # floor/ceiling/wall planes (fitted to measured points of that class) are
   # filled on a fill_spacing_m grid. rule sam_plane_free_space (Domenic,
@@ -169,6 +205,7 @@ dense_reconstruction:
       point_cleaning: {}
       depth_fill: {}
       surface_fusion: {}
+      superpoint_vote: {}
       plane_fill: {}
     camera:
       patch_match: {}
@@ -176,6 +213,7 @@ dense_reconstruction:
       point_cleaning: {}
       depth_fill: {}
       surface_fusion: {}
+      superpoint_vote: {}
       plane_fill: {}
     panorama_360:
       # window_step 2: 2.1x faster PatchMatch, depth within 0.16 % (median) of step 1 and
@@ -185,4 +223,5 @@ dense_reconstruction:
       point_cleaning: {}
       depth_fill: {}
       surface_fusion: {}
+      superpoint_vote: {}
       plane_fill: {}

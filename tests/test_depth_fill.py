@@ -10,7 +10,8 @@ import pytest
 from test_plane_fill import HOLE, SIZE, WALL_Y, _depth_for, _views, _wall_points
 
 from samcloud.colmap.depth_fill import fill_from_depth_prior, neighbor_views
-from samcloud.colmap.plane_fill import write_colmap_array
+from samcloud.colmap.mirror_filter import Mirror, behind_mirror_cone
+from samcloud.colmap.plane_fill import View, write_colmap_array
 
 WINDOW = 5
 
@@ -101,6 +102,30 @@ def test_classes_come_from_the_reference_sam_labels(tmp_path: Path) -> None:
     )
 
     assert len(cls) and np.all(cls == WALL)
+
+
+def test_depth_fill_skips_mirror_pixels(tmp_path: Path) -> None:
+    stereo = tmp_path / "stereo"
+    (stereo / "depth_maps").mkdir(parents=True)
+    views = [View(index, f"mirror_{index}.png", np.eye(3), np.array([-x, 0.0, 0.0]),
+                  50.0, 50.0, 50.0, 50.0, 100, 100) for index, x in enumerate((-0.5, 0.0, 0.5))]
+    priors = {view.name: np.full((100, 100), 4.5, np.float32) for view in views}
+    for view in views:
+        write_colmap_array(stereo / "depth_maps" / f"{view.name}.geometric.bin", np.zeros((100, 100), np.float32))
+    mask = np.zeros((100, 100), bool)
+    mask[35:65, 35:65] = True
+    mirror = Mirror(np.array([0.0, 0.0, -1.0]), 3.0, np.array([0.0, 0.0, 3.0]),
+                    [np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])], views,
+                    {view.name: mask for view in views}, 6)
+
+    xyz, _rgb, _cls, _votes, report = fill_from_depth_prior(
+        views, stereo, priors.get, np.empty((0, 3)), {"stride": 2, "device": "numpy", "spacing_m": 0.01},
+        mirrors=[mirror],
+    )
+
+    assert len(xyz) and report["added_points"] == len(xyz)
+    assert not behind_mirror_cone(xyz, views[1], [mirror], {}).any()
+    assert np.count_nonzero(np.abs(xyz[:, 0]) > 1.1) > 0
 
 
 def test_neighbours_look_in_a_similar_direction() -> None:

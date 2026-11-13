@@ -47,6 +47,9 @@ class DxfPlanResult:
     fingerprint_inputs: dict[str, Any] = field(default_factory=dict)
     layer_linetypes: dict[str, str] = field(default_factory=dict)
     layer_hatches: dict[str, bool] = field(default_factory=dict)
+    layer_styles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    blocks: list[str] = field(default_factory=list)
+    variant: str = "pointcloud"
 
 
 def result_to_dict(result: DxfPlanResult, *, include_images: bool = True) -> dict[str, Any]:
@@ -54,7 +57,25 @@ def result_to_dict(result: DxfPlanResult, *, include_images: bool = True) -> dic
     background: dict[str, Any] = {"bounds": result.background.bounds}
     if include_images:
         background.update({"rgb_png": _encode_bytes(result.background.rgb_png), "class_png": _encode_bytes(result.background.class_png)})
-    return {"project_name": result.project_name, "level_name": result.level_name, "mode": result.mode, "profile_name": result.profile_name, "scale_factor": result.scale_factor, "frame": {"origin": result.frame.origin.tolist(), "scale_factor": result.frame.scale_factor, "rotation": result.frame.rotation.tolist()}, "settings_fingerprint": result.settings_fingerprint, "fingerprint_inputs": result.fingerprint_inputs, "layers": result.layers, "statuses": {name: asdict(status) for name, status in result.statuses.items()}, "layer_colors": result.layer_colors, "layer_linetypes": result.layer_linetypes, "layer_hatches": result.layer_hatches, "background": background}
+    return {
+        "project_name": result.project_name,
+        "level_name": result.level_name,
+        "mode": result.mode,
+        "profile_name": result.profile_name,
+        "scale_factor": result.scale_factor,
+        "frame": {"origin": result.frame.origin.tolist(), "scale_factor": result.frame.scale_factor, "rotation": result.frame.rotation.tolist()},
+        "settings_fingerprint": result.settings_fingerprint,
+        "fingerprint_inputs": result.fingerprint_inputs,
+        "layers": result.layers,
+        "statuses": {name: asdict(status) for name, status in result.statuses.items()},
+        "layer_colors": result.layer_colors,
+        "layer_linetypes": result.layer_linetypes,
+        "layer_hatches": result.layer_hatches,
+        "layer_styles": result.layer_styles,
+        "blocks": list(result.blocks),
+        "variant": result.variant,
+        "background": background,
+    }
 
 
 def result_from_dict(payload: dict[str, Any], *, rgb_png: bytes | None = None, class_png: bytes | None = None) -> DxfPlanResult:
@@ -63,16 +84,62 @@ def result_from_dict(payload: dict[str, Any], *, rgb_png: bytes | None = None, c
     frame = Frame(np.asarray(frame_data["origin"], dtype=np.float64), float(frame_data["scale_factor"]), np.asarray(frame_data["rotation"], dtype=np.float64))
     image = payload["background"]
     background = BackgroundImage(rgb_png if rgb_png is not None else _decode_bytes(image.get("rgb_png")), class_png if class_png is not None else _decode_bytes(image.get("class_png")), tuple(float(value) for value in image["bounds"]))
-    return DxfPlanResult(str(payload["project_name"]), str(payload["level_name"]), payload["mode"], payload.get("profile_name"), float(payload["scale_factor"]), frame, str(payload["settings_fingerprint"]), {str(name): list(entities) for name, entities in payload["layers"].items()}, {str(name): LayerStatus(**status) for name, status in payload["statuses"].items()}, {str(name): int(color) for name, color in payload["layer_colors"].items()}, background, dict(payload.get("fingerprint_inputs", {})), {str(name): str(linetype) for name, linetype in payload.get("layer_linetypes", {}).items()}, {str(name): bool(hatch) for name, hatch in payload.get("layer_hatches", {}).items()})
+    return DxfPlanResult(
+        str(payload["project_name"]),
+        str(payload["level_name"]),
+        payload["mode"],
+        payload.get("profile_name"),
+        float(payload["scale_factor"]),
+        frame,
+        str(payload["settings_fingerprint"]),
+        {str(name): list(entities) for name, entities in payload["layers"].items()},
+        {str(name): LayerStatus(**status) for name, status in payload["statuses"].items()},
+        {str(name): int(color) for name, color in payload["layer_colors"].items()},
+        background,
+        dict(payload.get("fingerprint_inputs", {})),
+        {str(name): str(linetype) for name, linetype in payload.get("layer_linetypes", {}).items()},
+        {str(name): bool(hatch) for name, hatch in payload.get("layer_hatches", {}).items()},
+        dict(payload.get("layer_styles", {})),
+        list(payload.get("blocks", [])),
+        str(payload.get("variant", "pointcloud")),
+    )
 
 
 def vector_payload(result: DxfPlanResult, *, grid_size: int = 64) -> dict[str, Any]:
     """Build a JSON-serializable browser payload with RGB colors and bounds."""
     payload_layers: dict[str, dict[str, Any]] = {}
     for name, entities in result.layers.items():
-        bounds = _entity_bounds(entities)
-        payload_layers[name] = {"color": aci_to_rgb(result.layer_colors[name]), "entities": entities, "bounds": bounds, "grid": _grid_index(entities, bounds, grid_size), "cell_size": _grid_cell_size(bounds, grid_size)}
+        browser_entities = [_to_browser_entity(entity) for entity in entities]
+        bounds = _entity_bounds(browser_entities)
+        payload_layers[name] = {
+            "color": aci_to_rgb(result.layer_colors.get(name, 7)),
+            "entities": browser_entities,
+            "bounds": bounds,
+            "grid": _grid_index(browser_entities, bounds, grid_size),
+            "cell_size": _grid_cell_size(bounds, grid_size),
+        }
     return {"project_name": result.project_name, "level": result.level_name, "mode": result.mode, "layers": payload_layers, "background_bounds": result.background.bounds}
+
+
+def _to_browser_entity(entity: Entity) -> Entity:
+    """Format neutral entities for browser rendering."""
+    kind = entity.get("type")
+    if kind == "polyline3d":
+        return {
+            "type": "polyline",
+            "points": [[float(p[0]), float(p[1])] for p in entity.get("points", [])],
+            "closed": bool(entity.get("closed", False)),
+        }
+    if kind == "text":
+        point = entity.get("point", [0.0, 0.0])
+        return {
+            "type": "text",
+            "text": str(entity.get("text", "")),
+            "point": [float(point[0]), float(point[1])],
+            "height": float(entity.get("height", 0.12)),
+            "rotation": float(entity.get("rotation", 0.0)),
+        }
+    return entity
 
 
 def visible_cells(layer_payload: dict[str, Any], viewport: tuple[float, float, float, float]) -> list[str]:

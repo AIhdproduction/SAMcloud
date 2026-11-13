@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
 import torch
 import yaml
 from torch.nn import functional
+
+from samcloud.dxf.cancel import CancelToken, check_cancel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "config" / "flurseg.yml"
@@ -221,3 +224,28 @@ class FlurSegLabeler:
         lookup = torch.from_numpy(self.target_columns.astype(np.int64) + 1).to(self.device)
         labels = torch.where(best >= float(label_threshold), lookup[index], torch.zeros_like(index))
         return scores, labels.cpu().numpy().astype(np.uint8)
+
+    def label_image_scores(self, image: np.ndarray | Path | str, *, label_threshold: float = 0.4,
+                           progress: Callable[[float], None] | None = None,
+                           cancel: CancelToken | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Return uint8 SAMcloud labels and float16 winning probabilities.
+
+        Array inputs are RGB, matching orthophoto pixels, and are converted to
+        the BGR representation used by OpenCV-backed inference. Path inputs
+        are read by OpenCV and are consequently already BGR.
+        """
+        check_cancel(cancel)
+        if isinstance(image, np.ndarray):
+            if image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError("RGB image must have shape (height, width, 3)")
+            image_bgr = cv2.cvtColor(np.asarray(image, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr, _width, _height = self.load_image(image)
+        target = self._target_probabilities(image_bgr)
+        best, index = target.max(dim=0)
+        lookup = torch.from_numpy(self.target_columns.astype(np.int64) + 1).to(self.device)
+        labels = torch.where(best >= float(label_threshold), lookup[index], torch.zeros_like(index))
+        check_cancel(cancel)
+        if progress is not None:
+            progress(1.0)
+        return labels.cpu().numpy().astype(np.uint8), best.float().cpu().numpy().astype(np.float16)

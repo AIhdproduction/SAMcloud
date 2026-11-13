@@ -1,0 +1,52 @@
+# True-orthophoto defaults. Values are expressed in DXF-local metres unless noted.
+pixel_size_outdoor: 0.02
+pixel_size_indoor: 0.01
+max_side: 16000
+indoor:
+  cut_below_ceiling: 0.15
+  cut_fallback_above_floor: 2.0
+  floor_margin: 0.10
+  ceiling_codes: [101, 116]
+dsm:
+  cell_outdoor: 0.06                   # Coarse DSM raster cell size for outdoor scenes (m)
+  cell_indoor: 0.02                    # Coarse DSM raster cell size for indoor scenes (m)
+  hole_fill_max_area_m2: 1.0           # Max area of outdoor holes to fill (m²)
+  hole_fill_max_area_m2_indoor: 0.25   # Max area of indoor holes to fill (m²)
+  hole_fill_max_cells: 25              # Legacy fallback if hole_fill_max_area_m2 is not set
+  surface_fill_indoor: true            # Close indoor floor gaps and texture them from photos
+  surface_fill_close_m: 0.40           # Closing radius used to derive the scanned-room footprint (m)
+  surface_fill_max_hole_m2: 6.0        # Largest unmeasured footprint hole treated as floor (m²)
+  surface_fill_method: laplace         # Harmonic height interpolation; floor_plane preserves the previous behaviour
+zbuffer:
+  voxel_outdoor: 0.03
+  voxel_indoor: 0.015
+  max_long_side: 1600
+  rel_tol: 0.004                       # Relative depth tolerance for visibility testing
+  abs_tol_voxels: 2.0
+  min_filter_px: 2                     # Morphological min-filter radius (px) to close vegetation gaps
+  discontinuity_voxels: 4.0            # Only erode around genuine depth discontinuities
+  footprint_tolerance_scale: 1.0       # Depth tolerance derived from one reduced-camera pixel
+  cache_mb: 4096
+blend:
+  top_k: 3                             # Final number of candidate views blended per cell
+  candidates: 6                        # Best candidate views tracked before consistency filtering
+  consistency_threshold: 45.0          # Max RGB L2 distance to median for consistency check
+  max_incidence_deg: 60.0              # Reject camera rays steeper than this incidence angle (deg)
+  max_incidence_deg_indoor: 82.0       # Reject camera rays steeper than this incidence angle indoors (deg)
+  feather_px: 24
+  weight_angle: 1.0
+  weight_distance: 0.5
+  weight_center: 0.3
+  score_power: 2.0
+  score_gap_sigma: 0.15
+  nadir_soft_limit_deg: 45.0
+  nadir_penalty: 0.35
+  ray_check_enabled: false             # 2.5D DSM ray occlusion check (outdoor); off since the FOV fold-back fix made it redundant
+  ray_check_samples: 4
+  ray_check_distance: 15.0
+  ray_check_clearance: 0.15
+tile_size: 2048
+jpeg_long_sides: [8000, 4096]
+jpeg_quality: 92
+affine_max_residual: 0.002
+max_model_cloud_distance: 0.10

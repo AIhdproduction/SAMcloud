@@ -305,7 +305,7 @@ def tiepoint_pass_commands(
     return filtering, adjustment
 
 
-DENSE_PROFILE_SECTIONS = ("patch_match", "fusion", "point_cleaning", "depth_fill", "plane_fill", "surface_fusion")
+DENSE_PROFILE_SECTIONS = ("patch_match", "fusion", "point_cleaning", "depth_fill", "plane_fill", "surface_fusion", "superpoint_vote")
 
 
 def dense_profile(dense_config: dict[str, Any], capture_type: str | None) -> dict[str, Any]:

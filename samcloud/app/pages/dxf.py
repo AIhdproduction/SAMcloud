@@ -6,13 +6,14 @@ is started by an explicit button through DxfPageController.start_job. Settings o
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Callable
 
 from nicegui import run, ui
 
 from samcloud.app.dxf_controller import LAYER_MODES, MODEL_PROFILES, DxfPageController, dxf_unavailable_reason
-from samcloud.app.dxf_review_canvas import DxfReviewCanvas, background_url, payload_url
+from samcloud.app.dxf_review_canvas import DxfReviewCanvas, background_url, ortho_preview_url, payload_url
 from samcloud.app.dxf_side_canvas import DxfSideCanvas
 from samcloud.app.dxf_side_view import encode_png_data_url, render_side_view
 from samcloud.app.layout import render_page
@@ -25,6 +26,11 @@ ACTION_LABELS: dict[str, str] = {
     "levels": "Detect levels",
     "generate": "Generate DXF preview",
     "export": "Export DXF",
+    "ortho": "Building orthophoto",
+    "segment": "Segmenting orthophoto",
+    "clean_plan": "Generating clean plan",
+    "prepare_levels": "Detecting storeys",
+    "run_all": "Compute everything",
 }
 
 _RUNNERS: dict[Path, DxfJobRunner] = {}
@@ -82,10 +88,14 @@ class DxfPage:
         self.was_running = controller.is_running()
         targets = controller.review_targets()
         self.review_level: str | None = targets[0] if targets else None
+        levels = controller.available_levels()
+        self.compute_level: str | None = str(levels[0]["id"]) if controller.mode == "indoor" and len(levels) == 1 else None
         self.side_canvas: DxfSideCanvas | None = None
         self.side_scale: float = controller.scale_factor
         self.side_rendered = False
         self.review_canvas: DxfReviewCanvas | None = None
+        self.result_canvas: DxfReviewCanvas | None = None
+        self.run_all_button: ui.button | None = None
         self.hidden_layers: set[str] = set()
         self.measurement: dict[str, Any] | None = None
         self.job_stage: ui.label | None = None
@@ -107,6 +117,8 @@ class DxfPage:
         self.job_buttons = []
         self.side_canvas = None
         self.review_canvas = None
+        self.result_canvas = None
+        self.run_all_button = None
         self.job_stage = self.job_progress = self.cancel_button = self.job_log = None
         self.build_header()
         if self.controller.profile_required:
@@ -116,12 +128,14 @@ class DxfPage:
         if blocked is not None:
             _banner(blocked, "error").props("data-testid=blocked")
             return
-        self.build_job_bar()
-        self.stale_banner()
-        self.build_preparation()
-        if self.controller.mode == "indoor":
-            self.build_side_view()
-        self.build_review_section()
+        self.build_compute_card()
+        self.build_result_card()
+        with ui.expansion("Advanced", icon="tune", value=False).classes("w-full").mark("advanced"):
+            self.stale_banner()
+            self.build_preparation()
+            if self.controller.mode == "indoor":
+                self.build_side_view()
+            self.build_review_section()
         self.apply_busy(self.controller.is_running())
 
     def job_button(self, label: str, icon: str, on_click: Callable[[], Any], enabled: bool = True) -> ui.button:
@@ -194,12 +208,11 @@ class DxfPage:
 
     def build_job_bar(self) -> None:
         status = self.controller.job_status()
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-center w-full gap-3 no-wrap"):
-                self.job_stage = ui.label("").classes("text-sm").mark("job-stage")
-                self.job_progress = ui.linear_progress(value=0.0, show_value=False).classes("flex-1")
-                self.cancel_button = ui.button("Cancel", icon="stop", on_click=self.cancel).props("flat no-caps color=negative")
-            self.job_log = ui.label("").classes("sam-dxf-log w-full")
+        with ui.row().classes("items-center w-full gap-3 no-wrap"):
+            self.job_stage = ui.label("").classes("text-sm").mark("job-stage")
+            self.job_progress = ui.linear_progress(value=0.0, show_value=False).classes("flex-1")
+            self.cancel_button = ui.button("Cancel", icon="stop", on_click=self.cancel).props("flat no-caps color=negative")
+        self.job_log = ui.label("").classes("sam-dxf-log w-full")
         self.update_job_bar(status, self.controller.is_running())
 
     def update_job_bar(self, status: dict[str, Any], running: bool) -> None:
@@ -221,9 +234,9 @@ class DxfPage:
         if self.cancel_button is not None:
             self.cancel_button.set_visibility(running)
 
-    def start(self, action: str, level_id: str | None = None) -> None:
+    def start(self, action: str, level_id: str | None = None, *, force: bool = False) -> None:
         try:
-            self.controller.start_job(action, level_id)
+            self.controller.start_job(action, level_id, force=force)
         except (ValueError, RuntimeError) as error:
             ui.notify(str(error), type="negative")
             return
@@ -244,6 +257,11 @@ class DxfPage:
         if self.was_running and not running:
             self.was_running = False
             self.controller.refresh_state()
+            if str(status.get("action", "")) == "run_all" and str(status.get("state", "")) == "done":
+                self.controller.set_plan_variant("ortho")
+            levels = self.controller.available_levels()
+            if self.controller.mode == "indoor" and self.compute_level is None and len(levels) == 1:
+                self.compute_level = str(levels[0]["id"])
             job_state = str(status.get("state", ""))
             action = ACTION_LABELS.get(str(status.get("action", "")), "Job")
             kind = "positive" if job_state == "done" else ("warning" if job_state == "cancelled" else "negative")
@@ -257,13 +275,87 @@ class DxfPage:
         self.update_job_bar(status, running)
         self.apply_busy(running)
 
+    # ------------------------------------------------------------------ simple workflow
+
+    def primary_job_button(self, label: str, icon: str, on_click: Callable[[], Any], enabled: bool = True) -> ui.button:
+        button = self.job_button(label, icon, on_click, enabled=enabled)
+        button.props("color=primary").classes("text-lg")
+        return button
+
+    def build_compute_card(self) -> None:
+        controller = self.controller
+        with ui.card().classes("w-full gap-3"):
+            ui.label("Compute").classes("sam-section-title")
+            force = ui.checkbox("Recompute all (ignore cached steps)", value=False).classes("text-sm")
+            if controller.mode == "outdoor":
+                self.run_all_button = self.primary_job_button(
+                    "Compute everything", "play_arrow", lambda: self.start("run_all", force=bool(force.value)),
+                )
+                self.run_all_button.mark("run-all")
+                self.build_step_checklist(None)
+            else:
+                levels = controller.available_levels()
+                if not levels:
+                    self.primary_job_button(
+                        "Detect storeys", "layers", lambda: self.start("prepare_levels", force=bool(force.value)),
+                    ).mark("prepare-levels")
+                    self.build_step_checklist(None)
+                else:
+                    options = {
+                        str(level["id"]): f"{level['name']} ({float(level['floor_z']):.2f} m)"
+                        for level in levels
+                    }
+                    ui.toggle(options, value=self.compute_level if self.compute_level in options else None,
+                              on_change=lambda event: self.select_compute_level(event.value)).mark("storey-picker")
+                    label = "Compute everything" if self.compute_level is None else f"Compute everything for {options[self.compute_level]}"
+                    self.run_all_button = self.primary_job_button(
+                        label, "play_arrow", lambda: self.start("run_all", self.compute_level, force=bool(force.value)),
+                        enabled=self.compute_level is not None,
+                    )
+                    self.run_all_button.mark("run-all")
+                    self.job_button("Detect storeys again", "refresh", lambda: self.start("prepare_levels", force=bool(force.value))).props("flat")
+                    self.build_step_checklist(self.compute_level)
+            self.build_job_bar()
+
+    def select_compute_level(self, level_id: str | None) -> None:
+        self.compute_level = level_id
+        self.review_level = level_id
+        self.hidden_layers = set()
+        if self.run_all_button is None:
+            return
+        level = next((item for item in self.controller.available_levels() if item["id"] == level_id), None)
+        label = "Compute everything" if level is None else f"Compute everything for {level['name']} ({float(level['floor_z']):.2f} m)"
+        enabled = level is not None
+        self.run_all_button.set_text(label)
+        self.run_all_button.set_enabled(enabled and not self.controller.is_running())
+        self.job_buttons = [
+            (button, enabled if button is self.run_all_button else button_enabled)
+            for button, button_enabled in self.job_buttons
+        ]
+
+    def build_step_checklist(self, level_id: str | None) -> None:
+        controller = self.controller
+        labels = {"missing": "missing", "ok": "up to date", "stale": "stale"}
+        if controller.mode == "indoor" and level_id is None:
+            ui.label("Select a storey to see the workflow steps.").classes("sam-muted text-sm")
+            return
+        rows = [
+            ("Orthophoto", controller.ortho_status(level_id)),
+            ("Segmentation", controller.segment_status(level_id)),
+            ("Clean plan", controller.plan_status(level_id, "ortho")),
+            ("DXF export", controller.plan_status(level_id, "ortho")),
+        ]
+        with ui.column().classes("gap-1"):
+            for name, current in rows:
+                ui.label(f"{name}: {labels[current]}").classes("sam-muted text-sm")
+
     # ------------------------------------------------------------------ stale + preparation
 
     @ui.refreshable_method
     def stale_banner(self) -> None:
-        stale = self.controller.stale_levels()
-        if stale:
-            _banner(f"Settings changed: DXF preview is out of date ({', '.join(stale)}). Regenerate in the DXF review.").mark("stale-banner")
+        text = self.controller.stale_banner_text()
+        if text:
+            _banner(text).mark("stale-banner")
 
     def settings_changed(self) -> None:
         """Refresh only the staleness indicators; never regenerates anything."""
@@ -456,6 +548,105 @@ class DxfPage:
 
     # ------------------------------------------------------------------ review
 
+    def build_result_card(self) -> None:
+        controller = self.controller
+        level = self.compute_level if controller.mode == "indoor" else None
+        result = controller.plan_result(level, "ortho") if (controller.mode != "indoor" or level is not None) else None
+        with ui.card().classes("w-full gap-3"):
+            ui.label("Result").classes("sam-section-title")
+            if result is None:
+                ui.label("Press Compute everything to create the plan.").classes("sam-muted").mark("result-placeholder")
+                return
+            self.build_result_canvas(result, level)
+            with ui.row().classes("items-center gap-2"):
+                ui.button("Open DXF folder", icon="folder_open", on_click=self.open_dxf_folder).props("flat no-caps")
+                ui.button("Download DXF", icon="download", on_click=lambda: self.download_dxf(level)).props("flat no-caps")
+                ui.button("Save snapshot PNG", icon="photo_camera", on_click=lambda: self.save_snapshot("ortho", level)).props("flat no-caps")
+
+    def build_result_canvas(self, result: Any, level: str | None) -> None:
+        controller = self.controller
+        view = controller.state.view
+        background = str(view.get("result_background", "ortho"))
+        ortho = controller.ortho_result(level)
+        if background == "ortho":
+            image = ortho_preview_url(controller, level)
+        elif background == "classes":
+            image = background_url(controller, level, "classes")
+        else:
+            image = None
+        bounds = ortho.grid.bounds if ortho is not None else result.background.bounds
+        with ui.row().classes("w-full gap-4 no-wrap items-stretch"):
+            with ui.element("div").classes("flex-1").style("height:640px"):
+                self.result_canvas = DxfReviewCanvas().classes("w-full h-full").mark("result-canvas")
+                self.result_canvas.show(payload_url(controller, level, "ortho"), image, bounds)
+                self.result_canvas.set_opacity(1.0, float(view.get("dxf_opacity", 1.0)))
+                self.result_canvas.set_hidden_layers(sorted(self.hidden_layers))
+                self.result_canvas.on("measure", lambda event: self.on_review_measure(event.args, result.scale_factor))
+            with ui.column().classes("w-80 gap-2"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("Fit", on_click=lambda: self.result_canvas.fit() if self.result_canvas else None).props("flat no-caps")
+                    ui.toggle({"pan": "Pan", "measure": "Measure"}, value="pan",
+                              on_change=lambda event: self.result_canvas.set_tool(event.value) if self.result_canvas else None)
+                ui.toggle({"ortho": "Orthophoto", "none": "None", "classes": "Class colours"}, value=background,
+                          on_change=lambda event: self.set_result_background(event.value, level)).mark("result-background")
+                ui.label("DXF opacity").classes("text-sm")
+                ui.slider(min=0, max=100, step=1, value=round(float(view.get("dxf_opacity", 1.0)) * 100),
+                          on_change=lambda event: self.set_result_opacity(event.value)).props("label").mark("dxf-opacity")
+                ui.label("Layers").classes("text-sm q-mt-sm")
+                for name, status in result.statuses.items():
+                    color = ",".join(str(value) for value in _layer_rgb(result, name))
+                    with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                        ui.element("div").classes("sam-dxf-swatch").style(f"background:rgb({color})")
+                        ui.checkbox(name, value=name not in self.hidden_layers,
+                                    on_change=lambda event, layer=name: self.toggle_result_layer(layer, bool(event.value))).mark(f"result-layer-{name}")
+                        ui.label(str(status.entity_count)).classes("sam-muted text-xs")
+
+    def set_result_background(self, source: str, level: str | None) -> None:
+        self.controller.set_view_option("result_background", source)
+        if self.result_canvas is None:
+            return
+        if source == "ortho":
+            image = ortho_preview_url(self.controller, level)
+        elif source == "classes":
+            image = background_url(self.controller, level, "classes")
+        else:
+            image = None
+        self.result_canvas.set_image(image)
+
+    def set_result_opacity(self, percent: float | None) -> None:
+        value = max(0.0, min(1.0, float(percent or 0.0) / 100.0))
+        self.controller.set_view_option("dxf_opacity", value)
+        if self.result_canvas is not None:
+            self.result_canvas.set_opacity(1.0, value)
+
+    def toggle_result_layer(self, layer: str, visible: bool) -> None:
+        if visible:
+            self.hidden_layers.discard(layer)
+        else:
+            self.hidden_layers.add(layer)
+        if self.result_canvas is not None:
+            self.result_canvas.set_hidden_layers(sorted(self.hidden_layers))
+
+    def open_dxf_folder(self) -> None:
+        folder = self.controller.project_dir / "products" / "dxf" / "export"
+        if not folder.is_dir():
+            ui.notify("No DXF export folder exists yet.", type="warning")
+            return
+        try:
+            os.startfile(str(folder))
+        except OSError as error:
+            ui.notify(f"Could not open DXF folder: {error}", type="negative")
+
+    def download_dxf(self, level: str | None) -> None:
+        target_name = self.controller.level_label(level)
+        export_dir = self.controller.project_dir / "products" / "dxf" / "export"
+        matches = sorted(export_dir.glob(f"*{target_name}*clean.dxf")) if export_dir.is_dir() else []
+        if not matches:
+            ui.notify("No exported clean DXF is available for this target.", type="warning")
+            return
+        target = matches[-1]
+        ui.download(target.read_bytes(), filename=target.name, media_type="application/dxf")
+
     def build_review_section(self) -> None:
         self.review_section()
 
@@ -470,11 +661,12 @@ class DxfPage:
                 self.job_button("Generate DXF preview", "auto_fix_high", lambda: self.start("generate", self.review_level),
                                 enabled=controller.mode != "indoor" or self.review_level is not None)
             self.review_status()
-            result = controller.cached_result(self.review_level) if (controller.mode != "indoor" or self.review_level) else None
+            result = controller.plan_result(self.review_level, controller.state.plan_variant) if (controller.mode != "indoor" or self.review_level) else None
             if controller.mode == "indoor" and self.review_level is None:
                 ui.label("Detect or add levels and check at least one to review it.").classes("sam-muted")
             elif result is None:
-                ui.label("No DXF preview is cached for this target. Press Generate DXF preview.").classes("sam-muted").mark("no-cache")
+                variant_label = "clean orthophoto plan" if controller.state.plan_variant == "ortho" else "point-cloud plan"
+                ui.label(f"No cached {variant_label} exists for this target. Run its explicit workflow step first.").classes("sam-muted").mark("no-cache")
             else:
                 self.build_review_canvas(result)
             self.build_review_settings()
@@ -505,11 +697,30 @@ class DxfPage:
         source = str(view.get("image_source", "rgb"))
         if source == "rgb" and not has_rgb:
             source = "classes"
+        ortho = controller.ortho_result(level)
+        compare = bool(view.get("compare_plans", False))
+        use_ortho = (controller.background_source == "ortho" or compare) and ortho is not None
+        image = ortho_preview_url(controller, level) if use_ortho else background_url(controller, level, source)
+        bounds = ortho.grid.bounds if use_ortho else result.background.bounds
+        variant = controller.state.plan_variant
+        primary_variant = "pointcloud" if compare else variant
+        compare_variant = "ortho" if compare else None
+        primary_result = controller.plan_result(level, primary_variant)
+        compare_result = controller.plan_result(level, compare_variant) if compare_variant else None
+        if primary_result is None:
+            return
         with ui.row().classes("w-full gap-4 no-wrap items-stretch"):
             with ui.element("div").classes("flex-1").style("height:640px"):
                 self.review_canvas = DxfReviewCanvas().classes("w-full h-full").mark("review-canvas")
-                self.review_canvas.show(payload_url(controller, level), background_url(controller, level, source), result.background.bounds)
-                self.review_canvas.set_opacity(float(view.get("image_opacity", 1.0)), float(view.get("dxf_opacity", 1.0)))
+                self.review_canvas.show(
+                    payload_url(controller, level, primary_variant),
+                    image,
+                    bounds,
+                    payload_url(controller, level, compare_variant) if compare_result is not None and compare_variant else None,
+                )
+                primary_opacity = float(view.get("pointcloud_opacity", 1.0)) if compare else float(view.get("dxf_opacity", 1.0))
+                self.review_canvas.set_opacity(float(view.get("image_opacity", 1.0)), primary_opacity)
+                self.review_canvas.set_compare_opacity(float(view.get("clean_opacity", 1.0)))
                 self.review_canvas.set_hidden_layers(sorted(self.hidden_layers))
                 self.review_canvas.on("measure", lambda event: self.on_review_measure(event.args, result.scale_factor))
             with ui.column().classes("w-80 gap-2"):
@@ -549,6 +760,16 @@ class DxfPage:
         if self.review_canvas is not None:
             self.review_canvas.set_opacity(float(view.get("image_opacity", 1.0)), float(view.get("dxf_opacity", 1.0)))
 
+    def set_compare_opacity(self, key: str, percent: float | None, clean: bool) -> None:
+        """Persist one compare-overlay opacity and update only that canvas layer."""
+        value = max(0.0, min(1.0, float(percent or 0.0) / 100.0))
+        self.controller.set_view_option(key, value)
+        if self.review_canvas is not None:
+            if clean:
+                self.review_canvas.set_compare_opacity(value)
+            else:
+                self.review_canvas.set_opacity(float(self.controller.state.view.get("image_opacity", 1.0)), value)
+
     def toggle_layer(self, layer: str, visible: bool) -> None:
         if visible:
             self.hidden_layers.discard(layer)
@@ -571,15 +792,62 @@ class DxfPage:
             return
         if controller.is_stale(level):
             _banner("Settings changed since this preview was generated. Press Generate DXF preview to update.").mark("review-stale")
+        ortho_status = controller.ortho_status(level)
+        segment_status = controller.segment_status(level)
+        clean_status = controller.plan_status(level, "ortho")
+        selected_variant = controller.state.plan_variant
+        labels = {"missing": "missing", "ok": "up to date", "stale": "stale"}
+        colours = {"missing": "grey", "ok": "positive", "stale": "warning"}
         with ui.row().classes("items-center gap-3"):
             ui.toggle({"local": "Local coordinates", "original": "Original coordinates"},
                       value=str(controller.state.view.get("coordinates", "local")),
                       on_change=lambda event: controller.set_view_option("coordinates", event.value)).mark("coordinates")
-            self.job_button("Export DXF", "download", lambda: self.start("export", level), enabled=controller.export_enabled(level)).mark("export")
+            ui.select(
+                {"pointcloud": "Point cloud (fast)", "ortho": "Orthophoto (clean)"},
+                label="Plan variant",
+                value=selected_variant,
+                on_change=lambda event: self.set_plan_variant(event.value),
+            ).classes("w-56").props("outlined dense").mark("plan-variant")
+            ui.switch("Compare plans", value=bool(controller.state.view.get("compare_plans", False)),
+                      on_change=lambda event: self.set_compare_mode(bool(event.value))).mark("compare-plans")
+        with ui.row().classes("items-center gap-3 w-full no-wrap"):
+            self.job_button("Build orthophoto", "satellite_alt", lambda: self.start("ortho", level),
+                            enabled=controller.mode != "indoor" or level is not None).mark("ortho-build")
+            ui.chip(f"Orthophoto: {labels[ortho_status]}", color=colours[ortho_status], text_color="white").mark("ortho-status")
+            source_options = {"pointcloud": "Point cloud", "sam3": "SAM3", "combined": "Combined"}
+            if controller.mode != "indoor":
+                source_options["flurseg"] = "FlurSeg"
+            ui.select(source_options, label="Segmentation model", value=controller.state.segment_source,
+                      on_change=lambda event: self.set_segment_source(event.value)).classes("w-52").props("outlined dense").mark("segment-source")
+            self.job_button("Segment", "category", lambda: self.start("segment", level),
+                            enabled=ortho_status == "ok").mark("segment-build")
+            ui.chip(f"Segment: {labels[segment_status]}", color=colours[segment_status], text_color="white").mark("segment-status")
+            self.job_button("Generate clean plan", "architecture", lambda: self.start("clean_plan", level),
+                            enabled=segment_status == "ok").mark("clean-plan-build")
+            ui.chip(f"Clean plan: {labels[clean_status]}", color=colours[clean_status], text_color="white").mark("clean-plan-status")
+            self.job_button("Export DXF", "download", lambda: self.start("export", level),
+                            enabled=controller.export_enabled(level, selected_variant)).mark("export")
+            ui.chip(f"Export: {labels[controller.plan_status(level, selected_variant)]}", color=colours[controller.plan_status(level, selected_variant)], text_color="white").mark("export-status")
             if controller.mode == "indoor":
                 self.job_button("Export all checked levels", "download_for_offline", lambda: self.start("export", None),
-                                enabled=controller.all_exports_enabled()).mark("export-all")
+                                enabled=all(controller.export_enabled(target, selected_variant) for target in controller.review_targets())).mark("export-all")
             ui.button("Save snapshot PNG", icon="photo_camera", on_click=self.save_snapshot).props("flat no-caps").set_enabled(controller.cached_result(level) is not None)
+        if bool(controller.state.view.get("compare_plans", False)):
+            with ui.row().classes("items-center gap-3"):
+                ui.label("Point-cloud overlay opacity").classes("text-sm")
+                ui.slider(min=0, max=100, step=1, value=round(float(controller.state.view.get("pointcloud_opacity", 1.0)) * 100),
+                          on_change=lambda event: self.set_compare_opacity("pointcloud_opacity", event.value, False)).props("label").mark("compare-pointcloud-opacity")
+                ui.label("Clean-plan overlay opacity").classes("text-sm")
+                ui.slider(min=0, max=100, step=1, value=round(float(controller.state.view.get("clean_opacity", 1.0)) * 100),
+                          on_change=lambda event: self.set_compare_opacity("clean_opacity", event.value, True)).props("label").mark("compare-clean-opacity")
+        with ui.row().classes("items-center gap-3"):
+            has_ortho = controller.ortho_result(level) is not None
+            ui.toggle({"topview": "Point-cloud top view", "ortho": "Orthophoto"}, value=controller.background_source,
+                      on_change=lambda event: self.set_background_source(event.value)).mark("ortho-background").set_enabled(has_ortho)
+            self.ortho_link("Orthophoto JPEG (8000 px)", "jpg8000", level, "ortho-link-jpg8000")
+            self.ortho_link("JPEG (4096 px)", "jpg4096", level, "ortho-link-jpg4096")
+            self.ortho_link("Full PNG", "png", level, "ortho-link-png")
+            ui.button("Open folder", icon="folder_open", on_click=lambda: self.open_ortho_folder(level)).props("flat no-caps").mark("ortho-folder").set_enabled(has_ortho)
         last = controller.last_export()
         if last:
             with ui.column().classes("gap-0"):
@@ -588,12 +856,98 @@ class DxfPage:
                     ui.label(str(path)).classes("sam-muted text-xs")
         self.apply_busy(controller.is_running())
 
-    async def save_snapshot(self) -> None:
+    def set_segment_source(self, source: str | None) -> None:
+        if not source:
+            return
+        try:
+            self.controller.set_segment_source(source)
+        except ValueError as error:
+            ui.notify(str(error), type="negative")
+            return
+        self.review_section.refresh()
+
+    def set_plan_variant(self, variant: str | None) -> None:
+        if not variant:
+            return
+        self.controller.set_plan_variant(variant)
+        result = self.controller.plan_result(self.review_level, variant)
+        if self.review_canvas is None or result is None:
+            self.review_section.refresh()
+            return
         view = self.controller.state.view
+        compare = bool(view.get("compare_plans", False))
+        primary_variant = "pointcloud" if compare else variant
+        primary = self.controller.plan_result(self.review_level, primary_variant)
+        if primary is None:
+            self.review_section.refresh()
+            return
+        ortho = self.controller.ortho_result(self.review_level)
+        use_ortho = (self.controller.background_source == "ortho" or compare) and ortho is not None
+        image_source = str(view.get("image_source", "rgb"))
+        image = ortho_preview_url(self.controller, self.review_level) if use_ortho else background_url(self.controller, self.review_level, image_source)
+        bounds = ortho.grid.bounds if use_ortho else primary.background.bounds
+        clean = self.controller.plan_result(self.review_level, "ortho") if compare else None
+        self.review_canvas.show(
+            payload_url(self.controller, self.review_level, primary_variant), image, bounds,
+            payload_url(self.controller, self.review_level, "ortho") if clean is not None and compare else None,
+        )
+        self.review_status.refresh()
+
+    def set_compare_mode(self, enabled: bool) -> None:
+        self.controller.set_view_option("compare_plans", enabled)
+        self.set_plan_variant(self.controller.state.plan_variant)
+
+    def ortho_link(self, label: str, kind: str, level: str | None, marker: str) -> None:
+        """Add an orthophoto download link, disabled until its cached artifact exists."""
+        path = self.controller.ortho_file(level, kind)
+        if path is None:
+            ui.label(label).classes("sam-muted text-sm").mark(marker)
+            return
+        from samcloud.app.dxf_review_canvas import ORTHO_ROUTE, level_key
+
+        href = f"{ORTHO_ROUTE}/{level_key(level)}/{kind}?v={self.controller.ortho_version(level)}"
+        ui.link(label, target=href, new_tab=True).classes("text-sm").mark(marker)
+
+    def set_background_source(self, source: str) -> None:
+        self.controller.set_background_source(source)
+        if self.review_canvas is not None:
+            level = self.review_level
+            variant = self.controller.state.plan_variant
+            compare = bool(self.controller.state.view.get("compare_plans", False))
+            primary_variant = "pointcloud" if compare else variant
+            primary = self.controller.plan_result(level, primary_variant)
+            ortho = self.controller.ortho_result(level)
+            if primary is not None:
+                image = ortho_preview_url(self.controller, level) if source == "ortho" and ortho is not None else background_url(
+                    self.controller, level, str(self.controller.state.view.get("image_source", "rgb"))
+                )
+                bounds = ortho.grid.bounds if source == "ortho" and ortho is not None else primary.background.bounds
+                clean = self.controller.plan_result(level, "ortho") if compare else None
+                self.review_canvas.show(
+                    payload_url(self.controller, level, primary_variant), image, bounds,
+                    payload_url(self.controller, level, "ortho") if clean is not None and compare else None,
+                )
+        self.review_status.refresh()
+
+    def open_ortho_folder(self, level: str | None) -> None:
+        """Open the existing orthophoto cache folder in Windows Explorer."""
+        folder = self.controller.ortho_dir(level)
+        if not folder.is_dir():
+            ui.notify("No orthophoto cache folder exists yet.", type="warning")
+            return
+        try:
+            os.startfile(str(folder))
+        except OSError as error:
+            ui.notify(f"Could not open orthophoto folder: {error}", type="negative")
+
+    async def save_snapshot(self, variant: str = "pointcloud", level_id: str | None = None) -> None:
+        view = self.controller.state.view
+        target = self.review_level if level_id is None else level_id
         try:
             path = await run.io_bound(
-                self.controller.save_snapshot, self.review_level, str(view.get("image_source", "rgb")),
+                self.controller.save_snapshot, target, str(view.get("image_source", "rgb")),
                 float(view.get("image_opacity", 1.0)), float(view.get("dxf_opacity", 1.0)), sorted(self.hidden_layers),
+                variant, variant == "ortho" and str(view.get("result_background", "ortho")) == "ortho",
             )
         except (ValueError, RuntimeError) as error:
             ui.notify(str(error), type="negative")
@@ -612,7 +966,18 @@ class DxfPage:
                               value="centerlines" if view.get("wall_centerlines", True) else "polygons",
                               on_change=lambda event: self.change_setting(controller.set_view_option, "wall_centerlines", event.value == "centerlines")).mark("wall-output")
                     ui.switch("Door swing arc", value=bool(view.get("door_swing_arc", False)),
-                              on_change=lambda event: self.change_setting(controller.set_view_option, "door_swing_arc", bool(event.value))).mark("door-swing")
+                               on_change=lambda event: self.change_setting(controller.set_view_option, "door_swing_arc", bool(event.value))).mark("door-swing")
+            ui.label("Orthophoto").classes("text-sm q-mt-md")
+            with ui.row().classes("items-end gap-4"):
+                ortho = controller.state.ortho
+                ui.number("Pixel size outdoor (m, empty = default)", value=ortho.get("pixel_size_outdoor"), min=0.001, format="%.3f",
+                          on_change=lambda event: self.change_setting(controller.set_ortho_option, "pixel_size_outdoor", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-pixel-outdoor")
+                ui.number("Pixel size indoor (m, empty = default)", value=ortho.get("pixel_size_indoor"), min=0.001, format="%.3f",
+                          on_change=lambda event: self.change_setting(controller.set_ortho_option, "pixel_size_indoor", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-pixel-indoor")
+                ui.number("Maximum side (px, empty = default)", value=ortho.get("max_side"), min=1000, max=30000, step=1,
+                          on_change=lambda event: self.change_setting(controller.set_ortho_option, "max_side", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-max-side")
+                ui.number("Cut below ceiling (m, empty = default)", value=ortho.get("cut_below_ceiling"), min=0.0, max=1.0, format="%.3f",
+                          on_change=lambda event: self.change_setting(controller.set_ortho_option, "cut_below_ceiling", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-cut")
             for row in controller.layer_settings():
                 name = row["name"]
                 band = row["z_band"] or [None, None]

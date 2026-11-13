@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import cv2
 import numpy as np
@@ -24,8 +24,11 @@ from samcloud.dxf.overlay import composite, render_dxf_rgba
 from samcloud.dxf.pipeline import is_stale as pipeline_is_stale, load_cached_result
 from samcloud.dxf.result import DxfPlanResult, vector_payload
 from samcloud.dxf.scale import numeric_scale, two_point_scale
-from samcloud.dxf.state import DxfProjectState, load_state, plan_settings_for, save_state
+from samcloud.dxf.state import DxfProjectState, load_state, ortho_config_for, plan_settings_for, save_state
 from samcloud.dxf.writer import sanitize_dxf_name
+
+if TYPE_CHECKING:
+    from samcloud.ortho.build import OrthoResult
 
 MODEL_PROFILES: tuple[str, ...] = ("sam3_outdoor", "sam3_indoor", "flurseg_v1", "legacy_v1")
 """Profiles offered when a LAS file carries no provenance."""
@@ -128,6 +131,7 @@ class DxfPageController:
         self._state: DxfProjectState | None = None
         self._header_cache: dict[tuple[str, int, int], tuple[ProfileInfo | None, np.ndarray]] = {}
         self._result_memo: dict[str, tuple[tuple[int, int], DxfPlanResult]] = {}
+        self._ortho_result_memo: dict[str, tuple[tuple[int, int], OrthoResult]] = {}
         self.refresh_state()
         if self._las_path is None and self.state.view.get("las_path"):
             self._las_path = Path(str(self.state.view["las_path"])).resolve()
@@ -507,6 +511,67 @@ class DxfPageController:
         self.state.view[key] = value
         save_state(self.project_dir, self.state)
 
+    def set_ortho_option(self, name: str, value: Any) -> None:
+        """Set a validated orthophoto configuration option in state.
+
+        Options:
+        - pixel_size_outdoor: float > 0 or None
+        - pixel_size_indoor: float > 0 or None
+        - max_side: int between 1000 and 30000 or None
+        - cut_below_ceiling: float between 0.0 and 1.0 m or None
+        """
+        allowed = {"pixel_size_outdoor", "pixel_size_indoor", "max_side", "cut_below_ceiling"}
+        if name not in allowed:
+            raise ValueError(f"Unknown orthophoto option '{name}'. Allowed: {', '.join(sorted(allowed))}")
+
+        if value is None or value == "":
+            self.state.ortho[name] = None
+        elif name in ("pixel_size_outdoor", "pixel_size_indoor"):
+            val = float(value)
+            if not np.isfinite(val) or val <= 0:
+                raise ValueError(f"{name} must be a positive number greater than 0")
+            self.state.ortho[name] = val
+        elif name == "max_side":
+            val = int(value)
+            if not (1000 <= val <= 30000):
+                raise ValueError("max_side must be an integer between 1000 and 30000")
+            self.state.ortho[name] = val
+        elif name == "cut_below_ceiling":
+            val = float(value)
+            if not np.isfinite(val) or not (0.0 <= val <= 1.0):
+                raise ValueError("cut_below_ceiling must be between 0.0 and 1.0 m")
+            self.state.ortho[name] = val
+
+        save_state(self.project_dir, self.state)
+
+    def set_background_source(self, source: str) -> None:
+        """Set the review canvas background source: 'topview' or 'ortho'."""
+        if source not in ("topview", "ortho"):
+            raise ValueError(f"Invalid background source '{source}'. Must be 'topview' or 'ortho'.")
+        self.state.view["background_source"] = source
+        save_state(self.project_dir, self.state)
+
+    def set_segment_source(self, source: str) -> None:
+        """Select the cached orthophoto segmentation source without starting a job."""
+        if source not in {"pointcloud", "sam3", "flurseg", "combined"}:
+            raise ValueError("Unsupported segmentation source")
+        if source == "flurseg" and self.mode == "indoor":
+            raise ValueError("FlurSeg segmentation is only available for outdoor orthophotos")
+        self.state.segment_source = source
+        save_state(self.project_dir, self.state)
+
+    def set_plan_variant(self, variant: str) -> None:
+        """Select the cached plan variant used for review and export without starting a job."""
+        if variant not in {"pointcloud", "ortho"}:
+            raise ValueError("Plan variant must be 'pointcloud' or 'ortho'")
+        self.state.plan_variant = variant
+        save_state(self.project_dir, self.state)
+
+    @property
+    def background_source(self) -> str:
+        """Return the active background source: 'topview' or 'ortho'."""
+        return str(self.state.view.get("background_source", "topview"))
+
     def set_cell_size(self, cell_size: float | None) -> None:
         """Override vector plan rasterization cell size."""
         self.state.overrides["cell_size"] = float(cell_size) if cell_size is not None else None
@@ -570,9 +635,47 @@ class DxfPageController:
         stat = result_file.stat()
         return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
 
+    def plan_cache_dir(self, level_id: str | None, variant: str = "pointcloud") -> Path:
+        """Return the existing cache directory for a point-cloud or clean orthophoto plan."""
+        if variant == "pointcloud":
+            return self.cache_dir(level_id)
+        if variant == "ortho":
+            from samcloud.ortho.plan import clean_plan_cache_dir
+
+            return clean_plan_cache_dir(self.project_dir, self._resolve_level(level_id))
+        raise ValueError("Plan variant must be 'pointcloud' or 'ortho'")
+
+    def plan_version(self, level_id: str | None, variant: str = "pointcloud") -> str:
+        """Return a cache-busting token for one cached plan variant."""
+        result_file = self.plan_cache_dir(level_id, variant) / "result.json"
+        if not result_file.is_file():
+            return "none"
+        stat = result_file.stat()
+        return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
     def cached_result(self, level_id: str | None = None) -> DxfPlanResult | None:
         """Load cached vector plan from disk without recomputing (memoised by file stat)."""
         cache_dir = self.cache_dir(level_id)
+        result_file = cache_dir / "result.json"
+        if not result_file.is_file():
+            return None
+        stat = result_file.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+        memo = self._result_memo.get(str(cache_dir))
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        try:
+            result = load_cached_result(cache_dir)
+        except Exception:
+            return None
+        self._result_memo[str(cache_dir)] = (key, result)
+        return result
+
+    def plan_result(self, level_id: str | None, variant: str = "pointcloud") -> DxfPlanResult | None:
+        """Load one cached plan variant without generating it."""
+        if variant == "pointcloud":
+            return self.cached_result(level_id)
+        cache_dir = self.plan_cache_dir(level_id, variant)
         result_file = cache_dir / "result.json"
         if not result_file.is_file():
             return None
@@ -594,6 +697,14 @@ class DxfPageController:
         The culling grid defaults to geometry.vector_grid_size from config/dxf_export.yaml.
         """
         result = self.cached_result(level_id)
+        if result is None:
+            return None
+        size = int(grid_size) if grid_size is not None else int(load_dxf_config().geometry.vector_grid_size)
+        return vector_payload(result, grid_size=size)
+
+    def plan_payload(self, level_id: str | None, variant: str = "pointcloud", grid_size: int | None = None) -> dict[str, Any] | None:
+        """Return a browser payload for one cached plan variant without generating it."""
+        result = self.plan_result(level_id, variant)
         if result is None:
             return None
         size = int(grid_size) if grid_size is not None else int(load_dxf_config().geometry.vector_grid_size)
@@ -641,24 +752,58 @@ class DxfPageController:
         # Generation records the LAS provenance profile, so the fingerprint is compared against that.
         return pipeline_is_stale(cached, settings, level=level_obj, profile_name=None)
 
-    def export_enabled(self, level_id: str | None = None) -> bool:
+    def export_enabled(self, level_id: str | None = None, variant: str = "pointcloud") -> bool:
         """True only if cached plan exists, is fresh, and configuration is unblocked."""
         if self.blocked_message is not None:
             return False
         if self.profile_required:
             return False
-        cached = self.cached_result(level_id)
-        if cached is None:
-            return False
-        if self.is_stale(level_id):
-            return False
-        return True
+        return self.plan_status(level_id, variant) == "ok"
+
+    def segment_status(self, level_id: str | None, source: str | None = None) -> Literal["missing", "ok", "stale"]:
+        """Return the cached segmentation freshness for the selected source without loading a model."""
+        selected = source or self.state.segment_source
+        try:
+            from samcloud.ortho.segment import load_segment_result, segment_fingerprint
+
+            result = load_segment_result(self.project_dir, self._resolve_level(level_id), selected)
+            if result is None:
+                return "missing"
+            if result.is_stale:
+                return "stale"
+            return "ok" if result.fingerprint == segment_fingerprint(
+                self.project_dir, level=self._resolve_level(level_id), source=selected
+            ) else "stale"
+        except Exception:
+            return "stale"
+
+    def plan_status(self, level_id: str | None, variant: str = "pointcloud") -> Literal["missing", "ok", "stale"]:
+        """Return the cache freshness of a plan variant using only cache metadata and fingerprints."""
+        result = self.plan_result(level_id, variant)
+        if result is None:
+            return "missing"
+        if variant == "pointcloud":
+            return "stale" if self.is_stale(level_id) else "ok"
+        try:
+            from dataclasses import replace as dataclass_replace
+            from samcloud.ortho.plan import clean_plan_fingerprint, load_clean_plan_settings
+            from samcloud.ortho.segment import load_segment_result
+
+            settings = dataclass_replace(load_clean_plan_settings(), segment_source=self.state.segment_source)
+            if load_segment_result(self.project_dir, self._resolve_level(level_id), self.state.segment_source) is None:
+                settings = None
+            current = clean_plan_fingerprint(self.project_dir, self._resolve_level(level_id), settings)
+            return "ok" if result.settings_fingerprint == current else "stale"
+        except Exception as error:
+            if "segmentation" in str(error).lower():
+                return "missing"
+            return "stale"
 
     # -------------------------------------------------------------------------
     # Subprocess jobs (heavy work only through DxfJobRunner.start)
     # -------------------------------------------------------------------------
 
-    def start_job(self, action: str, level_id: str | None = None) -> Any:
+    def start_job(self, action: str, level_id: str | None = None, *, force: bool = False) -> Any:
         """Launch background subprocess job via the runner."""
         if self.blocked_message is not None:
             raise ValueError(self.blocked_message)
@@ -667,7 +812,16 @@ class DxfPageController:
         las = self.las_path
         if las is None or not Path(las).is_file():
             raise ValueError(f"No valid LAS file found to execute '{action}'")
-        return self.runner.start(action, las=las, level=level_id, mode=self.mode)
+        if action not in {"preview", "align", "levels", "generate", "export", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"}:
+            raise ValueError(f"Unsupported DXF job action '{action}'")
+        options: dict[str, str] = {}
+        if action in {"segment", "clean_plan", "run_all"}:
+            options["source"] = self.state.segment_source
+        if action == "run_all":
+            options["variant"] = "ortho"
+        elif action == "export":
+            options["variant"] = self.state.plan_variant
+        return self.runner.start(action, las=las, level=level_id, mode=self.mode, force=force, **options)
 
     def cancel_job(self) -> None:
         """Signal background job to cancel and terminate process if needed."""
@@ -706,6 +860,34 @@ class DxfPageController:
         """Display names of review targets whose cached DXF preview no longer matches the settings."""
         return [self.level_label(level_id) for level_id in self.review_targets() if self.is_stale(level_id)]
 
+    def stale_ortho_levels(self) -> list[str]:
+        """Display names of review targets whose cached orthophoto exists but is stale."""
+        return [self.level_label(level_id) for level_id in self.review_targets() if self.ortho_status(level_id) == "stale"]
+
+    def stale_banner_messages(self) -> list[str]:
+        """Human-readable messages for the stale banner covering DXF and orthophoto staleness."""
+        messages: list[str] = []
+        dxf_stale = self.stale_levels()
+        if dxf_stale:
+            messages.append(f"DXF preview is out of date ({', '.join(dxf_stale)})")
+        ortho_stale = self.stale_ortho_levels()
+        if ortho_stale:
+            messages.append(f"orthophoto is out of date ({', '.join(ortho_stale)})")
+        segment_stale = [self.level_label(level_id) for level_id in self.review_targets() if self.segment_status(level_id) == "stale"]
+        if segment_stale:
+            messages.append(f"orthophoto segmentation is out of date ({', '.join(segment_stale)})")
+        clean_stale = [self.level_label(level_id) for level_id in self.review_targets() if self.plan_status(level_id, "ortho") == "stale"]
+        if clean_stale:
+            messages.append(f"clean plan is out of date ({', '.join(clean_stale)})")
+        return messages
+
+    def stale_banner_text(self) -> str | None:
+        """Combined message explaining which cached results (DXF and/or orthophoto) are stale."""
+        messages = self.stale_banner_messages()
+        if not messages:
+            return None
+        return f"Settings changed: {' and '.join(messages)}. Regenerate in the DXF review."
+
     def all_exports_enabled(self) -> bool:
         """True when every review target has a fresh cached preview, so a batch export can run."""
         targets = self.review_targets()
@@ -717,6 +899,170 @@ class DxfPageController:
             raise ValueError("Background source must be 'rgb' or 'classes'")
         path = self.cache_dir(level_id) / ("background_rgb.png" if source == "rgb" else "background_classes.png")
         return path if path.is_file() else None
+
+    # -------------------------------------------------------------------------
+    # Orthophoto inspection and cached artifacts (cheap, never computes or builds)
+    # -------------------------------------------------------------------------
+
+    def _resolve_level(self, level_id: str | None) -> Level | None:
+        """Resolve a level ID to a Level dataclass instance, or None for outdoor / site."""
+        if self.mode != "indoor":
+            return None
+        if level_id is None:
+            if self.state.levels:
+                checked = next((lvl for lvl in self.state.levels if lvl.get("checked", True)), self.state.levels[0])
+                return _level_from_dict(checked)
+            return None
+        if level_id == "site":
+            return None
+        matched = next((lvl for lvl in self.state.levels if lvl["id"] == level_id), None)
+        return _level_from_dict(matched) if matched is not None else None
+
+    def ortho_dir(self, level_id: str | None = None) -> Path:
+        """Return products/ortho/<level id or site>/ (not created)."""
+        from samcloud.ortho.build import ortho_output_dir
+
+        level_obj = self._resolve_level(level_id)
+        if level_obj is not None:
+            return ortho_output_dir(self.project_dir, level_obj)
+        if level_id is not None and level_id != "site" and self.mode == "indoor":
+            return self.project_dir / "products" / "ortho" / str(level_id)
+        return ortho_output_dir(self.project_dir, None)
+
+    def ortho_version(self, level_id: str | None = None) -> str:
+        """Short token that changes whenever the cached orthophoto on disk changes (for browser cache busting)."""
+        fingerprint_file = self.ortho_dir(level_id) / "fingerprint.txt"
+        if not fingerprint_file.is_file():
+            return "none"
+        stat = fingerprint_file.stat()
+        return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+    def ortho_result(self, level_id: str | None = None) -> OrthoResult | None:
+        """Load cached orthophoto result from disk without recomputing (memoised by file stat)."""
+        target_dir = self.ortho_dir(level_id)
+        fingerprint_file = target_dir / "fingerprint.txt"
+        if not fingerprint_file.is_file():
+            return None
+        stat = fingerprint_file.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+        memo = self._ortho_result_memo.get(str(target_dir))
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        try:
+            from samcloud.ortho.build import load_ortho_result
+
+            result = load_ortho_result(target_dir)
+        except Exception:
+            return None
+        if result is not None:
+            self._ortho_result_memo[str(target_dir)] = (key, result)
+        return result
+
+    def ortho_status(self, level_id: str | None = None) -> Literal["missing", "ok", "stale"]:
+        """Check whether cached orthophoto is missing, up to date, or stale compared to current settings.
+
+        Cheap by design: checks file stats only and never builds anything or scans the full point cloud.
+        """
+        target_dir = self.ortho_dir(level_id)
+        fingerprint_file = target_dir / "fingerprint.txt"
+        ortho_image = target_dir / "ortho.png"
+        if not fingerprint_file.is_file() or not ortho_image.is_file():
+            return "missing"
+        try:
+            stored_fingerprint = fingerprint_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return "missing"
+        if not stored_fingerprint:
+            return "missing"
+
+        point_source = self.las_path if self.las_is_custom else project_point_source(self.project_dir)
+        if point_source is None or not point_source.is_file():
+            return "stale"
+
+        level_obj = self._resolve_level(level_id)
+
+        existing_result = self.ortho_result(level_id)
+
+        def _get_result_data(key: str) -> Any:
+            if existing_result is not None:
+                stats = getattr(existing_result, "stats", None)
+                if isinstance(stats, dict) and key in stats:
+                    return stats[key]
+            json_file = target_dir / "ortho.json"
+            if json_file.is_file():
+                try:
+                    payload = json.loads(json_file.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict) and key in payload:
+                        return payload[key]
+                except Exception:
+                    pass
+            return None
+
+        header = self._las_header()
+        origin: np.ndarray | None = header[1] if header is not None else None
+        if origin is None:
+            cached_info = self._load_las_info_cache()
+            if cached_info and "bounds_min" in cached_info:
+                origin = np.round(np.asarray(cached_info["bounds_min"], dtype=np.float64)).astype(np.float64)
+            else:
+                frame_data = _get_result_data("frame")
+                if isinstance(frame_data, dict) and "origin" in frame_data:
+                    origin = np.asarray(frame_data.get("origin", [0.0, 0.0, 0.0]), dtype=np.float64)
+                else:
+                    origin = np.zeros(3, dtype=np.float64)
+
+        frame = plan_settings_for(self.state, level_obj, base_frame=Frame(origin), project_directory=self.project_dir).frame
+        config = ortho_config_for(self.state)
+
+        sparse_model: Path | None = None
+        sparse_model_val = _get_result_data("sparse_model_used")
+        if sparse_model_val:
+            model_candidate = Path(str(sparse_model_val))
+            if model_candidate.is_dir():
+                sparse_model = model_candidate
+
+        try:
+            from samcloud.ortho.build import ortho_fingerprint
+
+            current_fingerprint = ortho_fingerprint(
+                self.project_dir,
+                level=level_obj,
+                config=config,
+                frame=frame,
+                point_source=point_source,
+                sparse_model=sparse_model,
+            )
+        except Exception:
+            return "stale"
+
+        return "ok" if current_fingerprint == stored_fingerprint else "stale"
+
+    def ortho_file(self, level_id: str | None, kind: str) -> Path | None:
+        """Return the path to a cached orthophoto artifact, or None if not cached.
+
+        Kind must be one of: 'preview', 'jpg8000', 'jpg4096', 'png', 'pgw', 'json'.
+        """
+        valid_kinds = {"preview", "jpg8000", "jpg4096", "png", "pgw", "json"}
+        if kind not in valid_kinds:
+            raise ValueError(f"Unsupported ortho file kind '{kind}'. Valid kinds: {', '.join(sorted(valid_kinds))}")
+        target_dir = self.ortho_dir(level_id)
+        if kind == "preview":
+            candidate = target_dir / "preview.jpg"
+        elif kind == "jpg8000":
+            candidate = target_dir / "ortho_8000.jpg"
+        elif kind == "jpg4096":
+            candidate = target_dir / "ortho_4096.jpg"
+        elif kind == "png":
+            candidate = target_dir / "ortho.png"
+        elif kind == "json":
+            candidate = target_dir / "ortho.json"
+        elif kind == "pgw":
+            world = target_dir / "ortho.pgw"
+            local_world = target_dir / "ortho_local.pgw"
+            candidate = world if world.is_file() else local_world
+        else:
+            return None
+        return candidate if candidate.is_file() else None
 
     def layer_settings(self) -> list[dict[str, Any]]:
         """Effective per-layer mode and z band for the current project mode (defaults plus project overrides)."""
@@ -781,18 +1127,27 @@ class DxfPageController:
         image_opacity: float = 1.0,
         dxf_opacity: float = 1.0,
         hidden_layers: list[str] | tuple[str, ...] = (),
+        variant: str = "pointcloud",
+        use_ortho_background: bool = False,
     ) -> Path:
         """Write a PNG of the cached review (background + DXF) with the same compositing as the canvas."""
-        result = self.cached_result(level_id)
+        result = self.plan_result(level_id, variant)
         if result is None:
-            raise ValueError("No cached DXF preview exists for this level. Generate it first.")
+            raise ValueError("No cached DXF plan exists for this target. Compute it first.")
         png = result.background.rgb_png if image_source == "rgb" else result.background.class_png
         png = png or result.background.rgb_png or result.background.class_png
         image: np.ndarray | None = None
+        if use_ortho_background:
+            ortho = self.ortho_file(level_id, "png")
+            if ortho is not None:
+                decoded = cv2.imread(str(ortho), cv2.IMREAD_COLOR)
+                if decoded is not None:
+                    image = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
         if png is not None:
-            decoded = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if decoded is not None:
-                image = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+            if image is None:
+                decoded = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if decoded is not None:
+                    image = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
         if image is None:
             min_x, min_y, max_x, max_y = result.background.bounds
             width = 1600

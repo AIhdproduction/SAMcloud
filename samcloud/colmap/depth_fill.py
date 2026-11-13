@@ -67,7 +67,24 @@ DEFAULTS: dict[str, Any] = {
     "max_incidence_deg": 75.0,
     "device": "auto",          # auto: cuda when available, else cpu
     "gpu_cache_maps": 256,     # per-view maps kept on the device (LRU)
+    "units_per_metre": 1.0,    # project scale: max_depth, min_baseline_m, spacing_m, max_neighbor_distance_m, plane tolerance
+    # Round 5: local, edge-aware re-alignment of the prior against COLMAP depth and reliable sparse points.
+    "local_alignment": False,  # (config/colmap.yml turns the round-5 rules on)   per region (strong image lines x tiles) instead of one global fit per view
+    "use_edges": True,         # regions never cross strong image lines
+    "use_sparse": True,        # reliable sparse points (error / track length filtered) as high-weight anchors
+    "halo_filter": False,      # prior depth jump without image edge, image edge with COLMAP jump but smooth prior
+    "anchor_rule": False,      # >= min_anchor_views COLMAP/sparse-confirmed views (breaks "Depth-Anything confirms itself")
+    "min_anchor_views": 1,
+    "plane_completion": False,  # RANSAC planes from anchors for textureless wall/ceiling SAM regions
+    "plane_label_ids": [],      # SAM label ids of wall/ceiling (filled from class names)
+    "plane_tolerance_m": 0.03,
+    "plane_min_inliers": 12,
+    "plane_max_planes": 3,
+    "plane_reach_frac": 0.15,
+    "image_edges": {},          # overrides of image_edges.EDGE_DEFAULTS
 }
+
+_SCALED_KEYS = ("max_depth", "min_baseline_m", "spacing_m", "max_neighbor_distance_m", "plane_tolerance_m")
 
 
 def _axis(view: View) -> np.ndarray:
@@ -155,6 +172,28 @@ def _sample(array: np.ndarray, view: View, u: np.ndarray, v: np.ndarray) -> np.n
     return array[y, x]
 
 
+def _mirror_mask(view: View, shape: tuple[int, int], mirrors) -> np.ndarray | None:
+    """Union and dilate the confirmed mirror masks for one view."""
+    if not mirrors:
+        return None
+    import cv2
+
+    combined = np.zeros(shape, dtype=bool)
+    radius = 0
+    for mirror in mirrors:
+        mask = mirror.masks.get(view.name)
+        if mask is None:
+            continue
+        source = np.asarray(mask, dtype=np.uint8)
+        if source.shape != shape:
+            source = cv2.resize(source, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        combined |= source > 0
+        radius = max(radius, int(getattr(mirror, "dilate_px", 0)))
+    if not combined.any():
+        return None
+    return cv2.dilate(combined.astype(np.uint8), np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)) > 0 if radius else combined
+
+
 class _TensorCache:
     """Least-recently-used per-view maps as float32 tensors on the compute device."""
 
@@ -216,6 +255,146 @@ def _incidence_mask_torch(depth, view: View, max_incidence_deg: float):
     return torch.nan_to_num(cosine) >= math.cos(math.radians(float(max_incidence_deg)))
 
 
+class PriorRefiner:
+    """Per-view prior after local, edge-aware alignment (round 5); ``depth`` and ``near`` maps share one computation.
+
+    ``depth(name)``: float32 map at prior resolution, 0 where the prior is distrusted (no anchors in
+    reach, residual above tolerance, halo, wrong against an image edge). ``near(name)``: 1 where a
+    COLMAP pixel or reliable sparse anchor lies within ``anchor_radius_frac``. Without
+    ``local_alignment`` the raw prior is returned and ``near`` is all ones.
+    """
+
+    def __init__(self, views, stereo_dir, prior_reader, settings, *, image_reader=None, label_reader=None, anchors=None):
+        from collections import OrderedDict
+
+        self.view_by_name = {view.name: view for view in views}
+        self.stereo_dir, self.prior_reader, self.settings = Path(stereo_dir), prior_reader, settings
+        self.image_reader, self.label_reader = image_reader, label_reader
+        self.anchors = anchors or {}
+        from samcloud.colmap.image_edges import EDGE_DEFAULTS
+
+        self.edge_settings = {**EDGE_DEFAULTS, **(settings.get("image_edges") or {})}
+        self._geo: "OrderedDict[str, Any]" = OrderedDict()
+        self._done: "OrderedDict[str, Any]" = OrderedDict()
+        self.info = {"views_refined": 0, "trusted_share_sum": 0.0, "halo_share_sum": 0.0, "wrong_share_sum": 0.0,
+                     "plane_views": 0, "planes": 0, "plane_pixels": 0}
+
+    def geometric(self, name: str) -> np.ndarray | None:
+        if name in self._geo:
+            self._geo.move_to_end(name)
+            return self._geo[name]
+        path = self.stereo_dir / "depth_maps" / f"{name}.geometric.bin"
+        value = None
+        if path.is_file():
+            from samcloud.colmap.depth_edges import geometric_valid_mask
+
+            depth = read_colmap_array(path)
+            value = np.where(geometric_valid_mask(depth, self.view_by_name[name], self.settings), depth, 0.0).astype(np.float32)
+        self._geo[name] = value
+        if len(self._geo) > 16:
+            self._geo.popitem(last=False)
+        return value
+
+    def _compute(self, name: str):
+        if name in self._done:
+            return self._done[name]
+        prior = self.prior_reader(name)
+        result = (None, None)
+        if prior is not None:
+            prior = np.asarray(prior, dtype=np.float32)
+            align = bool(self.settings.get("local_alignment", True))
+            if align or bool(self.settings.get("anchor_rule", False)):
+                result = self._refine(name, prior, align)
+            else:
+                result = (prior, np.ones(prior.shape, np.float32))
+        self._done[name] = result
+        if len(self._done) > 4:
+            self._done.popitem(last=False)
+        return result
+
+    def _refine(self, name: str, prior: np.ndarray, align: bool = True):
+        import cv2
+        from samcloud.colmap import image_edges as ie
+
+        view = self.view_by_name[name]
+        es = self.edge_settings
+        shape = prior.shape[:2]
+        wh, ww = ie.working_shape(shape, es)
+        geo = self.geometric(name)
+        if geo is None:
+            geo_w = np.zeros((wh, ww), np.float32)
+        else:
+            geo_w = cv2.resize(geo, (ww, wh), interpolation=cv2.INTER_NEAREST)
+        prior_w = cv2.resize(prior, (ww, wh), interpolation=cv2.INTER_NEAREST)
+        labels = self.label_reader(name) if self.label_reader is not None else None
+        edges, components = None, None
+        if bool(self.settings.get("use_edges", True)) and self.image_reader is not None:
+            edges = ie.detect_edges(self.image_reader(name), labels, (wh, ww), es)
+            components, _ = ie.edge_components(edges["strong"])
+        sparse_w = None
+        if bool(self.settings.get("use_sparse", True)):
+            sparse_w = ie.sparse_to_working(self.anchors.get(name), view, (wh, ww))
+        scale_w, near_w, _info = ie.fit_prior_regions(prior_w, geo_w, sparse_w, components, es)
+        distrust = np.zeros((wh, ww), bool)
+        halo_share = wrong_share = 0.0
+        if edges is not None and bool(self.settings.get("halo_filter", True)):
+            halo, wrong = ie.edge_consistency(prior_w, geo_w, edges, es)
+            distrust = halo | wrong
+            halo_share, wrong_share = float(halo.mean()), float(wrong.mean())
+        if align:
+            refined_w = np.where((scale_w > 0) & ~distrust, prior_w * scale_w, 0.0).astype(np.float32)
+        else:  # only the "anchor nearby" map is wanted: the prior stays as it is
+            refined_w = prior_w.astype(np.float32)
+        if bool(self.settings.get("plane_completion", False)) and labels is not None and \
+                self.settings.get("plane_label_ids"):
+            lab_w = cv2.resize(np.asarray(labels).astype(np.uint8), (ww, wh), interpolation=cv2.INTER_NEAREST)
+            region = np.isin(lab_w, np.asarray(self.settings["plane_label_ids"], dtype=np.uint8)) & (geo_w <= 0)
+            plane_settings = {**es, "plane_min_inliers": self.settings["plane_min_inliers"],
+                              "plane_max_planes": self.settings["plane_max_planes"],
+                              "plane_reach_frac": self.settings["plane_reach_frac"]}
+            plane_depth, used = ie.complete_planes(
+                refined_w, geo_w, sparse_w, region, components, view, plane_settings,
+                float(self.settings["plane_tolerance_m"]))
+            if used:
+                has = plane_depth > 0
+                refined_w = np.where(has, plane_depth, refined_w)
+                near_w = near_w | has
+                self.info["plane_views"] += 1
+                self.info["planes"] += used
+                self.info["plane_pixels"] += int(has.sum())
+        refined = cv2.resize(refined_w, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        near = cv2.resize(near_w.astype(np.uint8), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+        self.info["views_refined"] += 1
+        self.info["trusted_share_sum"] += float((refined_w > 0).mean())
+        self.info["halo_share_sum"] += halo_share
+        self.info["wrong_share_sum"] += wrong_share
+        return refined, near
+
+    def depth(self, name: str):
+        return self._compute(name)[0]
+
+    def near(self, name: str):
+        return self._compute(name)[1]
+
+    def report(self) -> dict[str, Any]:
+        n = max(1, self.info["views_refined"])
+        return {"views_refined": self.info["views_refined"],
+                "mean_trusted_share": round(self.info["trusted_share_sum"] / n, 4),
+                "mean_halo_share": round(self.info["halo_share_sum"] / n, 4),
+                "mean_wrong_share": round(self.info["wrong_share_sum"] / n, 4),
+                "plane_views": self.info["plane_views"], "planes": self.info["planes"],
+                "plane_pixels": self.info["plane_pixels"]}
+
+
+def _scaled(settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        unit = float(settings.get("units_per_metre", 1.0))
+    except (TypeError, ValueError):  # "auto" is resolved by the pipeline; direct callers get metric units
+        unit = 1.0
+    return {**settings, "units_per_metre": unit,
+            **{key: float(settings[key]) * unit for key in _SCALED_KEYS if key in settings}}
+
+
 def _fill_device(settings: dict[str, Any]) -> str:
     wanted = str(settings.get("device", "auto"))
     if wanted != "auto":
@@ -239,32 +418,44 @@ def fill_from_depth_prior(
     label_reader: Callable[[str], np.ndarray | None] | None = None,
     progress: Callable[[int, int], None] | None = None,
     exclude_label_ids: tuple[int, ...] = (),
+    mirrors=None,
+    anchors: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Return (xyz, rgb, class ids, agreeing view count, report) of confirmed prior points."""
-    settings = {**DEFAULTS, **(settings or {})}
+    """Return (xyz, rgb, class ids, agreeing view count, report) of confirmed prior points.
+
+    ``anchors``: name -> (uv, depth) of reliable sparse points (``image_edges.load_sparse_anchors``).
+    """
+    settings = _scaled({**DEFAULTS, **(settings or {})})
     device = _fill_device(settings)
+    refiner = PriorRefiner(views, stereo_dir, prior_reader, settings, image_reader=image_reader,
+                           label_reader=label_reader, anchors=anchors)
     if device != "numpy":
-        candidates = _candidates_torch(views, stereo_dir, prior_reader, settings, device, image_reader=image_reader,
-                                       label_reader=label_reader, progress=progress, exclude_label_ids=exclude_label_ids)
+        candidates = _candidates_torch(views, stereo_dir, refiner, settings, device, image_reader=image_reader,
+                                       label_reader=label_reader, progress=progress, exclude_label_ids=exclude_label_ids,
+                                       mirrors=mirrors)
         report_stats, blocks = candidates
+        report_stats["alignment"] = refiner.report()
         return _thin(blocks, existing_points, settings, report_stats, device)
-    priors = _MapCache(prior_reader)
-
-    def load_geometric(name: str) -> np.ndarray | None:
-        path = Path(stereo_dir) / "depth_maps" / f"{name}.geometric.bin"
-        return read_colmap_array(path) if path.is_file() else None
-
-    geometric = _MapCache(load_geometric)
+    priors = _MapCache(refiner.depth)
+    nears = _MapCache(refiner.near)
+    geometric = _MapCache(refiner.geometric)
+    anchor_rule = bool(settings["anchor_rule"])
+    min_anchor = int(settings["min_anchor_views"])
+    only = set(settings["reference_names"]) if settings.get("reference_names") else None
     neighbors = neighbor_views(views, settings)
     stride = max(1, int(settings["stride"]))
     tolerance = float(settings["tolerance"])
     margin = float(settings["free_space_margin"])
     blocks_xyz, blocks_rgb, blocks_cls, blocks_votes = [], [], [], []
-    stats = {"reference_views": 0, "candidates": 0, "rejected_free_space": 0, "rejected_votes": 0, "accepted": 0}
+    stats = {"reference_views": 0, "candidates": 0, "rejected_free_space": 0, "rejected_votes": 0,
+             "rejected_anchor": 0, "accepted": 0, "units_per_metre": float(settings["units_per_metre"])}
     for number, view in enumerate(views, start=1):
         if progress is not None:
             progress(number, len(views))
+        if only is not None and view.name not in only:
+            continue
         prior = priors.get(view.name)
+        near_ref = nears.get(view.name)
         if prior is None or not neighbors[number - 1]:
             continue
         stats["reference_views"] += 1
@@ -280,6 +471,9 @@ def fill_from_depth_prior(
         measured = geometric.get(view.name)
         if measured is not None:
             keep &= _sample(measured, view, u, v) <= 0
+        mirror = _mirror_mask(view, prior.shape, mirrors)
+        if mirror is not None:
+            keep &= ~mirror[rows, cols]
         labels = label_reader(view.name) if label_reader is not None else None
         pixel_labels = _sample(labels, view, u, v).astype(np.uint8) if labels is not None else None
         if pixel_labels is not None and exclude_label_ids:
@@ -291,13 +485,24 @@ def fill_from_depth_prior(
             pixel_labels = pixel_labels[keep]
         cam = np.column_stack(((u - view.cx) / view.fx * depth, (v - view.cy) / view.fy * depth, depth))
         world = (cam - view.translation) @ view.rotation
+        if mirrors:
+            from samcloud.colmap.mirror_filter import behind_mirror_cone
+
+            keep_cone = ~behind_mirror_cone(world, view, mirrors, settings)
+            u, v, depth, world = u[keep_cone], v[keep_cone], depth[keep_cone], world[keep_cone]
+            if pixel_labels is not None:
+                pixel_labels = pixel_labels[keep_cone]
+            if not len(world):
+                continue
         stats["candidates"] += len(world)
         agree = np.zeros(len(world), dtype=np.int32)
         disagree = np.zeros(len(world), dtype=np.int32)
         violations = np.zeros(len(world), dtype=np.int32)
+        anchored = (_sample(near_ref, view, u, v) > 0).astype(np.int32) if near_ref is not None else np.zeros(len(world), np.int32)
         for index in neighbors[number - 1]:
             other = views[index]
             other_prior = priors.get(other.name)
+            other_near = nears.get(other.name)
             other_geo = geometric.get(other.name)
             if other_prior is None and other_geo is None:
                 continue
@@ -314,20 +519,29 @@ def fill_from_depth_prior(
             occluded = np.zeros(len(sel), dtype=bool)
             if other_geo is not None:
                 g = _sample(other_geo, other, ou[sel], ov[sel])
+                other_mirror = _mirror_mask(other, other_geo.shape, mirrors)
+                if other_mirror is not None:
+                    blocked = _sample(other_mirror, other, ou[sel], ov[sel]).astype(bool)
+                    g = np.where(blocked, 0.0, g)
                 violations[sel[(g > 0) & (g > zs * (1.0 + margin))]] += 1
                 occluded = (g > 0) & (g < zs * (1.0 - margin))
             if other_prior is not None:
                 p = _sample(other_prior, other, ou[sel], ov[sel])
                 judge = ~occluded & (p > 0)
-                agree[sel[judge & (np.abs(p - zs) <= tolerance * zs)]] += 1
+                agreeing = judge & (np.abs(p - zs) <= tolerance * zs)
+                agree[sel[agreeing]] += 1
                 disagree[sel[judge & (p > zs * (1.0 + tolerance))]] += 1
+                if other_near is not None:
+                    anchored[sel[agreeing & (_sample(other_near, other, ou[sel], ov[sel]) > 0)]] += 1
         free_ok = violations == 0
         votes_ok = (agree >= int(settings["min_agreeing_views"])) & (
             agree >= float(settings["min_agree_ratio"]) * np.maximum(agree + disagree, 1)
         )
+        anchor_ok = (anchored >= min_anchor) if anchor_rule else np.ones(len(world), dtype=bool)
         stats["rejected_free_space"] += int(np.count_nonzero(~free_ok))
         stats["rejected_votes"] += int(np.count_nonzero(free_ok & ~votes_ok))
-        accepted = free_ok & votes_ok
+        stats["rejected_anchor"] += int(np.count_nonzero(free_ok & votes_ok & ~anchor_ok))
+        accepted = free_ok & votes_ok & anchor_ok
         if not np.any(accepted):
             continue
         stats["accepted"] += int(np.count_nonzero(accepted))
@@ -342,34 +556,38 @@ def fill_from_depth_prior(
             blocks_cls.append(pixel_labels[accepted])
         else:
             blocks_cls.append(np.zeros(int(np.count_nonzero(accepted)), dtype=np.uint8))
+    stats["alignment"] = refiner.report()
     return _thin((blocks_xyz, blocks_rgb, blocks_cls, blocks_votes), existing_points, settings, stats, "numpy")
 
 
-def _candidates_torch(views, stereo_dir, prior_reader, settings, device, *, image_reader, label_reader, progress,
-                      exclude_label_ids):
+def _candidates_torch(views, stereo_dir, refiner, settings, device, *, image_reader, label_reader, progress,
+                      exclude_label_ids, mirrors=None):
     """GPU version of the per-view confirmation loop; returns (stats, numpy blocks)."""
     import torch
 
-    def load_geometric(name: str) -> np.ndarray | None:
-        path = Path(stereo_dir) / "depth_maps" / f"{name}.geometric.bin"
-        return read_colmap_array(path) if path.is_file() else None
-
     capacity = int(settings.get("gpu_cache_maps", 256))
-    priors = _TensorCache(prior_reader, device, capacity)
-    geometric = _TensorCache(load_geometric, device, capacity)
+    priors = _TensorCache(refiner.depth, device, capacity)
+    nears = _TensorCache(refiner.near, device, capacity)
+    geometric = _TensorCache(refiner.geometric, device, capacity)
+    anchor_rule = bool(settings["anchor_rule"])
+    min_anchor = int(settings["min_anchor_views"])
+    only = set(settings["reference_names"]) if settings.get("reference_names") else None
     neighbors = neighbor_views(views, settings)
     stride = max(1, int(settings["stride"]))
     tolerance = float(settings["tolerance"])
     margin = float(settings["free_space_margin"])
     excluded = torch.as_tensor(list(exclude_label_ids), dtype=torch.long, device=device) if exclude_label_ids else None
     blocks_xyz, blocks_rgb, blocks_cls, blocks_votes = [], [], [], []
-    stats = {"reference_views": 0, "candidates": 0, "rejected_free_space": 0, "rejected_votes": 0, "accepted": 0,
-             "device": device}
+    stats = {"reference_views": 0, "candidates": 0, "rejected_free_space": 0, "rejected_votes": 0,
+             "rejected_anchor": 0, "accepted": 0, "device": device, "units_per_metre": float(settings["units_per_metre"])}
     f32 = dict(dtype=torch.float32, device=device)
     for number, view in enumerate(views, start=1):
         if progress is not None:
             progress(number, len(views))
+        if only is not None and view.name not in only:
+            continue
         prior = priors.get(view.name)
+        near_ref = nears.get(view.name)
         if prior is None or not neighbors[number - 1]:
             continue
         stats["reference_views"] += 1
@@ -385,6 +603,10 @@ def _candidates_torch(views, stereo_dir, prior_reader, settings, device, *, imag
         measured = geometric.get(view.name)
         if measured is not None:
             keep &= _sample_t(measured, view, u, v) <= 0
+        mirror = _mirror_mask(view, (ph, pw), mirrors)
+        if mirror is not None:
+            mirror_t = torch.as_tensor(mirror, dtype=torch.bool, device=device)
+            keep &= ~mirror_t[rows, cols]
         labels = label_reader(view.name) if label_reader is not None else None
         pixel_labels = None
         if labels is not None:
@@ -401,13 +623,25 @@ def _candidates_torch(views, stereo_dir, prior_reader, settings, device, *, imag
         translation = torch.as_tensor(view.translation, **f32)
         cam = torch.stack(((u - view.cx) / view.fx * depth, (v - view.cy) / view.fy * depth, depth), dim=1)
         world = (cam - translation) @ rotation
+        if mirrors:
+            from samcloud.colmap.mirror_filter import behind_mirror_cone
+
+            cone = torch.as_tensor(behind_mirror_cone(world.detach().cpu().numpy(), view, mirrors, settings), device=device)
+            keep_cone = ~cone
+            u, v, depth, world = u[keep_cone], v[keep_cone], depth[keep_cone], world[keep_cone]
+            if pixel_labels is not None:
+                pixel_labels = pixel_labels[keep_cone]
+            if not len(world):
+                continue
         stats["candidates"] += int(len(world))
         agree = torch.zeros(len(world), dtype=torch.int32, device=device)
         disagree = torch.zeros_like(agree)
         violations = torch.zeros_like(agree)
+        anchored = (_sample_t(near_ref, view, u, v) > 0).to(torch.int32) if near_ref is not None else torch.zeros_like(agree)
         for index in neighbors[number - 1]:
             other = views[index]
             other_prior = priors.get(other.name)
+            other_near = nears.get(other.name)
             other_geo = geometric.get(other.name)
             if other_prior is None and other_geo is None:
                 continue
@@ -425,20 +659,30 @@ def _candidates_torch(views, stereo_dir, prior_reader, settings, device, *, imag
             occluded = torch.zeros(len(sel), dtype=torch.bool, device=device)
             if other_geo is not None:
                 g = _sample_t(other_geo, other, ou[sel], ov[sel])
+                other_mirror = _mirror_mask(other, tuple(other_geo.shape), mirrors)
+                if other_mirror is not None:
+                    mirror_t = torch.as_tensor(other_mirror, dtype=torch.bool, device=device)
+                    blocked = _sample_t(mirror_t, other, ou[sel], ov[sel]).bool()
+                    g = torch.where(blocked, torch.zeros_like(g), g)
                 violations[sel[(g > 0) & (g > zs * (1.0 + margin))]] += 1
                 occluded = (g > 0) & (g < zs * (1.0 - margin))
             if other_prior is not None:
                 p = _sample_t(other_prior, other, ou[sel], ov[sel])
                 judge = ~occluded & (p > 0)
-                agree[sel[judge & ((p - zs).abs() <= tolerance * zs)]] += 1
+                agreeing = judge & ((p - zs).abs() <= tolerance * zs)
+                agree[sel[agreeing]] += 1
                 disagree[sel[judge & (p > zs * (1.0 + tolerance))]] += 1
+                if other_near is not None:
+                    anchored[sel[agreeing & (_sample_t(other_near, other, ou[sel], ov[sel]) > 0)]] += 1
         free_ok = violations == 0
         votes_ok = (agree >= int(settings["min_agreeing_views"])) & (
             agree.float() >= float(settings["min_agree_ratio"]) * (agree + disagree).clamp(min=1).float()
         )
+        anchor_ok = (anchored >= min_anchor) if anchor_rule else torch.ones_like(free_ok)
         stats["rejected_free_space"] += int((~free_ok).sum())
         stats["rejected_votes"] += int((free_ok & ~votes_ok).sum())
-        accepted = free_ok & votes_ok
+        stats["rejected_anchor"] += int((free_ok & votes_ok & ~anchor_ok).sum())
+        accepted = free_ok & votes_ok & anchor_ok
         count = int(accepted.sum())
         if not count:
             continue
@@ -518,6 +762,7 @@ def fill_classified_from_prior(
     labels_dir: Path | None = None,
     progress: Callable[[int, int], None] | None = None,
     class_names: list[str] | None = None,
+    mirrors=None,
 ) -> dict[str, Any]:
     """Append prior points confirmed by several views to a classified cloud in place."""
     import cv2
@@ -544,9 +789,22 @@ def fill_classified_from_prior(
 
     short = [name.split(",", 1)[0].strip().lower() for name in (class_names or [])]
     excluded = tuple(short.index(name.lower()) + 1 for name in settings.get("exclude_classes") or [] if name.lower() in short)
+    if not settings.get("plane_label_ids"):
+        settings["plane_label_ids"] = [short.index(name) + 1 for name in ("wall", "ceiling") if name in short]
+    anchors = None
+    if bool(settings.get("local_alignment")) and bool(settings.get("use_sparse", True)) and (dense_dir / "sparse").is_dir():
+        from samcloud.colmap.image_edges import EDGE_DEFAULTS, load_sparse_anchors
+
+        edge = {**EDGE_DEFAULTS, **(settings.get("image_edges") or {})}
+        try:
+            anchors = load_sparse_anchors(dense_dir / "sparse", views, float(edge["sparse_max_error_px"]),
+                                          int(edge["sparse_min_track"]))
+        except Exception as error:  # noqa: BLE001 - the dense COLMAP pixels still anchor the alignment
+            print(f"WARNING: Sparse anchors were skipped: {error}")
     xyz, rgb, cls, votes, report = fill_from_depth_prior(
         views, dense_dir / "stereo", prior_reader, existing, settings,
         image_reader=read_image, label_reader=read_labels, progress=progress, exclude_label_ids=excluded,
+        mirrors=mirrors, anchors=anchors,
     )
     report["excluded_label_ids"] = list(excluded)
     report = {"enabled": True, "rule": "depth_anything_multiview", "original_points": int(len(existing)), **report}

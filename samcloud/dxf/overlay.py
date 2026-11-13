@@ -131,6 +131,15 @@ def render_dxf_rgba(
                 start_deg = float(entity.get("start_angle", 0.0))
                 end_deg = float(entity.get("end_angle", 360.0))
                 cv2.ellipse(canvas, (cx, cy), (r_px, r_px), 0, -end_deg, -start_deg, color_bgra, thickness=1, lineType=cv2.LINE_AA)
+            elif etype == "text":
+                point = entity.get("point", (0.0, 0.0))
+                text = str(entity.get("text", ""))
+                height_m = max(0.01, float(entity.get("height", 0.12)))
+                # Hershey Simplex has an approximately 21 px cap height at
+                # fontScale=1.  Convert DXF model height to that cap height.
+                font_scale = max(0.01, height_m * float(np.sqrt(scale_x * scale_y)) / 21.0)
+                anchor = (to_u(float(point[0])), to_v(float(point[1])))
+                cv2.putText(canvas, text, anchor, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_bgra, 1, cv2.LINE_AA)
             elif etype == "insert":
                 point = entity["point"]
                 px, py = to_u(float(point[0])), to_v(float(point[1]))

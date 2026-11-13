@@ -155,6 +155,11 @@ def export_las(
         )
     )
 
+    with input_path.open("rb") as probe:
+        has_fine_term = "fine_term" in (_ply_vertex_dtype(probe).names or ())
+    if has_fine_term:  # per-point fine SAM term (see fine_labels.json next to the PLY)
+        header.add_extra_dim(laspy.ExtraBytesParams(name="fine_term", type=np.uint8, description="fine SAM term id"))
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with input_path.open("rb") as source, laspy.open(output_path, mode="w", header=header) as destination:
         for points in _ply_chunks(source, payload_offset, vertex_count, chunk_size):
@@ -178,6 +183,8 @@ def export_las(
             las_points.classification = classifications
             las_points.return_number = np.ones(count, dtype=np.uint8)
             las_points.number_of_returns = np.ones(count, dtype=np.uint8)
+            if has_fine_term:
+                las_points.fine_term = points["fine_term"]
             destination.write_points(las_points)
 
     write_profile_sidecar(output_path, profile, class_set, class_set)
@@ -226,15 +233,56 @@ def _load_georeference_for_export(
     return load_georeference(path)
 
 
+_PLY_SCALAR_TYPES = {
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1", "short": "<i2", "int16": "<i2",
+    "ushort": "<u2", "uint16": "<u2", "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4",
+    "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+}
+
+
+def _ply_vertex_dtype(source) -> np.dtype:
+    """Vertex record layout declared in the PLY header (extra properties such as ``fine_term`` allowed).
+
+    Falls back to :data:`PLY_DTYPE` when the header declares something this reader does not know.
+    """
+    position = source.tell()
+    try:
+        source.seek(0)
+        fields: list[tuple[str, str]] = []
+        in_vertex = False
+        while True:
+            line = source.readline()
+            if not line:
+                return PLY_DTYPE
+            words = line.decode("ascii", errors="replace").split()
+            if not words:
+                continue
+            if words[0] == "end_header":
+                break
+            if words[0] == "element":
+                in_vertex = words[1] == "vertex"
+            elif words[0] == "property" and in_vertex:
+                if words[1] == "list" or words[1] not in _PLY_SCALAR_TYPES:
+                    return PLY_DTYPE
+                fields.append((words[2], _PLY_SCALAR_TYPES[words[1]]))
+        names = [name for name, _kind in fields]
+        if not fields or any(name not in names for name in PLY_DTYPE.names):
+            return PLY_DTYPE
+        return np.dtype(fields)
+    finally:
+        source.seek(position)
+
+
 def _ply_chunks(source, payload_offset: int, vertex_count: int, chunk_size: int):
+    dtype = _ply_vertex_dtype(source)
     source.seek(payload_offset)
     remaining = vertex_count
     while remaining:
         count = min(chunk_size, remaining)
-        data = source.read(count * PLY_DTYPE.itemsize)
-        if len(data) != count * PLY_DTYPE.itemsize:
+        data = source.read(count * dtype.itemsize)
+        if len(data) != count * dtype.itemsize:
             raise ValueError("PLY data ended before all declared vertices were read")
-        yield np.frombuffer(data, dtype=PLY_DTYPE)
+        yield np.frombuffer(data, dtype=dtype)
         remaining -= count
 
 

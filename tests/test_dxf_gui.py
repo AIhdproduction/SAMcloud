@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.pages import dxf as dxf_page
 from samcloud.app.state import state as app_state
 from samcloud.dxf import jobs, pipeline, preview, writer
+from samcloud.dxf.pipeline import save_cached_result
 from samcloud.dxf.cancel import CancelToken
 from samcloud.dxf.job_runner import DxfJobRunner
 from samcloud.dxf.las_source import Frame, classified_ply_source, iter_source_chunks, read_las_header_origin, read_las_info
@@ -33,6 +35,8 @@ from samcloud.engine.export_las import export_las as export_classified_las
 from samcloud.engine.ply_io import write_classified_ply
 from samcloud.dxf.overlay import composite
 from samcloud.dxf.result import BackgroundImage, DxfPlanResult, LayerStatus, vector_payload, visible_cells, visible_entity_indices
+from samcloud.ortho import build as ortho_build, colorize as ortho_colorize, dsm as ortho_dsm
+from samcloud.ortho.plan import clean_plan_cache_dir
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -104,7 +108,8 @@ def heavy_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     for module, name in (
         (jobs, "create_preview"), (jobs, "estimate_alignment"), (jobs, "detect_levels"), (jobs, "generate_plan"),
-        (jobs, "export_plan"), (preview, "create_preview"), (pipeline, "generate_plan"), (writer, "export_plan"),
+        (jobs, "export_plan"), (jobs, "build_orthophoto"), (preview, "create_preview"), (pipeline, "generate_plan"),
+        (writer, "export_plan"), (jobs, "segment_ortho"), (jobs, "generate_clean_plan"), (ortho_build, "build_orthophoto"), (ortho_colorize, "colorize"), (ortho_dsm, "read_cloud"),
     ):
         monkeypatch.setattr(module, name, recorder(f"{module.__name__}.{name}"))
     monkeypatch.setattr(DxfJobRunner, "start", recorder("DxfJobRunner.start"))
@@ -579,6 +584,80 @@ async def test_dxf_page_with_only_classified_ply_uses_it_directly(
 
 
 # --------------------------------------------------------------------------- 7. GUI smoke
+
+
+@pytest.mark.anyio
+async def test_simple_outdoor_compute_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, heavy_calls: list[str]) -> None:
+    project, _las = _make_project(tmp_path, "SimpleOutdoor", "outdoor")
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see("Compute everything", marker="run-all")
+        await user.should_see("Advanced", marker="advanced")
+        assert not bool(_element(user, "advanced").value)
+        for marker in ("ortho-build", "segment-build", "clean-plan-build", "export"):
+            await user.should_see(marker=marker)
+    assert heavy_calls == []
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_simple_indoor_requires_storey_detection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    project, _las = _make_project(tmp_path, "SimpleIndoor", "indoor")
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see("Detect storeys", marker="prepare-levels")
+        await user.should_not_see(marker="run-all")
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_simple_indoor_storey_picker_starts_selected_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project, las = _make_project(tmp_path, "Picker", "indoor")
+    level_ids = _prepare_indoor(project, las)
+    calls: list[tuple[str, str | None]] = []
+
+    def start_job(self: DxfPageController, action: str, level_id: str | None = None, **_kwargs: object) -> None:
+        calls.append((action, level_id))
+
+    monkeypatch.setattr(DxfPageController, "start_job", start_job)
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see(marker="storey-picker")
+        assert not _element(user, "run-all").enabled
+        _set(user, "storey-picker", level_ids[0])
+        assert _element(user, "run-all").enabled
+        user.find(marker="run-all").click()
+    assert calls == [("run_all", level_ids[0])]
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_simple_indoor_single_storey_is_preselected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    project, las = _make_project(tmp_path, "SingleStorey", "indoor")
+    level_ids = _prepare_indoor(project, las)
+    DxfPageController(project).delete_level(level_ids[1])
+    async with _dxf_user(project, monkeypatch) as user:
+        assert _element(user, "storey-picker").value == level_ids[0]
+        assert _element(user, "run-all").enabled
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("with_clean_plan", [True, False])
+async def test_result_card_uses_cached_clean_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, with_clean_plan: bool,
+) -> None:
+    project, las = _make_project(tmp_path, "Result", "outdoor")
+    if with_clean_plan:
+        _generate(project, las, [None], "outdoor")
+        pointcloud = DxfPageController(project).cached_result(None)
+        assert pointcloud is not None
+        save_cached_result(replace(pointcloud, variant="ortho"), clean_plan_cache_dir(project, None))
+    async with _dxf_user(project, monkeypatch) as user:
+        if with_clean_plan:
+            await user.should_see(marker="review-canvas")
+        else:
+            await user.should_see("Press Compute everything to create the plan.", marker="result-placeholder")
+    _no_error_logs(caplog)
 
 
 @pytest.mark.anyio

@@ -1,0 +1,231 @@
+# Outdoor DTM contours and smart text labels configuration
+
+contours:
+  resolution: 0.20
+  major_interval: 1.0
+  minor_interval: 0.25
+  max_gap: 3.0
+  smoothing_sigma_m: 0.3
+  min_length: 2.0
+  simplify_tolerance: 0.03
+  chaikin_iterations: 2
+  ground_codes:
+    - 2    # Ground
+    - 3    # Low Vegetation (lawn)
+    - 9    # Water
+    - 11   # Road Surface (road / road marking)
+    - 20   # Ignored Ground
+    - 66   # Hardscape (paved)
+    - 70   # Natural terrain
+    - 71   # Sealed terrain (paved)
+    - 73   # Side walk
+    - 74   # Curbstone
+    - 172  # HCS asphalt road
+    - 173  # HCS asphalt hardscape
+    - 174  # HCS concrete road
+    - 175  # HCS concrete hardscape
+    - 184  # HCS curb
+
+labels:
+  base_height_factor: 0.12
+  min_height: 0.08
+  max_height: 0.60
+  min_area: 1.0
+  padding_factor: 0.15
+  char_width_factor: 0.62
+  shrink_step: 0.85
+
+layers:
+  S-TOPO-MAJR:
+    true_color: [150, 60, 40]
+    lineweight: 25
+    description: "Major contour lines (every 1.0 m)"
+  S-TOPO-MINR:
+    true_color: [120, 170, 110]
+    lineweight: 13
+    description: "Minor contour lines (every 0.25 m)"
+  S-ANNO:
+    color: 7
+    lineweight: 18
+    description: "Outdoor text annotations and labels"
+  S-ELEV:
+    color: 3
+    lineweight: 18
+    description: "DGM spot elevations: crosses with absolute height text"
+  A-ANNO:
+    color: 7
+    lineweight: 18
+    description: "Indoor text annotations and labels"
+  A-FURN-DETL:
+    color: 8
+    lineweight: 13
+    description: "Indoor furniture height-step detail lines"
+  A-EINB:
+    color: 30
+    lineweight: 35
+    description: "Indoor built-ins and floor-standing fronts (vertical surface check)"
+  A-AREA:
+    color: 140
+    lineweight: 13
+    description: "Indoor room boundaries from the ceiling"
+  A-OBEN:
+    color: 8
+    lineweight: 18
+    linetype: DASHED
+    description: "Indoor overhead elements (upper cabinets 1.80-2.20 m), dashed"
+
+indoor_vertical:
+  bins: 16
+  floor_fraction: 0.04
+  ceiling_fraction: 0.97
+  fill_fraction: 0.70
+  full_fraction: 0.85
+  counter_fraction: 0.30
+  wall_band_m: 0.10
+  min_length_m: 0.40
+  axis_tolerance_deg: 5.0
+  rms_m: 0.02
+  support_fraction: 0.70
+  max_gap_m: 0.15
+  merge_offset_m: 0.03
+  furniture_distance_m: 0.05
+  isolation_distance_m: 0.60
+
+indoor_ceiling:
+  close_radius_m: 0.15
+  marker_distance_m: 0.25
+  neck_width_m: 0.50
+  min_room_area_m2: 1.0
+  edge_min_length_m: 0.30
+  cover_distance_m: 0.10
+  axis_tolerance_deg: 5.0
+  sliver_width_m: 0.20
+  hole_fraction: 0.25
+  hole_owner_share: 0.6
+
+clean_plan:
+  segment_source: combined
+  label_min_area_outdoor: 20.0
+  label_min_area_indoor: 0.3
+  building_angle_tolerance_deg: 15.0
+  line_gap_max: 1.5
+  line_angle_tol_deg: 20.0
+  line_min_length: 2.0
+  courtyard_min_area: 25.0
+  tree_min_height: 2.0
+  point_object_min_area: 0.02
+  contours: true
+  # For local 360 scans, ceiling height is the best available scale estimate.
+  # These are fractions of floor-to-ceiling height; metric defaults remain the
+  # fallback whenever the ceiling is unknown.
+  nominal_storey_height: 2.5
+  indoor_bands:
+    wall: [0.72, 0.94]
+    section: [0.36, 0.52]
+    sill: [0.08, 0.32]
+    lintel: [0.82, 0.94]
+  # Indoor wall-face fitting works on measured upper-band points.
+  indoor_face_min_length: 0.30
+  indoor_face_ransac_residual: 0.02
+  # Height-map furniture footprints. Values are in metres before local scaling.
+  footprint_min_height: 0.05
+  footprint_max_ceiling_fraction: 0.97
+  footprint_step_height: 0.10
+
+# Freestanding kitchen island (metres, scaled by the project units per metre).
+indoor_island:
+  min_height_m: 0.85
+  max_height_m: 0.95
+  min_depth_m: 0.80
+  max_depth_m: 1.20
+  min_length_m: 1.20
+  wall_clearance_m: 0.15
+  min_rectangularity: 0.80
+  axis_tolerance_deg: 12.0
+  zone_radius_m: 3.0
+
+# Upper kitchen cabinets (layer A-OBEN) from the upper z band above a kitchen run.
+# Recessed built-in niche (open wardrobe / coat niche): the wall follows the niche, the back wall is
+# searched from measured evidence (wall line, wall points, room edge, side panel, contents boundary).
+indoor_niche:
+  min_width_m: 0.6
+  max_width_m: 3.0
+  min_depth_m: 0.20
+  max_depth_m: 1.20
+  content_height_m: 1.0
+  far_percentile: 90.0
+  evidence_tolerance_m: 0.10
+  panel_reach_m: 0.30
+  wall_point_min_count: 15
+  wall_point_min_extent_m: 0.35
+  beyond_reach_m: 0.60
+  require_panel: true
+
+indoor_upper_cabinets:
+  band_min_m: 1.80
+  band_max_m: 2.20
+  depth_m: 0.35
+  min_length_m: 0.40
+  min_coverage: 0.50
+  gap_fill_m: 0.15
+  bins: 16
+
+# Semantic room names; rooms below min_room_area_m2 without sanitary fixtures are dropped.
+indoor_room_names:
+  min_room_area_m2: 2.0
+  guest_wc_max_area_m2: 4.0
+
+# Kitchen run along the walls (straight / L / U) with cooktop and sink inserts from fine labels.
+indoor_kitchen_run:
+  depth_m: 0.60
+  wall_reach_m: 0.30
+  strip_reach_m: 0.90
+  min_leg_length_m: 0.60
+  corner_reach_m: 0.35
+
+# Outdoor surveyor / DGM site-plan standard (metres).
+outdoor_trunk:
+  search_radius_m: 1.0
+  z_min_m: 0.4
+  z_max_m: 1.8
+  inlier_tolerance_m: 0.02
+  min_points: 30
+  min_inliers: 25
+  min_inlier_fraction: 0.35
+  min_coverage_deg: 120.0
+  min_diameter_m: 0.05
+  max_diameter_m: 1.5
+  ransac_iterations: 400
+  text_height_m: 0.5
+
+outdoor_hedges:
+  min_height_m: 0.5
+  max_height_m: 2.0
+  min_area_m2: 2.0
+  close_radius_m: 0.3
+  smooth_sigma_m: 0.25
+  simplify_m: 0.04
+  chaikin_iterations: 1
+
+outdoor_spots:
+  grid_spacing_m: 17.5
+  min_spacing_m: 4.5
+  curb_spacing_m: 15.0
+  cross_size_m: 0.6
+  text_height_m: 0.7
+  max_spots: 4000
+
+outdoor_contour_labels:
+  text_height_m: 1.0
+  interval_m: 60.0
+  min_length_m: 20.0
+  gap_padding_m: 0.4
+  char_width_factor: 0.62
+
+outdoor_roof:
+  ridge_percentile: 98.0
+  eave_ring_inner_m: 0.3
+  eave_ring_outer_m: 1.2
+  flat_roof_difference_m: 0.5
+  text_height_m: 0.8
+  min_area_m2: 20.0

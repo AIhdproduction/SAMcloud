@@ -41,6 +41,8 @@ def migrate_classes_config(config: dict) -> dict:
     """Return an in-memory Cyclone-safe migration of a legacy project class configuration."""
     config = deepcopy(config)
     global_config = json.loads(global_classes_path().read_text(encoding="utf-8"))
+    if "suppress" not in config:
+        config["suppress"] = deepcopy(global_config.get("suppress", {}))
     custom_codes = [code for code, entry in load_cyclone_codes().items() if entry.get("custom") and code != 82]
     for class_set in ("outdoor", "indoor"):
         codes = config.get("las_codes", {}).get(class_set)

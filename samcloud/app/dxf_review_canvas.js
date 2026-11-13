@@ -13,10 +13,12 @@ export default {
   `,
   props: {
     payloadUrl: String,
+    comparePayloadUrl: String,
     imageUrl: String,
     imageBounds: Array,
     imageOpacity: Number,
     dxfOpacity: Number,
+    compareOpacity: Number,
     hiddenLayers: Array,
     tool: String,
     background: Array,
@@ -27,6 +29,7 @@ export default {
   mounted() {
     this.view = { k: 1, ox: 0, oy: 0, fitted: false };
     this.layers = [];
+    this.compareLayers = [];
     this.hideDxf = false;
     this.drag = null;
     this.measurePoints = [];
@@ -60,6 +63,7 @@ export default {
     this.resize();
     this.loadImage();
     this.loadPayload();
+    this.loadComparePayload();
   },
   unmounted() {
     if (this.observer) this.observer.disconnect();
@@ -73,6 +77,9 @@ export default {
       this.measurePoints = [];
       this.loadPayload();
     },
+    comparePayloadUrl() {
+      this.loadComparePayload();
+    },
     imageUrl() {
       this.loadImage();
     },
@@ -83,6 +90,9 @@ export default {
       this.requestDraw();
     },
     dxfOpacity() {
+      this.requestDraw();
+    },
+    compareOpacity() {
       this.requestDraw();
     },
     hiddenLayers() {
@@ -129,7 +139,7 @@ export default {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const payload = await response.json();
         if (url !== this.payloadUrl) return;
-        this.prepare(payload);
+        this.prepare(payload, "layers");
         this.message = "";
         let entities = 0;
         for (const layer of this.layers) entities += layer.entities.length;
@@ -140,9 +150,27 @@ export default {
       if (!this.view.fitted) this.fit();
       this.requestDraw();
     },
-    prepare(payload) {
-      this.backgroundBounds = payload.background_bounds;
-      this.layers = Object.entries(payload.layers || {}).map(([name, layer]) => ({
+    async loadComparePayload() {
+      this.compareLayers = [];
+      if (!this.comparePayloadUrl) {
+        this.requestDraw();
+        return;
+      }
+      const url = this.comparePayloadUrl;
+      try {
+        const response = await fetch(this.absoluteUrl(url), { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (url !== this.comparePayloadUrl) return;
+        this.prepare(payload, "compareLayers");
+      } catch (error) {
+        this.compareLayers = [];
+      }
+      this.requestDraw();
+    },
+    prepare(payload, target) {
+      if (target === "layers") this.backgroundBounds = payload.background_bounds;
+      this[target] = Object.entries(payload.layers || {}).map(([name, layer]) => ({
         name,
         color: `rgb(${layer.color[0]},${layer.color[1]},${layer.color[2]})`,
         entities: layer.entities || [],
@@ -154,6 +182,7 @@ export default {
         cellPath: null,
         cellKey: "",
         markers: (layer.entities || []).filter((entity) => entity.type === "point"),
+        texts: (layer.entities || []).filter((entity) => entity.type === "text"),
       }));
     },
     resize() {
@@ -202,7 +231,7 @@ export default {
       if (type === "line") {
         path.moveTo(entity.start[0], entity.start[1]);
         path.lineTo(entity.end[0], entity.end[1]);
-      } else if (type === "polyline") {
+      } else if (type === "polyline" || type === "polyline3d") {
         const rings = [entity.points || [], ...(entity.holes || [])];
         rings.forEach((ring, index) => {
           if (ring.length < 2) return;
@@ -303,36 +332,11 @@ export default {
         ctx.imageSmoothingEnabled = (x1 - x0) < this.img.naturalWidth * 2;
         ctx.drawImage(this.img, x0, y0, x1 - x0, y1 - y0);
       }
-      if (!this.hideDxf && dxfOpacity > 0 && this.layers.length) {
+      if (!this.hideDxf) {
         const hidden = new Set(this.hiddenLayers || []);
         const viewport = this.viewport();
-        ctx.globalAlpha = dxfOpacity;
-        for (const layer of this.layers) {
-          if (hidden.has(layer.name)) continue;
-          const path = this.layerPath(layer, viewport);
-          if (path) {
-            ctx.save();
-            ctx.setTransform(ratio * this.view.k, 0, 0, -ratio * this.view.k, ratio * this.view.ox, ratio * this.view.oy);
-            ctx.lineWidth = 1.25 / this.view.k;
-            ctx.strokeStyle = layer.color;
-            ctx.stroke(path);
-            ctx.restore();
-          }
-          if (layer.markers.length) {
-            ctx.strokeStyle = layer.color;
-            ctx.lineWidth = 1.25;
-            ctx.beginPath();
-            for (const entity of layer.markers) {
-              const [sx, sy] = this.toScreen(entity.point[0], entity.point[1]);
-              if (sx < -5 || sy < -5 || sx > this.cssWidth + 5 || sy > this.cssHeight + 5) continue;
-              ctx.moveTo(sx - 4, sy);
-              ctx.lineTo(sx + 4, sy);
-              ctx.moveTo(sx, sy - 4);
-              ctx.lineTo(sx, sy + 4);
-            }
-            ctx.stroke();
-          }
-        }
+        this.drawLayers(ctx, this.layers, dxfOpacity, hidden, viewport, ratio);
+        this.drawLayers(ctx, this.compareLayers, Math.max(0, Math.min(1, Number(this.compareOpacity ?? 1))), hidden, viewport, ratio);
       }
       ctx.globalAlpha = 1;
       if (this.measurePoints.length) {
@@ -353,6 +357,54 @@ export default {
           const [p1, p2] = this.measurePoints;
           const distance = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
           ctx.fillText(`${distance.toFixed(3)} m`, (screen[0][0] + screen[1][0]) / 2 + 6, (screen[0][1] + screen[1][1]) / 2 - 6);
+        }
+      }
+    },
+    drawLayers(ctx, layers, opacity, hidden, viewport, ratio) {
+      if (opacity <= 0 || !layers.length) return;
+      ctx.globalAlpha = opacity;
+      for (const layer of layers) {
+        if (hidden.has(layer.name)) continue;
+        const path = this.layerPath(layer, viewport);
+        if (path) {
+          ctx.save();
+          ctx.setTransform(ratio * this.view.k, 0, 0, -ratio * this.view.k, ratio * this.view.ox, ratio * this.view.oy);
+          ctx.lineWidth = 1.25 / this.view.k;
+          ctx.strokeStyle = layer.color;
+          ctx.stroke(path);
+          ctx.restore();
+        }
+        if (layer.markers.length) {
+          ctx.strokeStyle = layer.color;
+          ctx.lineWidth = 1.25;
+          ctx.beginPath();
+          for (const entity of layer.markers) {
+            const [sx, sy] = this.toScreen(entity.point[0], entity.point[1]);
+            if (sx < -5 || sy < -5 || sx > this.cssWidth + 5 || sy > this.cssHeight + 5) continue;
+            ctx.moveTo(sx - 4, sy);
+            ctx.lineTo(sx + 4, sy);
+            ctx.moveTo(sx, sy - 4);
+            ctx.lineTo(sx, sy + 4);
+          }
+          ctx.stroke();
+        }
+        if (layer.texts && layer.texts.length) {
+          ctx.fillStyle = layer.color;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          for (const entity of layer.texts) {
+            const pt = entity.point || [0, 0];
+            const [sx, sy] = this.toScreen(pt[0], pt[1]);
+            if (sx < -50 || sy < -50 || sx > this.cssWidth + 50 || sy > this.cssHeight + 50) continue;
+            const fontSize = Math.max(6, Math.round(Number(entity.height || 0.12) * this.view.k));
+            const rotation = (Number(entity.rotation || 0) * Math.PI) / 180;
+            ctx.save();
+            ctx.translate(sx, sy);
+            if (rotation) ctx.rotate(-rotation);
+            ctx.font = `${fontSize}px sans-serif`;
+            ctx.fillText(String(entity.text || ""), 0, 0);
+            ctx.restore();
+          }
         }
       }
     },

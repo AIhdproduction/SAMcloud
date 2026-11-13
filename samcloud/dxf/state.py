@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import numpy as np
 
@@ -20,6 +20,9 @@ from samcloud.dxf.levels import Level
 from samcloud.dxf.pipeline import PlanSettings
 from samcloud.dxf.scale import ScaleState
 
+if TYPE_CHECKING:
+    from samcloud.ortho.config import OrthoConfig
+
 DEFAULT_VIEW: dict[str, Any] = {
     "side_axis": "x",
     "slab_center": None,
@@ -30,12 +33,20 @@ DEFAULT_VIEW: dict[str, Any] = {
     "coordinates": "local",
     "wall_centerlines": True,
     "door_swing_arc": False,
+    "background_source": "topview",
 }
 
 DEFAULT_SCALE: dict[str, Any] = {
     "factor": 1.0,
     "source": "none",
     "status_text": "No scale adjustment applied.",
+}
+
+DEFAULT_ORTHO: dict[str, Any] = {
+    "pixel_size_outdoor": None,
+    "pixel_size_indoor": None,
+    "max_side": None,
+    "cut_below_ceiling": None,
 }
 
 
@@ -50,6 +61,9 @@ class DxfProjectState:
     levels: list[dict[str, Any]] = field(default_factory=list)
     view: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_VIEW))
     overrides: dict[str, Any] = field(default_factory=lambda: {"cell_size": None, "layers": {}})
+    ortho: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_ORTHO))
+    segment_source: str = "combined"
+    plan_variant: str = "pointcloud"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a clean JSON-serializable dictionary."""
@@ -61,6 +75,9 @@ class DxfProjectState:
             "levels": [dict(level) for level in self.levels],
             "view": dict(self.view),
             "overrides": dict(self.overrides),
+            "ortho": dict(self.ortho),
+            "segment_source": self.segment_source,
+            "plan_variant": self.plan_variant,
         }
 
     @classmethod
@@ -69,6 +86,7 @@ class DxfProjectState:
         view = {**DEFAULT_VIEW, **data.get("view", {})}
         scale = {**DEFAULT_SCALE, **data.get("scale", {})}
         overrides = {"cell_size": None, "layers": {}, **data.get("overrides", {})}
+        ortho = {**DEFAULT_ORTHO, **data.get("ortho", {})}
         return cls(
             mode_override=data.get("mode_override"),
             profile_name=data.get("profile_name"),
@@ -77,6 +95,9 @@ class DxfProjectState:
             levels=list(data.get("levels", [])),
             view=view,
             overrides=overrides,
+            ortho=ortho,
+            segment_source=str(data.get("segment_source", "combined")),
+            plan_variant=str(data.get("plan_variant", "pointcloud")),
         )
 
 
@@ -181,3 +202,28 @@ def plan_settings_for(
         wall_centerlines=wall_centerlines,
         door_swing_arc=door_swing_arc,
     )
+
+
+def ortho_config_for(state: DxfProjectState, base_config: OrthoConfig | None = None) -> OrthoConfig:
+    """Apply state ortho overrides with dataclasses.replace on load_ortho_config()."""
+    if base_config is not None:
+        config = base_config
+    else:
+        from samcloud.ortho.config import load_ortho_config
+
+        config = load_ortho_config()
+    ortho_dict = getattr(state, "ortho", {}) or {}
+
+    updates: dict[str, Any] = {}
+    if ortho_dict.get("pixel_size_outdoor") is not None:
+        updates["pixel_size_outdoor"] = float(ortho_dict["pixel_size_outdoor"])
+    if ortho_dict.get("pixel_size_indoor") is not None:
+        updates["pixel_size_indoor"] = float(ortho_dict["pixel_size_indoor"])
+    if ortho_dict.get("max_side") is not None:
+        updates["max_side"] = int(ortho_dict["max_side"])
+    if ortho_dict.get("cut_below_ceiling") is not None:
+        updates["indoor"] = replace(config.indoor, cut_below_ceiling=float(ortho_dict["cut_below_ceiling"]))
+
+    if updates:
+        config = replace(config, **updates)
+    return config

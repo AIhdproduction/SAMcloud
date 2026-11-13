@@ -24,7 +24,7 @@ CACHE_DIRECTORY = "processing_cache"
 SAM_CLOUD = "classified_after_sam.ply"
 SAM_SCORES = "classified_scores_after_sam.npz"
 MANIFEST = "cache.json"
-DENSE_TREES = ("stereo", "images", "sparse", "sparse_txt", "sam_labels")
+DENSE_TREES = ("stereo", "images", "sparse", "sparse_txt", "sam_labels", "sam_mirror")
 DENSE_FILES = ("fused.ply", "fused.ply.vis")
 
 

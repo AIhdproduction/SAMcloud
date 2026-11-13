@@ -35,7 +35,12 @@
         "blanket",
         "cushion",
         "laundry",
-        "plastic container"
+        "plastic container",
+        "pile of clothes",
+        "folded clothes",
+        "garment",
+        "t-shirt",
+        "towel"
       ],
       [
         "wall",
@@ -172,7 +177,24 @@
         "dining table",
         "bookcase",
         "refrigerator",
-        "fridge"
+        "fridge",
+        "cushion",
+        "sofa cushion",
+        "throw pillow",
+        "pillow",
+        "bed pillow",
+        "blanket",
+        "duvet",
+        "bedding",
+        "mattress",
+        "nightstand",
+        "coffee table",
+        "sideboard",
+        "tv stand",
+        "television",
+        "cat tree",
+        "plant",
+        "floor lamp"
       ],
       [
         "stove",
@@ -183,7 +205,10 @@
         "extractor hood",
         "washing machine",
         "clothes dryer",
-        "microwave oven"
+        "microwave oven",
+        "kitchen counter",
+        "kitchen cabinet",
+        "kitchen sink"
       ],
       [
         "toilet",
@@ -571,8 +596,104 @@
       "Baumstamm"
     ]
   },
+  "suppress": {
+    "indoor": [
+      "curtain, curtains, drapes, sheer curtain, window curtain"
+    ],
+    "outdoor": []
+  },
+  "mirror": {
+    "indoor": ["mirror, wall mirror, wardrobe mirror, mirror glass, bathroom mirror"],
+    "outdoor": []
+  },
+  "fine_terms": {
+    "indoor": [
+      "sofa",
+      "couch",
+      "armchair",
+      "bed",
+      "nightstand",
+      "table",
+      "coffee table",
+      "dining table",
+      "desk",
+      "chair",
+      "wardrobe",
+      "chest of drawers",
+      "shelf",
+      "bookcase",
+      "sideboard",
+      "tv stand",
+      "television",
+      "cat tree",
+      "plant",
+      "floor lamp",
+      "cushion",
+      "pillow",
+      "blanket",
+      "mattress",
+      "clothes",
+      "refrigerator",
+      "washing machine",
+      "kitchen counter",
+      "kitchen cabinet",
+      "stove",
+      "kitchen sink",
+      "toilet",
+      "washbasin",
+      "bathtub",
+      "shower tray",
+      "radiator"
+    ],
+    "outdoor": []
+  },
+  "fine_aliases": {
+    "couch": "sofa",
+    "pillow": "cushion"
+  },
+  "fine_term_classes": {
+    "indoor": {
+      "sofa": 117,
+      "couch": 117,
+      "armchair": 117,
+      "bed": 117,
+      "nightstand": 117,
+      "table": 117,
+      "coffee table": 117,
+      "dining table": 117,
+      "desk": 117,
+      "chair": 117,
+      "wardrobe": 117,
+      "chest of drawers": 117,
+      "shelf": 117,
+      "bookcase": 117,
+      "sideboard": 117,
+      "tv stand": 117,
+      "television": 117,
+      "cat tree": 117,
+      "plant": 117,
+      "floor lamp": 117,
+      "cushion": 117,
+      "pillow": 117,
+      "blanket": 117,
+      "mattress": 117,
+      "clothes": 180,
+      "refrigerator": 117,
+      "washing machine": 120,
+      "kitchen counter": 120,
+      "kitchen cabinet": 120,
+      "stove": 120,
+      "kitchen sink": 120,
+      "toilet": 121,
+      "washbasin": 121,
+      "bathtub": 121,
+      "shower tray": 121,
+      "radiator": 114
+    },
+    "outdoor": {}
+  },
   "indoor": [
-    "construction material, suitcase, luggage, backpack, bag, clothes, jacket, shoes, toys, stuffed animal, cardboard box, storage box, basket, bottle, bucket, book, loose household items, household clutter, tools, building material, construction material, construction container, site container, handbag, shopping bag, sweater, trousers, blanket, cushion, laundry, plastic container",
+    "construction material, suitcase, luggage, backpack, bag, clothes, jacket, shoes, toys, stuffed animal, cardboard box, storage box, basket, bottle, bucket, book, loose household items, household clutter, tools, building material, construction material, construction container, site container, handbag, shopping bag, sweater, trousers, blanket, cushion, laundry, plastic container, pile of clothes, folded clothes, garment, t-shirt, towel",
     "wall, wall, interior wall, partition wall, drywall, plaster wall, tiled wall",
     "ceiling, ceiling, interior ceiling, suspended ceiling, soffit, plaster ceiling, ceiling panels",
     "floor, floor, interior floor, flooring, floor slab, wooden floor, parquet floor, tiled floor, carpeted floor",
@@ -588,8 +709,8 @@
     "electrical, electrical cabinet, distribution board, switch box, socket, fuse box, electrical outlet",
     "hvac, air duct, ventilation duct, HVAC unit, air conditioning unit, radiator, heating unit, air vent, ventilation grille",
     "ceiling equipment, ceiling light, sprinkler, ceiling mounted fixture, ceiling lamp, pendant light, smoke detector",
-    "furniture, furniture, cabinet, shelf, chair, table, desk, sofa, couch, armchair, bed, wardrobe, chest of drawers, dining table, bookcase, refrigerator, fridge",
-    "appliances, stove, cooktop, kitchen oven, dishwasher, range hood, extractor hood, washing machine, clothes dryer, microwave oven",
+    "furniture, furniture, cabinet, shelf, chair, table, desk, sofa, couch, armchair, bed, wardrobe, chest of drawers, dining table, bookcase, refrigerator, fridge, cushion, sofa cushion, throw pillow, pillow, bed pillow, blanket, duvet, bedding, mattress, nightstand, coffee table, sideboard, tv stand, television, cat tree, plant, floor lamp",
+    "appliances, stove, cooktop, kitchen oven, dishwasher, range hood, extractor hood, washing machine, clothes dryer, microwave oven, kitchen counter, kitchen cabinet, kitchen sink",
     "sanitary fixtures, toilet, toilet bowl, toilet cistern, bathtub, bath tub, washbasin, bathroom sink, shower tray, shower enclosure, bidet, urinal, faucet, shower head, wash basin, shower base"
   ],
   "outdoor": [

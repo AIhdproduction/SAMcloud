@@ -23,6 +23,7 @@ this module returns.
 
 import math
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -30,6 +31,8 @@ import torch
 import torch.nn.functional as F
 import ultralytics
 from ultralytics.models.sam import SAM3SemanticPredictor
+
+from samcloud.dxf.cancel import CancelToken, check_cancel
 
 
 def compute_tile_starts(dim, tile, min_overlap_frac=0.2):
@@ -127,19 +130,9 @@ class _RawHeadResult:
         self.speed = {}
 
 
-class RawHeadSAM3SemanticPredictor(SAM3SemanticPredictor):
-    """Return SAM3's raw semantic heads at the original tile resolution."""
+class _PromptBatchingMixin:
+    """Run long text prompt lists in small grounding passes after one backbone pass."""
 
-    mask_query_chunk_size = 32
-    # False: return the heads at mask resolution; the caller fuses prompts into
-    # classes there and upsamples only the class maps (much less GPU memory/time).
-    full_resolution = True
-    # Text prompts per grounding pass. The image backbone runs once per tile;
-    # many prompts (Nomivox presets: ~160) in one pass exhaust a 24 GB GPU.
-    # Measured 2026-11-09 on 3200 px drone images (12 tiles, 169 outdoor prompts,
-    # RTX 4090): 32 reserves 21.4 GB and spills into shared system memory under
-    # WDDM (250 s/image); 16 -> 18.9 GB, 27 s; 8 -> 15.7 GB, 29 s. 8 leaves room
-    # for other GPU applications at ~7 % cost.
     prompt_batch = 8
 
     def _inference_features(self, features, bboxes=None, labels=None, text: list[str] | None = None):
@@ -160,12 +153,30 @@ class RawHeadSAM3SemanticPredictor(SAM3SemanticPredictor):
         merged = {}
         for key in chunks[0]:
             parts = [chunk[key] for chunk in chunks]
-            if key == "presence_logit_dec":
-                merged[key] = torch.cat([part.reshape(-1) for part in parts])
-            else:
-                merged[key] = torch.cat(parts, dim=0)
+            # Standard SAM3 keeps presence logits as (classes, 1), while the
+            # raw-head path accepts either shape via ``numel``. Preserve that
+            # rank so the stock postprocessor can broadcast scores correctly.
+            merged[key] = torch.cat(parts, dim=0)
         return merged
 
+
+class BatchedSAM3SemanticPredictor(_PromptBatchingMixin, SAM3SemanticPredictor):
+    """Standard SAM3 result predictor with WDDM-safe prompt batching."""
+
+
+class RawHeadSAM3SemanticPredictor(_PromptBatchingMixin, SAM3SemanticPredictor):
+    """Return SAM3's raw semantic heads at the original tile resolution."""
+
+    mask_query_chunk_size = 32
+    # False: return the heads at mask resolution; the caller fuses prompts into
+    # classes there and upsamples only the class maps (much less GPU memory/time).
+    full_resolution = True
+    # Text prompts per grounding pass. The image backbone runs once per tile;
+    # many prompts (Nomivox presets: ~160) in one pass exhaust a 24 GB GPU.
+    # Measured 2026-11-09 on 3200 px drone images (12 tiles, 169 outdoor prompts,
+    # RTX 4090): 32 reserves 21.4 GB and spills into shared system memory under
+    # WDDM (250 s/image); 16 -> 18.9 GB, 27 s; 8 -> 15.7 GB, 29 s. 8 leaves room
+    # for other GPU applications at ~7 % cost.
     def postprocess(self, preds, img, orig_imgs):
         required_keys = ("pred_logits", "pred_masks", "semantic_seg", "presence_logit_dec")
         for key in required_keys:
@@ -310,7 +321,15 @@ class SemanticLabeler:
             mode="predict",
             model=model_path,
         )
-        self.predictor = SAM3SemanticPredictor(overrides=overrides)
+        # Resolve the base predictor at construction time so legacy callers
+        # can monkeypatch the module-level SAM3SemanticPredictor symbol.
+        predictor_type = type("BatchedSAM3SemanticPredictor", (_PromptBatchingMixin, SAM3SemanticPredictor), {})
+        self.predictor = predictor_type(overrides=overrides)
+        self.predictor.args.save = False
+        self.predictor.args.save_txt = False
+        self.predictor.args.save_crop = False
+        self.predictor.args.show = False
+        self.predictor.args.verbose = False
 
     def _label_tile(self, tile_img):
         """Runs SAM3 with all class prompts on one tile and returns class/confidence rasters."""
@@ -345,24 +364,19 @@ class SemanticLabeler:
 
         return raster, best_conf
 
-    def label_image(self, image_path):
-        """
-        Returns (H, W) uint8 array of class ids for the full-resolution
-        image. 0 = unknown/no class matched. Internally tiles the image so
-        SAM3 always sees crops close to its native input resolution, then
-        merges tiles back by highest confidence per pixel.
-        """
-        img = cv2.imread(str(image_path))
-        if img is None:
-            raise RuntimeError(f"Could not read image {image_path}")
+    def _label_image_bgr(self, image: np.ndarray, *, progress: Callable[[float], None] | None = None,
+                         cancel: CancelToken | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Label one BGR image with tiled SAM3 inference and return labels plus winning mask scores."""
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("image must have shape (height, width, 3)")
+        img = np.ascontiguousarray(image, dtype=np.uint8)
         height, width = img.shape[:2]
-
         raster = np.zeros((height, width), dtype=np.uint8)
         best_conf = np.zeros((height, width), dtype=np.float32)
-        for x0, y0, x1, y1 in iter_tiles(width, height, effective_tile_size(width, height, self.tile_size), self.min_overlap_frac):
-            tile_img = img[y0:y1, x0:x1]
-            tile_raster, tile_conf = self._label_tile(tile_img)
-
+        tiles = list(iter_tiles(width, height, effective_tile_size(width, height, self.tile_size), self.min_overlap_frac))
+        for index, (x0, y0, x1, y1) in enumerate(tiles, start=1):
+            check_cancel(cancel)
+            tile_raster, tile_conf = self._label_tile(img[y0:y1, x0:x1])
             region_conf = best_conf[y0:y1, x0:x1]
             region_raster = raster[y0:y1, x0:x1]
             better = tile_conf > region_conf
@@ -370,10 +384,38 @@ class SemanticLabeler:
             region_conf[better] = tile_conf[better]
             raster[y0:y1, x0:x1] = region_raster
             best_conf[y0:y1, x0:x1] = region_conf
+            if progress is not None:
+                progress(index / len(tiles))
+        check_cancel(cancel)
+        return raster, best_conf.astype(np.float16)
 
-        # A valid image can contain none of the requested semantic classes.
-        # Keep its all-zero raster so these points remain unknown.
-        return raster
+    def label_image_scores(self, image: np.ndarray | Path | str, *, progress: Callable[[float], None] | None = None,
+                           cancel: CancelToken | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Return uint8 labels and float16 confidence for an image.
+
+        Array inputs are RGB, matching orthophoto pixels, and are converted to
+        BGR because the Ultralytics predictor receives OpenCV-style images.
+        Path inputs are read by OpenCV and therefore already BGR.
+        """
+        if isinstance(image, np.ndarray):
+            if image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError("RGB image must have shape (height, width, 3)")
+            bgr = cv2.cvtColor(np.asarray(image, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+        else:
+            bgr = cv2.imread(str(image))
+            if bgr is None:
+                raise RuntimeError(f"Could not read image {image}")
+        return self._label_image_bgr(bgr, progress=progress, cancel=cancel)
+
+    def label_image(self, image_path):
+        """
+        Returns (H, W) uint8 array of class ids for the full-resolution
+        image. 0 = unknown/no class matched. Internally tiles the image so
+        SAM3 always sees crops close to its native input resolution, then
+        merges tiles back by highest confidence per pixel.
+        """
+        labels, _confidence = self.label_image_scores(image_path)
+        return labels
 
 
 class HeadFusionLabeler:
@@ -382,7 +424,11 @@ class HeadFusionLabeler:
     def __init__(self, class_names, unknown_id=0,
                  model_path=Path(__file__).resolve().parents[2] / "models" / "sam3.pt", conf=0.4,
                  tile_size=1008, min_overlap_frac=0.2, query_threshold=0.4, prompts=None,
-                 fuse_at_mask_resolution=True):
+                 fuse_at_mask_resolution=True, fine_queries=None):
+        """``fine_queries`` optionally lists, per fine term, the flat prompt indices that
+        answer it; their gated score maps are kept next to the class probabilities (see
+        :meth:`score_points`, ``fine_scores_out``). The extra SAM work is zero: the term
+        maps exist before the prompts are pooled into classes."""
         self.class_names = class_names
         self.prompts = resolve_prompts(class_names, prompts)
         self._flat_prompts, self._prompt_owner = flatten_prompts(self.prompts)
@@ -398,6 +444,8 @@ class HeadFusionLabeler:
         self.min_overlap_frac = min_overlap_frac
         self.query_threshold = query_threshold
         self.last_tile_diagnostics = None
+        self.fine_queries = [list(map(int, group)) for group in fine_queries] if fine_queries else None
+        self.last_fine_probs = None
         overrides = dict(
             conf=conf,
             imgsz=644,
@@ -421,12 +469,19 @@ class HeadFusionLabeler:
         result = self.predictor(source=tile_img, text=self._flat_prompts, verbose=False)[0]
         sem_probs = result.semantic_seg.sigmoid()
         fused = fuse_heads(sem_probs, result.inst_agg)
-        final_probs = reduce_prompt_scores(
-            apply_presence_gate(fused, result.presence_scores), self._prompt_owner, len(self.class_names)
-        )
+        gated = apply_presence_gate(fused, result.presence_scores)
+        final_probs = reduce_prompt_scores(gated, self._prompt_owner, len(self.class_names))
         tile_h, tile_w = tile_img.shape[:2]
         if tuple(final_probs.shape[1:]) != (tile_h, tile_w):
             final_probs = F.interpolate(final_probs[None].float(), (tile_h, tile_w), mode="bilinear")[0]
+        self.last_fine_probs = None
+        if self.fine_queries:
+            # Fine terms: max over the queries of each term, taken from the same gated maps the class
+            # pooling used (no extra SAM call), then upsampled like the class maps.
+            fine_probs = torch.stack([gated[group].amax(dim=0) for group in self.fine_queries])
+            if tuple(fine_probs.shape[1:]) != (tile_h, tile_w):
+                fine_probs = F.interpolate(fine_probs[None].float(), (tile_h, tile_w), mode="bilinear")[0]
+            self.last_fine_probs = fine_probs
         self.last_tile_diagnostics = {
             "raw_shapes": result.raw_shapes,
             "presence_scores": result.presence_scores.detach().float().cpu().numpy(),
@@ -448,13 +503,18 @@ class HeadFusionLabeler:
         height, width = img.shape[:2]
         return img, width, height
 
-    def score_points(self, image_path, u, v, image=None, label_threshold=None):
+    def score_points(self, image_path, u, v, image=None, label_threshold=None,
+                     label_exclude_ids=None, return_raw_labels=False, fine_scores_out=None):
         """Return final probabilities for in-bounds integer (u, v) image coordinates.
 
-        With ``label_threshold`` a per-pixel label raster is returned as well:
-        ``(scores, labels)`` where ``labels`` holds the winning 1-based class id
-        wherever its probability reaches the threshold and 0 elsewhere (also in
-        tiles without projected points, which are not run through SAM3).
+        With ``label_threshold`` a per-pixel label raster is returned as well.
+        ``label_exclude_ids`` removes internal-only classes from that raster
+        before selecting the winner. When ``return_raw_labels`` is true, the
+        unfiltered raster is returned as a third value for side-channel masks.
+
+        ``fine_scores_out`` (float32, shape ``(len(u), len(fine_queries))``, zero-filled by the
+        caller) receives the per-fine-term scores of the same points, sampled exactly like the
+        class probabilities; the returned values are unchanged.
         """
         if image is None:
             image, width, height = self.load_image(image_path)
@@ -468,10 +528,14 @@ class HeadFusionLabeler:
             raise ValueError("score_points requires in-bounds pixel coordinates")
 
         scores = np.zeros((u.size, len(self.class_names)), dtype=np.float32)
-        labels = best = None
+        labels = best = raw_labels = raw_best = None
         if label_threshold is not None:
             labels = np.zeros((height, width), dtype=np.uint8)
             best = np.zeros((height, width), dtype=np.float32)
+            if return_raw_labels:
+                raw_labels = np.zeros((height, width), dtype=np.uint8)
+                raw_best = np.zeros((height, width), dtype=np.float32)
+        excluded = np.asarray(sorted(label_exclude_ids or ()), dtype=np.intp) - 1
         for x0, y0, x1, y1 in iter_tiles(width, height, effective_tile_size(width, height, self.tile_size), self.min_overlap_frac):
             selected = (u >= x0) & (u < x1) & (v >= y0) & (v < y1)
             if not np.any(selected):
@@ -481,8 +545,20 @@ class HeadFusionLabeler:
             local_v = torch.from_numpy(v[selected] - y0).to(final_probs.device)
             sampled = final_probs[:, local_v, local_u].transpose(0, 1)
             scores[selected] = np.maximum(scores[selected], sampled.detach().float().cpu().numpy())
+            fine_tile = getattr(self, "last_fine_probs", None) if fine_scores_out is not None else None
+            if fine_tile is not None:
+                fine_sampled = fine_tile[:, local_v, local_u].transpose(0, 1).detach().float().cpu().numpy()
+                fine_scores_out[selected] = np.maximum(fine_scores_out[selected], fine_sampled)
             if labels is not None:
-                tile_best, tile_class = final_probs.max(dim=0)
+                raw_tile_best, raw_tile_class = final_probs.max(dim=0)
+                raw_tile_best = raw_tile_best.detach().float().cpu().numpy()
+                raw_tile_class = raw_tile_class.detach().cpu().numpy().astype(np.uint8) + 1
+                if excluded.size:
+                    allowed = final_probs.clone()
+                    allowed[excluded] = 0
+                    tile_best, tile_class = allowed.max(dim=0)
+                else:
+                    tile_best, tile_class = final_probs.max(dim=0)
                 tile_best = tile_best.detach().float().cpu().numpy()
                 tile_class = tile_class.detach().cpu().numpy().astype(np.uint8) + 1
                 tile_class[tile_best < float(label_threshold)] = 0
@@ -490,6 +566,14 @@ class HeadFusionLabeler:
                 better = tile_best > region_best
                 labels[y0:y1, x0:x1][better] = tile_class[better]
                 region_best[better] = tile_best[better]
+                if raw_labels is not None:
+                    raw_tile_class[raw_tile_best < float(label_threshold)] = 0
+                    raw_region_best = raw_best[y0:y1, x0:x1]
+                    raw_better = raw_tile_best > raw_region_best
+                    raw_labels[y0:y1, x0:x1][raw_better] = raw_tile_class[raw_better]
+                    raw_region_best[raw_better] = raw_tile_best[raw_better]
         if labels is not None:
+            if return_raw_labels:
+                return scores, labels, raw_labels
             return scores, labels
         return scores

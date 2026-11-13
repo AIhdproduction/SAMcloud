@@ -1,0 +1,50 @@
+# Semantic segmentation defaults for cached orthophotos.
+chunk_px: 4096
+chunk_overlap_px: 256
+min_image_confidence: 0.50
+pointcloud_confidence: 0.60
+high_threshold: 0.50
+low_threshold: 0.20
+code_groups:
+  outdoor:
+    high_codes: [5, 6, 72, 84, 91]
+    low_codes: [2, 3, 9, 11, 71, 73, 82]
+  indoor:
+    high_codes: [100, 108, 117]
+    low_codes: [102]
+fine_allowed_codes:
+  indoor: [114, 117, 120, 121, 180]
+fine_prompts:
+  indoor:
+    - toilet
+    - washbasin
+    - bathtub
+    - shower tray
+    - kitchen sink
+    - stove
+    - bed
+    - sofa
+    - armchair
+    - table
+    - chair
+    - wardrobe
+    - shelf
+    - desk
+    - refrigerator
+    - washing machine
+    - radiator
+    - cushion
+    - pillow
+    - blanket
+    - clothes
+    - nightstand
+    - coffee table
+    - sideboard
+    - tv stand
+    - kitchen counter
+    - kitchen cabinet
+    - cat tree
+    - plant
+    - floor lamp
+    - television
+    - mirror

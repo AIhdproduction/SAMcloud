@@ -11,6 +11,10 @@ import yaml
 from samcloud.classification.profiles import load_cyclone_codes
 from samcloud.core.paths import CONFIG_DIRECTORY
 
+VALID_DXF_LINEWEIGHTS: tuple[int, ...] = (
+    0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158, 200, 211
+)
+
 ProjectMode = Literal["indoor", "outdoor"]
 LayerMode = Literal["cut_band", "footprint", "top_surface", "ground_surface", "ignore"]
 GeometryType = Literal["wall", "opening", "polygon", "line", "furniture", "skeleton", "circle", "tree", "point", "ignore"]
@@ -29,6 +33,10 @@ class LayerDefinition:
     min_area: float
     simplify_tolerance: float
     hatch: bool
+    true_color: tuple[int, int, int] | None = None
+    lineweight: int | None = None
+    hatch_pattern: str | None = None
+    hatch_scale: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +112,65 @@ def _parse_layer(record: object, index: int, registry: dict[int, dict[str, objec
         raise ValueError(f"DXF layer entry {index} has a negative area or tolerance")
     if mode == "cut_band" and z_band is None:
         raise ValueError(f"DXF layer entry {index} mode 'cut_band' requires z_band")
-    return LayerDefinition(project_mode, mode, codes, str(record["name"]), color, str(record["linetype"]), geometry, z_band, min_area, tolerance, bool(record["hatch"]))
+
+    raw_true_color = record.get("true_color")
+    if raw_true_color is not None:
+        if not isinstance(raw_true_color, (list, tuple)) or len(raw_true_color) != 3:
+            raise ValueError(f"DXF layer entry {index} has invalid true_color '{raw_true_color}'")
+        try:
+            tc_values = tuple(int(c) for c in raw_true_color)
+            if not all(0 <= c <= 255 for c in tc_values):
+                raise ValueError
+            true_color: tuple[int, int, int] | None = (tc_values[0], tc_values[1], tc_values[2])
+        except (ValueError, TypeError):
+            raise ValueError(f"DXF layer entry {index} has invalid true_color components")
+    else:
+        true_color = None
+
+    raw_lineweight = record.get("lineweight")
+    if raw_lineweight is not None:
+        try:
+            lw = int(raw_lineweight)
+        except (ValueError, TypeError):
+            raise ValueError(f"DXF layer entry {index} has invalid lineweight '{raw_lineweight}'")
+        if lw not in VALID_DXF_LINEWEIGHTS:
+            raise ValueError(f"DXF layer entry {index} lineweight {lw} is not a valid DXF lineweight")
+        lineweight: int | None = lw
+    else:
+        lineweight = None
+
+    raw_hatch_pattern = record.get("hatch_pattern")
+    hatch_pattern = str(raw_hatch_pattern) if raw_hatch_pattern is not None else None
+
+    raw_hatch_scale = record.get("hatch_scale")
+    if raw_hatch_scale is not None:
+        try:
+            hs = float(raw_hatch_scale)
+            if hs <= 0:
+                raise ValueError
+            hatch_scale: float | None = hs
+        except (ValueError, TypeError):
+            raise ValueError(f"DXF layer entry {index} has invalid hatch_scale '{raw_hatch_scale}'")
+    else:
+        hatch_scale = None
+
+    return LayerDefinition(
+        project_mode,
+        mode,
+        codes,
+        str(record["name"]),
+        color,
+        str(record["linetype"]),
+        geometry,
+        z_band,
+        min_area,
+        tolerance,
+        bool(record["hatch"]),
+        true_color,
+        lineweight,
+        hatch_pattern,
+        hatch_scale,
+    )
 
 
 def _legacy_layer_mode(record: dict[object, object]) -> LayerMode:

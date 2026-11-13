@@ -119,6 +119,9 @@ class DxfJobRunner:
         las: Path | str,
         level: str | None = None,
         mode: str | None = None,
+        source: str | None = None,
+        variant: str | None = None,
+        force: bool = False,
     ) -> subprocess.Popen[str]:
         """Launch a background DXF job subprocess with sys.executable (only one at a time)."""
         if self.is_running():
@@ -144,6 +147,12 @@ class DxfJobRunner:
             command.extend(["--level", str(level)])
         if mode is not None:
             command.extend(["--mode", str(mode)])
+        if source is not None:
+            command.extend(["--source", str(source)])
+        if variant is not None:
+            command.extend(["--variant", str(variant)])
+        if force:
+            command.append("--force")
         launched = time.time()
         command.extend(["--launched", repr(launched)])
 

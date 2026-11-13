@@ -158,6 +158,38 @@ unknown). Inference uses a 768 px sliding window (stride 384) in fp16; the
 multi-view voting, step 6 and geometric refinement are the same as for SAM3.
 Its classes are fixed by the training and cannot be customised.
 
+#### Download and install the model
+
+The model is published at [https://huggingface.co/AIhdproduction/Flurseg](https://huggingface.co/AIhdproduction/Flurseg). The repository provides two versions in separate subfolders as well as an `evaluation/` folder with metrics and comparison panels:
+
+- `v1/`: **recommended**, trained on SAM 3 pseudo-labels that were manually reviewed and refined.
+- `v2/`: experimental self-training round, not better than v1 on the independent test.
+
+Each version folder contains `config.json`, `model.safetensors`, and `preprocessor_config.json` (plus `classes.yaml`, `summary.json`, `train.log`, `train_config.yaml`, and `README.md`).
+
+SAMcloud loads the model from the folder set in `config/flurseg.yml` under `model.directory`. A relative path is resolved against the SAMcloud root (the current default is `models/flurseg_eomt_dinov3l_20261107-211214/best`). That folder must directly contain `config.json`, `model.safetensors`, and `preprocessor_config.json`. Note that `models/` is not part of the git repository.
+
+1. **Download the model:** The `huggingface_hub` package is installed in the venv, so the `hf` CLI is available. Run from the SAMcloud root:
+   ```bash
+   venv\Scripts\hf download AIhdproduction/Flurseg --include "v1/*" --local-dir models/flurseg
+   ```
+   Alternatively, download manually from the website ("Files and versions") using the same folder layout.
+2. **Resulting folder layout:** This creates `models/flurseg/v1` directly containing the required files:
+   ```text
+   models/flurseg/v1/
+   ├── config.json
+   ├── model.safetensors
+   └── preprocessor_config.json
+   ```
+3. **Configure the path:** Set `model.directory` in `config/flurseg.yml`:
+   ```yaml
+   model:
+     directory: models/flurseg/v1
+   ```
+4. **Select FlurSeg:** Choose FlurSeg as the classification engine in the project settings or dashboard when configuring an outdoor project.
+
+If any required model file is missing from that directory, the run reports `FlurSeg model file missing: <path>`. The weights are based on DINOv3; see `LICENSE` and `NOTICE.md` in the Hugging Face repo for the license.
+
 Grütistrasse test (291 drone photos, same dense cloud with 65 M points, SAM3 as
 reference):
 
@@ -170,8 +202,7 @@ reference):
 Ground, low vegetation, vehicle, paved surface and building agree closely
 (IoU 0.79–0.98). Tree, manhole, construction and curb are weaker, and FlurSeg
 cannot separate sidewalk from road or detect fences, poles, signs, walls and
-other fine classes. The model folder (`models/flurseg_eomt_dinov3l_*`) is not
-part of the repository; download it from [Hugging Face](https://huggingface.co/AIhdproduction/Flurseg) (includes `EVALUATION.md`) and place it under `models/` (e.g. `models/flurseg_eomt_dinov3l_<timestamp>/`).
+other fine classes. The model is not part of the repository; see *Download and install the model* above.
 
 The dashboard button **Klassifizierung neu rechnen** (pipeline `--reclassify`)
 re-runs only classification, step 6 and geometry on the kept dense cloud, so

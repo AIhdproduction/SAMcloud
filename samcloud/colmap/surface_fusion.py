@@ -33,6 +33,12 @@ After plane snapping a second pass also uses the agreeing prior: points seen by
 fewer than ``point_min_seen_views`` cameras but hidden behind a nearer surface
 in ``point_hidden_views`` (behind walls, above the ceiling), and wall planes
 whose points the cameras hardly see (``wall_min_seen_views``), are removed.
+The same pass runs the ``hidden_filter``: a point no COLMAP depth map confirms
+(measured depth equal to it or beyond it, at its pixel or in a small window around
+it), that at most ``max_prior_views`` agreeing priors back, and that at least
+``min_closed_views`` cameras see only through a clearly nearer COLMAP surface
+(floor behind a wall, an unscanned room), is removed. Points without any such
+evidence (textureless ceilings no camera measured) stay.
 
 Afterwards ``plane_classes`` (ceiling, floor, walls) are fitted with planes
 (horizontal for ceiling/floor, vertical for walls) and points within
@@ -78,6 +84,18 @@ DEFAULTS: dict[str, Any] = {
     "edge_tolerance": 0.02,
     "max_incidence_deg": 70.0,
     "exclude_classes": ["window"],
+    "depth_edge_filter": {"enabled": True, "max_incidence_deg": 80.0, "edge_px": 1,
+                          "edge_jump_rel": 0.05, "edge_jump_m": 0.03, "drop_lonely": False},
+    "mirror_filter": {"enabled": True, "ring_inner_px": 4, "ring_outer_px": 12, "min_depth_jump_m": 0.25,
+                      "merge_angle_deg": 3, "merge_offset_m": 0.03, "min_views": 2, "min_baseline_m": 0.3,
+                      "min_mask_share": 0.002, "mirror_dilate_px": 6, "through_share": 0.8, "fill_plane": False,
+                      "prior_tolerance": 0.03, "prior_edge_tolerance": 0.02,
+                      "ring_label_ids": [2, 5, 17]},
+    "behind_wall_filter": {"enabled": False, "keep_depth_m": 1.0, "cell_m": 0.05, "floor_band_m": 0.15,
+                           "extent_margin_m": 0.25, "blocked_share": 0.9, "min_support_views": 2,
+                           "mirror_image": {"enabled": False, "search_front_m": 1.2, "search_back_m": 0.2,
+                                            "step_m": 0.01, "match_m": 0.04, "min_score": 0.35,
+                                            "min_points": 2000}},
     # snap mode
     "iterations": 5,
     "max_residual_m": 0.02,
@@ -93,6 +111,22 @@ DEFAULTS: dict[str, Any] = {
     "wall_min_seen_views": 3,
     "point_min_seen_views": 2,   # points seen by fewer views ...
     "point_hidden_views": 10,    # ... but hidden behind a nearer surface in this many are removed  # median number of views seeing a wall plane; fewer: a wall behind a wall
+    "units_per_metre": 1.0,
+    # points no COLMAP depth confirms, few priors back and many cameras only see through a nearer COLMAP surface
+    "hidden_filter": {"enabled": False, "window_frac": 0.0556, "window_grid": 5, "min_window_valid": 5,
+                      "open_share": 0.2, "closed_share": 0.8, "min_closed_views": 10, "max_prior_views": 2},
+    # occupancy ray-march: every sampled supporting view of a point looks through a solid surface
+    "raymarch_filter": {"enabled": True, "voxel_m": 0.04, "dilate_voxels": 2, "structure_classes": ["wall", "door", "ceiling", "floor"],
+                        "occ_min_support": 30, "own_skip_voxels": 3, "run_samples": 3, "max_steps": 200, "min_false": 3,
+                        "max_views": 32, "chunk": 20000, "max_voxels": 400_000_000,
+                        # tall furniture (built-in wardrobes, shelf walls) occludes like a wall; low furniture stays permeable
+                        "tall_furniture_enabled": True, "tall_furniture_classes": ["furniture"], "tall_furniture_min_height_m": 1.6,
+                        "tall_furniture_cell_m": 0.08, "tall_furniture_min_fill": 0.5, "tall_furniture_min_extent_m": 0.5,
+                        "tall_furniture_min_points": 2, "floor_cell_m": 1.0,
+                        # holes in tall vertical bodies narrower than close_gap_m are closed (textureless wall, glossy panels)
+                        "close_gaps_enabled": True, "body_fill": 0.35, "close_gap_m": 0.5, "fill_body_columns": False,
+                        # a point whose line of sight runs longer than this inside solid voxels is buried in a body: that view counts as blocked
+                        "bury_depth_m": 0.0},
     # planes
     "plane_classes": ["ceiling", "floor", "wall"],
     "plane_manhattan": True,
@@ -223,6 +257,9 @@ def view_depth(
     excluded: tuple[int, ...],
     settings: dict[str, Any],
     device: str = "cpu",
+    mirror_mask: np.ndarray | None = None,
+    mirror_plane: Any | None = None,
+    edge_report: dict[str, int] | None = None,
 ):
     """Combined depth and weights (torch, at the geometric map size) or None.
 
@@ -237,7 +274,24 @@ def view_depth(
         return None  # without measurements a prior cannot be checked
     g = torch.as_tensor(np.asarray(geometric, dtype=np.float32), device=device)
     h, w = g.shape
-    g_ok = (g > 0) & (g <= float(settings["max_geometric_depth"]))
+    if mirror_mask is not None:
+        mask = torch.as_tensor(np.asarray(mirror_mask, dtype=bool), device=device)
+        if mask.shape != g.shape:
+            mask = F.interpolate(mask[None, None].float(), size=(h, w), mode="nearest")[0, 0] > 0.5
+        if bool(settings.get("mirror_filter", {}).get("fill_plane", False)) and mirror_plane is not None:
+            from samcloud.colmap.mirror_filter import plane_depth_map
+
+            plane_depth = torch.as_tensor(plane_depth_map(view, (h, w), mirror_plane), device=device)
+            g = torch.where(mask & (plane_depth > 0), plane_depth, g)
+        else:
+            g = torch.where(mask, torch.zeros_like(g), g)
+    from samcloud.colmap.depth_edges import geometric_valid_mask_torch
+
+    raw_valid = (g > 0) & (g <= float(settings["max_geometric_depth"]))
+    g_ok = geometric_valid_mask_torch(g, view, settings) & (g <= float(settings["max_geometric_depth"]))
+    if edge_report is not None:
+        edge_report["valid"] = edge_report.get("valid", 0) + int(raw_valid.sum())
+        edge_report["dropped"] = edge_report.get("dropped", 0) + int((raw_valid & ~g_ok).sum())
     depth = torch.where(g_ok, g, torch.zeros_like(g))
     weight = torch.where(g_ok, torch.full_like(g, float(settings["geometric_weight"])), torch.zeros_like(g))
     if prior is not None:
@@ -245,7 +299,8 @@ def view_depth(
         if p.shape != g.shape:
             p = F.interpolate(p[None, None], size=(h, w), mode="nearest")[0, 0]
         p, usable = fit_prior_locally(p, torch.where(g_ok, g, torch.zeros_like(g)), settings)
-        ok = usable & ~g_ok & (p > 0) & (p <= float(settings["max_prior_depth"]))
+        ok = usable & ~g_ok & ~mask if mirror_mask is not None else usable & ~g_ok
+        ok &= (p > 0) & (p <= float(settings["max_prior_depth"]))
         ok &= _edge_mask_t(p, float(settings["edge_tolerance"]))
         ok &= _incidence_mask_t(p, view, float(settings["max_incidence_deg"]))
         if labels is not None and excluded:
@@ -495,7 +550,10 @@ def fuse_views(
     label_reader: Callable[[str], np.ndarray | None] | None = None,
     image_reader: Callable[[str], np.ndarray | None] | None = None,
     excluded: tuple[int, ...] = (),
+    mirror_masks: dict[str, np.ndarray] | None = None,
+    mirror_planes: dict[str, Any] | None = None,
     progress: Callable[[int, int], None] | None = None,
+    depth_filter_report: dict[str, int] | None = None,
 ) -> int:
     """Integrate every view; disk reads run one view ahead in a background thread."""
     from concurrent.futures import ThreadPoolExecutor
@@ -521,7 +579,9 @@ def fuse_views(
             if loaded is None:
                 continue
             geometric, prior, labels, image = loaded
-            combined = view_depth(view, geometric, prior, labels, excluded, settings, device=tsdf.device)
+            combined = view_depth(view, geometric, prior, labels, excluded, settings, device=tsdf.device,
+                                  mirror_mask=(mirror_masks or {}).get(view.name),
+                                  mirror_plane=(mirror_planes or {}).get(view.name), edge_report=depth_filter_report)
             if combined is None:
                 continue
             tsdf.integrate(view, *combined, image=image,
@@ -590,14 +650,51 @@ def snap_points(points: np.ndarray, tsdf: Tsdf, settings: dict[str, Any], chunk:
     return out, keep, stats, normals
 
 
+def _window_evidence(depth, u, v, z, tolerance, config: dict[str, Any]):
+    """Per point: (open, closed) from the COLMAP depth around its pixel (torch, ``depth`` 0 where invalid).
+
+    A grid of ``window_grid`` x ``window_grid`` samples spans ``window_frac`` of the image either way.
+    With at least ``min_window_valid`` measured samples the view is *closed* when ``closed_share`` of
+    them lie clearly nearer than the point (a wall in front of it, seen over a whole neighbourhood, even
+    where the wall itself is textureless at the point's own pixel) and *open* when ``open_share`` of them
+    reach the point's depth or lie beyond it.
+    """
+    import torch
+
+    h, w = depth.shape
+    grid = max(2, int(config["window_grid"]))
+    radius = float(config["window_frac"]) * min(h, w)
+    offsets = torch.round(torch.linspace(-radius, radius, grid, device=depth.device)).long()
+    dx, dy = torch.meshgrid(offsets, offsets, indexing="ij")
+    dx, dy = dx.reshape(-1), dy.reshape(-1)
+    uu = (u.long()[:, None] + dx[None, :]).clamp(0, w - 1)
+    vv = (v.long()[:, None] + dy[None, :]).clamp(0, h - 1)
+    sample = depth[vv, uu]
+    valid = sample > 0
+    measured = valid.sum(1)
+    front = (valid & (sample < (z - tolerance)[:, None])).sum(1)
+    enough = measured >= int(config["min_window_valid"])
+    share = front.float() / measured.clamp(min=1).float()
+    return enough & ((1.0 - share) >= float(config["open_share"])), enough & (share >= float(config["closed_share"]))
+
+
+def unconfirmed_mask(evidence: dict[str, np.ndarray], config: dict[str, Any]) -> np.ndarray:
+    """True for points no COLMAP depth confirms and many cameras only see through a nearer COLMAP surface."""
+    confirmed = (evidence["support"] + evidence["through"] > 0) | (evidence["window_open"] > 0)
+    return (~confirmed & (evidence["prior_open"] <= int(config["max_prior_views"]))
+            & (evidence["window_closed"] >= int(config["min_closed_views"])))
+
+
 def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, settings: dict[str, Any],
                     device: str = "cpu", progress: Callable[[int, int], None] | None = None,
-                    prior_reader: Callable[[str], np.ndarray | None] | None = None, count_seen: bool = False):
+                    prior_reader: Callable[[str], np.ndarray | None] | None = None, count_seen: bool = False,
+                    evidence: dict[str, np.ndarray] | None = None):
     """True for points no camera disproves: COLMAP depth maps only (see module docstring).
 
     Returns (keep, stats); with ``count_seen`` (keep, stats, seen) where ``seen`` is
     the number of views per point that see it (COLMAP depth, plus the
-    Depth-Anything prior where it agrees with COLMAP).
+    Depth-Anything prior where it agrees with COLMAP). With ``count_seen`` the
+    ``hidden_filter`` also runs; ``evidence`` (a dict) receives the per-point counters it uses.
     """
     import torch
     from concurrent.futures import ThreadPoolExecutor
@@ -611,9 +708,15 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
     support = torch.zeros(len(p), dtype=torch.int32, device=device)
     seen = torch.zeros(len(p), dtype=torch.int32, device=device)
     hidden = torch.zeros(len(p), dtype=torch.int32, device=device)
-    margin_abs = float(settings["visibility_margin_m"])
+    prior_open = torch.zeros(len(p), dtype=torch.int32, device=device)
+    window_open = torch.zeros(len(p), dtype=torch.int32, device=device)
+    window_closed = torch.zeros(len(p), dtype=torch.int32, device=device)
+    hidden_config = {**DEFAULTS["hidden_filter"], **(settings.get("hidden_filter") or {})}
+    use_window = bool(count_seen and hidden_config.get("enabled", False))
+    margin_abs = float(settings["visibility_margin_m"]) * float(settings.get("units_per_metre", 1.0))
     margin_rel = float(settings["visibility_margin_rel"])
     max_depth = float(settings["max_geometric_depth"])
+    chunk = 262_144
 
     def load(view: View):
         path = Path(stereo_dir) / "depth_maps" / f"{view.name}.geometric.bin"
@@ -622,7 +725,7 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
         prior = prior_reader(view.name) if count_seen and prior_reader is not None else None
         return read_colmap_array(path), prior
 
-    def confirm(view: View, depth, local) -> None:
+    def confirm(view: View, depth, weight, local) -> None:
         h, w = depth.shape
         z = local[:, 2]
         u = (view.fx * local[:, 0] / z + view.cx) * (w / view.width)
@@ -630,11 +733,14 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
         index = torch.nonzero((z > 0.1) & (u >= 0) & (u < w) & (v >= 0) & (v < h), as_tuple=False).squeeze(1)
         if not len(index):
             return
-        dd = depth[v[index].long(), u[index].long()]
+        pixel_v, pixel_u = v[index].long(), u[index].long()
+        dd = depth[pixel_v, pixel_u]
         zz = z[index]
         tolerance = margin_abs + margin_rel * zz
         seen[index[(dd > 0) & ((dd - zz).abs() <= tolerance)]] += 1
         hidden[index[(dd > 0) & (dd < zz - tolerance)]] += 1
+        from_prior = weight[pixel_v, pixel_u] < float(settings["geometric_weight"])
+        prior_open[index[(dd > 0) & from_prior & (dd >= zz - tolerance)]] += 1
 
     used = 0
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -648,7 +754,9 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
                 continue
             depth, prior = loaded
             d = torch.as_tensor(np.asarray(depth, dtype=np.float32), device=device)
-            d = torch.where(d <= max_depth, d, torch.zeros_like(d))
+            from samcloud.colmap.depth_edges import geometric_valid_mask_torch
+
+            d = torch.where(geometric_valid_mask_torch(d, view, settings) & (d <= max_depth), d, torch.zeros_like(d))
             h, w = d.shape
             rotation = torch.as_tensor(view.rotation, dtype=torch.float32, device=device)
             translation = torch.as_tensor(view.translation, dtype=torch.float32, device=device)
@@ -656,7 +764,7 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
             if count_seen:
                 combined = view_depth(view, depth, prior, None, (), settings, device=device)
                 if combined is not None:
-                    confirm(view, combined[0], local)
+                    confirm(view, combined[0], combined[1], local)
             z = local[:, 2]
             u = (view.fx * local[:, 0] / z + view.cx) * (w / view.width)
             v = (view.fy * local[:, 1] / z + view.cy) * (h / view.height)
@@ -669,6 +777,13 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
             margin = margin_abs + margin_rel * zz
             through[index[measured & (dd > zz + margin)]] += 1
             support[index[measured & ((dd - zz).abs() <= margin)]] += 1
+            if use_window:
+                for start in range(0, len(index), chunk):
+                    part = index[start:start + chunk]
+                    is_open, is_closed = _window_evidence(d, u[part], v[part], z[part], margin_abs + margin_rel * z[part],
+                                                          hidden_config)
+                    window_open[part[is_open]] += 1
+                    window_closed[part[is_closed]] += 1
             used += 1
     disproved = (through >= int(settings["visibility_min_through"])) & \
         (through.float() > float(settings["visibility_through_ratio"]) * support.float())
@@ -679,8 +794,288 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
         unseen = (seen < int(settings["point_min_seen_views"])) & (hidden >= int(settings["point_hidden_views"]))
         stats["removed_hidden"] = int((unseen & ~disproved).sum())
         keep &= ~unseen.cpu().numpy()
-        return keep, stats, seen.cpu().numpy()
+        counters = {"support": support, "through": through, "prior_open": prior_open, "window_open": window_open,
+                    "window_closed": window_closed, "seen": seen, "hidden": hidden}
+        counters = {name: value.cpu().numpy() for name, value in counters.items()}
+        if evidence is not None:
+            evidence.update(counters)
+        unconfirmed = unconfirmed_mask(counters, hidden_config) if use_window else np.zeros(len(keep), dtype=bool)
+        stats["removed_unconfirmed"] = int((unconfirmed & keep).sum())
+        keep &= ~unconfirmed
+        return keep, stats, counters["seen"]
     return keep, stats
+
+
+def _march_blocked(grid, origin, voxel: float, dims, points, camera, config: dict[str, Any]):
+    """True where the segment point -> camera crosses a solid occupied run after leaving the point's own surface.
+
+    ``grid`` is a dense boolean occupancy grid (torch). Marching starts at the point: occupied voxels that
+    touch the first ``own_skip_voxels`` belong to the point's own surface and are skipped until the first empty
+    sample; after that a run of ``run_samples`` occupied samples blocks the line of sight.
+    """
+    import torch
+
+    steps = int(config["max_steps"])
+    delta = camera - points
+    length = delta.norm(dim=1).clamp(min=1e-3)
+    direction = delta / length[:, None]
+    step = torch.maximum(torch.full_like(length, 0.75 * voxel), length / steps)
+    index = torch.arange(steps, device=points.device)[None, :]
+    along = index * step[:, None]
+    position = points[:, None, :] + direction[:, None, :] * along[..., None]
+    cell = torch.floor((position - origin) / voxel).long()
+    limit = torch.as_tensor(dims, device=points.device)
+    inside = ((cell >= 0) & (cell < limit)).all(-1) & (along <= length[:, None])
+    cell = torch.minimum(cell.clamp(min=0), limit - 1)
+    occupied = grid[cell[..., 0], cell[..., 1], cell[..., 2]] & inside
+    near = along <= float(config["own_skip_voxels"]) * voxel
+    own_end = torch.where(occupied & near, index.expand_as(occupied), torch.full_like(index.expand_as(occupied), -1)).max(1).values
+    free_after = (~occupied) & (index > own_end[:, None])
+    first_free = torch.where(free_after.any(1), free_after.float().argmax(1), torch.full_like(own_end, steps))
+    run = int(config["run_samples"])
+    solid = occupied[:, : steps - run + 1].clone()
+    for offset in range(1, run):
+        solid &= occupied[:, offset: steps - run + 1 + offset]
+    valid = (index[:, : steps - run + 1] >= first_free[:, None]) & \
+        (along[:, : steps - run + 1] <= (length - float(config["own_skip_voxels"]) * voxel)[:, None])
+    blocked = (solid & valid).any(1)
+    bury = float(config.get("bury_depth_m", 0.0)) * float(config.get("units_per_metre", 1.0))
+    if bury > 0:  # the point sits deep inside a solid mass: its own run of occupied samples is longer than a surface can be
+        leading = occupied.long().cumprod(1).sum(1)
+        blocked |= leading.float() * step > bury
+    return blocked
+
+
+def _local_floor_z(points: np.ndarray, floor_points: np.ndarray, query_xy: np.ndarray, xy0: np.ndarray, fcell: float) -> np.ndarray:
+    """Local floor height at ``query_xy``: 10th-percentile z of the floor points per ``fcell`` cell, nearest known cell elsewhere."""
+    from scipy import ndimage
+
+    fshape = np.floor((points[:, :2].max(axis=0) - xy0) / fcell).astype(np.int64) + 1
+    fidx = np.floor((floor_points[:, :2] - xy0) / fcell).astype(np.int64)
+    flat = fidx[:, 0] * fshape[1] + fidx[:, 1]
+    order = np.argsort(flat, kind="stable")
+    flat_sorted, z_sorted = flat[order], floor_points[order, 2]
+    cells, starts = np.unique(flat_sorted, return_index=True)
+    ends = np.append(starts[1:], len(flat_sorted))
+    floor_grid = np.full(tuple(int(v) for v in fshape), np.nan)
+    known = np.zeros(tuple(int(v) for v in fshape), dtype=bool)
+    for c, a, b in zip(cells, starts, ends):
+        floor_grid[c // fshape[1], c % fshape[1]] = np.percentile(z_sorted[a:b], 10)
+        known[c // fshape[1], c % fshape[1]] = True
+    nearest = ndimage.distance_transform_edt(~known, return_distances=False, return_indices=True)
+    floor_grid = floor_grid[nearest[0], nearest[1]]
+    q = np.floor((query_xy - xy0) / fcell).astype(np.int64)
+    return floor_grid[q[:, 0].clip(0, fshape[0] - 1), q[:, 1].clip(0, fshape[1] - 1)]
+
+
+def tall_furniture_members(points: np.ndarray, labels: np.ndarray, class_ids: dict[str, int], unit: float,
+                           config: dict[str, Any]) -> np.ndarray:
+    """Boolean mask of furniture points that belong to a tall, vertical body (built-in wardrobe, shelf wall, tall cabinet).
+
+    Scale-free: every metric key is multiplied by ``unit`` (units per metre). The furniture points are binned into
+    XY columns of ``tall_furniture_cell_m``; a column counts when its occupied height bins (>= ``tall_furniture_min_points``
+    points each) fill at least ``tall_furniture_min_fill`` of the band from 0.15 m above the *local* floor up to
+    ``tall_furniture_min_height_m`` and its top reaches that height. Requiring a filled band that starts near the floor
+    keeps floor lamps, plants, coat stands (thin), cat trees (sparse) and wall-mounted upper cabinets (no body near the
+    floor) out. The local floor is the 10th percentile z of the floor-class points per ``floor_cell_m`` cell, filled from the
+    nearest cell that has floor points. A connected component (8-neighbourhood) of such columns must span at least
+    ``tall_furniture_min_extent_m`` (its largest bounding-box side) to be an occluder.
+    """
+    from scipy import ndimage
+
+    members = np.zeros(len(points), dtype=bool)
+    ids = [class_ids[name] for name in config.get("tall_furniture_classes", []) if name in class_ids]
+    floor_id = class_ids.get("floor")
+    if not ids or floor_id is None or not config.get("tall_furniture_enabled", False):
+        return members
+    fur = np.flatnonzero(np.isin(labels, ids))
+    floor_points = points[labels == floor_id]
+    if len(fur) < 10 or len(floor_points) < 10:
+        return members
+    cell = float(config["tall_furniture_cell_m"]) * unit
+    xy0 = points[:, :2].min(axis=0) - cell
+    col = np.floor((points[fur, :2] - xy0) / cell).astype(np.int64)
+    shape = col.max(axis=0) + 1
+    floor_z = _local_floor_z(points, floor_points, points[fur, :2], xy0, float(config["floor_cell_m"]) * unit)
+    height = points[fur, 2] - floor_z
+    tall = float(config["tall_furniture_min_height_m"]) * unit
+    band_lo = 0.15 * unit
+    bin_size = 0.08 * unit
+    zbin = np.floor((height - band_lo) / bin_size).astype(np.int64)
+    n_bins = max(1, int(np.floor((tall - band_lo) / bin_size)))
+    key = (col[:, 0] * shape[1] + col[:, 1]) * 4096 + np.clip(zbin, -1, 2000) + 1
+    keys, counts = np.unique(key, return_counts=True)
+    keys = keys[counts >= int(config["tall_furniture_min_points"])]
+    zb, column_key = keys % 4096 - 1, keys // 4096
+    n_cols = int(shape[0] * shape[1])
+    in_band = (zb >= 0) & (zb < n_bins)
+    fill = np.bincount(column_key[in_band], minlength=n_cols)[:n_cols] / n_bins
+    top = np.full(n_cols, -np.inf)
+    np.maximum.at(top, column_key, band_lo + (zb + 1) * bin_size)
+    good = (fill >= float(config["tall_furniture_min_fill"])) & (top >= tall - bin_size)
+    mask2d = good.reshape(tuple(int(v) for v in shape))
+    comp, count = ndimage.label(mask2d, structure=np.ones((3, 3)))
+    if not count:
+        return members
+    extent_min = float(config["tall_furniture_min_extent_m"]) * unit
+    valid = np.zeros(count + 1, dtype=bool)
+    for number, sl in enumerate(ndimage.find_objects(comp), start=1):
+        valid[number] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) * cell >= extent_min
+    label_per_point = comp[col[:, 0], col[:, 1]]
+    members[fur[valid[label_per_point]]] = True
+    return members
+
+
+def closed_body_columns(points: np.ndarray, labels: np.ndarray, class_ids: dict[str, int], solid: np.ndarray, unit: float,
+                        config: dict[str, Any]):
+    """Vertical bodies (walls, built-ins) with holes: columns that only a *gap* in the surface separates are solid too.
+
+    White textureless wall or glossy panels leave holes in an otherwise tall, vertical sheet of points; rays slip through
+    the holes to points on the far side. Columns of 0.08 m (``tall_furniture_cell_m``) whose solid points (any class but
+    floor, ceiling and window) fill >= ``body_fill`` of the band from 0.15 m above the local floor to 1.6 m are body
+    columns. A binary closing along x and along y with ``close_gap_m`` fills gaps narrower than that between body columns.
+    Returns (xy cell centres, floor z) of the *added* columns only; empty arrays if nothing was added.
+    """
+    from scipy import ndimage
+
+    empty = (np.zeros((0, 2)), np.zeros(0))
+    floor_id = class_ids.get("floor")
+    if not config.get("close_gaps_enabled", False) or floor_id is None:
+        return empty
+    skip = [class_ids[n] for n in ("floor", "ceiling", "window") if n in class_ids]
+    use = np.flatnonzero(solid & ~np.isin(labels, skip))
+    floor_points = points[labels == floor_id]
+    if len(use) < 10 or len(floor_points) < 10:
+        return empty
+    cell = float(config["tall_furniture_cell_m"]) * unit
+    xy0 = points[:, :2].min(axis=0) - cell
+    col = np.floor((points[use, :2] - xy0) / cell).astype(np.int64)
+    shape = np.floor((points[:, :2].max(axis=0) - xy0) / cell).astype(np.int64) + 2
+    floor_z = _local_floor_z(points, floor_points, points[use, :2], xy0, float(config["floor_cell_m"]) * unit)
+    band_lo, bin_size = 0.15 * unit, 0.08 * unit
+    tall = float(config["tall_furniture_min_height_m"]) * unit
+    n_bins = max(1, int(np.floor((tall - band_lo) / bin_size)))
+    zbin = np.floor((points[use, 2] - floor_z - band_lo) / bin_size).astype(np.int64)
+    inside = (zbin >= 0) & (zbin < n_bins)
+    key = (col[inside, 0] * shape[1] + col[inside, 1]) * 4096 + zbin[inside]
+    keys, counts = np.unique(key, return_counts=True)
+    keys = keys[counts >= int(config["tall_furniture_min_points"])]
+    n_cols = int(shape[0] * shape[1])
+    fill = np.bincount(keys // 4096, minlength=n_cols)[:n_cols] / n_bins
+    body = (fill >= float(config["body_fill"])).reshape(tuple(int(v) for v in shape))
+    length = int(round(float(config["close_gap_m"]) * unit / cell)) + 1
+    closed = ndimage.binary_closing(np.pad(body, length), structure=np.ones((1, length), bool))[length:-length, length:-length]
+    closed |= ndimage.binary_closing(np.pad(body, length), structure=np.ones((length, 1), bool))[length:-length, length:-length]
+    added = np.argwhere(closed if config.get("fill_body_columns", True) else closed & ~body)
+    if not len(added):
+        return empty
+    centres = xy0 + (added + 0.5) * cell
+    z = _local_floor_z(points, floor_points, centres, xy0, float(config["floor_cell_m"]) * unit)
+    return centres, z
+
+
+def raymarch_mask(points: np.ndarray, labels: np.ndarray, class_ids: dict[str, int], views: list[View], stereo_dir: Path,
+                  settings: dict[str, Any], evidence: dict[str, np.ndarray], device: str = "cpu",
+                  prior_reader: Callable[[str], np.ndarray | None] | None = None):
+    """Remove points whose every sampled supporting view looks through a solid surface (``raymarch_filter``).
+
+    Occupancy is built from the cloud itself: points of the ``structure_classes`` (walls, doors, ceiling, floor)
+    plus points that at least ``occ_min_support`` COLMAP depth maps confirm, dilated by ``dilate_voxels`` so
+    walls are watertight. A view *supports* a point when COLMAP (or the agreeing prior) sees it there; the
+    segment view centre -> point is marched through the grid. A point goes when it has no clear supporting view
+    and at least ``min_false`` blocked ones. Only points with fewer than ``occ_min_support`` COLMAP views
+    are tested; at most ``max_views`` supporting views per point are sampled.
+    Returns (remove, stats).
+    """
+    import torch
+
+    config = {**DEFAULTS["raymarch_filter"], **(settings.get("raymarch_filter") or {})}
+    config["units_per_metre"] = float(settings.get("units_per_metre", 1.0))
+    stats = {"raymarch_candidates": 0, "raymarch_removed": 0}
+    remove = np.zeros(len(points), dtype=bool)
+    if not config.get("enabled", False) or not len(points) or not views:
+        return remove, stats
+    unit = float(settings.get("units_per_metre", 1.0))
+    voxel = float(config["voxel_m"]) * unit
+    structure = [class_ids[name] for name in config["structure_classes"] if name in class_ids]
+    solid_points = (evidence["support"] >= int(config["occ_min_support"])) | np.isin(labels, structure)
+    tall = tall_furniture_members(points, labels, class_ids, unit, config)
+    stats["raymarch_tall_furniture_points"] = int(tall.sum())
+    solid_points |= tall
+    low = points.min(axis=0) - 0.5 * unit
+    dims = np.ceil((points.max(axis=0) + 0.5 * unit - low) / voxel).astype(np.int64)
+    while int(np.prod(dims)) > int(config["max_voxels"]):
+        voxel *= 1.5
+        dims = np.ceil((points.max(axis=0) + 0.5 * unit - low) / voxel).astype(np.int64)
+    grid = torch.zeros(tuple(int(d) for d in dims), dtype=torch.bool, device=device)
+    cells = torch.as_tensor(np.floor((points[solid_points] - low) / voxel).astype(np.int64), device=device)
+    grid[cells[:, 0], cells[:, 1], cells[:, 2]] = True
+    gap_xy, gap_floor = closed_body_columns(points, labels, class_ids, solid_points, unit, config)
+    stats["raymarch_closed_columns"] = int(len(gap_xy))
+    if len(gap_xy):
+        steps_z = np.arange(0.0, float(config["tall_furniture_min_height_m"]) * unit, 0.5 * voxel)
+        zz = gap_floor[:, None] + 0.1 * unit + steps_z[None, :]
+        fill = np.floor((np.dstack((np.repeat(gap_xy[:, None, 0], len(steps_z), 1), np.repeat(gap_xy[:, None, 1], len(steps_z), 1), zz))
+                         .reshape(-1, 3) - low) / voxel).astype(np.int64)
+        fill = fill[((fill >= 0) & (fill < np.asarray(dims))).all(1)]
+        grid[torch.as_tensor(fill[:, 0], device=device), torch.as_tensor(fill[:, 1], device=device),
+             torch.as_tensor(fill[:, 2], device=device)] = True
+    radius = int(config["dilate_voxels"])
+    if radius > 0:
+        grid = torch.nn.functional.max_pool3d(grid[None, None].float(), 2 * radius + 1, 1, radius)[0, 0] > 0.5
+    candidate = (evidence["support"] < int(config["occ_min_support"])) & ~tall  # an occluder never removes itself
+    rows = np.flatnonzero(candidate)
+    stats["raymarch_candidates"] = int(len(rows))
+    if not len(rows):
+        return remove, stats
+    total = (evidence["seen"][rows] + evidence["prior_open"][rows]).astype(np.float64)
+    quota = torch.as_tensor(np.minimum(1.0, int(config["max_views"]) / np.maximum(total, 1.0)), dtype=torch.float32, device=device)
+    pts = torch.as_tensor(points[rows], dtype=torch.float32, device=device)
+    row_id = torch.arange(len(rows), device=device, dtype=torch.int64)
+    origin = torch.as_tensor(low, dtype=torch.float32, device=device)
+    clear = torch.zeros(len(rows), dtype=torch.int32, device=device)
+    blocked = torch.zeros(len(rows), dtype=torch.int32, device=device)
+    margin_abs = float(settings["visibility_margin_m"]) * unit
+    margin_rel = float(settings["visibility_margin_rel"])
+    chunk = int(config["chunk"])
+    for number, view in enumerate(views):
+        path = Path(stereo_dir) / "depth_maps" / f"{view.name}.geometric.bin"
+        if not path.is_file():
+            continue
+        depth_np = read_colmap_array(path)
+        prior = prior_reader(view.name) if prior_reader is not None else None
+        combined = view_depth(view, depth_np, prior, None, (), settings, device=device)
+        if combined is None:
+            continue
+        depth, weight = combined
+        h, w = depth.shape
+        rotation = torch.as_tensor(view.rotation, dtype=torch.float32, device=device)
+        translation = torch.as_tensor(view.translation, dtype=torch.float32, device=device)
+        local = pts @ rotation.T + translation
+        z = local[:, 2]
+        u = (view.fx * local[:, 0] / z + view.cx) * (w / view.width)
+        v = (view.fy * local[:, 1] / z + view.cy) * (h / view.height)
+        index = torch.nonzero((z > 0.1) & (u >= 0) & (u < w) & (v >= 0) & (v < h), as_tuple=False).squeeze(1)
+        if not len(index):
+            continue
+        pixel_v, pixel_u = v[index].long(), u[index].long()
+        measured = depth[pixel_v, pixel_u]
+        zz = z[index]
+        tolerance = margin_abs + margin_rel * zz
+        from_prior = weight[pixel_v, pixel_u] < float(settings["geometric_weight"])
+        supports = (measured > 0) & (((measured - zz).abs() <= tolerance) | (from_prior & (measured >= zz - tolerance)))
+        hashed = ((row_id[index] * 2654435761 + (number + 1) * 40503) % 65536).float() / 65536.0
+        index = index[supports & (hashed < quota[index])]
+        camera = torch.as_tensor(view.center, dtype=torch.float32, device=device)
+        for start in range(0, len(index), chunk):
+            part = index[start:start + chunk]
+            stopped = _march_blocked(grid, origin, voxel, dims, pts[part], camera[None, :].expand(len(part), 3), config)
+            blocked[part[stopped]] += 1
+            clear[part[~stopped]] += 1
+    gone = ((clear == 0) & (blocked >= int(config["min_false"]))).cpu().numpy()
+    remove[rows[gone]] = True
+    stats["raymarch_removed"] = int(remove.sum())
+    return remove, stats
 
 
 def unseen_wall_mask(plane_index: np.ndarray, seen: np.ndarray, min_seen: float) -> tuple[np.ndarray, list[int]]:
@@ -1095,6 +1490,35 @@ def sparse_point_mask(points: np.ndarray, settings: dict[str, Any], device: str 
 # ----------------------------------------------------------------------------- entry point
 
 
+def derive_units_per_metre(z: np.ndarray, labels: np.ndarray, class_ids: dict[str, int],
+                           nominal_storey_height_m: float = 2.5) -> dict[str, Any]:
+    """Local units per metre of an unscaled indoor project from the storey height (floor vs ceiling class).
+
+    ``z`` are the point heights, ``labels`` their class ids. Median floor and ceiling heights give the
+    storey height in local units; a standard storey (``nominal_storey_height_m``, default 2.5 m) turns it
+    into a scale (the ortho plan uses the same approximation, ``ortho/plan.py _indoor_scale_and_bands``).
+    Fallback 1.0 without both classes or when the result is implausible (outside 0.3..3).
+    """
+    fallback = {"units_per_metre": 1.0, "source": "fallback"}
+    floor_id, ceiling_id = class_ids.get("floor"), class_ids.get("ceiling")
+    if floor_id is None or ceiling_id is None or not len(z):
+        return fallback
+    floor = z[labels == floor_id]
+    ceiling = z[labels == ceiling_id]
+    if len(floor) < 1000 or len(ceiling) < 1000:
+        return fallback
+    floor_z = float(np.median(floor))
+    above = ceiling[ceiling > floor_z]
+    if len(above) < 1000:
+        return fallback
+    height = float(np.median(above)) - floor_z
+    unit = height / float(nominal_storey_height_m)
+    if not (0.3 <= unit <= 3.0):
+        return fallback
+    return {"units_per_metre": round(unit, 4), "source": "storey_height", "storey_height_local": round(height, 4),
+            "nominal_storey_height_m": float(nominal_storey_height_m)}
+
+
 def _class_ids(class_names: list[str] | None) -> dict[str, int]:
     short = [name.split(",", 1)[0].strip().lower() for name in (class_names or [])]
     return {name: index + 1 for index, name in enumerate(short)}
@@ -1111,6 +1535,7 @@ def consolidate_classified_cloud(
     labels_dir: Path | None = None,
     class_names: list[str] | None = None,
     progress: Callable[[int, int], None] | None = None,
+    mirrors: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Fuse all depth maps into a TSDF and rewrite the classified cloud as one surface layer (in place)."""
     started = time.perf_counter()
@@ -1129,6 +1554,35 @@ def consolidate_classified_cloud(
     points = np.column_stack((vertex["x"], vertex["y"], vertex["z"])).astype(np.float64)
     if not len(points):
         return {"enabled": True, "reason": "empty cloud"}
+    input_point_count = len(points)
+    source_indices = np.arange(len(points))
+    mirror_settings = {
+        **settings.get("mirror_filter", {}),
+        "depth_edge_filter": settings.get("depth_edge_filter", {}),
+        "units_per_metre": settings.get("units_per_metre", 1.0),
+        "visibility_margin_m": settings.get("visibility_margin_m", 0.03),
+        "visibility_margin_rel": settings.get("visibility_margin_rel", 0.01),
+        "max_geometric_depth": settings.get("max_geometric_depth", np.inf),
+    }
+    supplied_mirrors = mirrors is not None
+    mirrors = [] if mirrors is None else mirrors
+    mirror_masks: dict[str, np.ndarray] = {}
+    mirror_planes: dict[str, Any] = {}
+    removed_by_mirror = np.zeros(len(points), dtype=bool)
+    if bool(mirror_settings.get("enabled", True)):
+        from samcloud.colmap.mirror_filter import detect_mirrors, mirror_report, phantom_mask
+
+        if not supplied_mirrors:
+            mirrors = detect_mirrors(views, stereo_dir, dense_dir / "sam_mirror", mirror_settings, labels_dir)
+        for mirror in mirrors:
+            for name, mask in mirror.masks.items():
+                mirror_masks[name] = mask if name not in mirror_masks else (mirror_masks[name] | mask)
+                mirror_planes.setdefault(name, mirror)
+        if mirrors:
+            removed_by_mirror = phantom_mask(points, mirrors, views, stereo_dir, mirror_settings,
+                                             masks_dir=dense_dir / "sam_mirror")
+            keep = ~removed_by_mirror
+            vertex, points, source_indices = vertex[keep], points[keep], source_indices[keep]
     mode = str(settings.get("mode", "extract"))
     ids = _class_ids(class_names)
     excluded = tuple(ids[n.lower()] for n in settings.get("exclude_classes") or [] if n.lower() in ids)
@@ -1155,14 +1609,23 @@ def consolidate_classified_cloud(
     origin, voxel, dims = grid_for_points(points, settings)
     tsdf = Tsdf(origin, voxel, dims, float(settings["truncation_m"]), device, attributes=(mode == "extract"))
     lap('setup')
+    depth_filter_report: dict[str, int] = {}
     used = fuse_views(views, stereo_dir, prior_reader, tsdf, settings, label_reader=read_labels,
-                      image_reader=read_image, excluded=excluded, progress=progress)
+                      image_reader=read_image, excluded=excluded, mirror_masks=mirror_masks,
+                      mirror_planes=mirror_planes, progress=progress, depth_filter_report=depth_filter_report)
     report: dict[str, Any] = {
         "enabled": True, "mode": mode,
         "settings": {key: settings[key] for key in DEFAULTS if key != "enabled"},
         "voxel_m": voxel, "grid": list(dims), "device": device, "views_fused": used,
-        "excluded_label_ids": list(excluded), "original_points": int(len(points)),
+        "excluded_label_ids": list(excluded), "original_points": int(input_point_count),
+        "depth_edge_filter": {"dropped_pixels": depth_filter_report.get("dropped", 0),
+                              "valid_pixels": depth_filter_report.get("valid", 0),
+                              "dropped_share": depth_filter_report.get("dropped", 0) / max(depth_filter_report.get("valid", 0), 1)},
     }
+    if mirrors:
+        report.update(mirror_report(mirrors, removed_by_mirror))
+    else:
+        report.update({"mirrors": [], "mirror_points_removed": 0})
     template = vertex[:0]
     if mode == "extract":
         xyz, rgb, lab = tsdf.extract(float(settings["min_weight"]))
@@ -1182,12 +1645,13 @@ def consolidate_classified_cloud(
         del tsdf
         if device == "cuda":
             torch.cuda.empty_cache()
-        selected = dedupe_first(xyz, keep, float(settings["dedupe_m"]))
+        selected = source_indices[dedupe_first(xyz, keep, float(settings["dedupe_m"]))]
         report.update(stats)
         rgb = np.column_stack((vertex["red"], vertex["green"], vertex["blue"])) if "red" in vertex.dtype.names else None
         lab = np.asarray(vertex["scalar_class"]) if "scalar_class" in vertex.dtype.names else np.zeros(len(points), np.uint8)
-        xyz, lab, normals = xyz[selected], lab[selected], normals[selected]
-        rgb = rgb[selected] if rgb is not None else np.full((len(selected), 3), 200, np.uint8)
+        selected_local = np.searchsorted(source_indices, selected)
+        xyz, lab, normals = xyz[selected_local], lab[selected_local], normals[selected_local]
+        rgb = rgb[selected_local] if rgb is not None else np.full((len(selected), 3), 200, np.uint8)
     lap('snap')
     if settings.get("visibility_check", True):
         visible, vis_stats = visibility_mask(xyz, views, stereo_dir, settings, device=device)
@@ -1204,18 +1668,58 @@ def consolidate_classified_cloud(
         xyz, rgb, lab, selected = xyz[inside], rgb[inside], lab[inside], selected[inside]
         wall_index = wall_index[inside]
     lap('planes')
+    seen = None
     if settings.get("visibility_check", True) and settings.get("plane_classes"):
         # again at the final positions: a plane in front of the real wall is seen through as well,
         # and a plane behind it is seen by (almost) no camera at all
+        evidence: dict[str, np.ndarray] = {}
         visible, vis_stats, seen = visibility_mask(xyz, views, stereo_dir, settings, device=device,
-                                                   prior_reader=prior_reader, count_seen=True)
+                                                   prior_reader=prior_reader, count_seen=True, evidence=evidence)
         report["removed_visibility_after_planes"] = vis_stats["removed_visibility"]
         report["removed_hidden"] = vis_stats["removed_hidden"]
+        report["removed_unconfirmed"] = vis_stats["removed_unconfirmed"]
         seen_walls, unseen = unseen_wall_mask(wall_index, seen, float(settings["wall_min_seen_views"]))
         report["removed_unseen_walls"] = {"planes": unseen, "points": int((~seen_walls).sum())}
         visible &= seen_walls
         xyz, rgb, lab, selected = xyz[visible], rgb[visible], lab[visible], selected[visible]
+        wall_index, seen = wall_index[visible], seen[visible]
+        evidence = {name: values[visible] for name, values in evidence.items()}
+        marched, march_stats = raymarch_mask(xyz, lab, ids, views, stereo_dir, settings, evidence, device=device,
+                                             prior_reader=prior_reader)
+        report.update(march_stats)
+        if marched.any():
+            keep_march = ~marched
+            xyz, rgb, lab, selected = xyz[keep_march], rgb[keep_march], lab[keep_march], selected[keep_march]
+            wall_index, seen = wall_index[keep_march], seen[keep_march]
     lap('visibility_after_planes')
+    if settings.get("plane_classes"):
+        from samcloud.colmap.behind_wall import behind_wall_mask
+
+        fine_terms = None
+        fine_labels = None
+        if scores_path is not None:
+            # Fine terms are snapshotted before step 6.  ``selected`` still maps
+            # every surviving snap-mode point to that source cloud, so no nearest
+            # neighbour transfer (and no semantic drift) is needed here.
+            from samcloud.engine.fine_terms import SOURCE_NAME
+
+            source_path = Path(scores_path).with_name(SOURCE_NAME)
+            if mode != "extract" and source_path.is_file():
+                with np.load(source_path) as archive:
+                    source_terms = np.asarray(archive.get("fine_term", ()), dtype=np.uint8)
+                    source_labels = archive.get("fine_labels")
+                if len(source_terms) == input_point_count and source_labels is not None and len(selected):
+                    fine_terms = source_terms[selected]
+                    fine_labels = [str(value) for value in source_labels.tolist()]
+        behind_keep, behind_stats = behind_wall_mask(xyz, lab, wall_index, report["planes"], views, stereo_dir, settings,
+                                                      mirrors=mirrors, class_ids=ids, seen=seen, fine_terms=fine_terms,
+                                                      fine_labels=fine_labels, device=device)
+        report.update(behind_stats)
+        xyz, rgb, lab, selected = xyz[behind_keep], rgb[behind_keep], lab[behind_keep], selected[behind_keep]
+        wall_index = wall_index[behind_keep]
+    else:
+        report.update({"behind_wall_removed": 0, "behind_wall_planes": []})
+    lap('behind_wall')
     if settings.get("class_coherence", True):
         lab, coherent, class_stats = class_coherence(xyz, lab, ids, settings, device=device)
         report.update(class_stats)
@@ -1244,7 +1748,10 @@ def consolidate_classified_cloud(
         else:
             with np.load(scores_path) as archive:
                 arrays = {name: archive[name] for name in archive.files}
-            if all(len(values) == len(points) for values in arrays.values()):
+            # ``selected`` always indexes the original classified cloud. Mirror
+            # removal happens before snapping, so checking the shortened cloud
+            # here would silently leave every score array out of sync.
+            if all(len(values) == input_point_count for values in arrays.values()):
                 np.savez(scores_path, **{name: values[selected] for name, values in arrays.items()})
                 report["scores_filtered"] = True
     lap('write')

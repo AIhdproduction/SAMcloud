@@ -10,10 +10,12 @@ from samcloud.classification.profiles import NEVER_CLASSIFIED_ID
 
 if __package__:
     from .colmap_model import load_model
+    from .fine_terms import build_fine_vocabulary, mask_removed_class_votes, resolve_fine_terms
     from .ply_io import read_fused_points, read_vis_file, write_classified_ply
     from .sam_labeler import HeadFusionLabeler, SemanticLabeler
 else:
     from colmap_model import load_model
+    from fine_terms import build_fine_vocabulary, mask_removed_class_votes, resolve_fine_terms
     from ply_io import read_fused_points, read_vis_file, write_classified_ply
     from sam_labeler import HeadFusionLabeler, SemanticLabeler
 
@@ -154,21 +156,130 @@ def extract_top2_confidences(scores, view_counts, final_class, chunk_size=1_000_
     return top1_class, top1_conf, top2_class, top2_conf
 
 
-def save_score_summary(path, scores, view_counts, final_class):
-    """Write compact SAM confidence arrays for the main threshold accumulator."""
+def save_score_summary(path, scores, view_counts, final_class, suppressed=None, protected_clutter=None,
+                       fine_term=None, fine_conf=None, fine_labels=None):
+    """Write compact SAM confidence arrays for the main threshold accumulator.
+
+    ``fine_term`` / ``fine_conf`` / ``fine_labels`` (optional) carry the winning fine SAM term per point
+    (0 = none, 1..F = index into ``fine_labels`` + 1) and the canonical label vocabulary.
+    """
     top1_class, top1_conf, top2_class, top2_conf = extract_top2_confidences(
         scores, view_counts, final_class
     )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        path,
-        top1_class=top1_class,
-        top1_conf=top1_conf,
-        top2_class=top2_class,
-        top2_conf=top2_conf,
-        view_count=view_counts.astype(np.uint16, copy=False),
-    )
+    arrays = {
+        "top1_class": top1_class,
+        "top1_conf": top1_conf,
+        "top2_class": top2_class,
+        "top2_conf": top2_conf,
+        "view_count": view_counts.astype(np.uint16, copy=False),
+    }
+    if suppressed is not None:
+        suppressed = np.asarray(suppressed, dtype=bool)
+        if len(suppressed) != len(final_class):
+            raise ValueError("suppressed must have one value per final class")
+        arrays["suppressed"] = suppressed
+    if protected_clutter is not None:
+        protected_clutter = np.asarray(protected_clutter, dtype=bool)
+        if len(protected_clutter) != len(final_class):
+            raise ValueError("protected_clutter must have one value per final class")
+        arrays["protected_clutter"] = protected_clutter
+    if fine_term is not None:
+        fine_term = np.asarray(fine_term, dtype=np.uint8)
+        if len(fine_term) != len(final_class) or fine_labels is None:
+            raise ValueError("fine_term needs one value per final class and a fine_labels vocabulary")
+        arrays["fine_term"] = fine_term
+        arrays["fine_conf"] = (np.zeros(len(fine_term), dtype=np.float16) if fine_conf is None
+                               else np.asarray(fine_conf, dtype=np.float16))
+        arrays["fine_labels"] = np.asarray([str(label) for label in fine_labels])
+    np.savez(path, **arrays)
+
+
+def suppression_queries(config, class_set):
+    """Return internal SAM3 query names and prompts for classes suppressed to Unknown."""
+    names, prompts = [], []
+    suppress = config.get("suppress")
+    if suppress is None:
+        fallback = Path(__file__).resolve().parents[2] / "config" / "classes.json"
+        try:
+            suppress = json.loads(fallback.read_text(encoding="utf-8")).get("suppress", {})
+        except (OSError, json.JSONDecodeError):
+            suppress = {}
+    for entry in suppress.get(class_set, []) or []:
+        values = [value.strip() for value in str(entry).split(",") if value.strip()]
+        if values:
+            names.append(values[0])
+            prompts.append(values)
+    return names, prompts
+
+
+def internal_queries(config, key, class_set):
+    """Return internal SAM query names and prompt groups from a classes.json section."""
+    names, prompts = [], []
+    entries = config.get(key)
+    if entries is None:
+        fallback = Path(__file__).resolve().parents[2] / "config" / "classes.json"
+        try:
+            entries = json.loads(fallback.read_text(encoding="utf-8")).get(key, {})
+        except (OSError, json.JSONDecodeError):
+            entries = {}
+    values = entries.get(class_set, []) if isinstance(entries, dict) else []
+    for entry in values or []:
+        group = [value.strip() for value in str(entry).split(",") if value.strip()]
+        if group:
+            names.append(group[0])
+            prompts.append(group)
+    return names, prompts
+
+
+def mirror_queries(config, class_set):
+    """Return mirror-only SAM queries; their winners retain a non-mirror class."""
+    return internal_queries(config, "mirror", class_set)
+
+
+def clothing_protection_queries(class_set):
+    """Return indoor clothing queries whose winning points must remain loose clutter."""
+    if class_set != "indoor":
+        return [], []
+    prompts = ["pile of clothes", "laundry", "folded clothes", "garment", "t-shirt", "towel"]
+    return ["protected clothing"], [prompts]
+
+
+def map_suppressed_winners(class_ids, suppress_ids, unknown_id=0):
+    """Map internal suppress-query winners to Unknown and return their marker."""
+    class_ids = np.asarray(class_ids, dtype=np.uint8)
+    suppressed = np.isin(class_ids, np.asarray(sorted(suppress_ids), dtype=np.uint8))
+    mapped = class_ids.copy()
+    mapped[suppressed] = np.uint8(unknown_id)
+    return mapped, suppressed
+
+
+def map_internal_winners(class_ids, mirror_ids, suppress_ids, protected_ids, unknown_id=0):
+    """Map internal query winners while retaining markers used by later pipeline stages."""
+    mapped, suppressed = map_suppressed_winners(class_ids, suppress_ids, unknown_id)
+    class_ids = np.asarray(class_ids, dtype=np.uint8)
+    mirror = np.isin(class_ids, np.asarray(sorted(mirror_ids), dtype=np.uint8)) if mirror_ids else np.zeros(len(class_ids), bool)
+    protected = np.isin(class_ids, np.asarray(sorted(protected_ids), dtype=np.uint8)) if protected_ids else np.zeros(len(class_ids), bool)
+    mapped[mirror] = np.uint8(unknown_id)
+    mapped[protected] = np.uint8(1)  # indoor loose clutter is the first stable class
+    return mapped, suppressed, mirror, protected
+
+
+def replace_mirror_point_winners(point_probs, mirror_ids, protected_ids):
+    """Remove mirror-only queries and map clothing-only queries to loose clutter votes in-place."""
+    if point_probs.size == 0:
+        return np.zeros(0, dtype=bool)
+    winners = point_probs.argmax(axis=1) + 1
+    mirror = np.isin(winners, np.asarray(sorted(mirror_ids), dtype=np.intp)) if mirror_ids else np.zeros(len(winners), bool)
+    protected = np.isin(winners, np.asarray(sorted(protected_ids), dtype=np.intp)) if protected_ids else np.zeros(len(winners), bool)
+    if protected_ids:
+        columns = np.asarray(sorted(protected_ids), dtype=np.intp) - 1
+        point_probs[:, 0] = np.maximum(point_probs[:, 0], point_probs[:, columns].max(axis=1))
+        point_probs[:, columns] = 0.0
+    if mirror_ids:
+        point_probs[:, np.asarray(sorted(mirror_ids), dtype=np.intp) - 1] = 0.0
+    return protected
 
 
 DEPTH_CHECK_DEFAULTS = {"radius": 16, "step": 4, "abs_tol": 0.05, "rel_tol": 0.03, "min_neighbors": 3}
@@ -330,6 +441,16 @@ def save_label_raster(labels_dir, image_name, labels):
         raise RuntimeError(f"Could not write label raster {path}")
 
 
+def save_mirror_raster(labels_dir, image_name, mirror_mask):
+    """Store one view's binary SAM mirror raster next to the class label rasters."""
+    import cv2
+
+    path = Path(labels_dir).parent / "sam_mirror" / f"{image_name}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), np.where(mirror_mask, 255, 0).astype(np.uint8)):
+        raise RuntimeError(f"Could not write mirror raster {path}")
+
+
 def parse_threshold_sweep(value):
     """Parse a comma-separated background-threshold list."""
     if not value:
@@ -350,7 +471,7 @@ def _class_counts(final_class, class_names):
     }
 
 
-def make_point_labeler(args, class_names, unknown_id, prompts=None):
+def make_point_labeler(args, class_names, unknown_id, prompts=None, fine_vocabulary=None):
     """Point scorer of the selected engine: SAM3 head fusion or the FlurSeg model (outdoor only)."""
     if getattr(args, "engine", "sam3") == "flurseg":
         if __package__:
@@ -366,17 +487,48 @@ def make_point_labeler(args, class_names, unknown_id, prompts=None):
         min_overlap_frac=args.tile_min_overlap,
         query_threshold=args.query_threshold,
         prompts=prompts,
+        fine_queries=fine_vocabulary.queries if fine_vocabulary is not None else None,
     )
 
 
 def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
-                     prompts=None):
-    """Classify with SegEarth-OV3 fusion and class-weighted 3D voting."""
+                     prompts=None, suppress_names=None, suppress_prompts=None,
+                     mirror_names=None, mirror_prompts=None, protected_names=None, protected_prompts=None,
+                     fine_config=None, fine_vocabulary=None):
+    """Classify with SegEarth-OV3 fusion and class-weighted 3D voting.
+
+    ``fine_config`` (the classes.json mapping) or a ready ``fine_vocabulary`` switches on the per-point fine
+    term vote: the scores of the fine SAM queries are voted like the class scores and the winner is stored
+    in the scores file (``fine_term`` / ``fine_conf`` / ``fine_labels``). Class results are unaffected.
+    """
     thresholds = [args.background_threshold]
     for threshold in parse_threshold_sweep(args.threshold_sweep):
         if threshold not in thresholds:
             thresholds.append(threshold)
-    num_classes = len(class_names)
+    suppress_names = list(suppress_names or [])
+    mirror_names = list(mirror_names or [])
+    protected_names = list(protected_names or [])
+    query_class_names = [*class_names, *suppress_names, *mirror_names, *protected_names]
+    suppress_ids = set(range(len(class_names) + 1, len(class_names) + len(suppress_names) + 1))
+    mirror_start = len(class_names) + len(suppress_names) + 1
+    mirror_ids = set(range(mirror_start, mirror_start + len(mirror_names)))
+    protected_start = mirror_start + len(mirror_names)
+    protected_ids = set(range(protected_start, protected_start + len(protected_names)))
+    query_prompts = prompts
+    if suppress_names or mirror_names or protected_names:
+        query_prompts = [*(list(prompts) if prompts is not None else class_names),
+                         *(suppress_prompts or suppress_names), *(mirror_prompts or mirror_names),
+                         *(protected_prompts or protected_names)]
+    if (fine_vocabulary is None and fine_config is not None and query_prompts is not None
+            and getattr(args, "engine", "sam3") == "sam3"):
+        fine_vocabulary = build_fine_vocabulary(fine_config, args.class_set, query_prompts)
+    fine_size = fine_vocabulary.size if fine_vocabulary is not None else 0
+    fine_scores = fine_counts = None
+    if fine_size:
+        fine_scores = np.zeros((xyz.shape[0], fine_size), dtype=np.float32)
+        fine_counts = np.zeros(xyz.shape[0], dtype=np.uint16)
+        print(f"      Fine terms: {fine_size} labels, {fine_scores.nbytes / 1024 ** 2:.1f} MiB accumulator")
+    num_classes = len(query_class_names)
     bytes_per_threshold = xyz.shape[0] * (num_classes * np.dtype(np.float32).itemsize + np.dtype(np.uint16).itemsize)
     print(
         "      SegEarth-OV3 accumulator memory: "
@@ -391,11 +543,13 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         )
         for threshold in thresholds
     }
-    labeler = make_point_labeler(args, class_names, unknown_id, prompts)
+    labeler = make_point_labeler(args, query_class_names, unknown_id, query_prompts,
+                                 **({"fine_vocabulary": fine_vocabulary} if fine_size else {}))
 
     depth_check = bool(getattr(args, "depth_check", 1))
     depth_stats = {"checked": 0, "class_removed": 0, "occluded": 0, "raster_pixels_moved": 0}
     depth_settings = {"abs_tol": getattr(args, "depth_check_abs", 0.05), "rel_tol": getattr(args, "depth_check_rel", 0.03)}
+    protected_clutter = np.zeros(len(xyz), dtype=bool)
     write_progress(progress_path, 0, len(image_items))
     for processed, (img_id, listed_points) in enumerate(tqdm(image_items, desc="images"), start=1):
         image = images[img_id]
@@ -407,24 +561,44 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         )
         if len(sel_points):
             depth = read_depth_map(args.dense_dir, image.name) if depth_check else None
+            term_probs = np.zeros((len(sel_points), fine_size), dtype=np.float32) if fine_size else None
+            fine_kwargs = {"fine_scores_out": term_probs} if fine_size else {}
             if args.labels_dir or depth is not None:
-                point_probs, labels = labeler.score_points(
-                    image_path, ui, vi, image=image_pixels, label_threshold=args.background_threshold
+                result = labeler.score_points(
+                    image_path, ui, vi, image=image_pixels, label_threshold=args.background_threshold,
+                    label_exclude_ids=mirror_ids, return_raw_labels=True, **fine_kwargs,
                 )
+                if len(result) == 3:
+                    point_probs, labels, raw_labels = result
+                else:  # Compatibility with focused test doubles and older labelers.
+                    point_probs, raw_labels = result
+                    labels, _suppressed, _mirror, _protected = map_internal_winners(
+                        raw_labels, mirror_ids, suppress_ids, protected_ids, unknown_id
+                    )
                 if depth is not None:  # class edges onto the depth edges (raster, then the points)
-                    labels, changed = refine_labels_with_depth(labels, depth, depth_settings, len(class_names) + 1)
+                    labels, changed = refine_labels_with_depth(labels, depth, depth_settings, len(query_class_names) + 1)
                     depth_stats["raster_pixels_moved"] += changed
                 if args.labels_dir:
-                    save_label_raster(args.labels_dir, image.name, labels)
+                    mirror_mask = np.isin(raw_labels, np.asarray(sorted(mirror_ids), dtype=np.uint8)) if mirror_ids else np.zeros(labels.shape, bool)
+                    saved_labels, _saved_suppressed, _saved_mirror, _saved_protected = map_internal_winners(
+                        labels, mirror_ids, suppress_ids, protected_ids, unknown_id
+                    )
+                    save_label_raster(args.labels_dir, image.name, saved_labels)
+                    save_mirror_raster(args.labels_dir, image.name, mirror_mask)
+                protected_clutter[sel_points] |= replace_mirror_point_winners(point_probs, mirror_ids, protected_ids)
                 if depth is not None:
                     view_stats = depth_consistent_probs(point_probs, ui, vi, z, labels, depth,
                                                         args.background_threshold, depth_settings)
                     for key, value in view_stats.items():
                         depth_stats[key] += value
             else:
-                point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels)
+                point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels, **fine_kwargs)
+                protected_clutter[sel_points] |= replace_mirror_point_winners(point_probs, mirror_ids, protected_ids)
             for threshold, (scores, view_counts, seen_counts) in vote_states.items():
                 accumulate_weighted_votes(scores, view_counts, sel_points, point_probs, threshold, seen_counts)
+            if fine_size:  # same weighted vote and threshold, only for terms whose class kept its vote in this view
+                mask_removed_class_votes(term_probs, point_probs, fine_vocabulary.owner_class)
+                accumulate_weighted_votes(fine_scores, fine_counts, sel_points, term_probs, args.background_threshold)
         write_progress(progress_path, processed, len(image_items))
 
     if depth_check:
@@ -435,11 +609,16 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
     output_path = Path(args.out)
     threshold_summary = {}
     main_final_class = None
+    main_suppressed = None
     for threshold, (scores, view_counts, seen_counts) in vote_states.items():
-        final_class = resolve_weighted_votes(scores, view_counts, args.min_votes, unknown_id, seen_counts, NEVER_CLASSIFIED_ID)
+        query_final_class = resolve_weighted_votes(scores, view_counts, args.min_votes, unknown_id, seen_counts, NEVER_CLASSIFIED_ID)
+        final_class, suppressed, _mirror, _protected = map_internal_winners(
+            query_final_class, mirror_ids, suppress_ids, protected_ids, unknown_id
+        )
         if threshold == args.background_threshold:
             destination = output_path
             main_final_class = final_class
+            main_suppressed = suppressed
         else:
             destination = output_path.with_name(f"{output_path.stem}_tau{threshold:.2f}{output_path.suffix}")
         write_classified_ply(destination, xyz, rgb, final_class)
@@ -451,7 +630,13 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
 
     if args.scores_out:
         main_scores, main_view_counts, _main_seen_counts = vote_states[args.background_threshold]
-        save_score_summary(args.scores_out, main_scores, main_view_counts, main_final_class)
+        fine_term = fine_conf = None
+        if fine_size:
+            fine_term, fine_conf = resolve_fine_terms(fine_scores, fine_counts, args.background_threshold)
+            print(f"      Fine terms: {int(np.count_nonzero(fine_term)):,} of {len(fine_term):,} points labelled")
+        save_score_summary(args.scores_out, main_scores, main_view_counts, main_final_class, main_suppressed,
+                           protected_clutter, fine_term=fine_term, fine_conf=fine_conf,
+                           fine_labels=fine_vocabulary.labels if fine_size else None)
         print(f"SAM confidence scores written to {args.scores_out}")
 
     class_counts = _class_counts(main_final_class, class_names)
@@ -546,6 +731,9 @@ def main():
     if prompts is not None and len(prompts) != len(class_names):
         sys.exit(f"classes.json: prompts.{args.class_set} must list one prompt per class ({len(class_names)})")
     unknown_id = cfg.get("unknown_class_id", 0)
+    suppress_names, suppress_prompts = ([], []) if args.engine == "flurseg" else suppression_queries(cfg, args.class_set)
+    mirror_names, mirror_prompts = ([], []) if args.engine == "flurseg" else mirror_queries(cfg, args.class_set)
+    protected_names, protected_prompts = ([], []) if args.engine == "flurseg" else clothing_protection_queries(args.class_set)
 
     print(f"[1/5] Loading dense point cloud from {dense_dir / 'fused.ply'}")
     xyz, rgb = read_fused_points(dense_dir / "fused.ply")
@@ -575,7 +763,10 @@ def main():
     if args.mode == "segearth_ov3" or args.engine == "flurseg":
         run_segearth_ov3(
             args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
-            prompts=prompts,
+            prompts=prompts, suppress_names=suppress_names, suppress_prompts=suppress_prompts,
+            mirror_names=mirror_names, mirror_prompts=mirror_prompts,
+            protected_names=protected_names, protected_prompts=protected_prompts,
+            fine_config=cfg,
         )
         return
 

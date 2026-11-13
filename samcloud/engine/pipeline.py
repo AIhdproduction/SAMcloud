@@ -1,10 +1,13 @@
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +41,7 @@ from samcloud.core.configuration import load_global_config
 from samcloud.core.project_manager import ProjectManager
 from samcloud.core.storage import compact_project, ensure_available, ensure_text_model, release_after_fusion, remove_generated, storage_settings
 from samcloud.engine.run_summary import RunSummary
+from samcloud.engine.fine_terms import LABELS_NAME, SOURCE_NAME, attach_fine_terms, snapshot_fine_terms
 from samcloud.engine.extract_gps import is_dji_rtk_project
 from samcloud.control_points.georeference import coordinates_to_ecef, enu_rotation_at_ecef, georeference_from_control_points, save_control_point_report
 from samcloud.control_points.model_transform import transform_text_model
@@ -192,6 +196,8 @@ def _build_estimator(
             plan.append(("surface_fusion", num_images))
         if _plane_fill_settings(args) is not None:
             plan.append(("plane_fill", num_images))
+        if _superpoint_vote_settings(args) is not None:
+            plan.append(("superpoint_vote", num_images))
         if args.geometry_refinement == "1":
             plan.append(("geometry_refinement", num_images))
     return ProgressEstimator(
@@ -1209,6 +1215,14 @@ def _surface_fusion_settings(args) -> dict | None:
     return settings if bool(settings.get("enabled", False)) else None
 
 
+def _superpoint_vote_settings(args) -> dict | None:
+    """Final geometry-aware semantic vote, enabled only for indoor SAM3 clouds."""
+    if getattr(args, "class_set", None) != "indoor":
+        return None
+    settings = _dense_settings(args)["superpoint_vote"]
+    return settings if bool(settings.get("enabled", False)) else None
+
+
 def _fusion_rebuilds_cloud(args) -> bool:
     settings = _surface_fusion_settings(args)
     return settings is not None and str(settings.get("mode", "extract")) == "extract"
@@ -1253,9 +1267,47 @@ def _estimator_progress(progress: "ProgressTracker | None"):
     return report
 
 
+def _resolve_units_per_metre(args, dense_dir: Path, classified_raw: Path, fill_settings: dict | None,
+                             fusion: dict | None, summary: RunSummary):
+    """Set ``units_per_metre`` of depth fill and surface fusion (``auto`` = from the storey height).
+
+    Unscaled indoor projects (no georeference) take floor/ceiling heights against a standard storey;
+    georeferenced projects keep 1.0. A number in the config overrides.
+    """
+    wanted = [item for item in (fill_settings, fusion) if item is not None]
+    if not wanted:
+        return fill_settings, fusion
+    setting = next((item.get("units_per_metre", "auto") for item in wanted), "auto")
+    if isinstance(setting, str) and setting.lower() == "auto":
+        outdir = dense_dir.parent
+        info: dict = {"units_per_metre": 1.0, "source": "georeferenced"}
+        if not ((outdir / "georeference.json").is_file() or (outdir / "gps_ref.txt").is_file()):
+            try:
+                from samcloud.colmap.surface_fusion import derive_units_per_metre
+                from samcloud.engine.ply_io import read_vertex_array
+
+                names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
+                short = [name.split(",", 1)[0].strip().lower() for name in names]
+                ids = {name: short.index(name) + 1 for name in ("floor", "ceiling") if name in short}
+                vertex = read_vertex_array(classified_raw)
+                info = derive_units_per_metre(np.asarray(vertex["z"], dtype=np.float64), np.asarray(vertex["scalar_class"]),
+                                              ids, float(wanted[0].get("nominal_storey_height_m", 2.5)))
+            except Exception as error:  # noqa: BLE001 - metric units stay valid
+                info = {"units_per_metre": 1.0, "source": "error", "error": str(error)}
+        print(f"Project scale: {info['units_per_metre']} units per metre ({info.get('source')}).")
+    else:
+        info = {"units_per_metre": float(setting), "source": "config"}
+    summary.settings["units_per_metre"] = info
+    unit = float(info["units_per_metre"])
+    fill_settings = None if fill_settings is None else {**fill_settings, "units_per_metre": unit}
+    fusion = None if fusion is None else {**fusion, "units_per_metre": unit}
+    return fill_settings, fusion
+
+
 def _refine_after_classification(
     args, dense_dir: Path, classified_raw: Path, scores_path: Path, summary: RunSummary,
-    progress: "ProgressTracker | None" = None, *, keep_caches: bool = False, reuse_priors: bool = False,
+    progress: "ProgressTracker | None" = None, *, report_dir: Path | None = None,
+    keep_caches: bool = False, reuse_priors: bool = False,
 ) -> None:
     """Workflow step 6 "Verbessern & filtern" (before the geometric refinement).
 
@@ -1273,6 +1325,10 @@ def _refine_after_classification(
 
     if progress:
         progress.update(93, "Improving and filtering")
+    try:  # step 6 keeps the score file row-aligned; the fine terms wait in a snapshot (see fine_terms.py)
+        snapshot_fine_terms(classified_raw, scores_path)
+    except Exception as error:  # noqa: BLE001 - the classification itself stays valid without fine terms
+        print(f"WARNING: Fine terms could not be set aside for step 6: {error}")
     scores = scores_path if scores_path.is_file() else None
     has_depth = (dense_dir / "stereo" / "depth_maps").is_dir()
     views = None
@@ -1314,6 +1370,28 @@ def _refine_after_classification(
                     save_depth_priors(dense_dir.parent.parent, dense_dir)
     labels_dir = dense_dir / "sam_labels"
     fill_settings = _depth_fill_settings(args)
+    fusion = _surface_fusion_settings(args)
+    fill_settings, fusion = _resolve_units_per_metre(args, dense_dir, classified_raw, fill_settings, fusion, summary)
+    mirrors = []
+    if views is not None and (fill_settings is not None or fusion is not None):
+        from samcloud.colmap.mirror_filter import detect_mirrors
+        from samcloud.colmap.surface_fusion import DEFAULTS as FUSION_DEFAULTS
+
+        active_fusion = fusion or FUSION_DEFAULTS
+        mirror_settings = {**active_fusion.get("mirror_filter", {}),
+                           "depth_edge_filter": active_fusion.get("depth_edge_filter", {}),
+                           "units_per_metre": active_fusion.get("units_per_metre", 1.0)}
+        if bool(mirror_settings.get("enabled", True)):
+            started_at = time.perf_counter()
+            try:
+                mirrors = detect_mirrors(views, dense_dir / "stereo", dense_dir / "sam_mirror", mirror_settings, labels_dir)
+            except Exception as error:  # noqa: BLE001 - depth fill remains available without masks
+                print(f"WARNING: Mirror detection was skipped: {error}")
+                mirrors = []
+            else:
+                summary.record_stage("Mirror detection", time.perf_counter() - started_at)
+        if fill_settings is not None:
+            fill_settings = {**fill_settings, "depth_edge_filter": active_fusion.get("depth_edge_filter", {})}
     if fill_settings is not None and views is not None and priors is not None:
         from samcloud.colmap.depth_fill import fill_classified_from_prior
 
@@ -1324,7 +1402,7 @@ def _refine_after_classification(
             class_names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
             report = fill_classified_from_prior(
                 dense_dir, classified_raw, views, priors, fill_settings, scores_path=scores,
-                labels_dir=labels_dir, progress=_estimator_progress(progress), class_names=class_names,
+                labels_dir=labels_dir, progress=_estimator_progress(progress), class_names=class_names, mirrors=mirrors,
             )
         except Exception as error:  # noqa: BLE001 - the unfilled classification stays valid
             print(f"WARNING: Depth-Anything fill was skipped: {error}")
@@ -1348,7 +1426,6 @@ def _refine_after_classification(
             summary.record_stage("Point cleaning", time.perf_counter() - started_at)
             print(f"Point cleaning removed {report.get('removed_points', 0):,} floating points.")
         summary.settings["point_cleaning"] = report
-    fusion = _surface_fusion_settings(args)
     if fusion is not None and views is not None:
         from samcloud.colmap.surface_fusion import consolidate_classified_cloud
 
@@ -1359,7 +1436,7 @@ def _refine_after_classification(
             class_names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
             report = consolidate_classified_cloud(
                 dense_dir, classified_raw, views, priors, fusion, scores_path=scores,
-                labels_dir=labels_dir, class_names=class_names, progress=_estimator_progress(progress),
+                labels_dir=labels_dir, class_names=class_names, progress=_estimator_progress(progress), mirrors=mirrors,
             )
         except Exception as error:  # noqa: BLE001 - the unfused cloud stays valid
             print(f"WARNING: Surface fusion was skipped: {error}")
@@ -1387,6 +1464,26 @@ def _refine_after_classification(
             summary.record_stage("Plane filling", time.perf_counter() - started_at)
             print(f"Plane filling added {report.get('added_points', 0):,} points (SAM + plane + free space).")
         summary.settings["plane_fill"] = report
+    superpoint = _superpoint_vote_settings(args)
+    if superpoint is not None:
+        from samcloud.colmap.superpoint_vote import vote_classified_cloud
+
+        if progress:
+            progress.begin("superpoint_vote")
+        started_at = time.perf_counter()
+        try:
+            class_names = json.loads(Path(args.classes_json).read_text(encoding="utf-8"))[args.class_set]
+            report = vote_classified_cloud(
+                classified_raw, superpoint, class_names, scores_path=scores,
+                report_dir=report_dir or summary.report_dir, progress=print,
+            )
+        except Exception as error:  # noqa: BLE001 - the pre-vote cloud remains valid
+            print(f"WARNING: Superpoint voting was skipped: {error}")
+            report = {"enabled": True, "error": str(error)}
+        else:
+            summary.record_stage("Superpoint voting", time.perf_counter() - started_at)
+            print(f"Superpoint voting changed {report.get('changed_points', {}).get('count', 0):,} points.")
+        summary.settings["superpoint_vote"] = report
     if keep_caches:  # running on the processing cache itself: never delete it
         return
     if (dense_dir.parent.parent / "project.samcloud.yml").is_file():
@@ -1394,6 +1491,22 @@ def _refine_after_classification(
             if generated.exists():
                 remove_generated(generated, dense_dir.parent)
     _release_fusion_cache(dense_dir, summary)
+
+
+def _attach_fine_terms(args, classified_scores: Path, classified_output: Path, summary: RunSummary) -> None:
+    """Write the per-point fine SAM term into the product PLY (property ``fine_term``) and fine_labels.json."""
+    source = Path(classified_scores).with_name(SOURCE_NAME)
+    if not source.is_file() or not Path(classified_output).is_file():
+        return
+    try:
+        report = attach_fine_terms(source, classified_output, Path(args.classes_json), args.class_set)
+    except Exception as error:  # noqa: BLE001 - the classified cloud stays valid without fine terms
+        print(f"WARNING: Fine terms were not written: {error}")
+        summary.settings["fine_terms"] = {"enabled": True, "error": str(error)}
+        return
+    summary.settings["fine_terms"] = {key: value for key, value in report.items() if key != "labels"}
+    print(f"Fine terms: {report['labelled_points']:,} of {report['points']:,} points carry a fine term "
+          f"({len(report['labels'])} labels, {LABELS_NAME} written next to the PLY).")
 
 
 def _cache_after_sam(args, dense_dir: Path, classified_raw: Path, classified_scores: Path) -> None:
@@ -1450,6 +1563,8 @@ def _refine_from_cache(
             plan.append(("surface_fusion", views))
         if _plane_fill_settings(args) is not None:
             plan.append(("plane_fill", views))
+        if _superpoint_vote_settings(args) is not None:
+            plan.append(("superpoint_vote", views))
         if geometry_enabled:
             plan.append(("geometry_refinement", views))
         progress.estimator = ProgressEstimator(
@@ -1461,7 +1576,7 @@ def _refine_from_cache(
     summary.settings["refined_from_cache"] = manifest.get("created_at")
     print(f"Re-running step 6 from the processing cache of {manifest.get('created_at')}.")
     _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
-                                 keep_caches=True, reuse_priors=True)
+                                 report_dir=report_dir, keep_caches=True, reuse_priors=True)
     georeferenced = (outdir / "georeference.json").is_file()
     _finish_classification(args, outdir, report_dir, summary, progress, classified_raw, classified_scores,
                            classified_output, georeferenced)
@@ -1496,6 +1611,9 @@ def _reclassify_project(
     from samcloud.core.sparse_model import resolve_sparse_model
 
     dense_dir = outdir / "dense"
+    cache_dense = outdir.parent / "processing_cache" / "dense"
+    if not (dense_dir / "fused.ply").exists() and (cache_dense / "fused.ply").is_file():
+        dense_dir = _stage_reclassify_cache(cache_dense)
     for name in ("fused.ply", "fused.ply.vis"):
         _ensure_if_compressed(dense_dir / name)
     missing = [str(path) for path in (dense_dir / "fused.ply", dense_dir / "fused.ply.vis", dense_dir / "sparse")
@@ -1547,12 +1665,47 @@ def _reclassify_project(
     summary.settings["reclassified"] = True
     _classify_and_finish(
         args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, georeferenced,
+        cache_after_sam=False,
     )
+
+
+def _stage_reclassify_cache(cache_dense: Path) -> Path:
+    """Create a disposable read-only-input staging workspace from a processing cache.
+
+    The cached files are only hard-linked as inputs. Files step 6 may produce are
+    deliberately omitted, so SAM and refinement never modify the cache copy.
+    """
+    cache_dense = Path(cache_dense)
+    # ``tempfile.mkdtemp`` can create an ACL-isolated directory under the
+    # Windows service account. Make the unique directory directly instead.
+    staging_base = Path(os.environ.get("SAMCLOUD_TEST_WORKDIR", tempfile.gettempdir()))
+    staging_base.mkdir(parents=True, exist_ok=True)
+    staging_root = staging_base / f"samcloud_reclassify_{uuid.uuid4().hex}"
+    staging_root.mkdir()
+    staging = staging_root / "dense"
+    mutable_trees = {"sam_labels", "sam_mirror", "depth_prior"}
+    # Step 6 writes reports beside the read-only dense inputs. Do not stage
+    # report files as hard links: replacing or truncating one must never alter
+    # the cache inode.
+    mutable_files = {"surface_fusion.json", "depth_prior.json", "depth_fill.json", "point_cleaning.json", "plane_fill.json"}
+    for source in cache_dense.rglob("*"):
+        relative = source.relative_to(cache_dense)
+        if relative.parts and relative.parts[0] in mutable_trees:
+            continue
+        if source.is_file() and source.name not in mutable_files and source.suffix.lower() != ".json":
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+    return staging
 
 
 def _classify_and_finish(
     args, outdir: Path, dense_dir: Path, dense_sparse_txt: Path, report_dir: Path,
     summary: RunSummary, progress: ProgressTracker | None, classified_output: Path, georeferenced: bool,
+    *, cache_after_sam: bool = True,
 ) -> None:
     """Run the unchanged classification, refinement, and optional export tail."""
     classify_script = Path(__file__).resolve().parent / "classify.py"
@@ -1575,13 +1728,15 @@ def _classify_and_finish(
         *_labels_arguments(args, dense_dir)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
-    if geometry_enabled and _writes_scores(args):
+    if _writes_scores(args):
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
     run(classify_command, summary=summary, stage="SAM3 classification")
-    _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
-    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress)
+    if cache_after_sam:
+        _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
+    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
+                                 report_dir=report_dir)
     _finish_classification(args, outdir, report_dir, summary, progress, classified_raw, classified_scores,
                            classified_output, georeferenced)
 
@@ -1609,6 +1764,7 @@ def _finish_classification(
         if progress and progress.estimator is not None:
             progress.estimator.skip_stage("geometry_refinement")
         shutil.copy2(classified_raw, classified_output)
+    _attach_fine_terms(args, classified_scores, classified_output, summary)
     if args.skip_export:
         if progress:
             progress.finish()
@@ -2243,13 +2399,14 @@ def main():
          *_labels_arguments(args, dense_dir)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
-    if geometry_enabled and _writes_scores(args):
+    if _writes_scores(args):
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
     run(classify_command, summary=summary, stage="SAM3 classification")
     _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
-    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress)
+    _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
+                                 report_dir=report_dir)
     if progress:
         progress.update(97, "Improving and filtering")
 
@@ -2284,6 +2441,7 @@ def main():
             geometry_summary.parent.mkdir(parents=True, exist_ok=True)
             geometry_summary.write_text(json.dumps({"skipped": "not georeferenced"}, indent=2), encoding="utf-8")
 
+    _attach_fine_terms(args, classified_scores, classified_output, summary)
     if args.skip_export:
         if progress:
             progress.finish()
