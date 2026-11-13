@@ -2236,9 +2236,10 @@ def _emit_kitchen_run(
     union = np.zeros(pending[0][0].mask.shape, dtype=bool)
     for instance, _label, _display in pending:
         union |= instance.mask
-    run = build_kitchen_run(union, grid, wall_lines, units_per_metre, settings)
+    run = build_kitchen_run(union, grid, wall_lines, units_per_metre, settings, height_map)
     emitted = 0
     if run is not None:
+        metrics["kitchen_run_blobs_absorbed"] = _absorb_blobs_in_counter(layers, run.pieces)
         legs = [[[float(x), float(y)] for x, y in list(leg.polygon().exterior.coords)[:-1]] for leg in run.legs]
         for piece in run.pieces:
             layers["A-EINB"].append({"type": "polyline", "points": _polygon_points(piece), "closed": True, "holes": [], "_einb_kind": "fine_kitchen", "_kitchen_run": run.shape, "_run_legs": legs})
@@ -2266,6 +2267,34 @@ def _emit_kitchen_run(
         ])
         emitted += 1
     return emitted
+
+
+def _absorb_blobs_in_counter(layers: dict[str, list[dict[str, Any]]], pieces: list[Polygon], share: float = 0.50) -> int:
+    """Remove traced A-FURN blobs (objects standing on the counter) that lie >= ``share`` inside the counter footprint."""
+    counter = unary_union(pieces)
+    removed: list[Polygon] = []
+    kept: list[dict[str, Any]] = []
+    for entity in layers.get("A-FURN", []):
+        if entity.get("type") == "polyline" and entity.get("closed") and len(entity.get("points", [])) >= 3:
+            blob = Polygon(entity["points"]).buffer(0)
+            if not blob.is_empty and blob.area > 0.0 and blob.intersection(counter).area >= share * blob.area:
+                removed.append(blob)
+                continue
+        kept.append(entity)
+    if not removed:
+        return 0
+    layers["A-FURN"] = kept
+    zone = unary_union(removed).buffer(1e-6)
+    for name in ("A-ANNO", "A-FURN-DETL"):
+        if name in layers:
+            layers[name] = [
+                entity for entity in layers[name]
+                if not (
+                    (name == "A-ANNO" and entity.get("type") == "text" and " h=" in str(entity.get("text", "")) and zone.covers(Point(entity["point"][:2])))
+                    or (name == "A-FURN-DETL" and entity.get("type") == "polyline" and len(entity.get("points", [])) >= 2 and zone.covers(LineString(entity["points"])))
+                )
+            ]
+    return len(removed)
 
 
 def _kitchen_zone(rooms: list[Polygon], fine_classes: np.ndarray, fine_names: list[str], grid: RasterGrid, inserts: list[dict[str, object]], units_per_metre: float, radius_m: float) -> Any | None:

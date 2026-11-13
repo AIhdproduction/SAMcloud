@@ -190,12 +190,19 @@ export default {
       if (!canvas) return;
       const rect = this.$el.getBoundingClientRect();
       const ratio = window.devicePixelRatio || 1;
+      const oldWidth = this.cssWidth;
+      const oldHeight = this.cssHeight;
       canvas.width = Math.max(1, Math.round(rect.width * ratio));
       canvas.height = Math.max(1, Math.round(rect.height * ratio));
       this.ratio = ratio;
       this.cssWidth = rect.width;
       this.cssHeight = rect.height;
       if (!this.view.fitted || !this.view.userMoved) this.fit();
+      else if (oldWidth && oldHeight) {
+        // keep the world point at the view centre fixed when the container changes size
+        this.view.ox += (rect.width - oldWidth) / 2;
+        this.view.oy += (rect.height - oldHeight) / 2;
+      }
       this.requestDraw();
     },
     fit() {

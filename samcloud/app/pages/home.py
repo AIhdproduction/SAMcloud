@@ -19,7 +19,7 @@ _WORKFLOW = (
     ("Classify", "classification"),
     ("Improve & filter", "refinement"),
     ("Export LAS / PLY", "export"),
-    ("DXF export (optional)", "dxf"),
+    ("DXF export", "dxf"),
 )
 
 _PHASE_RANGES = {
@@ -197,7 +197,7 @@ def _render_project_workspace(project: dict | None) -> None:
 
 
 def _dxf_unavailable_reason(project: dict | None) -> str | None:
-    """Return why the optional DXF step cannot be opened yet, or None when it can (file existence checks only)."""
+    """Return why the DXF step cannot be opened yet, or None when it can (file existence checks only)."""
     from samcloud.app.dxf_controller import dxf_unavailable_reason
 
     return dxf_unavailable_reason(state.active_project_directory if project is not None else None)
@@ -424,7 +424,7 @@ def _render_workflow(project: dict | None) -> None:
     dxf_reason = _dxf_unavailable_reason(project)
     for index, (label, key) in enumerate(_WORKFLOW, start=1):
         if key == "dxf" and project is not None:
-            status = "optional" if dxf_reason is None else dxf_reason
+            status = "ready" if dxf_reason is None else dxf_reason
         else:
             status = "ready" if key is None and project is not None else statuses.get(key, "not started")
         step_class = "sam-workflow-step"
@@ -432,7 +432,7 @@ def _render_workflow(project: dict | None) -> None:
             step_class += " is-active"
         elif status == "completed":
             step_class += " is-complete"
-        elif status in {"running", "ready"}:
+        elif status == "running" or (status == "ready" and key != "dxf"):
             step_class += " is-active"
         with ui.element("div").classes(step_class):
             ui.label(str(index)).classes("sam-step-number")

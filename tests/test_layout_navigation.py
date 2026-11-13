@@ -189,7 +189,7 @@ async def test_home_dxf_button_enabled_with_classified_las(tmp_path: Path, monke
         button = _single(user, "home-open-dxf")
         assert not button.props.get("disable")
         await user.should_not_see(marker="home-dxf-status")
-        await user.should_see("optional")
+        await user.should_see("ready")
 
 
 @pytest.mark.anyio
@@ -217,7 +217,7 @@ async def test_home_dxf_button_enabled_with_only_classified_ply(tmp_path: Path, 
         button = _single(user, "home-open-dxf")
         assert not button.props.get("disable")
         await user.should_not_see(marker="home-dxf-status")
-        await user.should_see("optional")
+        await user.should_see("ready")
 
 
 @pytest.mark.anyio
@@ -226,5 +226,5 @@ async def test_home_dxf_button_absent_without_project(monkeypatch: pytest.Monkey
     async with user_simulation(root=lambda: None) as user:
         ui.page("/workflow")(_workflow_route)
         await user.open("/workflow")
-        await user.should_see("DXF export (optional)")
+        await user.should_see("DXF export")
         await user.should_not_see(marker="home-open-dxf")

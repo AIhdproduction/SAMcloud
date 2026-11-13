@@ -42,6 +42,10 @@ _STYLE = """
 .sam-dxf-banner.is-error { background:rgba(239,107,115,.13); border:1px solid #9b3c43; color:#ffc2c6; }
 .sam-dxf-banner.is-info { background:rgba(38,183,239,.10); border:1px solid #24719b; color:#bfe9fb; }
 .sam-dxf-swatch { width:14px; height:14px; border-radius:3px; border:1px solid rgba(255,255,255,.35); flex:none; }
+.sam-result-fullscreen { position:fixed!important; inset:0; z-index:6000; background:var(--sam-bg); padding:12px; width:100vw!important; height:100vh!important; }
+.sam-result-fullscreen .sam-result-canvas-box { height:100%!important; }
+.sam-result-fullscreen .sam-result-side { overflow-y:auto; overflow-x:hidden; min-width:0; max-height:100%; flex:none; }
+.sam-result-side .q-checkbox__label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
 .sam-dxf-log { max-height:220px; overflow:auto; white-space:pre-wrap; font-family:monospace; font-size:11px; color:#c9d8e4; background:#050b12; border:1px solid #20394b; border-radius:6px; padding:8px; }
 </style>
 """
@@ -95,6 +99,9 @@ class DxfPage:
         self.side_rendered = False
         self.review_canvas: DxfReviewCanvas | None = None
         self.result_canvas: DxfReviewCanvas | None = None
+        self.result_fullscreen = False
+        self.result_row: ui.row | None = None
+        self.result_opacity_slider: ui.slider | None = None
         self.run_all_button: ui.button | None = None
         self.hidden_layers: set[str] = set()
         self.measurement: dict[str, Any] | None = None
@@ -118,6 +125,9 @@ class DxfPage:
         self.side_canvas = None
         self.review_canvas = None
         self.result_canvas = None
+        self.result_row = None
+        self.result_opacity_slider = None
+        self.result_fullscreen = False
         self.run_all_button = None
         self.job_stage = self.job_progress = self.cancel_button = self.job_log = None
         self.build_header()
@@ -575,23 +585,33 @@ class DxfPage:
         else:
             image = None
         bounds = ortho.grid.bounds if ortho is not None else result.background.bounds
-        with ui.row().classes("w-full gap-4 no-wrap items-stretch"):
-            with ui.element("div").classes("flex-1").style("height:640px"):
+        self.result_fullscreen = False
+        with ui.row().classes("w-full gap-4 no-wrap items-stretch") as result_row:
+            self.result_row = result_row
+            with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:640px;min-width:0"):
                 self.result_canvas = DxfReviewCanvas().classes("w-full h-full").mark("result-canvas")
                 self.result_canvas.show(payload_url(controller, level, "ortho"), image, bounds)
-                self.result_canvas.set_opacity(1.0, float(view.get("dxf_opacity", 1.0)))
+                self.result_canvas.set_opacity(self._result_image_opacity(background), 1.0)
                 self.result_canvas.set_hidden_layers(sorted(self.hidden_layers))
                 self.result_canvas.on("measure", lambda event: self.on_review_measure(event.args, result.scale_factor))
-            with ui.column().classes("w-80 gap-2"):
+                self.result_fullscreen_button = ui.button(icon="fullscreen", on_click=self.toggle_result_fullscreen).props(
+                    "flat round dense color=white").classes("absolute").style(
+                    "top:8px;left:8px;z-index:10;background:rgba(9,19,29,.65)").mark("result-fullscreen")
+                with self.result_fullscreen_button:
+                    self.result_fullscreen_tooltip = ui.tooltip("Fullscreen")
+                ui.keyboard(on_key=self.on_result_key, ignore=["input", "select", "textarea"])
+            with ui.column().classes("w-80 gap-2 sam-result-side"):
                 with ui.row().classes("items-center gap-2"):
                     ui.button("Fit", on_click=lambda: self.result_canvas.fit() if self.result_canvas else None).props("flat no-caps")
                     ui.toggle({"pan": "Pan", "measure": "Measure"}, value="pan",
                               on_change=lambda event: self.result_canvas.set_tool(event.value) if self.result_canvas else None)
                 ui.toggle({"ortho": "Orthophoto", "none": "None", "classes": "Class colours"}, value=background,
                           on_change=lambda event: self.set_result_background(event.value, level)).mark("result-background")
-                ui.label("DXF opacity").classes("text-sm")
-                ui.slider(min=0, max=100, step=1, value=round(float(view.get("dxf_opacity", 1.0)) * 100),
-                          on_change=lambda event: self.set_result_opacity(event.value)).props("label").mark("dxf-opacity")
+                ui.label("Orthophoto opacity").classes("text-sm")
+                self.result_opacity_slider = ui.slider(
+                    min=0, max=100, step=1, value=round(float(view.get("result_image_opacity", 1.0)) * 100),
+                    on_change=lambda event: self.set_result_opacity(event.value)).props("label").mark("result-image-opacity")
+                self.result_opacity_slider.set_enabled(background != "none")
                 ui.label("Layers").classes("text-sm q-mt-sm")
                 for name, status in result.statuses.items():
                     color = ",".join(str(value) for value in _layer_rgb(result, name))
@@ -601,8 +621,16 @@ class DxfPage:
                                     on_change=lambda event, layer=name: self.toggle_result_layer(layer, bool(event.value))).mark(f"result-layer-{name}")
                         ui.label(str(status.entity_count)).classes("sam-muted text-xs")
 
+    def _result_image_opacity(self, background: str) -> float:
+        if background == "none":
+            return 1.0
+        return max(0.0, min(1.0, float(self.controller.state.view.get("result_image_opacity", 1.0))))
+
     def set_result_background(self, source: str, level: str | None) -> None:
         self.controller.set_view_option("result_background", source)
+        slider = self.result_opacity_slider
+        if slider is not None:
+            slider.set_enabled(source != "none")
         if self.result_canvas is None:
             return
         if source == "ortho":
@@ -612,12 +640,35 @@ class DxfPage:
         else:
             image = None
         self.result_canvas.set_image(image)
+        self.result_canvas.set_opacity(self._result_image_opacity(source), 1.0)
 
     def set_result_opacity(self, percent: float | None) -> None:
+        """Orthophoto/background opacity of the result view; the DXF is always drawn fully opaque."""
         value = max(0.0, min(1.0, float(percent or 0.0) / 100.0))
-        self.controller.set_view_option("dxf_opacity", value)
+        self.controller.set_view_option("result_image_opacity", value)
         if self.result_canvas is not None:
-            self.result_canvas.set_opacity(1.0, value)
+            background = str(self.controller.state.view.get("result_background", "ortho"))
+            self.result_canvas.set_opacity(self._result_image_opacity(background), 1.0)
+
+    def toggle_result_fullscreen(self) -> None:
+        self.set_result_fullscreen(not self.result_fullscreen)
+
+    def set_result_fullscreen(self, active: bool) -> None:
+        """Expand the result row (canvas + controls) over the viewport with a CSS overlay."""
+        row = self.result_row
+        if row is None:
+            return
+        self.result_fullscreen = active
+        if active:
+            row.classes(add="sam-result-fullscreen")
+        else:
+            row.classes(remove="sam-result-fullscreen")
+        self.result_fullscreen_button.props(f"icon={'fullscreen_exit' if active else 'fullscreen'}")
+        self.result_fullscreen_tooltip.set_text("Exit fullscreen" if active else "Fullscreen")
+
+    def on_result_key(self, event: Any) -> None:
+        if self.result_fullscreen and event.action.keydown and event.key.escape:
+            self.set_result_fullscreen(False)
 
     def toggle_result_layer(self, layer: str, visible: bool) -> None:
         if visible:

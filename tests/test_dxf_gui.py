@@ -660,6 +660,60 @@ async def test_result_card_uses_cached_clean_plan(
     _no_error_logs(caplog)
 
 
+def _result_project(tmp_path: Path, name: str) -> Path:
+    project, las = _make_project(tmp_path, name, "outdoor")
+    _generate(project, las, [None], "outdoor")
+    pointcloud = DxfPageController(project).cached_result(None)
+    assert pointcloud is not None
+    save_cached_result(replace(pointcloud, variant="ortho"), clean_plan_cache_dir(project, None))
+    return project
+
+
+@pytest.mark.anyio
+async def test_result_fullscreen_toggle_switches_wrapper_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _result_project(tmp_path, "ResultFullscreen")
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see(marker="result-canvas")
+        button = _element(user, "result-fullscreen")
+        row = button.parent_slot.parent.parent_slot.parent
+        assert row is not None and "sam-result-fullscreen" not in row.classes
+        assert button.props["icon"] == "fullscreen"
+        user.find(marker="result-fullscreen").click()
+        assert "sam-result-fullscreen" in row.classes
+        assert button.props["icon"] == "fullscreen_exit"
+        user.find(marker="result-fullscreen").click()
+        assert "sam-result-fullscreen" not in row.classes
+        assert button.props["icon"] == "fullscreen"
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_result_slider_controls_orthophoto_opacity_not_dxf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _result_project(tmp_path, "ResultOpacity")
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see(marker="result-canvas")
+        canvas = _element(user, "result-canvas")
+        assert canvas.props["image-opacity"] == pytest.approx(1.0)
+        _set(user, "result-image-opacity", 40)
+        assert canvas.props["image-opacity"] == pytest.approx(0.4)
+        assert canvas.props["dxf-opacity"] == pytest.approx(1.0)
+        _set(user, "result-background", "classes")
+        assert canvas.props["image-opacity"] == pytest.approx(0.4)
+        assert canvas.props["dxf-opacity"] == pytest.approx(1.0)
+        assert _element(user, "result-image-opacity").enabled
+        _set(user, "result-background", "none")
+        assert not _element(user, "result-image-opacity").enabled
+        assert canvas.props["dxf-opacity"] == pytest.approx(1.0)
+    stored = json.loads((project / "products" / "dxf" / "state.json").read_text(encoding="utf-8"))
+    assert stored["view"]["result_image_opacity"] == pytest.approx(0.4)
+    assert stored["view"].get("dxf_opacity", 1.0) == pytest.approx(1.0)
+    _no_error_logs(caplog)
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", ["indoor", "outdoor"])
 async def test_dxf_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, kind: str) -> None:

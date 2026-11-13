@@ -181,7 +181,7 @@ indoor_kitchen_run:
   wall_reach_m: 0.30
   strip_reach_m: 0.90
   min_leg_length_m: 0.60
-  corner_reach_m: 0.35
+  corner_reach_m: 0.50
 
 # Outdoor surveyor / DGM site-plan standard (metres).
 outdoor_trunk:
