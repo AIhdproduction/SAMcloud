@@ -334,7 +334,11 @@ def test_sam3_outdoor_prompt_batches_are_fast() -> None:
     labels, confidence = labeler.label_image_scores(np.full((1008, 1008, 3), 120, dtype=np.uint8))
 
     assert labels.shape == confidence.shape == (1008, 1008)
-    assert time.perf_counter() - started < 10.0
+    # Must stay far below the ~120 s VRAM-spill regression (160 prompts in one SAM3 pass)
+    # while tolerating GPU warm-up variance (~11 s observed on a normal run).
+    max_seconds = 30.0
+    duration = time.perf_counter() - started
+    assert duration < max_seconds, f"SAM3 outdoor prompt batch took {duration:.1f} s (limit {max_seconds:.0f} s)"
 
 
 @pytest.mark.skipif(flurseg_availability() is not None, reason="FlurSeg model is unavailable")
