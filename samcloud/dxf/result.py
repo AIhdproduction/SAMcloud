@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import base64
+import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -109,7 +111,12 @@ def vector_payload(result: DxfPlanResult, *, grid_size: int = 64) -> dict[str, A
     """Build a JSON-serializable browser payload with RGB colors and bounds."""
     payload_layers: dict[str, dict[str, Any]] = {}
     for name, entities in result.layers.items():
-        browser_entities = [_to_browser_entity(entity) for entity in entities]
+        browser_entities = []
+        for entity in entities:
+            if entity.get("type") == "insert":
+                browser_entities.extend(expand_insert(entity))
+            else:
+                browser_entities.append(_to_browser_entity(entity))
         bounds = _entity_bounds(browser_entities)
         payload_layers[name] = {
             "color": aci_to_rgb(result.layer_colors.get(name, 7)),
@@ -119,6 +126,65 @@ def vector_payload(result: DxfPlanResult, *, grid_size: int = 64) -> dict[str, A
             "cell_size": _grid_cell_size(bounds, grid_size),
         }
     return {"project_name": result.project_name, "level": result.level_name, "mode": result.mode, "layers": payload_layers, "background_bounds": result.background.bounds}
+
+
+_UNIT_SQUARE: tuple[Entity, ...] = ({"type": "polyline", "points": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], "closed": True},)
+
+
+@lru_cache(maxsize=256)
+def _block_primitives(name: str) -> tuple[Entity, ...] | None:
+    """Return the block geometry the DXF writer defines for ``name`` (cached), or None when unknown."""
+    key = str(name).upper()
+    if key == "FURNITURE":  # the writer defines the legacy FURNITURE block as a 0..1 unit square
+        return _UNIT_SQUARE
+    from samcloud.ortho.vector.symbols import SYMBOLS
+
+    definition = SYMBOLS.get(key)
+    return None if definition is None else tuple(definition.entities)
+
+
+def expand_insert(entity: Entity) -> list[Entity]:
+    """Expand one neutral ``insert`` into transformed block primitives (lines, polylines, circles).
+
+    Arcs and non-uniformly scaled or mirrored circles become polylines.  Unknown blocks fall back
+    to the unit rectangle.  Block geometry comes from ``samcloud.ortho.vector.symbols.SYMBOLS``,
+    the same definitions ``add_symbol_blocks`` writes into the DXF.
+    """
+    primitives = _block_primitives(str(entity.get("name", ""))) or _UNIT_SQUARE
+    point = entity.get("point", [0.0, 0.0])
+    px, py = float(point[0]), float(point[1])
+    angle = math.radians(float(entity.get("rotation", 0.0)))
+    sx, sy = float(entity.get("xscale", 1.0)), float(entity.get("yscale", 1.0))
+    cos, sin = math.cos(angle), math.sin(angle)
+
+    def move(x: float, y: float) -> list[float]:
+        return [px + sx * x * cos - sy * y * sin, py + sx * x * sin + sy * y * cos]
+
+    def ring(cx: float, cy: float, radius: float, start: float, end: float, closed: bool) -> Entity:
+        steps = max(2, int(math.ceil(abs(end - start) / 12.0))) if not closed else 32
+        points = [move(cx + radius * math.cos(start + (end - start) * index / steps), cy + radius * math.sin(start + (end - start) * index / steps)) for index in range(steps + (0 if closed else 1))]
+        return {"type": "polyline", "points": points, "closed": closed}
+
+    expanded: list[Entity] = []
+    for primitive in primitives:
+        kind = primitive["type"]
+        if kind == "line":
+            expanded.append({"type": "line", "start": move(*primitive["start"][:2]), "end": move(*primitive["end"][:2])})
+        elif kind == "polyline":
+            expanded.append({"type": "polyline", "points": [move(float(p[0]), float(p[1])) for p in primitive["points"]], "closed": bool(primitive.get("closed", False))})
+        elif kind == "circle":
+            cx, cy = float(primitive["center"][0]), float(primitive["center"][1])
+            radius = float(primitive["radius"])
+            if math.isclose(abs(sx), abs(sy), rel_tol=1e-9):
+                expanded.append({"type": "circle", "center": move(cx, cy), "radius": radius * abs(sx)})
+            else:
+                expanded.append(ring(cx, cy, radius, 0.0, 2.0 * math.pi, True))
+        elif kind == "arc":
+            start, end = math.radians(float(primitive["start_angle"])), math.radians(float(primitive["end_angle"]))
+            if end <= start:
+                end += 2.0 * math.pi
+            expanded.append(ring(float(primitive["center"][0]), float(primitive["center"][1]), float(primitive["radius"]), start, end, False))
+    return expanded
 
 
 def _to_browser_entity(entity: Entity) -> Entity:

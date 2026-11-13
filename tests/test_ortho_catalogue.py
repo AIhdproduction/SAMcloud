@@ -588,3 +588,102 @@ def test_bathtub_long_side_along_wall_versus_short_end_against_wall(upm: float) 
     assert foot_b.bounds[1] == pytest.approx(0.0, abs=1e-9)
     assert foot_b.centroid.x == pytest.approx(3.0 * upm, abs=1e-9)
     assert foot_a.bounds[3] - foot_a.bounds[1] < foot_b.bounds[3] - foot_b.bounds[1]  # not simply snapped long-side-first
+
+
+# --------------------------------------------------------------------------- viewer / snapshot block expansion
+
+_VIEWER_BLOCKS = ("WC_WALL", "WASHBASIN", "BATHTUB", "BED_DOUBLE", "COOKTOP")
+
+
+def _viewer_inserts() -> list[dict]:
+    inserts = []
+    for index, name in enumerate(_VIEWER_BLOCKS):
+        for turn, rotation in enumerate((0.0, 90.0, 180.0, 270.0)):
+            inserts.append({"type": "insert", "name": name, "point": [4.0 + 5.0 * index, 4.0 + 5.0 * turn], "rotation": rotation, "xscale": UPM_V8, "yscale": UPM_V8, "attributes": {}})
+    return inserts
+
+
+def _footprint(insert: dict) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = symbol_extents(insert["name"])
+    corners = np.asarray([_world(insert, x, y) for x in (x0, x1) for y in (y0, y1)])
+    return float(corners[:, 0].min()), float(corners[:, 1].min()), float(corners[:, 0].max()), float(corners[:, 1].max())
+
+
+def _world_inverse(insert: dict, x: float, y: float) -> tuple[float, float]:
+    angle = math.radians(float(insert["rotation"]))
+    dx, dy = x - insert["point"][0], y - insert["point"][1]
+    scale = float(insert["xscale"])
+    return ((dx * math.cos(angle) + dy * math.sin(angle)) / scale, (-dx * math.sin(angle) + dy * math.cos(angle)) / scale)
+
+
+def test_vector_payload_expands_catalogue_inserts_into_symbol_primitives() -> None:
+    from samcloud.dxf.result import vector_payload
+
+    inserts = _viewer_inserts()
+    payload = vector_payload(_result({"A-SYMB": inserts}), grid_size=16)
+    layer = payload["layers"]["A-SYMB"]
+    assert all(entity["type"] != "insert" for entity in layer["entities"])
+    per_insert = [len(SYMBOLS[name].entities) for name in _VIEWER_BLOCKS for _ in range(4)]
+    assert len(layer["entities"]) == sum(per_insert)
+    cursor = 0
+    for insert, count in zip(inserts, per_insert, strict=True):
+        part = layer["entities"][cursor:cursor + count]
+        cursor += count
+        xs: list[float] = []
+        ys: list[float] = []
+        for entity in part:
+            for point in entity.get("points", []):
+                xs.append(point[0])
+                ys.append(point[1])
+            if entity["type"] == "circle":
+                xs.extend((entity["center"][0] - entity["radius"], entity["center"][0] + entity["radius"]))
+                ys.extend((entity["center"][1] - entity["radius"], entity["center"][1] + entity["radius"]))
+        expected = _footprint(insert)
+        assert (min(xs), min(ys), max(xs), max(ys)) == pytest.approx(expected, abs=1e-6)
+        entry = CATALOGUE[insert["name"]][0]
+        width, height = expected[2] - expected[0], expected[3] - expected[1]
+        if int(insert["rotation"]) % 180:
+            width, height = height, width
+        assert (width, height) == pytest.approx((entry.width_m * UPM_V8, entry.depth_m * UPM_V8), abs=1e-6)
+        # origin on the wall edge: the symbol lies entirely on the local +Y side of the insert point
+        local_y = [_world_inverse(insert, px, py)[1] for px, py in zip(xs, ys, strict=True)]
+        assert min(local_y) >= -1e-6
+        assert max(local_y) == pytest.approx(entry.depth_m, abs=1e-6)
+    bounds = layer["bounds"]
+    assert bounds[0] <= min(_footprint(i)[0] for i in inserts) + 1e-9
+    assert bounds[3] >= max(_footprint(i)[3] for i in inserts) - 1e-9
+    assert layer["grid"] and max(index for cell in layer["grid"].values() for index in cell) < len(layer["entities"])
+
+
+def test_vector_payload_mirrored_scale_arc_and_legacy_unit_block() -> None:
+    from samcloud.dxf.result import vector_payload
+
+    door = {"type": "insert", "name": "DOOR", "point": [1.0, 1.0], "rotation": 0.0, "xscale": -2.0, "yscale": 2.0, "attributes": {}}
+    legacy = {"type": "insert", "name": "FURNITURE", "point": [10.0, 10.0], "rotation": 90.0, "xscale": 2.0, "yscale": 3.0, "attributes": {}}
+    unknown = {"type": "insert", "name": "NOT_A_BLOCK", "point": [0.0, 20.0], "rotation": 0.0, "xscale": 1.0, "yscale": 1.0, "attributes": {}}
+    entities = vector_payload(_result({"A-SYMB": [door, legacy, unknown]}), grid_size=8)["layers"]["A-SYMB"]["entities"]
+    line, arc = entities[0], entities[1]
+    assert line["type"] == "line" and line["start"] == pytest.approx([1.0, 1.0]) and line["end"] == pytest.approx([1.0, 3.0])
+    assert arc["type"] == "polyline" and not arc["closed"]
+    assert arc["points"][0] == pytest.approx([-1.0, 1.0]) and arc["points"][-1] == pytest.approx([1.0, 3.0])
+    assert all(math.hypot(x - 1.0, y - 1.0) == pytest.approx(2.0, abs=1e-6) for x, y in arc["points"])
+    rectangle = entities[2]
+    assert rectangle["type"] == "polyline" and rectangle["closed"] and len(rectangle["points"]) == 4
+    assert np.asarray(rectangle["points"]).ravel() == pytest.approx([10.0, 10.0, 10.0, 12.0, 7.0, 12.0, 7.0, 10.0])
+    assert np.asarray(entities[3]["points"]).ravel() == pytest.approx([0.0, 20.0, 1.0, 20.0, 1.0, 21.0, 0.0, 21.0])
+
+
+def test_overlay_raster_draws_symbol_pixels_inside_footprint() -> None:
+    from samcloud.dxf.overlay import render_dxf_rgba
+
+    insert = {"type": "insert", "name": "BATHTUB", "point": [2.0, 1.0], "rotation": 90.0, "xscale": UPM_V8, "yscale": UPM_V8, "attributes": {}}
+    rendered = render_dxf_rgba(_result({"P-SANI": [insert]}), bounds=(0.0, 0.0, 4.0, 4.0), size=(400, 400))
+    ink = np.argwhere(rendered[..., 3] > 0)
+    assert len(ink) > 200
+    x0, y0, x1, y1 = _footprint(insert)
+    world_x, world_y = ink[:, 1] / 399 * 4.0, 4.0 - ink[:, 0] / 399 * 4.0
+    assert world_x.min() >= x0 - 0.02 and world_x.max() <= x1 + 0.02
+    assert world_y.min() >= y0 - 0.02 and world_y.max() <= y1 + 0.02
+    # the inner basin outline (not only the outer rectangle) is drawn: ink exists well inside the footprint
+    inner = (world_x > x0 + 0.04) & (world_x < x1 - 0.04) & (world_y > y0 + 0.04) & (world_y < y1 - 0.04)
+    assert int(inner.sum()) > 20

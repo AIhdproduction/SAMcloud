@@ -5,7 +5,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from samcloud.dxf.result import DxfPlanResult, aci_to_rgb
+from samcloud.dxf.result import DxfPlanResult, aci_to_rgb, expand_insert
 
 
 def composite(
@@ -90,7 +90,8 @@ def render_dxf_rgba(
         r, g, b = aci_to_rgb(aci)
         color_bgra = (int(b), int(g), int(r), 255)
 
-        for entity in entities:
+        drawable = [part for entity in entities for part in (expand_insert(entity) if entity.get("type") == "insert" else (entity,))]
+        for entity in drawable:
             etype = entity.get("type")
             if etype == "line":
                 start = entity["start"]
@@ -140,9 +141,5 @@ def render_dxf_rgba(
                 font_scale = max(0.01, height_m * float(np.sqrt(scale_x * scale_y)) / 21.0)
                 anchor = (to_u(float(point[0])), to_v(float(point[1])))
                 cv2.putText(canvas, text, anchor, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_bgra, 1, cv2.LINE_AA)
-            elif etype == "insert":
-                point = entity["point"]
-                px, py = to_u(float(point[0])), to_v(float(point[1]))
-                cv2.circle(canvas, (px, py), 3, color_bgra, thickness=-1)
 
     return cv2.cvtColor(canvas, cv2.COLOR_BGRA2RGBA)
