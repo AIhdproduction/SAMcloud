@@ -242,3 +242,68 @@ def test_review_script_selects_requested_marker() -> None:
     assert "get('marker')" in script
 
 
+def test_dense_point_info_script_has_round_points_drag_threshold_and_overlay() -> None:
+    from samcloud.app.potree_viewer import _script, _viewer_config
+
+    dense = _viewer_config("dense", "Dense", [[1, 2, 3]], class_names_de=["Unklassifiziert", "Wand"])
+    sparse = _viewer_config("sparse", "Sparse", [[1, 2, 3]])
+    script = _script(dense)
+
+    assert "PointShape.CIRCLE" in script
+    assert "Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) <= 4" in script
+    assert dense["class_names_de"] == ["Unklassifiziert", "Wand"]
+    assert dense["enable_point_info"] is True
+    assert sparse["enable_point_info"] is False
+    assert "pickCamera" in script and "cameraAt" in script
+    assert "Box3Helper" in script
+    assert 'event.key === "Escape"' in script
+
+
+
+
+def test_point_pick_respects_clip_boxes_and_uses_canvas_rect() -> None:
+    from samcloud.app import potree_viewer
+
+    script = potree_viewer._script({"element_id": "x", "kind": "dense", "title": "t", "metadata_url": "/m"})
+
+    assert "pickClipped: true" in script
+    assert "viewer.renderer.domElement.getBoundingClientRect()" in script
+    pick = script[script.index("const handlePointClick"):]
+    pick = pick[:pick.index("const point = hit")]
+    assert "root.getBoundingClientRect()" not in pick
+
+
+def test_instance_title_only_numbered_when_label_is_shared() -> None:
+    from samcloud.app import potree_viewer
+
+    script = potree_viewer._script({"element_id": "x", "kind": "dense", "title": "t", "metadata_url": "/m"})
+
+    assert "sameLabel > 1" in script
+
+
+def test_viewer_config_carries_fine_term_names() -> None:
+    from samcloud.app import potree_viewer
+
+    config = potree_viewer._viewer_config("dense", "t", [[0, 0, 0]], fine_term_names_de=["", "Sofa"])
+    assert config["fine_term_names_de"] == ["", "Sofa"]
+    assert potree_viewer._viewer_config("dense", "t", [[0, 0, 0]])["fine_term_names_de"] == []
+
+
+def test_fine_term_names_de_uses_aliases_german_and_fallback(tmp_path) -> None:
+    from samcloud.app.pages.dense_cloud import _fine_term_names_de
+
+    path = tmp_path / "fine_labels.json"
+    path.write_text(json.dumps({"labels": ["sofa", "couch2", "gizmo"]}), encoding="utf-8")
+    config = {"instance_labels_de": {"sofa": "Sofa", "table": "Tisch"}, "instance_label_aliases": {"couch2": "sofa"}}
+    assert _fine_term_names_de(path, config) == ["", "Sofa", "Sofa", "gizmo"]
+    assert _fine_term_names_de(tmp_path / "missing.json", config) == []
+    assert _fine_term_names_de(None, config) == []
+
+
+def test_point_card_script_has_fine_term_branch() -> None:
+    from samcloud.app import potree_viewer
+
+    script = potree_viewer._script({"element_id": "x", "kind": "dense", "title": "t", "metadata_url": "/m"})
+    assert '"user data"' in script
+    assert "fine_term_names_de" in script
+    assert "showPointCard(event, fineName, [className])" in script

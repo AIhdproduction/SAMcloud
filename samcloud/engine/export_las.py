@@ -157,8 +157,12 @@ def export_las(
 
     with input_path.open("rb") as probe:
         has_fine_term = "fine_term" in (_ply_vertex_dtype(probe).names or ())
+    with input_path.open("rb") as probe:
+        has_instance_id = "instance_id" in (_ply_vertex_dtype(probe).names or ())
     if has_fine_term:  # per-point fine SAM term (see fine_labels.json next to the PLY)
         header.add_extra_dim(laspy.ExtraBytesParams(name="fine_term", type=np.uint8, description="fine SAM term id"))
+    if has_instance_id:
+        header.add_extra_dim(laspy.ExtraBytesParams(name="instance_id", type=np.uint32, description="SAM object instance id"))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with input_path.open("rb") as source, laspy.open(output_path, mode="w", header=header) as destination:
@@ -185,6 +189,8 @@ def export_las(
             las_points.number_of_returns = np.ones(count, dtype=np.uint8)
             if has_fine_term:
                 las_points.fine_term = points["fine_term"]
+            if has_instance_id:
+                las_points.instance_id = points["instance_id"]
             destination.write_points(las_points)
 
     write_profile_sidecar(output_path, profile, class_set, class_set)

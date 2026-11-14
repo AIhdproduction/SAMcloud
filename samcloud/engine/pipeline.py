@@ -1,7 +1,10 @@
 import argparse
+import copy
+import dataclasses
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +12,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -42,14 +46,21 @@ from samcloud.core.project_manager import ProjectManager
 from samcloud.core.storage import compact_project, ensure_available, ensure_text_model, release_after_fusion, remove_generated, storage_settings
 from samcloud.engine.run_summary import RunSummary
 from samcloud.engine.fine_terms import LABELS_NAME, SOURCE_NAME, attach_fine_terms, snapshot_fine_terms
+from samcloud.engine.instances import SOURCE_NAME as INSTANCES_SOURCE_NAME, attach_instances, snapshot_instances
 from samcloud.engine.extract_gps import is_dji_rtk_project
 from samcloud.control_points.georeference import coordinates_to_ecef, enu_rotation_at_ecef, georeference_from_control_points, save_control_point_report
 from samcloud.control_points.model_transform import transform_text_model
-from samcloud.control_points.repository import load_detections, load_observations, read_control_points, save_detections, save_observations
-from samcloud.control_points.auto_detect import automatic_detection, populate_undistorted_coordinates
+from samcloud.control_points.repository import APRILTAG_CSV_NAME, load_detections, load_observations, read_apriltag_coordinates, read_control_points, save_detections, save_observations
+from samcloud.control_points.apriltags import (
+    MIN_GEOREF_TAGS, WARNING_GEOREF_UNAVAILABLE, TagGeorefUnavailable, apply_scale, build_tag_report, detect_apriltags,
+    load_tag_detections, save_tag_detections, save_tag_report, tag_detection_entries, tag_edge_lengths, tag_scale,
+    tags_are_non_collinear, triangulate_tags,
+)
+from samcloud.control_points.auto_detect import _similarity, automatic_detection, populate_undistorted_coordinates, triangulate_observations
 from samcloud.control_points.adjustment import build_control_point_report, camera_intrinsics, leave_one_out_errors, populate_review_projections, pose_priors_in_model_frame, quality_gate, run_gcp_bundle_adjustment
 from samcloud.pointcloud.georeference import fit_enu_to_ecef, fit_similarity, format_residuals, save_georeference
 from samcloud.engine.eta import ProgressEstimator, RateStore, stage_units
+from samcloud.core.project_manager import LOCAL_CRS_GPS_MESSAGE
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -290,6 +301,267 @@ def _release_sparse_intermediates(sparse_dir: Path, model0: Path) -> None:
 def _write_final_model(sparse_dir: Path, model0: Path) -> None:
     """Record the sparse model that later processing continues to use."""
     (sparse_dir / "final_model.txt").write_text(model0.name + "\n", encoding="utf-8")
+
+
+LOCAL_TAGS_FRAME = "local_tags"
+
+
+def _is_local_crs(crs: str | None) -> bool:
+    """Local (non-geodetic) survey system: coordinates are metres in the target frame itself."""
+    return str(crs or "").strip().upper() == "LOCAL"
+
+
+def _local_tag_georeferenced(outdir: Path) -> bool:
+    """True when the passed AprilTag step placed the model into local survey coordinates (no georeference.json)."""
+    try:
+        report = json.loads((outdir.parent / "reports" / "control_points_report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(report, dict) and report.get("source_frame") == LOCAL_TAGS_FRAME
+
+
+def _is_georeferenced(outdir: Path) -> bool:
+    return (outdir / "georeference.json").is_file() or _local_tag_georeferenced(outdir)
+
+
+class TagStepResult(NamedTuple):
+    """Outcome of the AprilTag step: model to continue with, report, and georeference state."""
+
+    model: Path
+    report: dict
+    georeferenced: bool = False
+    gate_failed: bool = False
+
+
+def _apriltag_step(
+    model0: Path, sparse_dir: Path, images_dir: Path, control_points_dir: Path, report_dir: Path,
+    *, outlier_pct: float, crs: str = "EPSG:2056+5728", settings: dict | None = None,
+) -> TagStepResult:
+    """Georeference from >=3 surveyed AprilTags, otherwise scale the sparse model from tag sizes."""
+    import pycolmap
+
+    reconstruction = pycolmap.Reconstruction(model0)
+    image_map = _image_path_map(images_dir)
+    paths = {
+        image.name: image_map[image.name]
+        for image in reconstruction.images.values() if image.name in image_map
+    }
+    detections_path = control_points_dir / "apriltag_detections.json"
+    detections = None
+    if detections_path.is_file():
+        try:
+            cached = load_tag_detections(detections_path)
+            if set(paths) <= set(cached):
+                detections = cached
+        except (ValueError, KeyError, OSError):
+            detections = None
+    if detections is None:
+        detections = detect_apriltags(paths)
+        save_tag_detections(detections_path, detections)
+    geometries = triangulate_tags(reconstruction, detections)
+    result = tag_scale(geometries, outlier_pct=outlier_pct)
+    report_path = report_dir / "apriltag_report.json"
+    gate_failed = False
+    if (control_points_dir / APRILTAG_CSV_NAME).is_file():
+        if settings is None:
+            settings = dict(load_global_config("defaults.yml").get("control_points", {}))
+        pristine = sparse_dir / "pre_gcp"
+        if not pristine.exists():
+            shutil.copytree(model0, pristine)
+        try:
+            adjusted = _apriltag_control_points(
+                pristine, sparse_dir / "pre_gcp_txt", images_dir, control_points_dir, crs, settings,
+                report_dir / "control_points_report.json", geometries, detections,
+            )
+        except TagGeorefUnavailable as error:
+            print(f"AprilTags: georeferencing unavailable ({error}); scale only.")
+            result = dataclasses.replace(result, warnings=[*result.warnings, WARNING_GEOREF_UNAVAILABLE])
+        else:
+            if adjusted is not None:
+                report = _georef_tag_report(adjusted, result, geometries, detections, report_dir / "control_points_report.json")
+                save_tag_report(report_path, report)
+                print(f"AprilTags: mode=georef, {len(report['tags'])} tag(s)")
+                return TagStepResult(adjusted, report, True, False)
+            gate_failed = True
+            result = dataclasses.replace(
+                result, warnings=[*result.warnings, "AprilTag-Georeferenzierung: Qualitätsprüfung nicht bestanden – Review nötig"],
+            )
+    if gate_failed or result.scale_factor is None:
+        report = build_tag_report(result, geometries, scale_applied=None, mode="none")
+        new_model = model0
+    else:
+        new_model = apply_scale(model0, sparse_dir / "0_tagscale", result.scale_factor)
+        report = build_tag_report(result, geometries, scale_applied=result.scale_factor, mode="scale")
+    save_tag_report(report_path, report)
+    factor = "none" if result.scale_factor is None else f"{result.scale_factor:.4f}"
+    print(f"AprilTags: mode={report['mode']}, scale factor {factor}, {len(geometries)} tag(s)"
+          + (f", warnings: {'; '.join(result.warnings)}" if result.warnings else ""))
+    return TagStepResult(new_model, report, False, gate_failed)
+
+
+def _georef_tag_report(
+    final_model: Path, result, geometries: dict, detections: dict, control_report_path: Path,
+) -> dict:
+    """Tag report in the final (GCP-local ENU) frame: re-triangulated centres/corners plus 3D errors."""
+    import pycolmap
+
+    final_geometries = triangulate_tags(pycolmap.Reconstruction(final_model), detections)
+    report = build_tag_report(result, final_geometries, scale_applied=1.0, mode="georef")
+    errors: dict[str, float | None] = {}
+    try:
+        control_report = json.loads(control_report_path.read_text(encoding="utf-8"))
+        errors = {str(point["name"]): point.get("error_3d_m") for point in control_report.get("points", [])}
+    except (OSError, ValueError):
+        pass
+    factors = []
+    for tag in report["tags"]:
+        tag_id = int(tag["id"])
+        final_edges = tag_edge_lengths(final_geometries[tag_id].corners_xyz)
+        tag["size_mm_after"] = float(final_edges[:4].mean() * 1000.0)
+        if tag_id in geometries:
+            original_edges = tag_edge_lengths(geometries[tag_id].corners_xyz)
+            factors.append(float(np.median(final_edges / original_edges)))
+            tag["size_mm_before"] = float(original_edges[:4].mean() * 1000.0)
+        error = errors.get(f"TAG{tag_id}")
+        tag["error_3d_m"] = None if error is None or not math.isfinite(float(error)) else float(error)
+    report["scale_applied"] = float(np.median(factors)) if factors else None
+    return report
+
+
+class _TagSeed(NamedTuple):
+    detections: dict
+    references: dict
+    ecef_by_name: dict
+    pass_names: list
+
+
+def _apriltag_control_points(
+    pristine_distorted: Path, pristine_text: Path, images_dir: Path, control_points_dir: Path, crs: str,
+    settings: dict, report_path: Path, tag_geometries: dict | None = None, tag_detections: dict | None = None,
+) -> Path | None:
+    """GCP adjustment from surveyed AprilTag centres; raises TagGeorefUnavailable when <3 usable pass tags.
+
+    With tag_geometries the detections are built from the fresh tag triangulation; without them the
+    reviewed control_points/detections.json is re-triangulated on the pristine model (resume/optimise).
+    """
+    import pycolmap
+
+    csv_path = control_points_dir / APRILTAG_CSV_NAME
+    if not csv_path.is_file():
+        raise TagGeorefUnavailable("apriltags.csv is missing")
+    table = read_apriltag_coordinates(csv_path)
+    try:
+        existing = load_detections(control_points_dir / "detections.json")
+    except (OSError, ValueError):
+        existing = {}
+    if tag_geometries is not None:
+        detections = tag_detection_entries(table, tag_geometries, tag_detections or {})
+        for name, entry in detections.items():
+            if existing.get(name, {}).get("disabled_by_reviewer"):
+                entry["enabled"], entry["status"], entry["disabled_by_reviewer"] = False, "disabled", True
+    else:
+        ensure_text_model(pristine_distorted, pristine_text)
+        reconstruction = pycolmap.Reconstruction(pristine_distorted)
+        detections = {}
+        for row in table.itertuples(index=False):
+            name = f"TAG{int(row.id)}"
+            if name not in existing:
+                continue
+            entry = copy.deepcopy(existing[name])
+            entry["role"] = str(row.role)
+            active = [item for item in entry.get("observations", []) if item.get("enabled", True)]
+            if len(active) >= 2:
+                try:
+                    entry["triangulated_model_xyz"] = [float(v) for v in triangulate_observations(reconstruction, active)[0]]
+                except ValueError:
+                    pass
+            detections[name] = entry
+    seed = _seed_tag_references(table, detections, crs)
+    ensure_text_model(pristine_distorted, pristine_text)
+    return _finish_control_point_adjustment(
+        pristine_distorted, control_points_dir, crs, settings, report_path, seed.detections,
+        {"apriltags": len(seed.detections)}, seed.references, seed.ecef_by_name, seed.pass_names,
+        rtk=False, use_pose_priors=False, local_frame=_is_local_crs(crs),
+    )
+
+
+def _seed_tag_references(table, detections: dict, crs: str) -> _TagSeed:
+    """Model-frame reference positions for every tag, from a similarity fit of the pass tags to local ENU."""
+    rows = {f"TAG{int(row.id)}": row for row in table.itertuples(index=False)}
+    names = [name for name in detections if name in rows]
+    usable = [
+        name for name in names
+        if detections[name].get("role") == "pass" and not detections[name].get("disabled_by_reviewer")
+        and detections[name].get("triangulated_model_xyz") is not None
+    ]
+    if len(usable) < MIN_GEOREF_TAGS:
+        raise TagGeorefUnavailable(f"{len(usable)} surveyed pass tag(s)")
+    surveyed = np.asarray([[rows[n].x, rows[n].y, rows[n].z] for n in names], dtype=float)
+    if _is_local_crs(crs):
+        # Local survey system (metres, z up): the coordinates are already the target frame.
+        ecef_by_name = dict(zip(names, surveyed, strict=True))
+        enu = dict(ecef_by_name)
+    else:
+        ecef = coordinates_to_ecef(surveyed, crs)
+        ecef_by_name = dict(zip(names, ecef, strict=True))
+        centroid = np.mean([ecef_by_name[n] for n in usable], axis=0)
+        rotation_enu = enu_rotation_at_ecef(centroid)
+        enu = {n: rotation_enu @ (ecef_by_name[n] - centroid) for n in names}
+    if not tags_are_non_collinear(np.asarray([enu[n] for n in usable])):
+        raise TagGeorefUnavailable("surveyed pass tags are collinear")
+    scale, rotation, translation = _similarity(
+        np.asarray([detections[n]["triangulated_model_xyz"] for n in usable], dtype=float),
+        np.asarray([enu[n] for n in usable], dtype=float),
+    )
+    references = {n: rotation.T @ (enu[n] - translation) / scale for n in names}
+    return _TagSeed(
+        {n: detections[n] for n in names}, references, ecef_by_name,
+        [n for n in names if detections[n].get("role") == "pass"],
+    )
+
+
+def _rerun_control_points(
+    model_path: Path, model_txt: Path, images_dir: Path, control_points_dir: Path, control_points_crs: str,
+    gps_ref_path: Path, settings: dict, report_path: Path, *, rtk: bool,
+) -> Path | None:
+    """Re-run the reviewed adjustment: AprilTag seeding for tag projects, GPS seeding otherwise."""
+    if _is_tag_project(control_points_dir, gps_ref_path):
+        try:
+            return _apriltag_control_points(
+                model_path, model_txt, images_dir, control_points_dir, control_points_crs, settings, report_path,
+            )
+        except TagGeorefUnavailable as error:
+            save_control_point_report(report_path, {
+                "gate": {"passed": False, "reasons": [f"AprilTag georeferencing unavailable: {error}"]}, "points": [],
+            })
+            return None
+    return _automatic_control_points(
+        model_path, model_txt, images_dir, control_points_dir, control_points_crs, gps_ref_path, settings,
+        report_path, rtk=rtk,
+    )
+
+
+def _is_tag_project(control_points_dir: Path, gps_ref_path: Path) -> bool:
+    """Surveyed-AprilTag project: apriltags.csv present and no GPS reference (or detections are all TAG<id>)."""
+    if not (control_points_dir / APRILTAG_CSV_NAME).is_file():
+        return False
+    if not gps_ref_path.is_file():
+        return True
+    try:
+        names = list(load_detections(control_points_dir / "detections.json"))
+    except (OSError, ValueError):
+        return False
+    if not (names and all(re.fullmatch(r"TAG\d+", name) for name in names)):
+        return False
+    try:
+        detections = load_detections(control_points_dir / "detections.json")
+    except (OSError, ValueError):
+        return False
+    for entry in detections.values():
+        observations = [obs for obs in entry.get("observations", []) if isinstance(obs, dict)]
+        if observations and not all(obs.get("source") == "apriltag" for obs in observations):
+            return False
+    return True
 
 
 def _align_panorama_gravity(sparse_dir: Path, model0: Path, report_dir: Path) -> tuple[Path, dict[str, object]]:
@@ -545,9 +817,13 @@ def _resume_automatic_control_points(
     dense_gpu_index: int, classified_output: Path, control_points_dir: Path,
 ) -> None:
     """Continue reviewed automatic GCP projects exactly like a passed automatic run."""
-    if not args.images:
+    cubemap_dir = outdir.parent / "inputs" / "cubemap"
+    if getattr(args, "capture_type", None) == "panorama_360" and cubemap_dir.is_dir():
+        images_dir = cubemap_dir.resolve()
+    elif args.images:
+        images_dir = Path(args.images).resolve()
+    else:
         raise ValueError("The original image directory (--images) is required to continue automatic control points")
-    images_dir = Path(args.images).resolve()
     image_list_path = outdir / "image_list.txt"
     if progress and progress.estimator is None:
         num_images = len([l for l in image_list_path.read_text(encoding="utf-8").splitlines() if l.strip()]) if image_list_path.is_file() else 0
@@ -563,7 +839,7 @@ def _resume_automatic_control_points(
     if progress:
         progress.begin("control_points")
         progress.update(57, "Applying control points")
-    adjusted_model = _automatic_control_points(
+    adjusted_model = _rerun_control_points(
         sparse_dir / "pre_gcp", sparse_dir / "pre_gcp_txt", images_dir, control_points_dir, args.control_points_crs,
         outdir / "gps_ref.txt", dict(load_global_config("defaults.yml").get("control_points", {})),
         report_dir / "control_points_report.json", rtk=bool(args.rtk),
@@ -658,6 +934,8 @@ def _resume_dense_stereo(
         except Exception as error:
             print(f"WARNING: Could not create GPS georeference: {error}")
             georeferenced = False
+    elif _local_tag_georeferenced(outdir):
+        georeferenced = True
     _classify_and_finish(
         args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, georeferenced,
     )
@@ -705,6 +983,8 @@ def _resume_after_control_points(
             gps_residuals = json.loads(gps_georeference.read_text(encoding="utf-8")).get("residual_m")
         except (OSError, json.JSONDecodeError):
             pass
+    if _is_local_crs(args.control_points_crs):
+        raise ValueError(LOCAL_CRS_GPS_MESSAGE)
     georeference, report, transform = georeference_from_control_points(
         pristine_sparse_txt, control_points_dir / "control_points.csv", control_points_dir / "observations.json",
         args.control_points_crs, settings, gps_residuals=gps_residuals,
@@ -812,7 +1092,14 @@ def _automatic_control_points(
     scale = float(georef["scale"])
     rotation = np.asarray(georef["rotation"], dtype=float)
     translation = np.asarray(georef["translation"], dtype=float)
-    ecef = coordinates_to_ecef(points[["x", "y", "z"]].to_numpy(dtype=float), control_points_crs)
+    try:
+        ecef = coordinates_to_ecef(points[["x", "y", "z"]].to_numpy(dtype=float), control_points_crs)
+    except Exception:
+        if not _is_local_crs(control_points_crs):
+            raise
+        print(f"WARNING: {LOCAL_CRS_GPS_MESSAGE}.")
+        save_control_point_report(report_path, {"gate": {"passed": False, "reasons": [LOCAL_CRS_GPS_MESSAGE]}, "points": []})
+        return None
     references = {
         str(row.name): rotation.T @ ((ecef[index] - translation) / scale)
         for index, (_, row) in enumerate(points.set_index("name").iterrows())
@@ -824,16 +1111,35 @@ def _automatic_control_points(
         0.03 if rtk else 3.0, 0.05 if rtk else 5.0,
         existing=load_detections(control_points_dir / "detections.json"),
     )
+    return _finish_control_point_adjustment(
+        model_path, control_points_dir, control_points_crs, settings, report_path,
+        detections, detection_statistics, references,
+        {str(name): ecef[index] for index, name in enumerate(points["name"].astype(str))},
+        [str(name) for name in points.loc[points["role"] == "pass", "name"]],
+        rtk=rtk, use_pose_priors=True,
+    )
+
+
+def _finish_control_point_adjustment(
+    model_path: Path, control_points_dir: Path, control_points_crs: str, settings: dict, report_path: Path,
+    detections: dict[str, dict], detection_statistics: dict, references: dict[str, np.ndarray],
+    ecef_by_name: dict[str, np.ndarray], pass_names: list[str], *, rtk: bool, use_pose_priors: bool,
+    local_frame: bool = False,
+) -> Path | None:
+    """Shared GCP adjustment: BA loop, gate, GCP-local ENU transform, leave-one-out, reports, georeference."""
+    import pycolmap
+
     before = camera_intrinsics(pycolmap.Reconstruction(model_path))
     pose_priors = None
     database_path = model_path.parents[1] / "database.db"
-    try:
-        ensure_available(database_path)
-    except FileNotFoundError:
-        pass
-    if database_path.is_file():
-        with pycolmap.Database.open(database_path) as database:
-            pose_priors = database.read_all_pose_priors()
+    if use_pose_priors:
+        try:
+            ensure_available(database_path)
+        except FileNotFoundError:
+            pass
+        if database_path.is_file():
+            with pycolmap.Database.open(database_path) as database:
+                pose_priors = database.read_all_pose_priors()
     raw_adjusted = model_path.parent / "gcp_adjusted_raw"
     adjustment: dict[str, object] = {}
     gate: tuple[bool, list[str], dict[str, dict[str, float]]] | None = None
@@ -857,12 +1163,18 @@ def _automatic_control_points(
         report["detection_statistics"] = detection_statistics
         save_control_point_report(report_path, report)
         return None
-    centroid = ecef.mean(axis=0)
-    enu_rotation = enu_rotation_at_ecef(centroid)
-    target_enu = (enu_rotation @ (ecef - centroid).T).T
-    enabled_pass = [str(name) for name in points.loc[points["role"] == "pass", "name"] if detections.get(str(name), {}).get("enabled")]
+    names = list(ecef_by_name)
+    if local_frame:
+        # Local survey coordinates are the target frame: no ECEF/ENU conversion and no centroid shift.
+        target_enu = {name: np.asarray(ecef_by_name[name], dtype=float) for name in names}
+    else:
+        ecef = np.asarray([ecef_by_name[name] for name in names], dtype=float)
+        centroid = ecef.mean(axis=0)
+        enu_rotation = enu_rotation_at_ecef(centroid)
+        target_enu = dict(zip(names, (enu_rotation @ (ecef - centroid).T).T, strict=True))
+    enabled_pass = [str(name) for name in pass_names if detections.get(str(name), {}).get("enabled")]
     source = np.asarray([references[name] for name in enabled_pass], dtype=float)
-    destination = np.asarray([target_enu[points.index[points["name"] == name][0]] for name in enabled_pass], dtype=float)
+    destination = np.asarray([target_enu[name] for name in enabled_pass], dtype=float)
     local_scale, local_rotation, local_translation, residuals = fit_similarity(source, destination)
     if float(residuals["max"]) >= 0.001:
         raise ValueError(f"GCP-local frame change residual is {residuals['max']:.6f} m, expected below 0.001 m")
@@ -893,12 +1205,23 @@ def _automatic_control_points(
         print(f"{point['name']} | {error_text} | {point['projections']} | {point['status']}")
     save_detections(control_points_dir / "detections.json", detections)
     report["residual_m"] = residuals
+    if local_frame and final_gate[0]:
+        report["crs"] = "LOCAL"
+        report["source_frame"] = report["method"] = LOCAL_TAGS_FRAME
     save_control_point_report(report_path, report)
     if not final_gate[0]:
         return None
+    if local_frame:
+        # The model already is in the target frame; LOCAL -> LOCAL export needs no georeference.json.
+        products = model_path.parents[1]
+        if (products.parent / "project.samcloud.yml").is_file():
+            for path in model_path.parent.glob("gcp_adjusted_raw*"):
+                if path != local_model:
+                    remove_generated(path, products)
+        return local_model
     save_georeference(model_path.parents[1] / "georeference.json", {
         "source_frame": "gcp_local_enu", "method": "gcp_bundle_adjustment", "scale": 1.0,
-        "rotation": enu_rotation.T.tolist(), "translation": centroid.tolist(), "pairs": len(points),
+        "rotation": enu_rotation.T.tolist(), "translation": centroid.tolist(), "pairs": len(names),
         "residual_m": residuals, "control_points": {"crs": control_points_crs, "origin_ecef": centroid.tolist()},
     })
     products = model_path.parents[1]
@@ -1281,7 +1604,7 @@ def _resolve_units_per_metre(args, dense_dir: Path, classified_raw: Path, fill_s
     if isinstance(setting, str) and setting.lower() == "auto":
         outdir = dense_dir.parent
         info: dict = {"units_per_metre": 1.0, "source": "georeferenced"}
-        if not ((outdir / "georeference.json").is_file() or (outdir / "gps_ref.txt").is_file()):
+        if not (_is_georeferenced(outdir) or (outdir / "gps_ref.txt").is_file()):
             try:
                 from samcloud.colmap.surface_fusion import derive_units_per_metre
                 from samcloud.engine.ply_io import read_vertex_array
@@ -1329,6 +1652,10 @@ def _refine_after_classification(
         snapshot_fine_terms(classified_raw, scores_path)
     except Exception as error:  # noqa: BLE001 - the classification itself stays valid without fine terms
         print(f"WARNING: Fine terms could not be set aside for step 6: {error}")
+    try:
+        snapshot_instances(classified_raw, classified_raw.with_name(INSTANCES_SOURCE_NAME))
+    except Exception as error:  # noqa: BLE001 - classifications remain usable without instances
+        print(f"WARNING: Instances could not be set aside for step 6: {error}")
     scores = scores_path if scores_path.is_file() else None
     has_depth = (dense_dir / "stereo" / "depth_maps").is_dir()
     views = None
@@ -1509,6 +1836,54 @@ def _attach_fine_terms(args, classified_scores: Path, classified_output: Path, s
           f"({len(report['labels'])} labels, {LABELS_NAME} written next to the PLY).")
 
 
+def _instance_params(args) -> dict:
+    return {
+        "min_points": int(args.instance_min_points),
+        "attach_radius_m": float(args.instance_attach_radius_m),
+    }
+
+
+def _instances_active(args) -> bool:
+    """Instance IDs are produced only when enabled and not switched off."""
+    return getattr(args, "instances_enabled", "0") == "1" and not bool(getattr(args, "no_instances", False))
+
+
+def _discard_stale_instances(classified_raw: Path) -> None:
+    """A fresh classification invalidates any instance snapshot left by an earlier run."""
+    stale = Path(classified_raw).with_name(INSTANCES_SOURCE_NAME)
+    try:
+        stale.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"WARNING: Stale instance snapshot could not be removed: {error}")
+
+
+def _snapshot_instances_safely(args, classified_raw: Path) -> None:
+    """Set the instance IDs aside for step 6; a failure must never abort the classification."""
+    if not _instances_active(args):
+        return
+    try:
+        snapshot_instances(classified_raw, Path(classified_raw).with_name(INSTANCES_SOURCE_NAME))
+    except Exception as error:  # noqa: BLE001 - classifications remain usable without instances
+        print(f"WARNING: Instances could not be set aside for step 6: {error}")
+
+
+def _attach_instances(args, classified_scores: Path, classified_output: Path, summary: RunSummary) -> None:
+    """Restore the per-point IDs after step 6 has produced its final point set."""
+    if not _instances_active(args):
+        return
+    source = Path(classified_scores).with_name(INSTANCES_SOURCE_NAME)
+    if not source.is_file() or not Path(classified_output).is_file():
+        return
+    try:
+        report = attach_instances(source, classified_output, _instance_params(args))
+    except Exception as error:  # noqa: BLE001 - product PLY remains valid without an instance field
+        print(f"WARNING: Instances were not written: {error}")
+        summary.settings["instances"] = {"enabled": True, "error": str(error)}
+        return
+    summary.settings["instances"] = {key: value for key, value in report.items() if key != "instances"}
+    print(f"Instances: {report.get('count', 0):,} objects, {report.get('points', 0):,} points carry an instance ID.")
+
+
 def _cache_after_sam(args, dense_dir: Path, classified_raw: Path, classified_scores: Path) -> None:
     """Keep the SAM result and dense workspace when the project wants a processing cache."""
     if str(getattr(args, "keep_processing_cache", "0")) != "1":
@@ -1531,7 +1906,7 @@ def _refine_from_cache(
     classified_output: Path,
 ) -> None:
     """Re-run workflow step 6 from the processing cache (no COLMAP, no SAM)."""
-    from samcloud.engine.processing_cache import SAM_CLOUD, SAM_SCORES, cache_directory, load_manifest
+    from samcloud.engine.processing_cache import INSTANCES_SOURCE, SAM_CLOUD, SAM_SCORES, cache_directory, load_manifest
 
     project_directory = outdir.parent
     manifest = load_manifest(project_directory)
@@ -1550,6 +1925,8 @@ def _refine_from_cache(
         shutil.copy2(cache / SAM_SCORES, classified_scores)
     elif classified_scores.exists():
         classified_scores.unlink()
+    if (cache / INSTANCES_SOURCE).is_file():
+        shutil.copy2(cache / INSTANCES_SOURCE, classified_scores.with_name(INSTANCES_SOURCE))
     views = int(manifest.get("files", {}).get("images", 0)) or 1
     if progress:
         plan = []
@@ -1577,7 +1954,7 @@ def _refine_from_cache(
     print(f"Re-running step 6 from the processing cache of {manifest.get('created_at')}.")
     _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
                                  report_dir=report_dir, keep_caches=True, reuse_priors=True)
-    georeferenced = (outdir / "georeference.json").is_file()
+    georeferenced = _is_georeferenced(outdir)
     _finish_classification(args, outdir, report_dir, summary, progress, classified_raw, classified_scores,
                            classified_output, georeferenced)
 
@@ -1591,6 +1968,23 @@ def _classification_engine(args) -> str:
 def _writes_scores(args) -> bool:
     """Whether classify.py writes weighted-vote confidence scores (SegEarth-OV3 voting or FlurSeg)."""
     return args.classification_mode == "segearth_ov3" or _classification_engine(args) == "flurseg"
+
+
+def _instance_arguments(args) -> list[str]:
+    """Forward the instance configuration to the standalone classifier CLI."""
+    values = [
+        "--instances-enabled", "0" if args.no_instances else "1" if args.instances_enabled == "1" else "0",
+        "--instance-query-threshold", str(args.instance_query_threshold),
+        "--instance-mask-threshold", str(args.instance_mask_threshold),
+        "--instance-min-mask-pixels", str(args.instance_min_mask_pixels),
+        "--instance-merge-overlap", str(args.instance_merge_overlap),
+        "--instance-min-shared-points", str(args.instance_min_shared_points),
+        "--instance-min-views", str(args.instance_min_views),
+        "--instance-min-points", str(args.instance_min_points),
+        "--instance-split-radius-m", str(args.instance_split_radius_m),
+        "--instance-debug-ply", "1" if args.instance_debug_ply == "1" else "0",
+    ]
+    return [*values, *( ["--no-instances"] if args.no_instances else [])]
 
 
 def _reclassify_project(
@@ -1655,7 +2049,7 @@ def _reclassify_project(
         shutil.move(str(workspace / "images"), str(images_dir))
         remove_generated(workspace, outdir)
     sparse_txt = ensure_text_model(dense_dir / "sparse", dense_dir / "sparse_txt")
-    georeferenced = (outdir / "georeference.json").is_file()
+    georeferenced = _is_georeferenced(outdir)
     if not georeferenced and (outdir / "gps_ref.txt").is_file():
         try:
             save_georeference(outdir / "georeference.json", fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt"))
@@ -1725,14 +2119,16 @@ def _classify_and_finish(
         "--engine", _classification_engine(args),
         "--background-threshold", str(args.background_threshold), "--query-threshold", str(args.query_threshold),
         "--summary-file", str(report_dir / "classification_summary.json"), "--out", str(classified_raw),
-        *_labels_arguments(args, dense_dir)]
+        *_labels_arguments(args, dense_dir), *_instance_arguments(args)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
     if _writes_scores(args):
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
+    _discard_stale_instances(classified_raw)
     run(classify_command, summary=summary, stage="SAM3 classification")
+    _snapshot_instances_safely(args, classified_raw)
     if cache_after_sam:
         _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
     _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
@@ -1765,6 +2161,7 @@ def _finish_classification(
             progress.estimator.skip_stage("geometry_refinement")
         shutil.copy2(classified_raw, classified_output)
     _attach_fine_terms(args, classified_scores, classified_output, summary)
+    _attach_instances(args, classified_scores, classified_output, summary)
     if args.skip_export:
         if progress:
             progress.finish()
@@ -1811,6 +2208,18 @@ def main():
                     help="SegEarth-OV3 background threshold")
     ap.add_argument("--query-threshold", type=float, default=0.4,
                     help="SegEarth-OV3 decoder query threshold")
+    ap.add_argument("--instances-enabled", choices=("0", "1"), default="0")
+    ap.add_argument("--no-instances", action="store_true", help="disable SAM object instance IDs")
+    ap.add_argument("--instance-query-threshold", type=float, default=0.5)
+    ap.add_argument("--instance-mask-threshold", type=float, default=0.5)
+    ap.add_argument("--instance-min-mask-pixels", type=int, default=12)
+    ap.add_argument("--instance-merge-overlap", type=float, default=0.5)
+    ap.add_argument("--instance-min-shared-points", type=int, default=10)
+    ap.add_argument("--instance-min-views", type=int, default=2)
+    ap.add_argument("--instance-min-points", type=int, default=100)
+    ap.add_argument("--instance-split-radius-m", type=float, default=0.05)
+    ap.add_argument("--instance-attach-radius-m", type=float, default=0.05)
+    ap.add_argument("--instance-debug-ply", choices=("0", "1"), default="0")
     ap.add_argument("--threshold-sweep", default="",
                     help="optional comma-separated SegEarth-OV3 background thresholds")
     ap.add_argument("--classes-json", default=str(PROJECT_ROOT / "config" / "classes.json"),
@@ -1874,6 +2283,7 @@ def main():
     )
     ap.add_argument("--control-points-dir", default=None, help="project control_points directory")
     ap.add_argument("--control-points-crs", default="EPSG:2056+5728")
+    ap.add_argument("--apriltags", action="store_true", help="search AprilTags and scale the sparse model from their size")
     ap.add_argument(
         "--progress-file",
         default=None,
@@ -1965,6 +2375,7 @@ def main():
         "classification_engine": _classification_engine(args),
         "background_threshold": args.background_threshold,
         "query_threshold": args.query_threshold,
+        "instances_enabled": args.instances_enabled == "1" and not args.no_instances,
         "geometry_refinement": args.geometry_refinement == "1",
         "source_crs": args.source_crs,
         "export_crs": args.export_crs,
@@ -2255,6 +2666,7 @@ def main():
     # Preserve the distorted sparse model before target observations or GCP BA.
     # Existing snapshots are deliberately retained so a review re-run starts
     # from exactly the same Phase-A reconstruction.
+    automatic_model_used = False
     if args.control_points_mode == "automatic":
         pristine_distorted = sparse_dir / "pre_gcp"
         if not pristine_distorted.exists():
@@ -2274,9 +2686,30 @@ def main():
             print("Automatic control-point quality gate did not pass. Waiting for control-point review.")
         else:
             model0 = automatic_model
+            automatic_model_used = True
+
+    tag_georeferenced = False
+    if args.apriltags and not georeferenced and not automatic_model_used and args.control_points_mode != "automatic":
+        try:
+            if progress:
+                progress.update(56, "Searching AprilTags")
+            tag_result = _apriltag_step(
+                model0, sparse_dir, images_dir, control_points_dir, report_dir,
+                outlier_pct=float(load_global_config("defaults.yml").get("apriltags", {}).get("outlier_pct", 3.0)),
+                crs=args.control_points_crs,
+            )
+            model0, tag_report = tag_result.model, tag_result.report
+            summary.settings["apriltags"] = tag_report
+            if tag_result.georeferenced:
+                georeferenced = tag_georeferenced = True
+            elif tag_result.gate_failed:
+                args.stop_after_alignment = True
+                print("AprilTag control-point quality gate did not pass. Waiting for control-point review.")
+        except Exception as error:
+            print(f"WARNING: AprilTag scaling failed, model stays unscaled: {error}")
 
     _release_sparse_intermediates(sparse_dir, model0)
-    if args.capture_type == "panorama_360" and bool(alignment_config.get("gravity_align_panorama", True)):
+    if args.capture_type == "panorama_360" and bool(alignment_config.get("gravity_align_panorama", True)) and not tag_georeferenced:
         model0, gravity_report = _align_panorama_gravity(sparse_dir, model0, report_dir)
         summary.settings["gravity_alignment"] = gravity_report
     _write_final_model(sparse_dir, model0)
@@ -2310,7 +2743,7 @@ def main():
              "--input_path", str(dense_dir / "sparse"),
              "--output_path", str(dense_sparse_txt),
              "--output_type", "TXT"], summary=summary, stage="Preparing control points")
-        if georeferenced:
+        if georeferenced and not tag_georeferenced:
             try:
                 georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path)
                 save_georeference(outdir / "georeference.json", georeference)
@@ -2356,7 +2789,7 @@ def main():
          "--output_path", str(dense_sparse_txt),
          "--output_type", "TXT"], summary=summary, stage="Preparing classification")
     georeference_path = outdir / "georeference.json"
-    if georeferenced:
+    if georeferenced and not tag_georeferenced:
         started_at = time.perf_counter()
         try:
             georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path)
@@ -2396,14 +2829,16 @@ def main():
          "--query-threshold", str(args.query_threshold),
          "--summary-file", str(report_dir / "classification_summary.json"),
          "--out", str(classified_raw),
-         *_labels_arguments(args, dense_dir)]
+         *_labels_arguments(args, dense_dir), *_instance_arguments(args)]
     if args.threshold_sweep:
         classify_command.extend(["--threshold-sweep", args.threshold_sweep])
     if _writes_scores(args):
         classify_command.extend(["--scores-out", str(classified_scores)])
     if args.progress_file:
         classify_command.extend(["--progress-file", str(Path(args.progress_file).with_name("classification_progress.json"))])
+    _discard_stale_instances(classified_raw)
     run(classify_command, summary=summary, stage="SAM3 classification")
+    _snapshot_instances_safely(args, classified_raw)
     _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
     _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
                                  report_dir=report_dir)
@@ -2442,6 +2877,7 @@ def main():
             geometry_summary.write_text(json.dumps({"skipped": "not georeferenced"}, indent=2), encoding="utf-8")
 
     _attach_fine_terms(args, classified_scores, classified_output, summary)
+    _attach_instances(args, classified_scores, classified_output, summary)
     if args.skip_export:
         if progress:
             progress.finish()

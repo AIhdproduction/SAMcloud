@@ -118,6 +118,8 @@ def _ensure_furniture_block(document: ezdxf.document.Drawing) -> None:
     block.add_lwpolyline([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], close=True)
     block.add_attdef("class", (0.0, -0.15), "", height=0.08)
     block.add_attdef("height", (0.0, -0.3), "", height=0.08)
+    block.add_attdef("instance", (0.0, -0.45), "", height=0.08)
+    block.add_attdef("label", (0.0, -0.6), "", height=0.08)
 
 
 def _add_entity(

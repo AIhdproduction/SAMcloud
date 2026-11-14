@@ -123,7 +123,10 @@ def _read_ply_header(source: Path) -> tuple[int, int, np.dtype, dict[str, int]]:
             in_vertex = False
         elif in_vertex and parts[:1] == ["property"] and len(parts) == 3:
             properties.append((parts[1], parts[2]))
-    type_map = {"float": "<f4", "float32": "<f4", "uchar": "u1", "uint8": "u1"}
+    type_map = {
+        "float": "<f4", "float32": "<f4", "uchar": "u1", "uint8": "u1",
+        "uint": "<u4", "uint32": "<u4", "int": "<i4", "int32": "<i4",
+    }
     if not vertex_count or not properties or any(kind not in type_map for kind, _ in properties):
         raise ValueError("PLY does not contain a supported vertex element")
     dtype = np.dtype([(name, type_map[kind]) for kind, name in properties], align=False)

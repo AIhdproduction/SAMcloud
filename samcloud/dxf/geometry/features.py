@@ -11,7 +11,7 @@ from shapely.geometry import LineString
 from samcloud.dxf.geometry.raster import rasterize_points
 
 
-def furniture_inserts(points: np.ndarray, codes: np.ndarray | int, *, eps: float = 0.25) -> list[dict[str, object]]:
+def furniture_inserts(points: np.ndarray, codes: np.ndarray | int, *, eps: float = 0.25, instance_ids: np.ndarray | None = None, instance_labels: dict[int, str] | None = None) -> list[dict[str, object]]:
     """Fit per-class furniture clusters as rotated rectangle block inserts."""
     values = np.asarray(points, dtype=np.float64)
     if values.size == 0:
@@ -19,15 +19,35 @@ def furniture_inserts(points: np.ndarray, codes: np.ndarray | int, *, eps: float
     class_values = np.full(len(values), int(codes), dtype=np.uint8) if np.isscalar(codes) else np.asarray(codes, dtype=np.uint8)
     if len(class_values) != len(values):
         raise ValueError("Furniture codes must have one value per point")
+    ids = np.zeros(len(values), dtype=np.uint32) if instance_ids is None else np.asarray(instance_ids, dtype=np.uint32)
+    if ids.shape != class_values.shape:
+        raise ValueError("Furniture instance IDs must have one value per point")
+    labels_by_id = instance_labels or {}
     result: list[dict[str, object]] = []
     for code in sorted(set(int(value) for value in class_values)):
-        members = values[class_values == code]
-        labels = DBSCAN(eps=eps, min_samples=min(5, len(members))).fit_predict(members[:, :2])
-        for label in sorted(set(int(value) for value in labels if value >= 0)):
-            cluster = members[labels == label]
-            rectangle = cv2.minAreaRect(cluster[:, :2].astype(np.float32))
-            (x, y), (width, height), angle = rectangle
-            result.append({"type": "insert", "name": "FURNITURE", "point": [float(x), float(y)], "rotation": float(angle), "xscale": float(width), "yscale": float(height), "attributes": {"class": str(code), "height": f"{float(cluster[:, 2].max()):.3f}"}})
+        code_mask = class_values == code
+        for instance_id in sorted(set(int(value) for value in ids[code_mask] if value > 0)):
+            members = values[code_mask & (ids == instance_id)]
+            result.extend(_furniture_clusters(members, code, eps, instance_id, labels_by_id.get(instance_id, "")))
+        members = values[code_mask & (ids == 0)]
+        result.extend(_furniture_clusters(members, code, eps, 0, ""))
+    return result
+
+
+def _furniture_clusters(members: np.ndarray, code: int, eps: float, instance_id: int, instance_label: str) -> list[dict[str, object]]:
+    if len(members) == 0:
+        return []
+    labels = DBSCAN(eps=eps, min_samples=min(5, len(members))).fit_predict(members[:, :2])
+    result: list[dict[str, object]] = []
+    for label in sorted(set(int(value) for value in labels if value >= 0)):
+        cluster = members[labels == label]
+        rectangle = cv2.minAreaRect(cluster[:, :2].astype(np.float32))
+        (x, y), (width, height), angle = rectangle
+        attributes: dict[str, object] = {"class": str(code), "height": f"{float(cluster[:, 2].max()):.3f}"}
+        if instance_id > 0:
+            attributes["instance"] = int(instance_id)
+            attributes["label"] = instance_label
+        result.append({"type": "insert", "name": "FURNITURE", "point": [float(x), float(y)], "rotation": float(angle), "xscale": float(width), "yscale": float(height), "attributes": attributes})
     return result
 
 

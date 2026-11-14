@@ -1,11 +1,13 @@
 """Project creation and reopening page."""
 
+import tempfile
 from pathlib import Path
 from tkinter import TclError, Tk, filedialog
 
-from nicegui import ui
+from nicegui import events, ui
 
 from samcloud.app.layout import render_page
+from samcloud.app.pages.control_points import _CRS_OPTIONS, LOCAL_CRS_HINT
 from samcloud.app.state import state
 from samcloud.classification.custom import standard_classes
 from samcloud.core.configuration import load_global_config
@@ -137,6 +139,33 @@ def render() -> None:
                 label="Klassifizierungsmodell (Aussenbereich)",
                 value="sam3",
             ).classes("min-w-[26rem]").bind_visibility_from(class_set, "value", lambda value: value == "outdoor")
+            apriltag_switch = ui.switch(
+                "AprilTags suchen (Maßstab)", value=class_set.value == "indoor"
+            ).mark("apriltag-switch")
+            capture_type.on_value_change(
+                lambda event: setattr(class_set, "value", "indoor") if event.value == "panorama_360" else None
+            )
+            class_set.on_value_change(lambda event: setattr(apriltag_switch, "value", event.value == "indoor"))
+            tag_upload: dict[str, str | None] = {"path": None}
+            with ui.column().classes("w-full gap-2"):
+                with ui.column().classes("w-full gap-2").bind_visibility_from(apriltag_switch, "value"):
+                    async def receive_tag_coordinates(event: events.UploadEventArguments) -> None:
+                        target = Path(tempfile.mkdtemp(prefix="samcloud_apriltags_")) / "apriltags_upload.csv"
+                        await event.file.save(target)
+                        tag_upload["path"] = str(target)
+
+                    ui.upload(
+                        on_upload=receive_tag_coordinates, auto_upload=True, label="Tag-Koordinaten (optional)"
+                    ).props("accept=.csv,.txt").classes("w-full max-w-md").mark("apriltag-coords-upload")
+                    tag_crs = ui.select(
+                        _CRS_OPTIONS, label="Koordinatensystem der Tags", value="EPSG:2056+5728"
+                    ).classes("w-full max-w-md").mark("apriltag-crs")
+                    tag_crs_hint = ui.label(LOCAL_CRS_HINT).classes("sam-muted text-sm").mark("apriltag-crs-local-hint")
+                    tag_crs_hint.set_visibility(False)
+                    tag_crs.on_value_change(lambda event: tag_crs_hint.set_visibility(event.value == "LOCAL"))
+                    ui.label(
+                        "Optional: Koordinaten der Tag-Mitte je ID. Die ID auf dem Ausdruck muss mit der ID in der Datei übereinstimmen."
+                    ).classes("sam-muted text-sm")
             class_editor = _ClassEditor()
 
             def update_class_editor() -> None:
@@ -243,6 +272,9 @@ def render() -> None:
                         rtk_enabled=rtk_enabled.value,
                         control_points_mode=control_points_mode.value,
                         storage={key: bool(control.value) for key, control in storage_switches.items()},
+                        apriltags_enabled=bool(apriltag_switch.value),
+                        apriltag_coordinates_csv=tag_upload["path"] if apriltag_switch.value else None,
+                        apriltag_crs=tag_crs.value if tag_upload["path"] else None,
                     )
                     state.open_project(project_directory)
                     ui.notify(f"Project created: {project_directory.name}")

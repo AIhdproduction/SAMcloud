@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 
-def write_outputs(output_dir: Path, *, rgba: np.ndarray, dsm: np.ndarray, dtm: np.ndarray, classes: np.ndarray, validity: np.ndarray, view_count: np.ndarray, metadata: dict[str, Any], fingerprint: str, local_world_file: tuple[float, float, float, float, float, float], original_world_file: tuple[float, float, float, float, float, float] | None, jpeg_sides: tuple[int, ...], jpeg_quality: int, fine_pc: np.ndarray | None = None, fine_pc_confidence: np.ndarray | None = None, fine_labels_source: Path | None = None) -> dict[str, Path]:
+def write_outputs(output_dir: Path, *, rgba: np.ndarray, dsm: np.ndarray, dtm: np.ndarray, classes: np.ndarray, validity: np.ndarray, view_count: np.ndarray, metadata: dict[str, Any], fingerprint: str, local_world_file: tuple[float, float, float, float, float, float], original_world_file: tuple[float, float, float, float, float, float] | None, jpeg_sides: tuple[int, ...], jpeg_quality: int, fine_pc: np.ndarray | None = None, fine_pc_confidence: np.ndarray | None = None, instance_pc: np.ndarray | None = None, fine_labels_source: Path | None = None) -> dict[str, Path]:
     """Write each final artifact through a sibling temporary file then ``os.replace``."""
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -24,6 +24,8 @@ def write_outputs(output_dir: Path, *, rgba: np.ndarray, dsm: np.ndarray, dtm: n
         paths["fine_pc"] = _write_npy(output_dir / "fine_pc.npy", np.asarray(fine_pc, dtype=np.uint8))
     if fine_pc_confidence is not None:
         paths["fine_pc_confidence"] = _write_npy(output_dir / "fine_pc_conf.npy", np.asarray(fine_pc_confidence, dtype=np.float16))
+    if instance_pc is not None:
+        paths["instance_pc"] = _write_npy(output_dir / "instance_pc.npy", np.asarray(instance_pc, dtype=np.uint32))
     if fine_labels_source is not None and fine_labels_source.is_file():
         paths["fine_pc_labels"] = _write_copy(output_dir / "fine_pc_labels.json", fine_labels_source)
     paths["valid"] = _write_image(output_dir / "valid.png", validity.astype(np.uint8), [cv2.IMWRITE_PNG_COMPRESSION, 3])

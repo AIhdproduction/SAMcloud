@@ -5,7 +5,7 @@ from samcloud.app import layout
 
 def test_navigation_hides_project_pages_without_project() -> None:
     visible_paths = [path for _, path, _ in layout._visible_navigation(False)]
-    assert visible_paths == ["/", "/projects", "/settings"]
+    assert visible_paths == ["/", "/projects", "/targets", "/settings"]
 
 
 def test_navigation_shows_all_pages_with_project() -> None:
@@ -15,6 +15,7 @@ def test_navigation_shows_all_pages_with_project() -> None:
         "/projects",
         "/sparse",
         "/control-points",
+        "/targets",
         "/dense",
         "/dxf",
         "/settings",

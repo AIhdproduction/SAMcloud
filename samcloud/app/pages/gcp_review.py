@@ -20,7 +20,7 @@ def _workspace_html() -> str:
   <div class="sam-gcp-banner" data-gate>Kontrollpunkte werden geladen.</div>
   <div class="sam-gcp-actions"><button class="primary" data-optimize>Optimieren</button><button data-continue>Weiter verarbeiten</button><button data-reload>Aktualisieren</button></div>
   <div class="sam-gcp-grid">
-    <div class="sam-gcp-table-wrap"><table class="sam-gcp-table"><thead><tr><th>Aktiv</th><th>Name</th><th>Rolle</th><th>X</th><th>Y</th><th>Z</th><th>Fehler X</th><th>Fehler Y</th><th>Fehler Z</th><th>Fehler</th><th>Projektionen</th><th>Fehler px</th></tr></thead><tbody data-table></tbody></table></div>
+    <div class="sam-gcp-table-wrap"><table class="sam-gcp-table"><thead><tr><th>Aktiv</th><th>Name</th><th>Rolle</th><th>X</th><th>Y</th><th>Z</th><th>Fehler X</th><th>Fehler Y</th><th>Fehler Z</th><th>Fehler</th><th>Projektionen</th><th>Fehler px</th><th>Tag mm</th><th>Abw. %</th></tr></thead><tbody data-table></tbody></table></div>
     <div class="sam-gcp-photos"><div class="sam-gcp-photos-head"><strong data-title>Fotos nach Marker filtern</strong><button data-sort>Nach Restfehler sortieren</button></div><div class="sam-gcp-strip" data-photos></div></div>
   </div>
   <div class="sam-gcp-viewer"><div class="sam-gcp-info" data-info>Ein Foto auswählen. Mausrad: Zoom, ziehen: Verschieben, Klick: Marker setzen. Pfeiltasten wechseln Fotos, Entf entfernt die Projektion, Leertaste aktiviert/deaktiviert sie.</div><div class="sam-gcp-photo-canvas" data-viewer></div></div>
@@ -92,6 +92,7 @@ def _workspace_script() -> str:
     };
 
     const number = value => value === null || value === undefined ? '–' : Number(value).toFixed(3);
+    const number1 = value => value === null || value === undefined ? '–' : Number(value).toFixed(1);
 
     const cropUrl = (photo, size = 96, centerU = null, centerV = null) => {
       const u = centerU !== null && centerU !== undefined ? centerU : photo.u;
@@ -180,7 +181,7 @@ def _workspace_script() -> str:
           root.querySelector('[data-photos]').scrollIntoView({behavior: 'smooth', block: 'nearest'});
         };
         const e = item.errors || {};
-        row.innerHTML = `<td><input type="checkbox" ${item.enabled ? 'checked' : ''}></td><td>${item.name}</td><td><button>${item.role === 'pass' ? 'Passpunkt' : 'Kontrollpunkt'}</button></td><td>${number(item.coordinates && item.coordinates[0])}</td><td>${number(item.coordinates && item.coordinates[1])}</td><td>${number(item.coordinates && item.coordinates[2])}</td><td>${number(e.x_m)}</td><td>${number(e.y_m)}</td><td>${number(e.z_m)}</td><td>${number(e.total_m)}</td><td>${item.projections}</td><td>${number(e.reprojection_px)}</td>`;
+        row.innerHTML = `<td><input type="checkbox" ${item.enabled ? 'checked' : ''}></td><td>${item.name}</td><td><button>${item.role === 'pass' ? 'Passpunkt' : 'Kontrollpunkt'}</button></td><td>${number(item.coordinates && item.coordinates[0])}</td><td>${number(item.coordinates && item.coordinates[1])}</td><td>${number(item.coordinates && item.coordinates[2])}</td><td>${number(e.x_m)}</td><td>${number(e.y_m)}</td><td>${number(e.z_m)}</td><td>${number(e.total_m)}</td><td>${item.projections}</td><td>${number(e.reprojection_px)}</td><td>${item.kind === 'apriltag' ? number1(item.tag_size_mm) : ''}</td><td>${item.kind === 'apriltag' ? number1(item.tag_deviation_pct) : ''}</td>`;
         const enabled = row.querySelector('input');
         enabled.onclick = event => event.stopPropagation();
         enabled.onchange = async () => {

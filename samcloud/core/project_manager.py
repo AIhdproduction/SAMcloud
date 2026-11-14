@@ -13,7 +13,10 @@ from samcloud.acquisition import validate_capture_configuration
 from samcloud.classification.custom import is_customized, normalize_customization, write_project_classes
 from samcloud.core.configuration import load_global_config, load_yaml
 from samcloud.core.paths import PROJECTS_DIRECTORY, ensure_workspace_directories
+from samcloud.control_points.repository import APRILTAG_CSV_NAME, read_apriltag_coordinates, write_apriltag_coordinates
 from samcloud.core.storage import DEFAULT_STORAGE
+
+LOCAL_CRS_GPS_MESSAGE = "Lokale Koordinaten sind nur für AprilTag-Projekte ohne GPS möglich"
 
 
 PROJECT_FILENAME = "project.samcloud.yml"
@@ -50,12 +53,23 @@ class ProjectManager:
         rtk_enabled: bool = False,
         control_points_mode: str = "none",
         storage: dict | None = None,
+        apriltags_enabled: bool | None = None,
+        apriltag_coordinates_csv: str | Path | None = None,
+        apriltag_crs: str | None = None,
     ) -> Path:
         """Create a self-contained project folder without copying source images."""
         normalized_name = self._normalize_name(name)
         project_directory = self.projects_directory / normalized_name
         if project_directory.exists():
             raise FileExistsError(f"A project named '{normalized_name}' already exists")
+
+        tag_points = None
+        if apriltag_coordinates_csv and str(apriltag_crs or "").upper() == "LOCAL" and capture_type == "drone_gps":
+            raise ValueError(LOCAL_CRS_GPS_MESSAGE)
+        if apriltag_coordinates_csv:
+            tag_points = read_apriltag_coordinates(Path(apriltag_coordinates_csv))
+            if tag_points.empty:
+                raise ValueError("Die AprilTag-Koordinatendatei enthält keine Punkte")
 
         project = self._new_project_data(
             normalized_name,
@@ -70,6 +84,7 @@ class ProjectManager:
             rtk_enabled=rtk_enabled,
             control_points_mode=control_points_mode,
             storage=storage,
+            apriltags_enabled=apriltags_enabled,
         )
 
         ensure_workspace_directories()
@@ -79,7 +94,10 @@ class ProjectManager:
 
         write_project_classes(project_directory, class_set,
                               project["settings"]["classification"].get("custom_classes"))
-        self.save(project_directory, project)
+        if tag_points is not None:
+            set_apriltag_coordinates(project_directory, project, tag_points, apriltag_crs)
+        else:
+            self.save(project_directory, project)
         return project_directory
 
     def discover_projects(self) -> list[Path]:
@@ -139,6 +157,7 @@ class ProjectManager:
         rtk_enabled: bool,
         control_points_mode: str,
         storage: dict | None = None,
+        apriltags_enabled: bool | None = None,
     ) -> dict[str, Any]:
         defaults = deepcopy(load_global_config("defaults.yml"))
         panorama_defaults = defaults.get("acquisition", {}).get("panorama", {})
@@ -164,6 +183,10 @@ class ProjectManager:
         if defaults["classification"]["engine"] == "sam3" and is_customized(custom_classes):
             defaults["classification"]["custom_classes"] = normalize_customization(custom_classes, class_set)
         defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic"}
+        tag_settings = defaults.setdefault("apriltags", {})
+        tag_settings.setdefault("outlier_pct", 3.0)
+        tag_settings.setdefault("last_printed_id", -1)
+        tag_settings["enabled"] = (class_set == "indoor") if apriltags_enabled is None else bool(apriltags_enabled)
         defaults["storage"] = {**DEFAULT_STORAGE, **(storage or {})}
         coordinates = defaults["coordinate_systems"]
         is_gps_capture = capture_type == "drone_gps"
@@ -219,3 +242,31 @@ class ProjectManager:
                 "control_points_mode": control_points_mode,
             },
         }
+
+
+def set_apriltag_coordinates(project_directory: Path, project: dict, points: Any, crs: str | None = None) -> None:
+    """Store surveyed tag centres, record their CRS and save the project.
+
+    For non-GPS captures the export CRS follows the tag CRS (input/working stay LOCAL) so the
+    LAS/DXF export transforms through georeference.json. LOCAL tag coordinates (own survey system in
+    metres) keep the export CRS LOCAL; they are rejected for GPS captures.
+    """
+    georeferencing = (project.get("acquisition") or {}).get("georeferencing") or {}
+    if str(crs or "").upper() == "LOCAL" and georeferencing.get("mode") == "gps":
+        raise ValueError(LOCAL_CRS_GPS_MESSAGE)
+    write_apriltag_coordinates(points, Path(project_directory) / "control_points" / APRILTAG_CSV_NAME)
+    settings = project.setdefault("settings", {})
+    control = settings.setdefault("control_points", {})
+    if crs:
+        control["crs"] = crs
+    else:
+        control.setdefault("crs", "EPSG:2056+5728")
+    if georeferencing.get("mode") != "gps":
+        settings.setdefault("coordinate_systems", {})["export_crs"] = control["crs"]
+    ProjectManager().save(Path(project_directory), project)
+
+
+def apriltags_enabled(project: dict) -> bool:
+    """Whether the project searches AprilTags for scale (missing block -> False)."""
+    block = (project.get("settings") or {}).get("apriltags")
+    return bool(block.get("enabled", False)) if isinstance(block, dict) else False

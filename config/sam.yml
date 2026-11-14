@@ -13,6 +13,18 @@ inference:
   query_threshold: 0.4
   threshold_sweep: []
 
+instances:
+  enabled: true
+  query_threshold: 0.5
+  mask_threshold: 0.5
+  min_mask_pixels: 12
+  merge_overlap: 0.5
+  min_shared_points: 10
+  min_views: 2
+  min_points: 100
+  split_radius_m: 0.05
+  debug_ply: false
+
 output:
   unknown_class_id: 0
   write_ply: true

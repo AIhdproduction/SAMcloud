@@ -2,6 +2,7 @@
 
 import json
 import re
+from pathlib import Path
 
 from nicegui import ui
 
@@ -33,6 +34,9 @@ def render() -> None:
         color_hexes = _class_color_hexes(project, len(classes) + 1, class_set)
         las_codes = class_las_codes(class_set, _class_config())
         labels = ["Unknown / noise", *[name.split(",")[0].title() for name in classes]]
+        class_names_de = _class_config().get("labels_de", {}).get(class_set) or labels
+        instance_labels_de = _class_config().get("instance_labels_de", {})
+        fine_term_names_de = _fine_term_names_de(_fine_labels_path(project), _class_config())
         with ui.column().classes("w-full gap-4"):
             with ui.card().classes("w-full"):
                 render_pointcloud_viewer(
@@ -43,6 +47,10 @@ def render() -> None:
                         f"{las_codes[class_id]}: {label}"
                         for class_id, label in enumerate(labels)
                     ],
+                    class_names_de=class_names_de,
+                    instance_labels_de=instance_labels_de if isinstance(instance_labels_de, dict) else {},
+                    fine_term_names_de=fine_term_names_de,
+                    marker_endpoint="/api/apriltags/markers",
                 )
             with ui.card().classes("w-full"):
                 ui.label("Classification visibility and colors").classes("text-lg font-medium")
@@ -101,6 +109,32 @@ def render() -> None:
                 ).props("outline")
 
     render_page("Dense Cloud", content, current_path="/dense", wide=True)
+
+
+def _fine_labels_path(project: dict):
+    """Path of the fine-term vocabulary next to the classified cloud (may not exist)."""
+    directory = state.active_project_directory
+    return None if directory is None else Path(directory) / "products" / "classified" / "fine_labels.json"
+
+
+def _fine_term_names_de(path, config: dict) -> list[str]:
+    """German names aligned with the fine_term property (index 0 = none); [] without a vocabulary."""
+    try:
+        labels = json.loads(Path(path).read_text(encoding="utf-8")).get("labels") if path else None
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(labels, list):
+        return []
+    german = config.get("instance_labels_de")
+    german = german if isinstance(german, dict) else {}
+    aliases = config.get("instance_label_aliases")
+    aliases = aliases if isinstance(aliases, dict) else {}
+    names = [""]
+    for label in labels:
+        english = str(label)
+        key = aliases.get(english, english)
+        names.append(str(german.get(key) or german.get(english) or english))
+    return names
 
 
 def _class_config() -> dict:

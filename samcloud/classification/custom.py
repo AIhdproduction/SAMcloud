@@ -43,6 +43,12 @@ def migrate_classes_config(config: dict) -> dict:
     global_config = json.loads(global_classes_path().read_text(encoding="utf-8"))
     if "suppress" not in config:
         config["suppress"] = deepcopy(global_config.get("suppress", {}))
+    if "instance_classes" not in config:
+        config["instance_classes"] = deepcopy(global_config.get("instance_classes", {}))
+    if "instance_labels_de" not in config:
+        config["instance_labels_de"] = deepcopy(global_config.get("instance_labels_de", {}))
+    if "instance_label_aliases" not in config:
+        config["instance_label_aliases"] = deepcopy(global_config.get("instance_label_aliases", {}))
     custom_codes = [code for code, entry in load_cyclone_codes().items() if entry.get("custom") and code != 82]
     for class_set in ("outdoor", "indoor"):
         codes = config.get("las_codes", {}).get(class_set)

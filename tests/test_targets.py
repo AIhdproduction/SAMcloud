@@ -157,3 +157,75 @@ def test_saturated_bright_blob_rejected() -> None:
     white = _bowtie_bgr(center, 12, (235, 235, 235), (60, 60, 60))
     assert detect_target(green, (center[0] + 0.5, center[1] + 0.5), 40, "cross", settings=settings) is None
     assert _error(detect_target(white, (center[0] + 0.5, center[1] + 0.5), 40, "cross", settings=settings), center) < 0.3
+
+
+# --- dark ground: painted white crosses must stay detectable, black-on-white sheets must be found, clutter rejected ---
+
+def _asphalt(shape: tuple[int, int], level: int = 60, seed: int = 3) -> np.ndarray:
+    """Grey ground with low-frequency mottling (+-10) and pixel noise, as float canvas."""
+    rng = np.random.default_rng(seed)
+    mottling = cv2.GaussianBlur(rng.normal(0, 1, shape).astype(np.float32), (0, 0), 6.0)
+    mottling *= 10.0 / max(float(mottling.std()) * 1.5, 1e-6)
+    return level + mottling
+
+
+def _bowtie_points(center: tuple[float, float], length: float, half_width: float, angle: float) -> list[np.ndarray]:
+    rotation = cv2.getRotationMatrix2D((0, 0), angle, 1.0)[:, :2]
+    cx, cy = np.array(center) * SCALE
+    return [
+        np.round(np.array([[0, 0], [s * length, -half_width], [s * length, half_width]], np.float32) * SCALE @ rotation.T + (cx, cy)).astype(np.int32)
+        for s in (-1, 1)
+    ]
+
+
+def _dark_ground_scene(painted=(), sheets=(), level: int = 60, seed: int = 3, noise: float = 4.0) -> np.ndarray:
+    """painted: (center, length, angle) white bow-ties; sheets: (center, side) white squares with black bow-tie."""
+    canvas = np.full((SHAPE[0] * SCALE, SHAPE[1] * SCALE), 0, np.float32)
+    ground = cv2.resize(_asphalt((SHAPE[0], SHAPE[1]), level, seed), (SHAPE[1] * SCALE, SHAPE[0] * SCALE), interpolation=cv2.INTER_LINEAR)
+    canvas[:] = ground
+    for center, length, angle in painted:
+        for triangle in _bowtie_points(center, length, 0.55 * length, angle):
+            cv2.fillConvexPoly(canvas, triangle, 235)
+    for center, side in sheets:
+        half = int(round((side / 2 + 1.2) * SCALE))  # thin white paper rim around the triangles (cut sheet)
+        cx, cy = int(round(center[0] * SCALE)), int(round(center[1] * SCALE))
+        cv2.rectangle(canvas, (cx - half, cy - half), (cx + half, cy + half), 245, -1)
+        for triangle in _bowtie_points(center, side / 2, side / 2, 0):
+            cv2.fillConvexPoly(canvas, triangle, 12)
+    small = cv2.resize(canvas, (SHAPE[1], SHAPE[0]), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), 0.7)
+    noisy = small + np.random.default_rng(seed + 100).normal(0, noise, small.shape)
+    return np.clip(noisy, 0, 255).astype(np.uint8)
+
+
+@pytest.mark.parametrize("length", [20, 30, 45])
+@pytest.mark.parametrize("angle", [0, 31])
+def test_painted_white_cross_on_textured_asphalt_regression(length: float, angle: float) -> None:
+    """Painted white crosses on mottled asphalt (grey 60) keep sub-pixel accuracy with polarity auto."""
+    center = (412.37, 288.81)
+    image = _dark_ground_scene(painted=[(center, length, angle)])
+    found = detect_target(image, (center[0] + 6.1, center[1] - 4.3), 60, "cross", settings=DetectionSettings())
+    assert _error(found, center) < 1.0
+
+
+def test_textured_asphalt_and_plain_white_sheet_are_not_targets() -> None:
+    """No target: bare ground (asphalt, concrete) and a white A4-like sheet without triangles are rejected."""
+    center = (412.37, 288.81)
+    for level in (60, 120):
+        bare = _dark_ground_scene(level=level, seed=level)
+        assert detect_target(bare, (center[0], center[1]), 80, "cross", settings=DetectionSettings()) is None
+        sheet = bare.copy()
+        sheet[int(center[1]) - 32 : int(center[1]) + 33, int(center[0]) - 46 : int(center[0]) + 47] = 235
+        sheet = cv2.GaussianBlur(sheet, (0, 0), 0.7)
+        assert detect_target(sheet, (center[0], center[1]), 80, "cross", settings=DetectionSettings()) is None
+
+
+def test_black_sheet_and_white_painted_cross_in_one_window_are_both_candidates() -> None:
+    """A printed black bow-tie sheet and a painted white cross side by side are both reported."""
+    from samcloud.control_points.targets import detect_targets_in_window
+
+    sheet_center, cross_center = (330.4, 290.2), (470.6, 288.8)
+    image = _dark_ground_scene(painted=[(cross_center, 30, 12)], sheets=[(sheet_center, 56)])
+    found = detect_targets_in_window(image, (400.0, 289.5), 110, "cross", settings=DetectionSettings(), max_results=5)
+    for expected in (sheet_center, cross_center):
+        assert any(np.hypot(item.u - (expected[0] + 0.5), item.v - (expected[1] + 0.5)) < 2.0 for item in found), (expected, [(i.u, i.v, i.score) for i in found])

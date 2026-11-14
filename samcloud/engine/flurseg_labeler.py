@@ -201,7 +201,7 @@ class FlurSegLabeler:
         del tensor
         return torch.einsum("tc,chw->thw", self.mapping, probs)
 
-    def score_points(self, image_path, u, v, image=None, label_threshold=None):
+    def score_points(self, image_path, u, v, image=None, label_threshold=None, instances_out=None, **_kwargs):
         """(N, num_classes) probabilities at integer (u, v); with label_threshold also an HxW label raster."""
         if image is None:
             image, width, height = self.load_image(image_path)

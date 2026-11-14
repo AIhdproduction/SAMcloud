@@ -55,6 +55,9 @@ _HEAD = f"""
 .sam-potree-camera-card.is-open {{ display:block; }}
 .sam-potree-camera-card img {{ display:block; width:100%; max-height:210px; margin-top:8px; object-fit:contain; background:#050b12; cursor:zoom-in; }}
 .sam-potree-camera-card a {{ color:#59c8f3; display:inline-block; margin-top:7px; }}
+.sam-potree-point-card {{ position:absolute; z-index:26; min-width:150px; max-width:260px; padding:9px 10px; border:1px solid #47718a; border-radius:7px; background:rgba(9,19,29,.96); color:#eaf2f8; font-size:12px; display:none; pointer-events:none; }}
+.sam-potree-point-card.is-open {{ display:block; }}
+.sam-potree-point-card strong {{ display:block; margin-bottom:3px; font-size:14px; }}
 </style>
 """
 
@@ -65,11 +68,14 @@ def render_potree_viewer(
     title: str,
     class_colors: list[list[int]],
     class_labels: list[str] | None = None,
+    class_names_de: list[str] | None = None,
+    instance_labels_de: dict[str, str] | None = None,
+    fine_term_names_de: list[str] | None = None,
     marker_endpoint: str | None = None,
     camera_endpoint: str | None = None,
 ) -> None:
     """Render a Potree viewer for the active project's sparse or dense cloud."""
-    config = _viewer_config(kind, title, class_colors, class_labels, marker_endpoint, camera_endpoint)
+    config = _viewer_config(kind, title, class_colors, class_labels, class_names_de, instance_labels_de, marker_endpoint, camera_endpoint, fine_term_names_de)
     element_id = config["element_id"]
     ui.add_head_html(_HEAD)
     ui.html(
@@ -78,6 +84,7 @@ def render_potree_viewer(
             show_classes=config["show_classes"],
             show_markers=config["show_markers"],
             show_cameras=config["show_cameras"],
+            markers_label="AprilTags" if kind == "dense" else "Passpunkte",
         ),
         sanitize=False,
     ).classes("w-full")
@@ -89,8 +96,11 @@ def _viewer_config(
     title: str,
     class_colors: list[list[int]],
     class_labels: list[str] | None = None,
+    class_names_de: list[str] | None = None,
+    instance_labels_de: dict[str, str] | None = None,
     marker_endpoint: str | None = None,
     camera_endpoint: str | None = None,
+    fine_term_names_de: list[str] | None = None,
 ) -> dict:
     """Build the browser configuration for one Potree cloud."""
     return {
@@ -101,6 +111,10 @@ def _viewer_config(
         "status_url": f"/api/potree/{kind}/status",
         "class_colors": class_colors,
         "class_labels": class_labels or [],
+        "class_names_de": class_names_de or [],
+        "instance_labels_de": instance_labels_de or {},
+        "fine_term_names_de": fine_term_names_de or [],
+        "enable_point_info": kind == "dense",
         "marker_endpoint": marker_endpoint,
         "camera_endpoint": camera_endpoint,
         "show_classes": kind == "dense",
@@ -115,9 +129,10 @@ def _html(
     show_classes: bool = True,
     show_markers: bool = False,
     show_cameras: bool = False,
+    markers_label: str = "Passpunkte",
 ) -> str:
     markers_btn = (
-        '    <button data-action="markers" class="is-selected">Passpunkte</button>\n'
+        f'    <button data-action="markers" class="is-selected">{markers_label}</button>\n'
         if show_markers
         else ""
     )
@@ -155,6 +170,7 @@ def _html(
   </div>
   <div class="sam-potree-classes"></div>
   <aside class="sam-potree-camera-card"></aside>
+  <aside class="sam-potree-point-card"></aside>
   <div class="sam-potree-status">Punktwolke wird vorbereitet …</div>
 </div>
 """
@@ -218,6 +234,7 @@ const start = () => {
       markersVisible = !markersVisible;
       for (const item of markerObjects) {
         item.sphere.visible = markersVisible;
+        if (item.square) item.square.visible = markersVisible;
         const element = item.annotation.domElement && item.annotation.domElement[0];
         if (element) element.classList.toggle("is-hidden", !markersVisible);
       }
@@ -334,6 +351,7 @@ const start = () => {
       viewer.scene.addPointCloud(cloud);
       cloud.material.size = 1.5;
       cloud.material.pointSizeType = Potree.PointSizeType.ADAPTIVE;
+      cloud.material.shape = Potree.PointShape.CIRCLE;
       cloud.material.activeAttributeName = "rgba";
       viewer.fitToScreen(0.55);
       setTimeout(() => viewer.fitToScreen(0.55), 1500);
@@ -370,7 +388,9 @@ const start = () => {
     setTimeout(pollStatus, 2000);
   };
   pollStatus();
-  const colours = { pass: "#26b7ef", control: "#ffb020", disabled: "#6b7c8a", needs_review: "#ff5a5a" };
+  const colours = { pass: "#26b7ef", control: "#ffb020", disabled: "#6b7c8a", needs_review: "#ff5a5a", apriltag: "#b06cff" };
+  let markerWarnings = [];
+  let highlightedTag = null;
   const markerObjects = [];
   let markersVisible = true;
    const cameraCard = root.querySelector(".sam-potree-camera-card");
@@ -448,7 +468,7 @@ const start = () => {
      const camera = viewer.scene.getActiveCamera();
     for (const item of markerObjects) {
       const distance = camera.position.distanceTo(item.sphere.position);
-      item.sphere.scale.setScalar(Math.max(0.5, distance * 0.012 / 0.18));
+      item.sphere.scale.setScalar(Math.max(0.5, distance * 0.012 / (item.radius || 0.18)));
     }
      for (const item of cameraObjects) {
        const distance = camera.position.distanceTo(item.marker.position);
@@ -463,19 +483,31 @@ const start = () => {
       const response = await fetch(config.marker_endpoint, { cache: "no-store" });
       if (!response.ok) return;
       const payload = await response.json();
+      markerWarnings = Array.isArray(payload.warnings) ? payload.warnings : [];
       for (const marker of payload.markers || []) {
         if (!Array.isArray(marker.coordinates) || marker.coordinates.length !== 3) continue;
         const annotation = new Potree.Annotation({ position: new THREE.Vector3(...marker.coordinates), title: marker.name });
         viewer.scene.annotations.add(annotation);
         const colour = colours[marker.state_color] || colours.needs_review;
+        const isTag = marker.kind === "apriltag";
+        const radius = isTag ? 0.05 : 0.18;
         const sphere = new THREE.Mesh(
-          new THREE.SphereGeometry(0.18, 20, 14),
+          new THREE.SphereGeometry(radius, 20, 14),
           new THREE.MeshBasicMaterial({ color: colour, depthTest: false, transparent: true, opacity: 0.95 })
         );
         sphere.position.set(...marker.coordinates);
         sphere.renderOrder = 999;
         viewer.scene.scene.add(sphere);
-        markerObjects.push({ annotation, sphere });
+        let square = null;
+        if (Array.isArray(marker.corners) && marker.corners.length === 4) {
+          const squareGeometry = new THREE.BufferGeometry();
+          squareGeometry.setAttribute("position", new THREE.Float32BufferAttribute(marker.corners.flat(), 3));
+          square = new THREE.LineLoop(squareGeometry, new THREE.LineBasicMaterial({ color: colour, depthTest: false, transparent: true, opacity: 0.95 }));
+          square.renderOrder = 998;
+          square.visible = markersVisible;
+          viewer.scene.scene.add(square);
+        }
+        markerObjects.push({ annotation, sphere, square, marker, radius, colour });
         const element = annotation.domElement && annotation.domElement[0];
         if (element) {
           element.style.setProperty("--sam-marker", colour);
@@ -486,7 +518,9 @@ const start = () => {
           element.addEventListener("dblclick", event => {
             event.preventDefault();
             event.stopPropagation();
-            window.location.href = `/control-points?marker=${encodeURIComponent(marker.name)}`;
+            window.location.href = isTag && marker.tag_id !== undefined
+              ? `/control-points?tag=${encodeURIComponent(marker.tag_id)}`
+              : `/control-points?marker=${encodeURIComponent(marker.name)}`;
           });
         }
       }
@@ -558,14 +592,15 @@ const start = () => {
     cameraCard.classList.add("is-open");
     armCameraCardTimer();
   };
-   const pickCamera = (event, includeImage) => {
-     if (!cameraObjects.length || !camerasVisible || !cameraPhotosVisible) return;
+  const pickCamera = (event, includeImage) => {
+     if (!cameraObjects.length || !camerasVisible || !cameraPhotosVisible) return null;
     const rect = root.getBoundingClientRect();
     pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     raycaster.setFromCamera(pointer, viewer.scene.getActiveCamera());
     const hit = raycaster.intersectObjects(cameraObjects.map(item => item.marker), false)[0];
-    if (hit && hit.object.userData.camera) showCamera(hit.object.userData.camera, includeImage);
+    if (hit && hit.object.userData.camera) { showCamera(hit.object.userData.camera, includeImage); return hit.object.userData.camera; }
+    return null;
   };
   const cameraAt = event => {
     if (!cameraObjects.length || !camerasVisible) return null;
@@ -584,8 +619,173 @@ const start = () => {
     event.stopPropagation();
     window.open(`/api/camera-thumbnail/${encodeURIComponent(camera.id)}?size=1024`, "_blank", "noopener");
   }, true);
-  root.querySelector(".sam-potree-area").addEventListener("pointermove", event => pickCamera(event, false));
-  root.querySelector(".sam-potree-area").addEventListener("click", event => pickCamera(event, true));
+  const area = root.querySelector(".sam-potree-area");
+  let pointerDown = null;
+  let pointOverlay = null;
+  let pointHelper = null;
+  const pointCard = root.querySelector(".sam-potree-point-card");
+  const clearPointInfo = () => {
+    if (pointOverlay) {
+      viewer.scene.scene.remove(pointOverlay);
+      pointOverlay.geometry.dispose();
+      pointOverlay.material.map && pointOverlay.material.map.dispose();
+      pointOverlay.material.dispose();
+      pointOverlay = null;
+    }
+    if (pointHelper) { viewer.scene.scene.remove(pointHelper); pointHelper.geometry.dispose(); pointHelper.material.dispose(); pointHelper = null; }
+    if (highlightedTag) { if (highlightedTag.square) highlightedTag.square.material.color.set(highlightedTag.colour); highlightedTag = null; }
+    if (pointCard) pointCard.classList.remove("is-open");
+  };
+  const readPickedValue = (point, names) => {
+    for (const name of names) {
+      const value = point && point[name];
+      if (Array.isArray(value) || ArrayBuffer.isView(value)) return Number(value[0]);
+      if (value !== undefined && value !== null) return Number(value);
+    }
+    return 0;
+  };
+  const showPointCard = (event, title, details) => {
+    if (!pointCard) return;
+    pointCard.innerHTML = "";
+    const heading = document.createElement("strong"); heading.textContent = title; pointCard.append(heading);
+    for (const detail of details) { const line = document.createElement("div"); line.textContent = detail; pointCard.append(line); }
+    const bounds = root.getBoundingClientRect();
+    pointCard.style.left = `${Math.min(bounds.width - 275, Math.max(10, event.clientX - bounds.left + 12))}px`;
+    pointCard.style.top = `${Math.min(bounds.height - 100, Math.max(10, event.clientY - bounds.top + 12))}px`;
+    pointCard.classList.add("is-open");
+  };
+  const showInstanceOverlay = async instance => {
+    clearPointInfo();
+    const response = await fetch(`/api/instances/${encodeURIComponent(instance.id)}/points`, { cache: "no-store" });
+    if (!response.ok) return;
+    const buffer = await response.arrayBuffer();
+    const view = new DataView(buffer);
+    const count = view.getUint32(8, true);
+    if (buffer.byteLength < 16 + count * 15) return;
+    const positions = new Float32Array(count * 3);
+    const colours = new Float32Array(count * 3);
+    for (let index = 0, offset = 16; index < count; index += 1, offset += 15) {
+      positions[index * 3] = view.getFloat32(offset, true); positions[index * 3 + 1] = view.getFloat32(offset + 4, true); positions[index * 3 + 2] = view.getFloat32(offset + 8, true);
+      colours[index * 3] = .5 + view.getUint8(offset + 12) / 510; colours[index * 3 + 1] = .5 + view.getUint8(offset + 13) / 510; colours[index * 3 + 2] = .5 + view.getUint8(offset + 14) / 510;
+    }
+    const textureCanvas = document.createElement("canvas"); textureCanvas.width = textureCanvas.height = 16;
+    const textureContext = textureCanvas.getContext("2d"); textureContext.beginPath(); textureContext.arc(8, 8, 7, 0, Math.PI * 2); textureContext.fillStyle = "white"; textureContext.fill();
+    const geometry = new THREE.BufferGeometry(); geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3)); geometry.setAttribute("color", new THREE.BufferAttribute(colours, 3));
+    const material = new THREE.PointsMaterial({ size: 2.4, vertexColors: true, map: new THREE.CanvasTexture(textureCanvas), alphaTest: .5, transparent: true, depthWrite: false, sizeAttenuation: true });
+    pointOverlay = new THREE.Points(geometry, material); pointOverlay.renderOrder = 10; viewer.scene.scene.add(pointOverlay);
+    if (Array.isArray(instance.bbox_min) && Array.isArray(instance.bbox_max)) {
+      pointHelper = new THREE.Box3Helper(new THREE.Box3(new THREE.Vector3(...instance.bbox_min), new THREE.Vector3(...instance.bbox_max)), 0xffffff);
+      viewer.scene.scene.add(pointHelper);
+    }
+  };
+  /* AprilTag-Marker: Kugel per Raycast, Quadrat/Zentrum mit Pixeltoleranz. */
+  const tagAt = event => {
+    const tags = markerObjects.filter(item => item.marker && item.marker.kind === "apriltag" && markersVisible);
+    if (!tags.length) return null;
+    const rect = root.getBoundingClientRect();
+    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    const activeCamera = viewer.scene.getActiveCamera();
+    raycaster.setFromCamera(pointer, activeCamera);
+    const hit = raycaster.intersectObjects(tags.map(item => item.sphere), false)[0];
+    if (hit) return tags.find(item => item.sphere === hit.object) || null;
+    const toScreen = position => {
+      const projected = new THREE.Vector3(...position).project(activeCamera);
+      return projected.z > 1 ? null : { x: (projected.x + 1) / 2 * rect.width + rect.left, y: (1 - projected.y) / 2 * rect.height + rect.top };
+    };
+    const tolerance = 10;
+    let best = null; let bestDistance = Infinity;
+    for (const item of tags) {
+      const centre = toScreen(item.marker.coordinates);
+      if (!centre) continue;
+      let distance = Math.hypot(event.clientX - centre.x, event.clientY - centre.y);
+      const corners = Array.isArray(item.marker.corners) ? item.marker.corners.map(toScreen) : [];
+      if (corners.length === 4 && corners.every(Boolean)) {
+        let inside = false;
+        for (let a = 0, b = 3; a < 4; b = a++) {
+          if ((corners[a].y > event.clientY) !== (corners[b].y > event.clientY)
+            && event.clientX < (corners[b].x - corners[a].x) * (event.clientY - corners[a].y) / (corners[b].y - corners[a].y) + corners[a].x) inside = !inside;
+        }
+        if (inside) distance = 0;
+        else {
+          for (let a = 0; a < 4; a += 1) {
+            const p = corners[a], q = corners[(a + 1) % 4];
+            const lengthSq = (q.x - p.x) ** 2 + (q.y - p.y) ** 2 || 1;
+            const t = Math.max(0, Math.min(1, ((event.clientX - p.x) * (q.x - p.x) + (event.clientY - p.y) * (q.y - p.y)) / lengthSq));
+            distance = Math.min(distance, Math.hypot(event.clientX - (p.x + t * (q.x - p.x)), event.clientY - (p.y + t * (q.y - p.y))));
+          }
+        }
+      }
+      if (distance <= tolerance && distance < bestDistance) { best = item; bestDistance = distance; }
+    }
+    return best;
+  };
+  const showTag = (event, item) => {
+    clearPointInfo();
+    const marker = item.marker;
+    const lines = [];
+    if (Number.isFinite(Number(marker.tag_size_mm))) {
+      const deviation = Number(marker.tag_deviation_pct);
+      lines.push(`Größe ${Number(marker.tag_size_mm).toFixed(1)} mm` + (Number.isFinite(deviation) ? ` (${deviation >= 0 ? "+" : ""}${deviation.toFixed(1)} %)` : ""));
+    }
+    const imageCount = Array.isArray(marker.images) ? marker.images.length : Number(marker.images);
+    if (Number.isFinite(imageCount)) lines.push(`Gesehen in ${imageCount} Bildern`);
+    const totalError = marker.errors ? marker.errors.total_m : null;
+    if (totalError !== null && totalError !== undefined && Number.isFinite(Number(totalError))) lines.push(`Fehler ${(Number(totalError) * 1000).toFixed(0)} mm`);
+    let statusText = marker.status === "outlier" ? "Ausreißer" : "ok";
+    if (markerWarnings.some(text => String(text).includes("keine Kontrolle möglich"))) statusText += ", keine Kontrolle möglich";
+    lines.push(statusText);
+    if (item.square) { item.square.material.color.set(0xffffff); highlightedTag = item; }
+    if (Array.isArray(marker.corners) && marker.corners.length === 4) {
+      const box = new THREE.Box3();
+      for (const corner of marker.corners) box.expandByPoint(new THREE.Vector3(...corner));
+      pointHelper = new THREE.Box3Helper(box, 0xffffff);
+      viewer.scene.scene.add(pointHelper);
+    }
+    showPointCard(event, `AprilTag ${marker.tag_id}`, lines);
+  };
+  const handlePointClick = async event => {
+    if (!config.enable_point_info || !cloud) return;
+    const canvasRect = viewer.renderer.domElement.getBoundingClientRect();
+    const mouse = { x: event.clientX - canvasRect.left, y: event.clientY - canvasRect.top };
+    const hit = Potree.Utils.getMousePointCloudIntersection(mouse, viewer.scene.getActiveCamera(), viewer, viewer.scene.pointclouds, { pickClipped: true });
+    const point = hit && hit.point;
+    if (!point) { clearPointInfo(); return; }
+    const classId = readPickedValue(point, ["classification", "class", "scalar_class"]);
+    const instanceId = readPickedValue(point, ["pointSourceID", "pointSourceId", "point_source_id", "source id", "point source id"]);
+    const className = config.class_names_de[classId] || config.class_labels[classId] || `Klasse ${classId}`;
+    const fineTerm = readPickedValue(point, ["user data", "userData", "user_data", "userdata", "user_data_8"]);
+    const fineName = fineTerm > 0 ? ((config.fine_term_names_de || [])[fineTerm] || "") : "";
+    const showFallback = () => {
+      if (fineName) showPointCard(event, fineName, [className]); else showPointCard(event, className, []);
+    };
+    if (!instanceId) { clearPointInfo(); showFallback(); return; }
+    try {
+      const response = await fetch("/api/instances", { cache: "no-store" });
+      const payload = response.ok ? await response.json() : { instances: [] };
+      const instance = (payload.instances || []).find(item => Number(item.id) === instanceId);
+      if (!instance) { clearPointInfo(); showFallback(); return; }
+      const label = config.instance_labels_de[instance.label] || instance.label_de || instance.label || className;
+      const sameLabel = (payload.instances || []).filter(item => (config.instance_labels_de[item.label] || item.label_de || item.label || className) === label).length;
+      const title = sameLabel > 1 && Number(instance.label_index) > 0 ? `${label} ${instance.label_index}` : label;
+      showPointCard(event, title, [className, `${Number(instance.point_count || 0).toLocaleString("de-CH")} Punkte`]);
+      await showInstanceOverlay(instance);
+      showPointCard(event, title, [className, `${Number(instance.point_count || 0).toLocaleString("de-CH")} Punkte`]);
+    } catch (_error) { clearPointInfo(); showFallback(); }
+  };
+  area.addEventListener("pointerdown", event => { pointerDown = { x: event.clientX, y: event.clientY }; });
+  area.addEventListener("pointerup", event => {
+    if (!pointerDown || Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) > 4) pointerDown = null;
+  });
+  area.addEventListener("pointermove", event => pickCamera(event, false));
+  area.addEventListener("click", event => {
+    const isClick = pointerDown && Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) <= 4;
+    pointerDown = null;
+    if (isClick && config.enable_point_info) { const tag = tagAt(event); if (tag) { showTag(event, tag); return; } }
+    if (pickCamera(event, true) || !isClick) return;
+    handlePointClick(event);
+  });
+  window.addEventListener("keydown", event => { if (event.key === "Escape") clearPointInfo(); });
   const loadCameras = async () => {
     if (!config.camera_endpoint || cameraObjects.length) return;
     try {

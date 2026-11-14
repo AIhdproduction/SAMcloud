@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,14 @@ def marker_payload(project_directory: Path) -> dict[str, object]:
     detections = load_detections(control_directory / "detections.json")
     report = _load_report(project_directory / "reports" / "control_points_report.json")
     report_points = {str(point.get("name")): point for point in report.get("points", []) if isinstance(point, dict)}
+    tag_report = _load_report(project_directory / "reports" / "apriltag_report.json")
+    tag_entries = {}
+    for tag in tag_report.get("tags", []):
+        if isinstance(tag, dict):
+            try:
+                tag_entries[int(tag.get("id"))] = tag
+            except (TypeError, ValueError):
+                continue
     markers = []
     for name, entry in detections.items():
         report_point = report_points.get(name, {})
@@ -96,7 +105,7 @@ def marker_payload(project_directory: Path) -> dict[str, object]:
                 "reprojection_px": None,
                 "score": None,
             })
-        markers.append({
+        marker_entry = {
             "name": name,
             "role": str(entry.get("role", report_point.get("role", "pass"))),
             "enabled": enabled,
@@ -113,8 +122,62 @@ def marker_payload(project_directory: Path) -> dict[str, object]:
             "projections": int(report_point.get("projections", len(entry.get("observations", [])))),
             "observations": entry.get("observations", []),
             "photos": photos,
-        })
+        }
+        tag_match = re.fullmatch(r"TAG(\d+)", str(name))
+        if tag_match:
+            tag_id = int(tag_match.group(1))
+            tag_info = tag_entries.get(tag_id, {})
+            marker_entry.update(kind="apriltag", tag_id=tag_id)
+            if tag_info.get("size_mm_after") is not None:
+                marker_entry["tag_size_mm"] = tag_info.get("size_mm_after")
+            if tag_info.get("deviation_pct") is not None:
+                marker_entry["tag_deviation_pct"] = tag_info.get("deviation_pct")
+        markers.append(marker_entry)
+    present = {str(marker["name"]) for marker in markers}
+    markers.extend(marker for marker in apriltag_marker_payload(project_directory) if marker["name"] not in present)
     return _json_safe({"gate": report.get("gate", {"passed": False, "reasons": []}), "totals": report.get("totals", {}), "markers": markers})
+
+
+def apriltag_marker_payload(project_directory: Path) -> list[dict[str, Any]]:
+    """One marker per usable AprilTag of reports/apriltag_report.json (empty without a report).
+
+    Coordinate frame: centre and corners are stored in the final sparse-model frame. The sparse viewer
+    places its points and the GCP markers (triangulated_model_xyz) raw in this frame, and the dense viewer
+    LAS (samcloud/viewer/potree.py write_viewer_las from classified.ply) only quantises with a header offset
+    and applies no shift or export transform, so the coordinates are served unchanged for both viewers.
+    """
+    tag_report = _load_report(Path(project_directory) / "reports" / "apriltag_report.json")
+    markers: list[dict[str, Any]] = []
+    for tag in tag_report.get("tags", []):
+        if not isinstance(tag, dict) or tag.get("status") == "insufficient":
+            continue
+        center = tag.get("center_xyz")
+        try:
+            tag_id = int(tag.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if not (isinstance(center, (list, tuple)) and len(center) == 3):
+            continue
+        state = "needs_review" if tag.get("status") == "outlier" else "apriltag"
+        error_total = _finite_or_none(tag.get("error_3d_m"))
+        marker: dict[str, Any] = {
+            "name": f"TAG{tag_id}", "kind": "apriltag", "tag_id": tag_id, "role": "apriltag", "enabled": True,
+            "state": state, "state_color": state,
+            "coordinates": [float(value) for value in center], "corners": tag.get("corners_xyz"),
+            "tag_size_mm": tag.get("size_mm_after"), "tag_deviation_pct": tag.get("deviation_pct"),
+            "images": tag.get("images"), "status": tag.get("status"),
+            "photos": [], "observations": [],
+        }
+        if error_total is not None:
+            marker["errors"] = {"total_m": error_total}
+        markers.append(marker)
+    return _json_safe(markers)
+
+
+def apriltag_warnings(project_directory: Path) -> list[str]:
+    """Warnings of the AprilTag report (for the viewer info card)."""
+    report = _load_report(Path(project_directory) / "reports" / "apriltag_report.json")
+    return [str(item) for item in report.get("warnings", []) if isinstance(item, str)]
 
 
 def image_crop(
@@ -186,7 +249,7 @@ def _image_roots(project_directory: Path, source: str) -> list[Path]:
     dense = project_directory / "products" / "dense" / "images"
     if source == "undistorted" and dense.is_dir():
         return [dense.resolve()]
-    roots = [project_directory / "inputs" / "images", project_directory / "inputs"]
+    roots = [project_directory / "inputs" / "images", project_directory / "inputs" / "cubemap", project_directory / "inputs"]
     project_path = project_directory / "project.samcloud.yml"
     try:
         project = yaml.safe_load(project_path.read_text(encoding="utf-8")) or {}

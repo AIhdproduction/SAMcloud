@@ -14,6 +14,10 @@ import cv2
 import numpy as np
 
 
+CLOSINGS = (5,)  # kernel sizes of the second, closed-mask bow-tie pass
+_EXTRA_LEVELS = 4  # additional bow-tie thresholds between the window median and its 1st percentile
+
+
 @dataclass(frozen=True)
 class DetectionSettings:
     min_contrast: float = 40.0
@@ -219,11 +223,25 @@ def _detect_bowties(
     for polarity in polarities:
         image = blur if polarity == "bright" else 255 - blur
         low, high = float(np.percentile(image, 50)), float(np.percentile(image, 99.7))
-        for threshold in np.linspace(high - 4, low, 12):
+        thresholds = list(np.linspace(high - 4, low, 12))
+        # Extra levels below the window median: on dark ground the median is the ground level, above the level
+        # at which two close triangle tips merge into a bow-tie.  Added after the classic ones, so earlier results stay.
+        floor = float(np.percentile(image, 1))
+        if low - floor > 30.0:
+            thresholds += list(np.linspace(low, floor, _EXTRA_LEVELS + 2)[1:-1])
+        # Second tier: the same levels with the mask closed, bridging the blurred gap between two tips that stay
+        # separate because a thin light rim (cut paper margin) keeps the lower levels from merging them.
+        passes = [(float(t), 0) for t in thresholds] + [(float(t), k) for k in CLOSINGS for t in thresholds[:12]]
+        for threshold, closing in passes:
             mask = (image > threshold).astype(np.uint8) * 255
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            for contour in contours:
+            if closing:
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((closing, closing), np.uint8))
+            # RETR_CCOMP also returns blobs lying inside holes of a larger region (a sheet on darker ground).
+            contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+            for index, contour in enumerate(contours):
+                if hierarchy[0][index][3] >= 0 and hierarchy[0][hierarchy[0][index][3]][3] < 0:
+                    continue  # hole boundary (parent is an outer contour), not a blob
                 area = cv2.contourArea(contour)
                 if area < max(40.0, settings.min_size_px ** 2) or area > settings.max_size_px ** 2:
                     continue
@@ -249,7 +267,8 @@ def _detect_bowties(
                 refined = point[0, 0].astype(float)
                 # cornerSubPix is very precise on clean backgrounds but can be pulled away by textured surroundings
                 # (e.g. checkered manhole covers); then keep the midpoint of the two triangle apexes.
-                if np.linalg.norm(refined - bowtie["apex_junction"]) > 0.8:
+                # Closed masks bias the apex midpoint by up to a couple of pixels, so the corner search may move further.
+                if np.linalg.norm(refined - bowtie["apex_junction"]) > (0.8 if closing == 0 else 2.5):
                     refined = bowtie["apex_junction"]
                 score = float(np.mean([
                     bowtie["ratio"], min(1.0, contrast / 80.0), min(1.0, bowtie["depth"] / 0.35), bowtie["triangle_fit"],
@@ -258,10 +277,11 @@ def _detect_bowties(
                 found.append(TargetDetection(
                     u=float(refined[0] + x0 + 0.5), v=float(refined[1] + y0 + 0.5), target_type="cross", score=score,
                     size_px=2.0 * bowtie["scale"],
-                    details={"polarity": polarity, "contrast": contrast, "threshold": float(threshold),
+                    details={"polarity": polarity, "contrast": contrast, "threshold": float(threshold), "closing": closing,
                              "lobe_ratio": bowtie["ratio"], "triangle_fit": bowtie["triangle_fit"]},
                 ))
-    found.sort(key=lambda item: item.score, reverse=True)
+    # Unclosed detections take precedence (unchanged results); closed ones only add targets not found otherwise.
+    found.sort(key=lambda item: (item.details["closing"] > 0, -item.score))
     merged: list[TargetDetection] = []
     for item in found:
         if all(np.hypot(item.u - other.u, item.v - other.v) > 0.25 * other.size_px for other in merged):

@@ -33,6 +33,7 @@ class DsmResult:
     full_colmap_xyz: np.ndarray
     fine_pc: np.ndarray
     fine_pc_confidence: np.ndarray
+    instance_pc: np.ndarray | None = None
 
 
 def read_cloud(
@@ -42,8 +43,14 @@ def read_cloud(
     *,
     voxel_size: float | None = None,
     progress: Callable[[float, str], None] | None = None,
+    return_instance_ids: bool = False,
 ) -> tuple[np.ndarray, ...]:
-    """Read classified points preserving raw PLY COLMAP coordinates for reprojection."""
+    """Read classified points preserving raw PLY COLMAP coordinates for reprojection.
+
+    Default result: (raw, local, classes, rgb, fine_terms[, voxel_points]). With
+    ``return_instance_ids=True`` an ``instance_ids`` item (uint32 array or None when the
+    cloud has no instance field) is inserted after ``fine_terms``.
+    """
     if is_ply_source(point_source):
         source = classified_ply_source(point_source)
         from samcloud.engine.export_las import _ply_chunks, read_ply_header
@@ -57,6 +64,8 @@ def read_cloud(
         classes: list[np.ndarray] = []
         colors: list[np.ndarray] = []
         fine_terms: list[np.ndarray] = []
+        instance_ids: list[np.ndarray] = []
+        instance_present = False
         voxel_key_parts: list[np.ndarray] = []
         voxel_point_parts: list[np.ndarray] = []
         with point_source.open("rb") as handle:
@@ -73,11 +82,15 @@ def read_cloud(
                 colors.append(np.column_stack((chunk["red"], chunk["green"], chunk["blue"])).astype(np.uint8))
                 names = chunk.dtype.names or ()
                 fine_terms.append(np.asarray(chunk["fine_term"], dtype=np.uint8) if "fine_term" in names else np.zeros(len(chunk), dtype=np.uint8))
+                instance_present |= "instance_id" in names
+                instance_ids.append(np.asarray(chunk["instance_id"], dtype=np.uint32) if "instance_id" in names else np.zeros(len(chunk), dtype=np.uint32))
                 points_read += len(raw)
                 if progress is not None:
                     progress(min(points_read / total_points, 1.0), "Reading point cloud")
         voxel_points = _deduplicate_voxel_keys(voxel_key_parts, voxel_point_parts) if voxel_size is not None else None
         values = np.vstack(raw_parts), np.vstack(local_parts), np.concatenate(classes), np.vstack(colors), np.concatenate(fine_terms)
+        if return_instance_ids:
+            values = (*values, (np.concatenate(instance_ids) if instance_present else None))
         return (*values, voxel_points) if voxel_size is not None else values
     info = read_las_info(point_source)
     total_points = max(info.point_count, 1)
@@ -86,6 +99,8 @@ def read_cloud(
     classes: list[np.ndarray] = []
     colors: list[np.ndarray] = []
     fine_terms: list[np.ndarray] = []
+    instance_ids: list[np.ndarray] = []
+    instance_present = False
     voxel_key_parts: list[np.ndarray] = []
     voxel_point_parts: list[np.ndarray] = []
     for chunk in iter_source_chunks(point_source, 500_000):
@@ -100,12 +115,16 @@ def read_cloud(
         colors.append((np.column_stack((chunk.red, chunk.green, chunk.blue)) / 257).astype(np.uint8))
         dimensions = {str(name).lower() for name in getattr(chunk.point_format, "dimension_names", ())}
         fine_terms.append(np.asarray(chunk.fine_term, dtype=np.uint8) if "fine_term" in dimensions else np.zeros(len(chunk), dtype=np.uint8))
+        instance_present |= "instance_id" in dimensions
+        instance_ids.append(np.asarray(chunk.instance_id, dtype=np.uint32) if "instance_id" in dimensions else np.zeros(len(chunk), dtype=np.uint32))
         points_read += len(raw_chunk)
         if progress is not None:
             progress(min(points_read / total_points, 1.0), "Reading point cloud")
     voxel_points = _deduplicate_voxel_keys(voxel_key_parts, voxel_point_parts) if voxel_size is not None else None
     raw = np.vstack(raw_parts)
     values = raw, frame.to_local(raw), np.concatenate(classes), np.vstack(colors), np.concatenate(fine_terms)
+    if return_instance_ids:
+        values = (*values, (np.concatenate(instance_ids) if instance_present else None))
     return (*values, voxel_points) if voxel_size is not None else values
 
 
@@ -162,6 +181,7 @@ def build_dsm(
     *,
     rgb: np.ndarray | None = None,
     fine_terms: np.ndarray | None = None,
+    instance_ids: np.ndarray | None = None,
     voxel_colmap_xyz: np.ndarray | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> DsmResult:
@@ -174,6 +194,9 @@ def build_dsm(
     fine = np.zeros(len(raw), dtype=np.uint8) if fine_terms is None else np.asarray(fine_terms, dtype=np.uint8)
     if fine.shape != (len(raw),):
         raise ValueError("Fine terms must have shape (N,)")
+    instance = None if instance_ids is None else np.asarray(instance_ids, dtype=np.uint32)
+    if instance is not None and instance.shape != (len(raw),):
+        raise ValueError("Instance IDs must have shape (N,)")
     colours = np.zeros((len(raw), 3), dtype=np.uint8) if rgb is None else np.asarray(rgb, dtype=np.uint8)
     if colours.shape != (len(raw), 3):
         raise ValueError("Point colours must have shape (N, 3)")
@@ -417,7 +440,8 @@ def build_dsm(
         progress(1.0, "Building surface model")
 
     fine_pc, fine_pc_confidence = _rasterize_fine_terms(local, code, fine, grid, level, config)
-    return DsmResult(dsm, dtm, top_class, validity, footprint, top_raw, top_rgb, normals, affine if method == "affine" else None, residual, method, voxel, fine_pc, fine_pc_confidence)
+    instance_pc = _rasterize_instance_ids(local, code, instance, grid, level, config) if instance is not None else None
+    return DsmResult(dsm, dtm, top_class, validity, footprint, top_raw, top_rgb, normals, affine if method == "affine" else None, residual, method, voxel, fine_pc, fine_pc_confidence, instance_pc)
 
 
 def _rasterize_fine_terms(
@@ -481,6 +505,43 @@ def _rasterize_fine_terms(
     supported = winning_terms > 0
     confidence.flat[supported] = (winning_counts[supported] / total[supported]).astype(np.float16)
     return labels, confidence
+
+
+def _rasterize_instance_ids(local_xyz: np.ndarray, classes: np.ndarray, instance_ids: np.ndarray, grid: OrthoGrid, level: Level | None, config: OrthoConfig) -> np.ndarray:
+    """Rasterise non-zero per-point instance IDs by per-column majority."""
+    result = np.zeros((grid.height, grid.width), dtype=np.uint32)
+    if level is None or not np.any(instance_ids):
+        return result
+    local = np.asarray(local_xyz, dtype=np.float64)
+    code = np.asarray(classes, dtype=np.uint8)
+    ids = np.asarray(instance_ids, dtype=np.uint32)
+    ceiling = float(level.ceiling_z) if level.ceiling_z is not None else float(level.floor_z + config.indoor.cut_fallback_above_floor)
+    rows = np.floor((grid.max_y - local[:, 1]) / grid.pixel_size).astype(np.int64)
+    cols = np.floor((local[:, 0] - grid.min_x) / grid.pixel_size).astype(np.int64)
+    column = (
+        np.isfinite(local).all(axis=1)
+        & (rows >= 0) & (rows < grid.height) & (cols >= 0) & (cols < grid.width)
+        & (local[:, 2] >= level.floor_z + config.indoor.floor_margin)
+        & (local[:, 2] <= ceiling)
+        & ~np.isin(code, (100, 101, 102, *config.indoor.ceiling_codes))
+        & (ids > 0)
+    )
+    if not np.any(column):
+        return result
+    flat = rows[column] * grid.width + cols[column]
+    values = ids[column]
+    keys = flat.astype(np.int64) * (int(values.max()) + 1) + values.astype(np.int64)
+    unique, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    cells = unique // (int(values.max()) + 1)
+    ids_by_key = (unique % (int(values.max()) + 1)).astype(np.uint32)
+    max_counts = np.zeros(grid.height * grid.width, dtype=np.int64)
+    np.maximum.at(max_counts, cells, counts)
+    winners = counts == max_counts[cells]
+    # Deterministically prefer the lowest ID on equal evidence.
+    winner_ids = np.full(grid.height * grid.width, np.iinfo(np.uint32).max, dtype=np.uint32)
+    np.minimum.at(winner_ids, cells[winners], ids_by_key[winners])
+    result.flat[:] = np.where(winner_ids == np.iinfo(np.uint32).max, 0, winner_ids)
+    return result
 
 
 def _fill_indoor_surface(dsm: np.ndarray, validity: np.ndarray, top_raw: np.ndarray, top_class: np.ndarray, top_rgb: np.ndarray, min_x: float, max_y: float, cell: float, level: Level, config: OrthoConfig) -> np.ndarray:

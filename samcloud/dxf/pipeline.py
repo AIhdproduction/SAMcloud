@@ -15,7 +15,7 @@ import numpy as np
 from samcloud.dxf.cancel import CancelToken, ProgressCallback, check_cancel, report_progress
 from samcloud.dxf.config import DxfExportConfig, load_dxf_config
 from samcloud.dxf.geometry import bridge_collinear, circles_from_clusters, furniture_inserts, opening_entities, opening_specs, points_from_cluster, polygons_from_points, skeleton_lines, tree_entities, wall_lines, wall_polygons
-from samcloud.dxf.las_source import Frame, iter_source_chunks, read_las_header_profile, read_las_info
+from samcloud.dxf.las_source import Frame, instance_id_fingerprint, iter_source_chunks, read_las_header_profile, read_las_info
 from samcloud.dxf.layers import LayerConfig, LayerDefinition, load_layer_config
 from samcloud.dxf.levels import Level
 from samcloud.dxf.result import BackgroundImage, DxfPlanResult, LayerStatus, result_from_dict, result_to_dict
@@ -58,6 +58,7 @@ def generate_plan(las_path: Path, mode: Literal["indoor", "outdoor"], level: Lev
         cancel,
         progress,
     )
+    instance_labels = _instance_labels(source)
     level_name = "site" if level is None else level.name
     fingerprint_inputs = _fingerprint_inputs(source, mode, level, chosen, cell_size, layers, info.profile.profile_name if info.profile else None, config)
     fingerprint = _hash_fingerprint_inputs(fingerprint_inputs)
@@ -72,18 +73,18 @@ def generate_plan(las_path: Path, mode: Literal["indoor", "outdoor"], level: Lev
         colors[definition.name] = definition.color
         linetypes[definition.name] = definition.linetype
         hatches[definition.name] = definition.hatch
-        points, class_values = accumulated.points_for(definition.codes)
+        points, class_values, instance_ids = accumulated.points_for(definition.codes, with_instance_ids=True)
         if len(points) == 0:
             statuses[definition.name] = LayerStatus(definition.name, "empty", _empty_reason(definition, info.profile, info.class_histogram), 0)
             output[definition.name] = []
             continue
-        points, class_values = _mode_points(points, class_values, definition, mode, level, cell_size)
+        points, class_values, instance_ids = _mode_points(points, class_values, definition, mode, level, cell_size, instance_ids=instance_ids)
         if len(points) == 0:
             statuses[definition.name] = LayerStatus(definition.name, "empty", f"class {definition.codes[0]} has no points in the selected elevation band", 0)
             output[definition.name] = []
             continue
         try:
-            entities = _layer_entities(definition, points, class_values, cell_size, config, chosen)
+            entities = _layer_entities(definition, points, class_values, cell_size, config, chosen, instance_ids=instance_ids, instance_labels=instance_labels)
             output[definition.name] = entities
             statuses[definition.name] = LayerStatus(definition.name, "ok" if entities else "empty", None if entities else "no geometry survived filtering", dxf_entity_count(entities))
         except Exception as error:
@@ -115,11 +116,26 @@ def _fingerprint_inputs(las_path: Path, mode: str, level: Level | None, settings
     source = Path(las_path)
     stat = source.stat()
     frame = settings.frame
-    return {"las": [str(source.resolve()), stat.st_mtime_ns, stat.st_size], "profile": profile_name, "mode": mode, "level": None if level is None else [level.id, level.name, level.floor_z, level.ceiling_z], "frame": None if frame is None else [frame.origin.tolist(), frame.scale_factor, frame.rotation.tolist()], "cell_size": cell_size, "plan_settings": _settings_snapshot(settings), "geometry": asdict(config.geometry), "layers": [{"project_mode": item.project_mode, "mode": item.mode, "codes": item.codes, "name": item.name, "color": item.color, "linetype": item.linetype, "geometry": item.geometry, "band": item.z_band, "area": item.min_area, "tolerance": item.simplify_tolerance, "hatch": item.hatch} for item in layers.layers]}
+    instances_path = source.with_name("instances.json")
+    instances_stamp = [instances_path.stat().st_mtime_ns, instances_path.stat().st_size] if instances_path.is_file() else None
+    return {"las": [str(source.resolve()), stat.st_mtime_ns, stat.st_size], "instance_ids": instance_id_fingerprint(source), "instances": instances_stamp, "profile": profile_name, "mode": mode, "level": None if level is None else [level.id, level.name, level.floor_z, level.ceiling_z], "frame": None if frame is None else [frame.origin.tolist(), frame.scale_factor, frame.rotation.tolist()], "cell_size": cell_size, "plan_settings": _settings_snapshot(settings), "geometry": asdict(config.geometry), "layers": [{"project_mode": item.project_mode, "mode": item.mode, "codes": item.codes, "name": item.name, "color": item.color, "linetype": item.linetype, "geometry": item.geometry, "band": item.z_band, "area": item.min_area, "tolerance": item.simplify_tolerance, "hatch": item.hatch} for item in layers.layers]}
 
 
 def _hash_fingerprint_inputs(value: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _instance_labels(source: Path) -> dict[int, str]:
+    """Read optional instance labels once for a plan run; malformed sidecars are ignored."""
+    path = Path(source).with_name("instances.json")
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        records = payload.get("instances", []) if isinstance(payload, dict) else []
+        return {int(record["id"]): str(record.get("label", "")) for record in records if isinstance(record, dict) and int(record.get("id", 0)) > 0}
+    except (OSError, ValueError, TypeError, KeyError):
+        return {}
 
 
 def cache_directory(las_path: Path, level: Level | None, settings: PlanSettings | None = None) -> Path:
@@ -180,6 +196,9 @@ def is_stale(
     if source.is_file():
         stat = source.stat()
         current["las"] = [str(source.resolve()), stat.st_mtime_ns, stat.st_size]
+        current["instance_ids"] = instance_id_fingerprint(source)
+        instances_path = source.with_name("instances.json")
+        current["instances"] = [instances_path.stat().st_mtime_ns, instances_path.stat().st_size] if instances_path.is_file() else None
         # Header-only provenance lookup: identical to read_las_info().profile without scanning all points.
         profile = read_las_header_profile(source)
         current_profile_name = profile.profile_name if profile else None
@@ -221,44 +240,52 @@ class _PointAccumulator:
     """
 
     cell_size: float
-    _parts: dict[int, list[np.ndarray]] = field(default_factory=dict)
+    _parts: dict[int, list[tuple[np.ndarray, np.ndarray]]] = field(default_factory=dict)
     _consolidated: dict[int, int] = field(default_factory=dict)
     _pending: dict[int, int] = field(default_factory=dict)
 
-    def add(self, points: np.ndarray, codes: np.ndarray) -> None:
+    def add(self, points: np.ndarray, codes: np.ndarray, instance_ids: np.ndarray | None = None) -> None:
         if len(points) == 0:
             return
+        ids = np.zeros(len(points), dtype=np.uint32) if instance_ids is None else np.asarray(instance_ids, dtype=np.uint32)
+        if ids.shape != (len(points),):
+            raise ValueError("Instance IDs must have one value per point")
         for code in np.unique(codes):
             key = int(code)
-            members = _first_per_voxel(points[codes == code], self.cell_size)
-            self._parts.setdefault(key, []).append(members)
+            members, member_ids = _first_per_voxel_with_instance_ids(points[codes == code], ids[codes == code], self.cell_size)
+            self._parts.setdefault(key, []).append((members, member_ids))
             self._pending[key] = self._pending.get(key, 0) + len(members)
             if self._pending[key] > max(self._consolidated.get(key, 0), 50_000):
                 self._consolidate(key)
 
     def _consolidate(self, code: int) -> None:
-        merged = np.concatenate(self._parts[code]) if len(self._parts[code]) > 1 else self._parts[code][0]
-        merged = _first_per_voxel(merged, self.cell_size)
-        self._parts[code] = [merged]
+        point_parts, id_parts = zip(*self._parts[code], strict=True)
+        merged, merged_ids = _first_per_voxel_with_instance_ids(np.concatenate(point_parts), np.concatenate(id_parts), self.cell_size)
+        self._parts[code] = [(merged, merged_ids)]
         self._consolidated[code] = len(merged)
         self._pending[code] = 0
 
-    def points_for(self, codes: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    def points_for(self, codes: tuple[int, ...], *, with_instance_ids: bool = False) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
         points: list[np.ndarray] = []
         classes: list[np.ndarray] = []
+        ids: list[np.ndarray] = []
         for code in codes:
             if code not in self._parts:
                 continue
             if len(self._parts[code]) > 1:
                 self._consolidate(code)
-            values = self._parts[code][0]
+            values, values_ids = self._parts[code][0]
             points.append(values)
             classes.append(np.full(len(values), code, dtype=np.uint8))
+            ids.append(values_ids)
         if not points:
-            return np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.uint8)
+            empty = (np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.uint8))
+            return (*empty, np.empty(0, dtype=np.uint32)) if with_instance_ids else empty
         if len(points) == 1:
-            return points[0], classes[0]
-        return np.concatenate(points), np.concatenate(classes)
+            values = (points[0], classes[0], ids[0])
+        else:
+            values = (np.concatenate(points), np.concatenate(classes), np.concatenate(ids))
+        return values if with_instance_ids else values[:2]
 
 
 def _first_per_voxel(points: np.ndarray, cell_size: float) -> np.ndarray:
@@ -266,6 +293,33 @@ def _first_per_voxel(points: np.ndarray, cell_size: float) -> np.ndarray:
         return np.empty((0, 3), dtype=np.float64)
     _, index = np.unique(np.floor(points / cell_size).astype(np.int64), axis=0, return_index=True)
     return points[np.sort(index)]
+
+
+def _first_per_voxel_with_instance_ids(points: np.ndarray, instance_ids: np.ndarray, cell_size: float) -> tuple[np.ndarray, np.ndarray]:
+    """Keep one voxel representative and its modal instance ID, including zero."""
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.uint32)
+    ids = np.asarray(instance_ids, dtype=np.uint32)
+    if not ids.any():
+        reps = _first_per_voxel(points, cell_size)
+        return reps, np.zeros(len(reps), dtype=np.uint32)
+    voxels = np.floor(points / cell_size).astype(np.int64)
+    _unique, first, inverse = np.unique(voxels, axis=0, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    order = np.argsort(first)
+    representatives = points[first[order]]
+    # Modal id per voxel (ties -> smallest id): sort by (voxel, id), count runs of equal pairs.
+    sorter = np.lexsort((ids, inverse))
+    sv, si = inverse[sorter], ids[sorter]
+    starts = np.flatnonzero(np.r_[True, (sv[1:] != sv[:-1]) | (si[1:] != si[:-1])])
+    counts = np.diff(np.r_[starts, len(sv)])
+    run_voxel, run_id = sv[starts], si[starts]
+    # Best run per voxel: max count, earliest (smallest id) on ties.
+    best = np.lexsort((np.arange(len(starts)), -counts, run_voxel))
+    first_run = np.r_[True, run_voxel[best][1:] != run_voxel[best][:-1]]
+    modal = np.zeros(len(first), dtype=np.uint32)
+    modal[run_voxel[best][first_run]] = run_id[best][first_run]
+    return representatives, modal[order]
 
 
 def _highest_per_cell(points: np.ndarray, cell_size: float) -> np.ndarray:
@@ -372,8 +426,9 @@ def _stream_local_points(
         if mode == "indoor" and level is not None:
             ceiling = level.ceiling_z if level.ceiling_z is not None else level.floor_z + config.geometry.indoor_default_height
             selected = (local[:, 2] >= level.floor_z - 0.1) & (local[:, 2] <= ceiling + 0.1)
-        local, codes = local[selected], codes[selected]
-        accumulator.add(local, codes)
+        instance_ids = np.asarray(getattr(chunk, "instance_id", np.zeros(len(chunk), dtype=np.uint32)), dtype=np.uint32)
+        local, codes, instance_ids = local[selected], codes[selected], instance_ids[selected]
+        accumulator.add(local, codes, instance_ids)
         rgb = None
         if len(local) and all(name in chunk.point_format.dimension_names for name in ("red", "green", "blue")):
             rgb = (np.column_stack((chunk.red, chunk.green, chunk.blue)).astype(np.uint16) // 257)[selected].astype(np.uint8)
@@ -389,10 +444,11 @@ def _transformed_bounds(frame: Frame, bounds_min: np.ndarray, bounds_max: np.nda
     return transformed.min(axis=0), transformed.max(axis=0)
 
 
-def _mode_points(points: np.ndarray, codes: np.ndarray, layer: LayerDefinition, project_mode: str, level: Level | None, cell_size: float) -> tuple[np.ndarray, np.ndarray]:
+def _mode_points(points: np.ndarray, codes: np.ndarray, layer: LayerDefinition, project_mode: str, level: Level | None, cell_size: float, *, instance_ids: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply a layer's semantic selection mode before geometry rasterization."""
     if layer.mode == "ignore":
-        return np.empty((0, 3)), np.empty(0, dtype=np.uint8)
+        empty = (np.empty((0, 3)), np.empty(0, dtype=np.uint8))
+        return (*empty, np.empty(0, dtype=np.uint32)) if instance_ids is not None else empty
     selected = np.ones(len(points), dtype=bool)
     if project_mode == "indoor" and level is not None:
         ceiling = level.ceiling_z if level.ceiling_z is not None else level.floor_z + 6.0
@@ -402,18 +458,21 @@ def _mode_points(points: np.ndarray, codes: np.ndarray, layer: LayerDefinition, 
     if layer.mode == "ground_surface":
         selected &= ~np.isin(codes, [3, 4, 5, 95])
     result_points, result_codes = points[selected], codes[selected]
+    result_ids = None if instance_ids is None else np.asarray(instance_ids, dtype=np.uint32)[selected]
     if layer.mode == "top_surface" and len(result_points):
         indices = _highest_per_cell(result_points, cell_size)
         result_points, result_codes = result_points[indices], result_codes[indices]
-    return result_points, result_codes
+        if result_ids is not None:
+            result_ids = result_ids[indices]
+    return (result_points, result_codes, result_ids) if result_ids is not None else (result_points, result_codes)
 
 
-def _layer_entities(layer: LayerDefinition, points: np.ndarray, codes: np.ndarray, cell_size: float, config: DxfExportConfig, settings: PlanSettings) -> list[dict[str, Any]]:
+def _layer_entities(layer: LayerDefinition, points: np.ndarray, codes: np.ndarray, cell_size: float, config: DxfExportConfig, settings: PlanSettings, *, instance_ids: np.ndarray | None = None, instance_labels: dict[int, str] | None = None) -> list[dict[str, Any]]:
     if layer.geometry == "wall":
         lines = _wall_lines(points, cell_size, config)
         return [{"type": "line", "start": list(start), "end": list(end)} for start, end in lines] if settings.wall_centerlines else wall_polygons(lines, points, minimum_thickness=config.geometry.wall_min_thickness)
     if layer.geometry == "furniture":
-        return furniture_inserts(points, codes)
+        return furniture_inserts(points, codes, instance_ids=instance_ids, instance_labels=instance_labels)
     if layer.geometry == "circle":
         return circles_from_clusters(points)
     if layer.geometry == "tree":

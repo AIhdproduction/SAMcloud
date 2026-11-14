@@ -258,8 +258,8 @@ def validate_detections(data: object) -> dict[str, dict[str, object]]:
             if not isinstance(image, str) or not image or image in images:
                 raise ValueError("Each control point may have one detection per image")
             source = observation.get("source", "auto")
-            if source not in {"auto", "manual"}:
-                raise ValueError("Detection source must be auto or manual")
+            if source not in {"auto", "manual", "apriltag"}:
+                raise ValueError("Detection source must be auto, manual or apriltag")
             item: dict[str, object] = {"image": image, "u": _finite_number(observation["u"], "u"), "v": _finite_number(observation["v"], "v"), "u_undist": _finite_number(observation.get("u_undist", observation["u"]), "u_undist"), "v_undist": _finite_number(observation.get("v_undist", observation["v"]), "v_undist"), "score": _finite_number(observation.get("score", 1.0), "score"), "source": source, "enabled": bool(observation.get("enabled", True)), "reprojection_px": _finite_number(observation.get("reprojection_px", 0.0), "reprojection_px")}
             if "reprojected_u" in observation:
                 item["reprojected_u"] = _finite_number(observation["reprojected_u"], "reprojected_u")
@@ -388,3 +388,65 @@ def _finite_number(value: object, field: str) -> float:
     if not pd.notna(number) or number in {float("inf"), float("-inf")}:
         raise ValueError(f"{field} must be a finite number")
     return number
+
+
+APRILTAG_CSV_NAME = "apriltags.csv"
+APRILTAG_COLUMNS = ("id", "x", "y", "z", "role")
+
+
+def apriltag_point_name(tag_id: int) -> str:
+    """Control-point name used for a surveyed AprilTag centre."""
+    return f"TAG{int(tag_id)}"
+
+
+def read_apriltag_coordinates(path: Path) -> pd.DataFrame:
+    """Load surveyed AprilTag centres (id, x, y, z[, role]); header optional."""
+    text = Path(path).read_text(encoding="utf-8-sig")
+    rows = [line.strip() for line in text.splitlines() if line.strip()]
+    if not rows:
+        return pd.DataFrame({"id": pd.Series(dtype=int), "x": pd.Series(dtype=float), "y": pd.Series(dtype=float), "z": pd.Series(dtype=float), "role": pd.Series(dtype=str)})
+    delimiter = _detect_delimiter(rows)
+    split = (lambda line: [part.strip() for part in line.split(delimiter)]) if delimiter else (lambda line: re.split(r"\s+", line.strip()))
+    values = [split(row) for row in rows]
+    first = [value.strip().lower() for value in values[0]]
+    has_header = "id" in first and {"x", "y", "z"}.issubset(first)
+    if not has_header and len(values[0]) >= 4:
+        has_header = not _coordinates_are_numeric(values[0][1:4], decimal_comma=delimiter != ",")
+    if has_header:
+        columns, data = first, values[1:]
+    else:
+        include_role = len(values[0]) > 4 and _is_role(values[0][4])
+        columns = ["id", "x", "y", "z"] + (["role"] if include_role else [])
+        data = [row[: len(columns)] for row in values]
+    table = pd.DataFrame(data, columns=columns)
+    missing = {"id", "x", "y", "z"} - set(table.columns)
+    if missing:
+        raise ValueError("AprilTag CSV is missing columns: " + ", ".join(sorted(missing)))
+    result = pd.DataFrame()
+    try:
+        result["id"] = table["id"].astype(str).str.strip().str.upper().str.removeprefix("TAG").astype(float).astype(int)
+    except ValueError as error:
+        raise ValueError("AprilTag ids must be integers") from error
+    for column in ("x", "y", "z"):
+        result[column] = pd.to_numeric(table[column].astype(str).str.replace("'", "", regex=False).str.replace(",", ".", regex=False), errors="raise")
+    roles = table["role"] if "role" in table.columns else pd.Series("", index=table.index)
+    result["role"] = [_normalise_role(role, "") for role in roles]
+    if result["id"].duplicated().any():
+        duplicates = sorted(set(result.loc[result["id"].duplicated(), "id"].tolist()))
+        raise ValueError(f"Duplicate AprilTag ids: {duplicates}")
+    return result.loc[:, list(APRILTAG_COLUMNS)].reset_index(drop=True)
+
+
+def write_apriltag_coordinates(points: pd.DataFrame, path: Path) -> None:
+    """Store AprilTag centres with a stable column order."""
+    missing = {"id", "x", "y", "z"} - set(points.columns)
+    if missing:
+        raise ValueError("AprilTag table is missing columns: " + ", ".join(sorted(missing)))
+    result = points.loc[:, ["id", "x", "y", "z"]].copy()
+    result["id"] = result["id"].astype(int)
+    if result["id"].duplicated().any():
+        raise ValueError("Duplicate AprilTag ids")
+    roles = points["role"] if "role" in points.columns else pd.Series("", index=points.index)
+    result["role"] = [_normalise_role(role, "") for role in roles]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(path, index=False)

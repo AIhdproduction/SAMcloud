@@ -111,3 +111,57 @@ def test_reviewer_flag_round_trip(tmp_path: Path) -> None:
     set_detection_enabled(detections_path, "P1", True)
     loaded = load_detections(detections_path)
     assert loaded["P1"]["disabled_by_reviewer"] is False
+
+
+def test_apriltag_csv_round_trip_with_decimal_commas_and_default_role(tmp_path: Path) -> None:
+    from samcloud.control_points.repository import (
+        APRILTAG_CSV_NAME,
+        read_apriltag_coordinates,
+        write_apriltag_coordinates,
+    )
+
+    assert APRILTAG_CSV_NAME == "apriltags.csv"
+    source = tmp_path / "surveyed.csv"
+    source.write_text("id;x;y;z;role\n7;2'600'000,125;1'200'000,5;500,25;\n12;2600003,75;1200001,25;501,5;CP\n", encoding="utf-8")
+
+    table = read_apriltag_coordinates(source)
+
+    assert table["id"].tolist() == [7, 12]
+    assert table["role"].tolist() == ["pass", "control"]
+    assert table.loc[0, "x"] == pytest.approx(2600000.125)
+    assert table.loc[1, "z"] == pytest.approx(501.5)
+
+    target = tmp_path / "out" / "apriltags.csv"
+    write_apriltag_coordinates(table, target)
+    again = read_apriltag_coordinates(target)
+    assert again.to_dict("records") == table.to_dict("records")
+
+
+def test_apriltag_csv_headerless_and_without_role(tmp_path: Path) -> None:
+    from samcloud.control_points.repository import read_apriltag_coordinates
+
+    path = tmp_path / "plain.txt"
+    path.write_text("3 1,5 2,25 0,75\n4 10 20 30\n", encoding="utf-8")
+
+    table = read_apriltag_coordinates(path)
+
+    assert table["id"].tolist() == [3, 4]
+    assert table.loc[0, ["x", "y", "z"]].tolist() == [1.5, 2.25, 0.75]
+    assert table["role"].tolist() == ["pass", "pass"]
+
+
+def test_apriltag_csv_duplicate_ids_raise(tmp_path: Path) -> None:
+    from samcloud.control_points.repository import read_apriltag_coordinates, write_apriltag_coordinates
+
+    path = tmp_path / "dup.csv"
+    path.write_text("id,x,y,z\n5,1,2,3\n5,4,5,6\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_apriltag_coordinates(path)
+    with pytest.raises(ValueError):
+        write_apriltag_coordinates(pd.DataFrame({"id": [1, 1], "x": [0.0, 1.0], "y": [0.0, 1.0], "z": [0.0, 1.0]}), tmp_path / "w.csv")
+
+
+def test_apriltag_point_name() -> None:
+    from samcloud.control_points.repository import apriltag_point_name
+
+    assert apriltag_point_name(7) == "TAG7"

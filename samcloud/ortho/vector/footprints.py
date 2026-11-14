@@ -36,6 +36,7 @@ class ObjectInstance:
     height: float
     solidity: float
     polygon: Polygon | None = None  # pre-fitted footprint (chairs); skips the generic fit
+    instance_id: int = 0
 
 
 @dataclass(slots=True)
@@ -63,6 +64,8 @@ def object_instances(
     free_floor: np.ndarray | None = None,
     wall_support: np.ndarray | None = None,
     view_count: np.ndarray | None = None,
+    instance_raster: np.ndarray | None = None,
+    instance_labels: dict[int, str] | None = None,
 ) -> tuple[list[ObjectInstance], dict[str, Any], np.ndarray]:
     """Extract object instances from the median-filtered height map.
 
@@ -70,6 +73,9 @@ def object_instances(
     area and a watershed fills each connected object component between them.
     """
     raw = np.asarray(dsm, dtype=np.float32)
+    instances_raster = None if instance_raster is None else np.asarray(instance_raster, dtype=np.uint32)
+    if instances_raster is not None and instances_raster.shape != raw.shape:
+        raise ValueError("Instance raster must match the DSM shape")
     hm = cv2.medianBlur(np.nan_to_num(raw - float(floor_z), nan=0.0).astype(np.float32), 5)
     pixel = grid.pixel_size
     wall_mask = _wall_mask(raw.shape, grid, wall_lines, 0.10 * units_per_metre)
@@ -110,18 +116,34 @@ def object_instances(
             continue
         markers = np.zeros(component.shape, dtype=np.int32)
         marker_labels: dict[int, str | None] = {}
+        marker_instance_ids: dict[int, int] = {}
         next_marker = 0
-        eligible_fine = component & (fine_classes > 0) & (fine_confidence >= 0.4)
-        for fine_id in np.unique(fine_classes[eligible_fine]):
-            if fine_id <= 0 or fine_id > len(fine_names):
-                continue
-            region = component & (fine_classes == fine_id) & (fine_confidence >= 0.4)
-            region = cv2.morphologyEx(region.astype(np.uint8), cv2.MORPH_CLOSE, close_kernel).astype(bool) & component
-            if int(region.sum()) < min_pixels:
-                continue
-            next_marker += 1
-            markers[region & (markers == 0)] = next_marker
-            marker_labels[next_marker] = _canonical_instance_label(fine_names[int(fine_id) - 1])
+        qualifying_ids: list[int] = []
+        if instances_raster is not None:
+            minimum_instance_pixels = max(1, int(math.ceil(0.05 / pixel**2)))
+            for instance_id in np.unique(instances_raster[component]):
+                if instance_id > 0 and int(np.count_nonzero(component & (instances_raster == instance_id))) >= minimum_instance_pixels:
+                    qualifying_ids.append(int(instance_id))
+        instance_split = len(qualifying_ids) >= 2
+        if instance_split:
+            for instance_id in qualifying_ids:
+                region = component & (instances_raster == instance_id)
+                next_marker += 1
+                markers[region] = next_marker
+                marker_instance_ids[next_marker] = instance_id
+                marker_labels[next_marker] = _label_for_region(region, fine_classes, fine_confidence, fine_names)
+        else:
+            eligible_fine = component & (fine_classes > 0) & (fine_confidence >= 0.4)
+            for fine_id in np.unique(fine_classes[eligible_fine]):
+                if fine_id <= 0 or fine_id > len(fine_names):
+                    continue
+                region = component & (fine_classes == fine_id) & (fine_confidence >= 0.4)
+                region = cv2.morphologyEx(region.astype(np.uint8), cv2.MORPH_CLOSE, close_kernel).astype(bool) & component
+                if int(region.sum()) < min_pixels:
+                    continue
+                next_marker += 1
+                markers[region & (markers == 0)] = next_marker
+                marker_labels[next_marker] = _canonical_instance_label(fine_names[int(fine_id) - 1])
         rest = component & (markers == 0) & ~step
         rest_count, rest_labels = cv2.connectedComponents(rest.astype(np.uint8), connectivity=4)
         for rest_id in range(1, rest_count):
@@ -145,7 +167,8 @@ def object_instances(
             if int(part.sum()) < min_pixels:
                 continue
             label = marker_labels.get(marker)
-            if (label or "").strip().lower() not in split_labels:
+            instance_id = marker_instance_ids.get(marker, _dominant_instance_id(part, instances_raster))
+            if (label or "").strip().lower() not in split_labels and not instance_split:
                 key = (label, 0)
                 grouped[key] = grouped.get(key, np.zeros_like(component, dtype=bool)) | part
                 continue
@@ -155,7 +178,7 @@ def object_instances(
                 if int(piece.sum()) >= min_pixels:
                     grouped[(label, marker * 10_000 + piece_id)] = piece
         for (label, _piece), part in grouped.items():
-            instance = _make_instance(part, label, classes, hm, grid)
+            instance = _make_instance(part, label, classes, hm, grid, instance_id=_dominant_instance_id(part, instances_raster))
             if instance is None:
                 continue
             if not instance.has_fine_label and _is_noise(instance.mask, raw, classes, hm, instance.height, instance.solidity):
@@ -171,11 +194,41 @@ def object_instances(
                 metrics["footprints_noise_dropped"] += 1
                 continue
             result.append(instance)
+    metrics["instance_labels_applied"] = _apply_instance_labels(result, instance_labels)
     result = _apply_fine_label_semantics(result, classes, hm, grid, units_per_metre, metrics)
     return result, metrics, hm
 
 
 _INSTANCE_LABEL_ALIASES = {"mattress": "bed", "duvet": "blanket", "pillow": "cushion", "couch": "sofa"}
+
+
+# Point-cloud instances of these labels are openings, fixtures on other objects or generic
+# furniture; they never name a floor-standing footprint.
+_NON_FOOTPRINT_INSTANCE_LABELS = frozenset({
+    "furniture", "window", "door", "faucet", "socket", "switch box", "light switch", "ventilation grille",
+    "radiator", "heater", "curtain", "mirror", "lamp", "ceiling lamp",
+})
+
+
+def _apply_instance_labels(instances: list[ObjectInstance], instance_labels: dict[int, str] | None) -> int:
+    """Name unlabelled footprints after their point-cloud instance (instances.json).
+
+    A fine label from the raster stays when present; the instance label only fills
+    gaps so objects are never less specific than without instance ids.
+    """
+    if not instance_labels:
+        return 0
+    applied = 0
+    for instance in instances:
+        if instance.instance_id <= 0 or instance.has_fine_label:
+            continue
+        label = str(instance_labels.get(int(instance.instance_id), "") or "").strip().lower()
+        if not label or label in _NON_FOOTPRINT_INSTANCE_LABELS:
+            continue
+        instance.label = _canonical_instance_label(label)
+        instance.has_fine_label = True
+        applied += 1
+    return applied
 
 
 def _canonical_instance_label(name: str) -> str:
@@ -230,7 +283,7 @@ def _apply_fine_label_semantics(
             if not anchors:
                 continue
             target_index, target = max(anchors, key=lambda item: float(np.count_nonzero(item[1].mask)))
-            merged = _make_instance(target.mask | instance.mask, target.label, classes, hm, grid)
+            merged = _make_instance(target.mask | instance.mask, target.label, classes, hm, grid, instance_id=target.instance_id)
             if merged is not None:
                 merged.code = target.code
                 active[target_index] = merged
@@ -261,7 +314,7 @@ def _apply_fine_label_semantics(
         ]
         if beds:
             target_index, target = max(beds, key=lambda item: float(np.count_nonzero(item[1].mask)))
-            merged = _make_instance(target.mask | instance.mask, target.label, classes, hm, grid)
+            merged = _make_instance(target.mask | instance.mask, target.label, classes, hm, grid, instance_id=target.instance_id)
             if merged is not None:
                 merged.code = target.code
                 active[target_index] = merged
@@ -278,7 +331,7 @@ def _apply_fine_label_semantics(
         ]
         if anchors:
             target_index, target = max(anchors, key=lambda item: float(np.count_nonzero(item[1].mask)))
-            merged = _make_instance(target.mask | instance.mask, target.label, classes, hm, grid)
+            merged = _make_instance(target.mask | instance.mask, target.label, classes, hm, grid, instance_id=target.instance_id)
             if merged is not None:
                 merged.code = target.code
                 active[target_index] = merged
@@ -755,14 +808,34 @@ def height_step_details(instance: ObjectInstance, hm: np.ndarray, grid: RasterGr
     return sorted(details, key=lambda item: item.length, reverse=True)[:2]
 
 
-def _make_instance(mask: np.ndarray, label: str | None, classes: np.ndarray, hm: np.ndarray, grid: RasterGrid) -> ObjectInstance | None:
+def _make_instance(mask: np.ndarray, label: str | None, classes: np.ndarray, hm: np.ndarray, grid: RasterGrid, *, instance_id: int = 0) -> ObjectInstance | None:
     polygons = mask_to_polygons(mask, grid)
     if not polygons:
         return None
     poly = max(polygons, key=lambda item: item.area)
     code = _dominant(classes[mask])
     height = float(np.percentile(hm[mask], 90))
-    return ObjectInstance(mask, label, code, label is not None, height, float(poly.area / max(poly.convex_hull.area, 1e-9)))
+    return ObjectInstance(mask, label, code, label is not None, height, float(poly.area / max(poly.convex_hull.area, 1e-9)), instance_id=int(instance_id))
+
+
+def _dominant_instance_id(mask: np.ndarray, instance_raster: np.ndarray | None) -> int:
+    if instance_raster is None:
+        return 0
+    values = np.asarray(instance_raster[mask], dtype=np.uint32)
+    values = values[values > 0]
+    if len(values) == 0:
+        return 0
+    ids, counts = np.unique(values, return_counts=True)
+    return int(ids[np.flatnonzero(counts == counts.max())[0]])
+
+
+def _label_for_region(region: np.ndarray, fine_classes: np.ndarray, fine_confidence: np.ndarray, fine_names: list[str]) -> str | None:
+    eligible = fine_classes[region & (fine_confidence >= 0.4)]
+    eligible = eligible[(eligible > 0) & (eligible <= len(fine_names))]
+    if len(eligible) == 0:
+        return None
+    fine_id = _dominant(eligible)
+    return _canonical_instance_label(fine_names[fine_id - 1])
 
 
 def _is_noise(mask: np.ndarray, raw: np.ndarray, classes: np.ndarray, hm: np.ndarray, height: float, solidity: float) -> bool:

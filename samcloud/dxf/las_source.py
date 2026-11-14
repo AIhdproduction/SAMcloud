@@ -135,9 +135,9 @@ class PlyPointChunk:
     16-bit like LAS colours (8-bit PLY value * 257), so LAS consumers handle both sources identically.
     """
 
-    DIMENSIONS: tuple[str, ...] = ("X", "Y", "Z", "classification", "red", "green", "blue")
+    DIMENSIONS: tuple[str, ...] = ("X", "Y", "Z", "classification", "red", "green", "blue", "instance_id")
 
-    def __init__(self, xyz: np.ndarray, classification: np.ndarray, rgb: np.ndarray) -> None:
+    def __init__(self, xyz: np.ndarray, classification: np.ndarray, rgb: np.ndarray, instance_id: np.ndarray | None = None) -> None:
         self.x = np.ascontiguousarray(xyz[:, 0], dtype=np.float64)
         self.y = np.ascontiguousarray(xyz[:, 1], dtype=np.float64)
         self.z = np.ascontiguousarray(xyz[:, 2], dtype=np.float64)
@@ -145,6 +145,9 @@ class PlyPointChunk:
         self.red = rgb[:, 0].astype(np.uint16) * 257
         self.green = rgb[:, 1].astype(np.uint16) * 257
         self.blue = rgb[:, 2].astype(np.uint16) * 257
+        self.instance_id = np.zeros(len(self.classification), dtype=np.uint32) if instance_id is None else np.asarray(instance_id, dtype=np.uint32)
+        if self.instance_id.shape != self.classification.shape:
+            raise ValueError("PLY instance IDs must have one value per point")
         self.point_format = _PlyPointFormat(self.DIMENSIONS)
 
     def __len__(self) -> int:
@@ -280,7 +283,9 @@ def iter_classified_ply_chunks(
             rgb = np.column_stack((points["red"], points["green"], points["blue"]))
             processed += len(points)
             report_progress(progress, processed / vertex_count if vertex_count else 1.0, stage)
-            yield PlyPointChunk(xyz, described.classify(points["scalar_class"]), rgb)
+            names = points.dtype.names or ()
+            instance_ids = np.asarray(points["instance_id"], dtype=np.uint32) if "instance_id" in names else None
+            yield PlyPointChunk(xyz, described.classify(points["scalar_class"]), rgb, instance_ids)
     check_cancel(cancel)
 
 
@@ -296,6 +301,36 @@ def iter_source_chunks(
     if is_ply_source(path):
         return iter_classified_ply_chunks(path, chunk_size, progress=progress, cancel=cancel, stage=stage or "Reading classified PLY points")
     return iter_las_chunks(path, chunk_size, progress=progress, cancel=cancel, stage=stage or "Reading LAS points")
+
+
+def instance_id_fingerprint(path: Path, *, chunk_size: int = 500_000) -> dict[str, Any]:
+    """Return a stable stamp for the optional per-point instance-id field."""
+    source = Path(path)
+    digest = hashlib.sha256()
+    present = False
+    count = 0
+    if is_ply_source(source):
+        from samcloud.engine.export_las import _ply_chunks, read_ply_header
+
+        offset, vertex_count = read_ply_header(source)
+        with source.open("rb") as handle:
+            for points in _ply_chunks(handle, offset, vertex_count, chunk_size):
+                if "instance_id" not in (points.dtype.names or ()):
+                    continue
+                values = np.ascontiguousarray(points["instance_id"], dtype=np.uint32)
+                digest.update(values.tobytes())
+                count += len(values)
+                present = True
+    else:
+        with laspy.open(source) as reader:
+            dimensions = {str(name).lower() for name in reader.header.point_format.dimension_names}
+            if "instance_id" in dimensions:
+                present = True
+                for points in reader.chunk_iterator(chunk_size):
+                    values = np.ascontiguousarray(points.instance_id, dtype=np.uint32)
+                    digest.update(values.tobytes())
+                    count += len(values)
+    return {"present": present, "points": count, "sha256": digest.hexdigest()}
 
 
 def _ply_cache_path(source: ClassifiedPlySource) -> Path:

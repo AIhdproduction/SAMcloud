@@ -11,6 +11,7 @@ _NAVIGATION = (
     ("Projects", "/projects", "folder"),
     ("Sparse cloud", "/sparse", "hub"),
     ("Control points", "/control-points", "my_location"),
+    ("Targets", "/targets", "qr_code_2"),
     ("Dense cloud", "/dense", "view_in_ar"),
     ("DXF", "/dxf", "architecture"),
     ("Settings", "/settings", "tune"),

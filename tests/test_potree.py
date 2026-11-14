@@ -11,6 +11,7 @@ import pytest
 from samcloud.app.application import potree_file
 from samcloud.app.state import state
 from samcloud.viewer.potree import (
+    _potree_paths,
     _ply_points,
     ensure_potree,
     potree_available,
@@ -406,3 +407,129 @@ def test_viewer_config_contains_status_url() -> None:
     from samcloud.app.potree_viewer import _viewer_config
 
     assert _viewer_config("dense", "Dense", [[0, 0, 0]])["status_url"] == "/api/potree/dense/status"
+
+
+def test_write_viewer_las_preserves_instance_ids_and_omits_invalid_values(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    xyz = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    rgb = np.full((3, 3), 20, dtype=np.uint8)
+    with_instances = tmp_path / "instances.las"
+    write_viewer_las(with_instances, xyz, rgb, instance_ids=np.array([12, 0, 65536]))
+    assert np.array_equal(np.asarray(laspy.read(with_instances).point_source_id), [12, 0, 0])
+    assert "above 65535" in caplog.text
+
+    without_instances = tmp_path / "no_instances.las"
+    write_viewer_las(without_instances, xyz, rgb)
+    assert np.array_equal(np.asarray(laspy.read(without_instances).point_source_id), [0, 0, 0])
+
+
+def test_dense_octree_signature_tracks_instance_property(tmp_path: Path) -> None:
+    source = tmp_path / "project" / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    base_header = (
+        "ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+        "property float x\nproperty float y\nproperty float z\nend_header\n"
+    ).encode("ascii")
+    source.write_bytes(base_header + np.zeros(1, dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4")]).tobytes())
+    without_instances = _potree_paths(tmp_path / "project", "dense")[3]
+
+    instance_header = base_header.replace(b"end_header", b"property uint instance_id\nend_header")
+    source.write_bytes(instance_header + np.zeros(1, dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("instance_id", "<u4")]).tobytes())
+    with_instances = _potree_paths(tmp_path / "project", "dense")[3]
+
+    assert "instance_ids" not in without_instances
+    assert with_instances["instance_ids"] is True
+    assert without_instances != with_instances
+
+
+def test_signature_without_instances_keeps_legacy_format(tmp_path: Path) -> None:
+    source = tmp_path / "project" / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    header = (
+        "ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+        "property float x\nproperty float y\nproperty float z\nend_header\n"
+    ).encode("ascii")
+    source.write_bytes(header + np.zeros(1, dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4")]).tobytes())
+    signature = _potree_paths(tmp_path / "project", "dense")[3]
+    assert set(signature) == {"source", "size", "mtime_ns", "encoding"}
+
+
+def test_potree_converter_gets_separate_attribute_tokens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    potree._POTREE_BUILD_STATES.clear()
+    project = tmp_path / "project"
+    source = project / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ply")
+    monkeypatch.setattr(potree, "potree_available", lambda: True)
+    monkeypatch.setattr(potree, "_ply_points", lambda _path: (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), None))
+    monkeypatch.setattr(potree, "write_viewer_las", lambda path, *_a: (path.parent.mkdir(parents=True, exist_ok=True), path.write_bytes(b"las")))
+    seen: list[list[str]] = []
+
+    def fake_converter(command, **_kwargs):
+        seen.append(list(command))
+        output = Path(command[command.index("-o") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "metadata.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(potree.subprocess, "run", fake_converter)
+    potree.ensure_potree(project, "dense")
+    command = seen[0]
+    index = command.index("--attributes")
+    assert command[index + 1:index + 4] == ["rgb", "classification", "point source id"]
+    assert not any("," in token for token in command[index + 1:])
+
+
+
+def test_write_viewer_las_writes_user_data_from_fine_terms(tmp_path: Path) -> None:
+    xyz = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    rgb = np.full((3, 3), 20, dtype=np.uint8)
+    with_terms = tmp_path / "fine.las"
+    write_viewer_las(with_terms, xyz, rgb, None, None, np.array([0, 3, 7]))
+    assert np.array_equal(np.asarray(laspy.read(with_terms).user_data), [0, 3, 7])
+    without = tmp_path / "none.las"
+    write_viewer_las(without, xyz, rgb)
+    assert np.array_equal(np.asarray(laspy.read(without).user_data), [0, 0, 0])
+
+
+def _tiny_ply(source: Path, with_fine: bool) -> None:
+    source.parent.mkdir(parents=True, exist_ok=True)
+    fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")] + ([("fine_term", "u1")] if with_fine else [])
+    names = {"<f4": "float", "u1": "uchar"}
+    header = "ply\nformat binary_little_endian 1.0\nelement vertex 1\n" + "".join(
+        f"property {names[kind]} {name}\n" for name, kind in fields) + "end_header\n"
+    source.write_bytes(header.encode("ascii") + np.zeros(1, dtype=fields).tobytes())
+
+
+def test_signature_tracks_fine_terms_only_when_present(tmp_path: Path) -> None:
+    source = tmp_path / "project" / "products" / "classified" / "classified.ply"
+    _tiny_ply(source, False)
+    plain = _potree_paths(tmp_path / "project", "dense")[3]
+    assert set(plain) == {"source", "size", "mtime_ns", "encoding"}
+    _tiny_ply(source, True)
+    fine = _potree_paths(tmp_path / "project", "dense")[3]
+    assert fine["fine_terms"] is True
+    assert potree._ply_fine_terms(source).tolist() == [0]
+
+
+def test_potree_converter_requests_user_data_attribute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    potree._POTREE_BUILD_STATES.clear()
+    project = tmp_path / "project"
+    source = project / "products" / "classified" / "classified.ply"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ply")
+    monkeypatch.setattr(potree, "potree_available", lambda: True)
+    monkeypatch.setattr(potree, "_ply_points", lambda _path: (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), None))
+    monkeypatch.setattr(potree, "write_viewer_las", lambda path, *_a: (path.parent.mkdir(parents=True, exist_ok=True), path.write_bytes(b"las")))
+    seen: list[list[str]] = []
+
+    def fake_converter(command, **_kwargs):
+        seen.append(list(command))
+        output = Path(command[command.index("-o") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "metadata.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(potree.subprocess, "run", fake_converter)
+    potree.ensure_potree(project, "dense")
+    command = seen[0]
+    assert command[command.index("--attributes") + 1:][-1] == "user data"

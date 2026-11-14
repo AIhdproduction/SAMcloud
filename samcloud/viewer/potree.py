@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -26,6 +27,7 @@ _POTREE_LOCKS: dict[tuple[Path, str], Lock] = {}
 _POTREE_LOCKS_GUARD = Lock()
 _POTREE_BUILD_STATES: dict[tuple[Path, str], dict[str, object]] = {}
 _POTREE_BUILD_STATES_GUARD = Lock()
+LOGGER = logging.getLogger(__name__)
 
 
 def write_viewer_manifest(path: Path, classes: list[dict[str, Any]], point_cloud_url: str) -> None:
@@ -44,7 +46,14 @@ def potree_available() -> bool:
     return POTREE_LIBRARY.is_file() and POTREE_CONVERTER.is_file()
 
 
-def write_viewer_las(path: Path, xyz: np.ndarray, rgb: np.ndarray, classes: np.ndarray | None = None) -> None:
+def write_viewer_las(
+    path: Path,
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    classes: np.ndarray | None = None,
+    instance_ids: np.ndarray | None = None,
+    fine_terms: np.ndarray | None = None,
+) -> None:
     """Write a LAS 1.4 (point format 7) file in the model frame for PotreeConverter."""
     header = laspy.LasHeader(point_format=7, version="1.4")
     header.scales = np.array([0.001, 0.001, 0.001])
@@ -55,6 +64,15 @@ def write_viewer_las(path: Path, xyz: np.ndarray, rgb: np.ndarray, classes: np.n
     las.red, las.green, las.blue = colours[:, 0], colours[:, 1], colours[:, 2]
     if classes is not None:
         las.classification = np.clip(np.asarray(classes), 0, 255).astype(np.uint8)
+    if instance_ids is not None:
+        source_ids = np.asarray(instance_ids, dtype=np.int64).copy()
+        too_large = source_ids > np.iinfo(np.uint16).max
+        if np.any(too_large):
+            LOGGER.warning("Instance ids above 65535 are omitted from the Potree point-source attribute")
+            source_ids[too_large] = 0
+        las.point_source_id = np.clip(source_ids, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    if fine_terms is not None:
+        las.user_data = np.clip(np.asarray(fine_terms, dtype=np.int64), 0, 255).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     las.write(path)
 
@@ -77,6 +95,30 @@ def _ply_points(source: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray | None
     if classes is not None:
         classes[classes == NEVER_CLASSIFIED_ID] = 0
     return xyz, rgb, classes
+
+
+def _ply_instance_ids(source: Path) -> np.ndarray | None:
+    """Return PLY instance ids when the classified cloud contains them."""
+    try:
+        count, _properties, dtype, offsets = _read_ply_header(source)
+    except ValueError:
+        return None
+    if "instance_id" not in offsets:
+        return None
+    data = np.fromfile(source, dtype=dtype, count=count, offset=_ply_header_size(source))
+    return np.asarray(data["instance_id"], dtype=np.int64)
+
+
+def _ply_fine_terms(source: Path) -> np.ndarray | None:
+    """Return the per-point fine term (0 = none) when the classified cloud has one."""
+    try:
+        count, _properties, dtype, offsets = _read_ply_header(source)
+    except ValueError:
+        return None
+    if "fine_term" not in offsets:
+        return None
+    data = np.fromfile(source, dtype=dtype, count=count, offset=_ply_header_size(source))
+    return np.asarray(data["fine_term"], dtype=np.int64)
 
 
 def _conversion_lock(project_directory: Path, kind: str) -> Lock:
@@ -102,10 +144,23 @@ def _potree_paths(project_directory: Path, kind: str) -> tuple[Path, Path, Path,
         raise FileNotFoundError(f"No {kind} point cloud is available yet")
     viewer_root = project_directory / "products" / "viewer" / "potree"
     output = viewer_root / kind
+    has_instance_ids = False
+    has_fine_terms = False
+    if kind == "dense":
+        try:
+            header_offsets = _read_ply_header(source)[3]
+            has_instance_ids = "instance_id" in header_offsets
+            has_fine_terms = "fine_term" in header_offsets
+        except ValueError:
+            pass
     signature = {
         "source": str(source), "size": source.stat().st_size, "mtime_ns": source.stat().st_mtime_ns,
         "encoding": "BROTLI",
     }
+    if has_instance_ids:
+        signature["instance_ids"] = True
+    if has_fine_terms:
+        signature["fine_terms"] = True
     if kind == "sparse":
         signature["sparse_filter"] = {"version": FILTER_VERSION, **sparse_cleaning_settings()}
     return source, output, viewer_root / f"{kind}.json", signature
@@ -189,12 +244,15 @@ def ensure_potree(project_directory: Path, kind: str) -> Path:
         if _cache_matches(output, signature_path, signature):
             return output
         xyz, rgb, classes = _sparse_points(source) if kind == "sparse" else _ply_points(source)
+        instance_ids = _ply_instance_ids(source) if kind == "dense" else None
         las_path = signature_path.parent / f"{kind}.las"
-        write_viewer_las(las_path, xyz, rgb, classes)
+        fine_terms = _ply_fine_terms(source) if kind == "dense" else None
+        write_viewer_las(las_path, xyz, rgb, classes, instance_ids, fine_terms)
         if output.exists():
             shutil.rmtree(output)
         result = subprocess.run(
-            [str(POTREE_CONVERTER), str(las_path), "-o", str(output), "--method", "poisson", "--encoding", "BROTLI"],
+            [str(POTREE_CONVERTER), str(las_path), "-o", str(output), "--method", "poisson", "--encoding", "BROTLI",
+             "--attributes", "rgb", "classification", "point source id", "user data"],
             capture_output=True, text=True, creationflags=_NO_CONSOLE,
         )
         if result.returncode != 0 or not (output / "metadata.json").is_file():

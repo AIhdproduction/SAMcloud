@@ -1,13 +1,19 @@
 """Route registration for the NiceGUI application."""
 
+import json
+import struct
+from pathlib import Path
+
+import numpy as np
+
 from nicegui import app, ui
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from samcloud.app.pages import control_points, dense_cloud, dxf, home, projects, settings, sparse_cloud
+from samcloud.app.pages import control_points, dense_cloud, dxf, home, projects, settings, sparse_cloud, targets
 from samcloud.app.state import state
 from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.dxf_review_canvas import review_background, review_payload
-from samcloud.app.gcp_review import image_crop, marker_payload, resolve_project_image
+from samcloud.app.gcp_review import apriltag_marker_payload, apriltag_warnings, image_crop, marker_payload, resolve_project_image
 from samcloud.core.paths import ASSETS_DIRECTORY
 from samcloud.control_points.repository import (
     move_detection_observation,
@@ -17,9 +23,159 @@ from samcloud.control_points.repository import (
     set_detection_observation_enabled,
     set_detection_role,
 )
-from samcloud.viewer.preview import ensure_preview
+from samcloud.viewer.preview import _ply_header_size, _read_ply_header, ensure_preview
 from samcloud.viewer.potree import ensure_potree, potree_status, start_potree_build
 from samcloud.viewer.cameras import camera_payload, camera_thumbnail
+
+
+_INSTANCE_POINT_LIMIT = 200_000
+
+
+def _instances_path(project_directory: Path) -> Path:
+    return project_directory / "products" / "classified" / "instances.json"
+
+
+def _classified_ply_path(project_directory: Path) -> Path:
+    return project_directory / "products" / "classified" / "classified.ply"
+
+
+def _instance_class_config(project_directory: Path) -> dict:
+    """Load the project class config for German instance/class labels; empty when unavailable."""
+    try:
+        from samcloud.classification.custom import load_project_classes
+
+        values = load_project_classes(project_directory)
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        values = {}
+    return values if isinstance(values, dict) else {}
+
+
+def _instance_label_map(project_directory: Path) -> dict[str, str]:
+    """Load optional German instance labels without requiring a newer classes config."""
+    values = _instance_class_config(project_directory).get("instance_labels_de", {})
+    return values if isinstance(values, dict) else {}
+
+
+def _class_names_de(config: dict) -> list:
+    """German class names of the active project's class set (index = class id), or an empty list."""
+    try:
+        project = state.active_project()
+        class_set = (project or {}).get("settings", {}).get("classification", {}).get("class_set", "outdoor")
+    except Exception:
+        class_set = "outdoor"
+    labels = config.get("labels_de", {})
+    names = labels.get(class_set) if isinstance(labels, dict) else None
+    return names if isinstance(names, list) else []
+
+
+def _instance_payload(project_directory: Path) -> list[dict[str, object]]:
+    """Return the public instance metadata, or no instances for older projects."""
+    path = _instances_path(project_directory)
+    if not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    class_config = _instance_class_config(project_directory)
+    labels_de = class_config.get("instance_labels_de", {})
+    labels_de = labels_de if isinstance(labels_de, dict) else {}
+    class_names_de = _class_names_de(class_config)
+    result: list[dict[str, object]] = []
+    for item in document.get("instances", []) if isinstance(document, dict) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+            continue
+        label = str(item.get("label") or item.get("class_name") or "Object")
+        class_id = item.get("class_id")
+        class_de = class_names_de[class_id] if isinstance(class_id, int) and 0 <= class_id < len(class_names_de) else None
+        result.append({
+            "id": item["id"],
+            "label": label,
+            "label_de": str(labels_de.get(label) or class_de or label),
+            "label_index": item.get("label_index"),
+            "class_id": item.get("class_id"),
+            "class_name": item.get("class_name"),
+            "point_count": item.get("point_count", 0),
+            "bbox_min": item.get("bbox_min"),
+            "bbox_max": item.get("bbox_max"),
+        })
+    return result
+
+
+def _instance_index(project_directory: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.dtype, dict[str, int]]:
+    """Load or rebuild the cached stable ordering of PLY rows by non-zero instance id."""
+    source = _classified_ply_path(project_directory)
+    if not source.is_file():
+        raise FileNotFoundError("No classified point cloud is available yet")
+    cache_path = project_directory / "products" / "viewer" / "instance_index.npz"
+    source_stat = source.stat()
+    signature = (source_stat.st_mtime_ns, source_stat.st_size)
+    try:
+        with np.load(cache_path) as cache:
+            if tuple(int(value) for value in cache["signature"]) == signature:
+                count, _properties, dtype, offsets = _read_ply_header(source)
+                return cache["ids"], cache["offsets"], cache["indices"], dtype, offsets
+    except (OSError, ValueError, KeyError):
+        pass
+    count, _properties, dtype, fields = _read_ply_header(source)
+    if "instance_id" not in fields:
+        return np.empty(0, np.uint32), np.zeros(1, np.int64), np.empty(0, np.int64), dtype, fields
+    data = np.fromfile(source, dtype=dtype, count=count, offset=_ply_header_size(source))
+    instance_ids = np.asarray(data["instance_id"], dtype=np.uint32)
+    valid_indices = np.flatnonzero(instance_ids)
+    ordered_indices = valid_indices[np.argsort(instance_ids[valid_indices], kind="stable")]
+    ordered_ids = instance_ids[ordered_indices]
+    ids, starts = np.unique(ordered_ids, return_index=True)
+    boundaries = np.append(starts, len(ordered_indices)).astype(np.int64)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        signature=np.asarray(signature, dtype=np.int64),
+        ids=ids,
+        offsets=boundaries,
+        indices=ordered_indices.astype(np.int64),
+    )
+    return ids, boundaries, ordered_indices.astype(np.int64), dtype, fields
+
+
+@app.get("/api/instances")
+def instances():
+    """Serve recognized dense-cloud object instances for the current project."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    return JSONResponse({"instances": _instance_payload(project_directory)})
+
+
+@app.get("/api/instances/{instance_id}/points")
+def instance_points(instance_id: int):
+    """Serve one instance's original-colour PLY points in the Potree coordinate frame."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "No project is open"}, status_code=404)
+    try:
+        ids, offsets, indices, dtype, fields = _instance_index(project_directory)
+        position = int(np.searchsorted(ids, instance_id))
+        if position >= len(ids) or int(ids[position]) != instance_id:
+            return JSONResponse({"error": "Instance not found"}, status_code=404)
+        selected = indices[offsets[position]:offsets[position + 1]]
+        if len(selected) > _INSTANCE_POINT_LIMIT:
+            selected = selected[np.linspace(0, len(selected) - 1, _INSTANCE_POINT_LIMIT, dtype=np.int64)]
+        source = _classified_ply_path(project_directory)
+        count = _read_ply_header(source)[0]
+        # Memory-map and gather only the requested rows; the cloud is never read in full.
+        rows = np.memmap(source, dtype=dtype, mode="r", offset=_ply_header_size(source), shape=(count,))
+        data = np.asarray(rows[np.sort(selected)])
+        del rows
+    except (FileNotFoundError, OSError, ValueError) as error:
+        return JSONResponse({"error": str(error)}, status_code=404)
+    record = np.empty(len(data), dtype=np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                                  ("r", "u1"), ("g", "u1"), ("b", "u1")]))
+    record["x"], record["y"], record["z"] = data["x"], data["y"], data["z"]
+    for channel, name in (("r", "red"), ("g", "green"), ("b", "blue")):
+        record[channel] = data[name] if name in fields else 200
+    records = b"SAMV" + struct.pack("<III", 1, len(data), 0) + record.tobytes()
+    return Response(records, media_type="application/octet-stream", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/pointcloud/{kind}")
@@ -139,6 +295,18 @@ def control_point_markers():
     if project_directory is None:
         return JSONResponse({"error": "No project is open"}, status_code=404)
     return JSONResponse(marker_payload(project_directory))
+
+
+@app.get("/api/apriltags/markers")
+def apriltag_markers():
+    """Serve the AprilTag squares (final sparse-model frame = dense viewer frame) for the dense view."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"markers": [], "warnings": []})
+    return JSONResponse({
+        "markers": apriltag_marker_payload(project_directory),
+        "warnings": apriltag_warnings(project_directory),
+    })
 
 
 @app.get("/api/control-points/crop")
@@ -331,6 +499,7 @@ def create_application() -> None:
     ui.page("/projects")(projects.render)
     ui.page("/sparse")(sparse_cloud.render)
     ui.page("/control-points")(control_points.render)
+    ui.page("/targets")(targets.render)
     ui.page("/dense")(dense_cloud.render)
     ui.page("/dxf")(dxf.render)
     ui.page("/settings")(settings.render)

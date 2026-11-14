@@ -23,6 +23,7 @@ from pathlib import Path
 CACHE_DIRECTORY = "processing_cache"
 SAM_CLOUD = "classified_after_sam.ply"
 SAM_SCORES = "classified_scores_after_sam.npz"
+INSTANCES_SOURCE = "instances_source.npz"
 MANIFEST = "cache.json"
 DENSE_TREES = ("stereo", "images", "sparse", "sparse_txt", "sam_labels", "sam_mirror")
 DENSE_FILES = ("fused.ply", "fused.ply.vis")
@@ -63,6 +64,9 @@ def save_after_sam(
     shutil.copy2(classified_raw, cache / SAM_CLOUD)
     if scores_path is not None and Path(scores_path).is_file():
         shutil.copy2(scores_path, cache / SAM_SCORES)
+    instance_source = Path(classified_raw).with_name(INSTANCES_SOURCE)
+    if instance_source.is_file():
+        shutil.copy2(instance_source, cache / INSTANCES_SOURCE)
     counts = {}
     for name in DENSE_FILES:
         if (dense_dir / name).is_file():

@@ -1,7 +1,7 @@
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -13,11 +13,13 @@ if __package__:
     from .fine_terms import build_fine_vocabulary, mask_removed_class_votes, resolve_fine_terms
     from .ply_io import read_fused_points, read_vis_file, write_classified_ply
     from .sam_labeler import HeadFusionLabeler, SemanticLabeler
+    from .instances import associate_instances, tag_point_mask, write_instance_product
 else:
     from colmap_model import load_model
     from fine_terms import build_fine_vocabulary, mask_removed_class_votes, resolve_fine_terms
     from ply_io import read_fused_points, read_vis_file, write_classified_ply
     from sam_labeler import HeadFusionLabeler, SemanticLabeler
+    from instances import associate_instances, tag_point_mask, write_instance_product
 
 
 def mvs_image_order(sparse_dir, image_ids=None):
@@ -471,7 +473,8 @@ def _class_counts(final_class, class_names):
     }
 
 
-def make_point_labeler(args, class_names, unknown_id, prompts=None, fine_vocabulary=None):
+def make_point_labeler(args, class_names, unknown_id, prompts=None, fine_vocabulary=None,
+                       instance_classes=None, instance_params=None):
     """Point scorer of the selected engine: SAM3 head fusion or the FlurSeg model (outdoor only)."""
     if getattr(args, "engine", "sam3") == "flurseg":
         if __package__:
@@ -488,13 +491,15 @@ def make_point_labeler(args, class_names, unknown_id, prompts=None, fine_vocabul
         query_threshold=args.query_threshold,
         prompts=prompts,
         fine_queries=fine_vocabulary.queries if fine_vocabulary is not None else None,
+        instance_classes=instance_classes,
+        instance_params=instance_params,
     )
 
 
 def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
                      prompts=None, suppress_names=None, suppress_prompts=None,
                      mirror_names=None, mirror_prompts=None, protected_names=None, protected_prompts=None,
-                     fine_config=None, fine_vocabulary=None):
+                     fine_config=None, fine_vocabulary=None, instance_config=None):
     """Classify with SegEarth-OV3 fusion and class-weighted 3D voting.
 
     ``fine_config`` (the classes.json mapping) or a ready ``fine_vocabulary`` switches on the per-point fine
@@ -521,8 +526,30 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                          *(protected_prompts or protected_names)]
     if (fine_vocabulary is None and fine_config is not None and query_prompts is not None
             and getattr(args, "engine", "sam3") == "sam3"):
-        fine_vocabulary = build_fine_vocabulary(fine_config, args.class_set, query_prompts)
+        fine_vocabulary = build_fine_vocabulary(fine_config, getattr(args, "class_set", None), query_prompts)
     fine_size = fine_vocabulary.size if fine_vocabulary is not None else 0
+    instance_params = dict(instance_config or {})
+    instances_enabled = bool(instance_params.get("enabled", False)) and not bool(
+        getattr(args, "no_instances", False)
+    ) and getattr(args, "engine", "sam3") == "sam3"
+    instance_classes = []
+    if instances_enabled:
+        instance_names = set((fine_config or {}).get("instance_classes", {}).get(getattr(args, "class_set", None), []) or [])
+        instance_classes = [index + 1 for index, name in enumerate(class_names)
+                            if name.split(",", 1)[0].strip() in instance_names]
+        if not instance_classes:
+            instances_enabled = False
+    prompt_entries = list(query_prompts) if query_prompts is not None else list(query_class_names)
+    flat_prompts = []
+    generic_prompt_ids = set()
+    for class_index, entry in enumerate(prompt_entries):
+        values = [entry] if isinstance(entry, str) else list(entry)
+        for value_index, value in enumerate(values):
+            if value_index == 0:
+                generic_prompt_ids.add(len(flat_prompts))
+            flat_prompts.append(str(value))
+    instance_point_rows, instance_vinst_rows = [], []
+    instance_classes_meta, instance_conf_meta, instance_prompt_meta, instance_view_meta = [], [], [], []
     fine_scores = fine_counts = None
     if fine_size:
         fine_scores = np.zeros((xyz.shape[0], fine_size), dtype=np.float32)
@@ -544,7 +571,9 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         for threshold in thresholds
     }
     labeler = make_point_labeler(args, query_class_names, unknown_id, query_prompts,
-                                 **({"fine_vocabulary": fine_vocabulary} if fine_size else {}))
+                                 **({"fine_vocabulary": fine_vocabulary} if fine_size else {}),
+                                 instance_classes=instance_classes if instances_enabled else None,
+                                 instance_params=instance_params if instances_enabled else None)
 
     depth_check = bool(getattr(args, "depth_check", 1))
     depth_stats = {"checked": 0, "class_removed": 0, "occluded": 0, "raster_pixels_moved": 0}
@@ -563,10 +592,12 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
             depth = read_depth_map(args.dense_dir, image.name) if depth_check else None
             term_probs = np.zeros((len(sel_points), fine_size), dtype=np.float32) if fine_size else None
             fine_kwargs = {"fine_scores_out": term_probs} if fine_size else {}
+            instance_out = {} if instances_enabled else None
+            instance_kwargs = {"instances_out": instance_out} if instance_out is not None else {}
             if args.labels_dir or depth is not None:
                 result = labeler.score_points(
                     image_path, ui, vi, image=image_pixels, label_threshold=args.background_threshold,
-                    label_exclude_ids=mirror_ids, return_raw_labels=True, **fine_kwargs,
+                    label_exclude_ids=mirror_ids, return_raw_labels=True, **fine_kwargs, **instance_kwargs,
                 )
                 if len(result) == 3:
                     point_probs, labels, raw_labels = result
@@ -592,8 +623,22 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                     for key, value in view_stats.items():
                         depth_stats[key] += value
             else:
-                point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels, **fine_kwargs)
+                point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels, **fine_kwargs, **instance_kwargs)
                 protected_clutter[sel_points] |= replace_mirror_point_winners(point_probs, mirror_ids, protected_ids)
+            if instance_out is not None:
+                local_ids = np.asarray(instance_out.get("point_local_instance", ()), dtype=np.int32)
+                local_meta = list(instance_out.get("instances", ()))
+                if len(local_ids) == len(sel_points) and local_meta:
+                    base = len(instance_classes_meta)
+                    for item in local_meta:
+                        instance_classes_meta.append(int(item["class_id"]))
+                        instance_conf_meta.append(float(item["conf"]))
+                        instance_prompt_meta.append(int(item["prompt_idx"]))
+                        instance_view_meta.append(int(processed - 1))
+                    valid_instance = (local_ids >= 0) & (point_probs.max(axis=1) >= args.background_threshold)
+                    if np.any(valid_instance):
+                        instance_point_rows.append(sel_points[valid_instance].astype(np.int32, copy=False))
+                        instance_vinst_rows.append((base + local_ids[valid_instance]).astype(np.int32, copy=False))
             for threshold, (scores, view_counts, seen_counts) in vote_states.items():
                 accumulate_weighted_votes(scores, view_counts, sel_points, point_probs, threshold, seen_counts)
             if fine_size:  # same weighted vote and threshold, only for terms whose class kept its vote in this view
@@ -610,6 +655,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
     threshold_summary = {}
     main_final_class = None
     main_suppressed = None
+    instance_id, instance_metadata = None, []
     for threshold, (scores, view_counts, seen_counts) in vote_states.items():
         query_final_class = resolve_weighted_votes(scores, view_counts, args.min_votes, unknown_id, seen_counts, NEVER_CLASSIFIED_ID)
         final_class, suppressed, _mirror, _protected = map_internal_winners(
@@ -622,6 +668,22 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
         else:
             destination = output_path.with_name(f"{output_path.stem}_tau{threshold:.2f}{output_path.suffix}")
         write_classified_ply(destination, xyz, rgb, final_class)
+        if threshold == args.background_threshold and instances_enabled:
+            if instance_point_rows:
+                instance_id, instance_metadata = associate_instances(
+                    np.concatenate(instance_point_rows), np.concatenate(instance_vinst_rows),
+                    np.asarray(instance_classes_meta, dtype=np.int32), np.asarray(instance_conf_meta, dtype=np.float32),
+                    np.asarray(instance_prompt_meta, dtype=np.int32), len(xyz), final_class, xyz, instance_params,
+                    flat_prompts, generic_prompt_ids, np.asarray(instance_view_meta, dtype=np.int32),
+                    # AprilTag squares never form or extend an object instance (report beside the summary).
+                    exclude_mask=tag_point_mask(
+                        xyz, Path(args.summary_file).parent / "apriltag_report.json" if args.summary_file else None),
+                )
+            else:
+                instance_id, instance_metadata = np.zeros(len(xyz), dtype=np.uint32), []
+            write_instance_product(destination, instance_id, instance_metadata,
+                                   bool(instance_params.get("debug_ply", False)))
+            print(f"      Instances: {len(instance_metadata):,} objects, {int(np.count_nonzero(instance_id)):,} points")
         threshold_summary[f"{threshold:.2f}"] = {
             "class_counts": _class_counts(final_class, class_names),
             "unknown_points": int((final_class == unknown_id).sum()),
@@ -659,6 +721,10 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                     "query_threshold": args.query_threshold,
                     "threshold_sweep": threshold_summary,
                     "depth_check": depth_stats if depth_check else None,
+                    "instances": {
+                        "count": len(instance_metadata or []) if instances_enabled else 0,
+                        "per_class": dict(Counter(item["class_name"] for item in (instance_metadata or []))) if instances_enabled else {},
+                    },
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -693,6 +759,18 @@ def main():
                     help="SegEarth-OV3 background threshold applied to every sampled point")
     ap.add_argument("--query-threshold", type=float, default=0.4,
                     help="SegEarth-OV3 initial confidence threshold for decoder queries")
+    ap.add_argument("--instances-enabled", type=int, choices=(0, 1), default=0,
+                    help="enable SAM decoder-mask 3D instance association")
+    ap.add_argument("--instance-query-threshold", type=float, default=0.5)
+    ap.add_argument("--instance-mask-threshold", type=float, default=0.5)
+    ap.add_argument("--instance-min-mask-pixels", type=int, default=12)
+    ap.add_argument("--instance-merge-overlap", type=float, default=0.5)
+    ap.add_argument("--instance-min-shared-points", type=int, default=10)
+    ap.add_argument("--instance-min-views", type=int, default=2)
+    ap.add_argument("--instance-min-points", type=int, default=100)
+    ap.add_argument("--instance-split-radius-m", type=float, default=0.05)
+    ap.add_argument("--instance-debug-ply", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--no-instances", action="store_true", help="disable per-point object instance IDs")
     ap.add_argument("--threshold-sweep", default="",
                     help="optional comma-separated SegEarth-OV3 background thresholds")
     ap.add_argument("--out", required=True, help="output PLY path")
@@ -728,6 +806,14 @@ def main():
         class_names = [entry.model_name for entry in flurseg_profile("outdoor").entries]
     # Optional short SAM3 prompts per class set (same order as the class names).
     prompts = None if args.engine == "flurseg" else cfg.get("prompts", {}).get(args.class_set) or None
+    instance_config = {
+        "enabled": bool(args.instances_enabled), "query_threshold": args.instance_query_threshold,
+        "mask_threshold": args.instance_mask_threshold, "min_mask_pixels": args.instance_min_mask_pixels,
+        "merge_overlap": args.instance_merge_overlap, "min_shared_points": args.instance_min_shared_points,
+        "min_views": args.instance_min_views, "min_points": args.instance_min_points,
+        "split_radius_m": args.instance_split_radius_m, "debug_ply": bool(args.instance_debug_ply),
+        "class_names": class_names,
+    }
     if prompts is not None and len(prompts) != len(class_names):
         sys.exit(f"classes.json: prompts.{args.class_set} must list one prompt per class ({len(class_names)})")
     unknown_id = cfg.get("unknown_class_id", 0)
@@ -766,7 +852,7 @@ def main():
             prompts=prompts, suppress_names=suppress_names, suppress_prompts=suppress_prompts,
             mirror_names=mirror_names, mirror_prompts=mirror_prompts,
             protected_names=protected_names, protected_prompts=protected_prompts,
-            fine_config=cfg,
+            fine_config=cfg, instance_config=instance_config,
         )
         return
 

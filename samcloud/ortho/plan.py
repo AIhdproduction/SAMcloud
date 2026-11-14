@@ -60,7 +60,7 @@ from samcloud.ortho.vector.upper_cabinets import UpperCabinetSettings, detect_up
 from samcloud.ortho.vector.room_names import RoomNameSettings, name_rooms, room_label_text, tag_for_name
 from samcloud.ortho.vector.builtin_fronts import resolve_builtin_fronts, tall_furniture_mask
 from samcloud.ortho.vector.niche import NicheSettings, content_mask, resolve_recessed_niches
-from samcloud.ortho.vector.footprints import ISLAND_LABELS, FootprintFit, IslandSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
+from samcloud.ortho.vector.footprints import _NON_FOOTPRINT_INSTANCE_LABELS, ISLAND_LABELS, FootprintFit, IslandSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
 from samcloud.ortho.vector.wall_lines import (
     WallFace,
     break_faces_at_openings,
@@ -251,6 +251,9 @@ def clean_plan_fingerprint(
         "ortho_plan_yaml": ortho_plan_content,
         "settings": asdict(plan_settings),
     }
+    instances_path = project / "products" / "classified" / "instances.json"
+    if instances_path.is_file():
+        payload["instances_json"] = hashlib.sha256(instances_path.read_bytes()).hexdigest()
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -758,6 +761,8 @@ def _generate_indoor_clean_plan(
     if classes.shape != (grid.height, grid.width) or dsm.shape != classes.shape:
         raise OrthoError("Indoor segmentation and elevation rasters do not match the orthophoto grid")
     fine_classes, fine_confidence, fine_names, fine_label_source = _load_fine_labels(segment, classes.shape)
+    instance_raster = _load_instance_raster(segment, classes.shape)
+    instance_labels = _load_instance_labels(project, point_source) if instance_raster is not None else {}
     indoor_layers = load_layer_config().for_project_mode("indoor")
     output_layers: dict[str, list[dict[str, Any]]] = {layer.name: [] for layer in indoor_layers}
     output_layers["A-FURN-DETL"] = []
@@ -882,6 +887,14 @@ def _generate_indoor_clean_plan(
     fixtures_rejected: dict[str, int] = {}
     catalogue_inserts: list[dict[str, object]] = []
     kitchen_islands = 0
+    if instance_raster is not None and instance_labels:
+        for placed, sani_mask, sani_slice, _sani_id in _sanitary_instance_inserts(instance_raster, instance_labels, grid, wall_lines, units_per_metre):
+            fixture_coverage[sani_slice] |= sani_mask[sani_slice]
+            if _insert_duplicates_existing(placed, output_layers):
+                continue
+            output_layers[str(placed["_catalogue"]["layer"]) if "_catalogue" in placed else "P-SANI"].append(placed)  # type: ignore[index]
+            if "_catalogue" in placed:
+                catalogue_inserts.append(placed)
     for component, component_slice, fine_label, code in _furniture_instances(legacy_fixture_mask, classes, dsm, level.floor_z, fine_classes, fine_confidence, fine_names, grid, units_per_metre):
         local_grid = _grid_for_slice(grid, component_slice)
         display = _furniture_display_name(fine_label, cyclone_codes.get(code, {}))
@@ -894,11 +907,22 @@ def _generate_indoor_clean_plan(
             continue
         if fixture in {"STOVE", "SINK"}:
             continue  # kitchen appliances are placed on the kitchen run, only where a label was observed
+        legacy_instance_id = _dominant_instance(instance_raster[component_slice][component]) if instance_raster is not None else 0
+        if instance_raster is not None and instance_labels and legacy_instance_id == 0:
+            legacy_instance_id = _dominant_instance_nearby(instance_raster, component_slice, component, grid.pixel_size, 0.15 * units_per_metre)
+        if instance_raster is not None and instance_labels and legacy_instance_id > 0 and instance_labels.get(legacy_instance_id):
+            # The dominant instance is labelled: sanitary ones were placed from the instance footprint above,
+            # everything else (window, door, furniture) must never receive a sanitary block.
+            continue
         placed = _catalogue_fixture(fixture, insert, wall_lines, units_per_metre)
         if placed is None and fixture in _FIXTURE_KINDS:
             continue
+        if instance_raster is not None:
+            display = _fixture_display_name(display, fixture, instance_labels.get(legacy_instance_id))
         if placed is not None:
             placed["attributes"] = {"LABEL": display}
+            if legacy_instance_id > 0:
+                placed["attributes"]["INSTANCE"] = str(legacy_instance_id)
             placed["_wall_aligned"] = aligned
             if _insert_duplicates_existing(placed, output_layers):
                 fixture_coverage[component_slice] |= component
@@ -908,12 +932,14 @@ def _generate_indoor_clean_plan(
         else:
             insert["name"] = fixture
             insert["attributes"] = {"LABEL": display}
+            if legacy_instance_id > 0:
+                insert["attributes"]["INSTANCE"] = str(legacy_instance_id)
             insert["_wall_aligned"] = aligned
             output_layers["P-SANI" if code in sanitary_codes else "A-FURN"].append(insert)
         fixture_coverage[component_slice] |= component
     instances, footprint_metrics, height_map = object_instances(
         dsm, level.floor_z, classes, fine_classes, fine_confidence, fine_names, grid, units_per_metre, ceiling_height, wall_lines,
-        free_space | closed_floor, outer_band | wall_evidence, view_count,
+        free_space | closed_floor, outer_band | wall_evidence, view_count, instance_raster, instance_labels,
     )
     labelled_instances = [item for item in instances if item.has_fine_label]
     instances = [
@@ -962,12 +988,23 @@ def _generate_indoor_clean_plan(
             continue
         insert = fit_block_insert(component, local_grid, "FURNITURE", display, units_per_metre=units_per_metre)
         fixture, aligned, rejected = _fixture_candidate(instance.code, insert, instance.height, instance.label, units_per_metre, faces, sanitary_codes, classes, fine_classes, fine_names, grid)
+        owner_id = instance.instance_id
+        if fixture != "FURNITURE" and instance_raster is not None and instance_labels and owner_id <= 0:
+            owner_id = _dominant_instance_nearby(instance_raster, component_slice, component, grid.pixel_size, 0.15 * units_per_metre)
+        if fixture != "FURNITURE" and instance_raster is not None and instance_labels and owner_id > 0 and instance_labels.get(owner_id):
+            if _sanitary_instance_kind(instance_labels.get(owner_id)) is not None:
+                continue  # placed from its instance footprint in the sanitary pre-pass
+            fixture = "FURNITURE"
         if fixture != "FURNITURE":
+            if instance_raster is not None:
+                display = _fixture_display_name(display, fixture, None)
             placed = _catalogue_fixture(fixture, insert, wall_lines, units_per_metre)
             if placed is None and fixture in _FIXTURE_KINDS:
                 fixture = "FURNITURE"
             elif placed is not None:
                 placed["attributes"] = {"LABEL": display}
+                if instance.instance_id > 0:
+                    placed["attributes"]["INSTANCE"] = str(instance.instance_id)
                 placed["_wall_aligned"] = aligned
                 if not _insert_duplicates_existing(placed, output_layers):
                     output_layers[str(placed["_catalogue"]["layer"])].append(placed)  # type: ignore[index]
@@ -976,6 +1013,8 @@ def _generate_indoor_clean_plan(
             else:
                 insert["name"] = fixture
                 insert["attributes"] = {"LABEL": display}
+                if instance.instance_id > 0:
+                    insert["attributes"]["INSTANCE"] = str(instance.instance_id)
                 insert["_wall_aligned"] = aligned
                 output_layers["P-SANI" if instance.code in sanitary_codes else "A-FURN"].append(insert)
                 continue
@@ -1021,6 +1060,8 @@ def _generate_indoor_clean_plan(
         furniture_insert = _furniture_catalogue_insert(str(instance.label or "").strip().lower(), fit, wall_lines, units_per_metre) if fit.kind in {"rect", "rect_free"} and not clutter else None
         if furniture_insert is not None and not _insert_duplicates_existing(furniture_insert, output_layers):
             furniture_insert["attributes"] = {"LABEL": display}
+            if instance.instance_id > 0:
+                furniture_insert["attributes"]["INSTANCE"] = str(instance.instance_id)
             output_layers["A-FURN"].append(furniture_insert)
             catalogue_inserts.append(furniture_insert)
             output_layers["A-ANNO"].append({
@@ -1036,6 +1077,7 @@ def _generate_indoor_clean_plan(
             "type": "polyline", "points": _polygon_points(fit.polygon), "closed": True, "holes": [],
             "_hausdorff": fit.dev90, "_label": display, "_footprint_kind": fit.kind,
             "_footprint_dev90": fit.dev90, "_wall_aligned": aligned,
+            **({"_instance_id": int(instance.instance_id)} if instance.instance_id > 0 else {}),
         })
         detail_labels = {"sofa", "armchair", "bed", "table", "desk", "kitchen counter", "wardrobe", "shelf", "bathtub"}
         if str(instance.label or "").strip().lower() in detail_labels:
@@ -1281,6 +1323,34 @@ def _load_fine_labels(segment: Any, shape: tuple[int, int]) -> tuple[np.ndarray,
     return labels, confidence, names, "ortho_sam" if np.any(labels) else "none"
 
 
+def _load_instance_raster(segment: Any, shape: tuple[int, int]) -> np.ndarray | None:
+    """Load the optional point-cloud instance raster without changing legacy jobs."""
+    path = Path(segment.output_dir) / "instance_pc.npy"
+    if not path.is_file():
+        return None
+    try:
+        values = np.load(path, allow_pickle=False).astype(np.uint32, copy=False)
+    except (OSError, ValueError, TypeError):
+        return None
+    return values if values.shape == shape else None
+
+
+def _load_instance_labels(project: Path, point_source: Path | None) -> dict[int, str]:
+    """Read canonical per-instance labels from instances.json; a missing or malformed file gives no labels."""
+    candidates = [Path(project) / "products" / "classified" / "instances.json"]
+    if point_source is not None:
+        candidates.append(Path(point_source).with_name("instances.json"))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            records = json.loads(path.read_text(encoding="utf-8")).get("instances", [])
+            return {int(item["id"]): str(item.get("label", "")).strip().lower() for item in records if isinstance(item, dict) and int(item.get("id", 0)) > 0}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return {}
+
+
 def _read_fine_label_rasters(labels_path: Path, confidence_path: Path, names_path: Path, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, list[str]] | None:
     if not all(path.is_file() for path in (labels_path, confidence_path, names_path)):
         return None
@@ -1326,13 +1396,93 @@ FINE_LABEL_GERMAN_NAMES: dict[str, str] = {
     "sofa": "Sofa", "couch": "Sofa", "armchair": "Sessel", "bed": "Bett", "mattress": "Bett",
     "nightstand": "Nachttisch", "table": "Tisch", "coffee table": "Couchtisch", "dining table": "Esstisch",
     "desk": "Schreibtisch", "chair": "Stuhl", "wardrobe": "Schrank", "chest of drawers": "Kommode",
-    "shelf": "Regal", "bookcase": "Bücherregal", "sideboard": "Sideboard", "tv stand": "Sideboard",
+    "shelf": "Regal", "cabinet": "Schrank", "bookcase": "Bücherregal", "sideboard": "Sideboard", "tv stand": "Sideboard",
     "television": "TV", "cat tree": "Kratzbaum", "plant": "Pflanze", "floor lamp": "Stehlampe",
     "cushion": "Kissen", "pillow": "Kissen", "blanket": "Decke", "duvet": "Decke", "clothes": "Kleidung",
     "refrigerator": "Kühlschrank", "washing machine": "Waschmaschine", "kitchen counter": "Küche",
     "kitchen cabinet": "Küche", "stove": "Herd", "kitchen sink": "Spüle", "toilet": "WC",
     "washbasin": "Lavabo", "bathtub": "Badewanne", "shower tray": "Dusche", "radiator": "Heizkörper",
 }
+
+
+_FIXTURE_KIND_GERMAN = {"WC": "WC", "WASHBASIN": "Lavabo", "BATHTUB": "Badewanne", "SHOWER": "Dusche"}
+
+
+def _dominant_instance(values: np.ndarray) -> int:
+    values = np.asarray(values, dtype=np.uint32)
+    values = values[values > 0]
+    if len(values) == 0:
+        return 0
+    ids, counts = np.unique(values, return_counts=True)
+    return int(ids[int(np.argmax(counts))])
+
+
+_SANITARY_INSTANCE_KINDS = {"bathtub": "BATHTUB", "bath tub": "BATHTUB", "washbasin": "WASHBASIN", "wash basin": "WASHBASIN", "toilet": "WC", "wc": "WC", "shower tray": "SHOWER", "shower": "SHOWER"}
+
+
+def _sanitary_instance_kind(label: str | None) -> str | None:
+    """Catalogue fixture kind for a canonical sanitary instance label, else None."""
+    return _SANITARY_INSTANCE_KINDS.get(str(label or "").strip().lower())
+
+
+def _sanitary_instance_inserts(
+    instance_raster: np.ndarray, instance_labels: dict[int, str], grid: RasterGrid, wall_lines: list[LineString], units_per_metre: float,
+    *, min_area_m2: float = 0.08,
+) -> list[tuple[dict[str, Any], np.ndarray, tuple[slice, slice], int]]:
+    """One catalogue block per sanitary instance group (touching same-kind instances merge), sized from the instance footprint."""
+    results: list[tuple[dict[str, Any], np.ndarray, tuple[slice, slice], int]] = []
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    for kind in ("BATHTUB", "WASHBASIN", "WC", "SHOWER"):
+        ids = sorted(identifier for identifier, label in instance_labels.items() if _sanitary_instance_kind(label) == kind)
+        present = [identifier for identifier in ids if np.any(instance_raster == identifier)]
+        if not present:
+            continue
+        union = np.isin(instance_raster, present)
+        count, components = cv2.connectedComponents(cv2.dilate(union.astype(np.uint8), kernel), connectivity=8)
+        for index in range(1, count):
+            mask = (components == index) & union
+            if float(mask.sum()) * grid.pixel_size**2 < min_area_m2 * units_per_metre**2:
+                continue
+            member_ids = np.unique(instance_raster[mask])
+            member_ids = member_ids[member_ids > 0]
+            dominant = _dominant_instance(instance_raster[mask])
+            component_slice = _mask_slice(mask)
+            component = mask[component_slice]
+            display = _FIXTURE_KIND_GERMAN.get(kind, kind)
+            insert = fit_block_insert(component, _grid_for_slice(grid, component_slice), "FURNITURE", display, units_per_metre=units_per_metre)
+            placed = _catalogue_fixture(kind, insert, wall_lines, units_per_metre)
+            if placed is None:
+                insert["name"] = kind
+                placed = insert
+            placed["attributes"] = {"LABEL": display, "INSTANCE": str(dominant)}
+            placed["_wall_aligned"] = False
+            results.append((placed, mask, component_slice, dominant))
+    return results
+
+
+def _dominant_instance_nearby(instance_raster: np.ndarray, component_slice: tuple[slice, slice], component: np.ndarray, pixel_size: float, radius: float) -> int:
+    """Dominant instance within ``radius`` of a component that itself carries no instance pixels (0 when none)."""
+    pad = max(1, int(math.ceil(radius / max(pixel_size, 1e-9))))
+    rows, cols = component_slice
+    r0, r1 = max(0, rows.start - pad), min(instance_raster.shape[0], rows.stop + pad)
+    c0, c1 = max(0, cols.start - pad), min(instance_raster.shape[1], cols.stop + pad)
+    padded = np.zeros((r1 - r0, c1 - c0), dtype=bool)
+    padded[rows.start - r0: rows.stop - r0, cols.start - c0: cols.stop - c0] = component
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1))
+    near = cv2.dilate(padded.astype(np.uint8), kernel).astype(bool)
+    return _dominant_instance(instance_raster[r0:r1, c0:c1][near])
+
+
+def _fixture_display_name(display: str, fixture: str, instance_label: str | None) -> str:
+    """Specific German name for a sanitary/catalogue insert whose fine label was missing (only with instance data)."""
+    if display != "Möbel":
+        return display
+    label = str(instance_label or "").strip().lower()
+    if label and label not in _NON_FOOTPRINT_INSTANCE_LABELS:
+        named = _furniture_display_name(label, {})
+        if named != "Möbel":
+            return named
+    return _FIXTURE_KIND_GERMAN.get(fixture, display)
 
 
 def _furniture_display_name(fine_label: str | None, class_info: dict[str, Any]) -> str:

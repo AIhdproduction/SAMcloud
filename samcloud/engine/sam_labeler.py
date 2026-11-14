@@ -121,12 +121,17 @@ def assign_classes(final_probs, background_threshold, unknown_id=0):
 class _RawHeadResult:
     """Small result object compatible with Ultralytics' predictor iteration."""
 
-    def __init__(self, inst_agg, semantic_seg, presence_scores, raw_shapes, retained_query_counts):
+    def __init__(self, inst_agg, semantic_seg, presence_scores, raw_shapes, retained_query_counts,
+                 instances=None):
         self.inst_agg = inst_agg
         self.semantic_seg = semantic_seg
         self.presence_scores = presence_scores
         self.raw_shapes = raw_shapes
         self.retained_query_counts = retained_query_counts
+        # Optional decoder-query masks used exclusively by the 3D instance
+        # side channel.  Keeping them separate is important: ``inst_agg`` and
+        # the semantic path deliberately remain byte-for-byte unchanged.
+        self.instances = instances
         self.speed = {}
 
 
@@ -171,6 +176,9 @@ class RawHeadSAM3SemanticPredictor(_PromptBatchingMixin, SAM3SemanticPredictor):
     # False: return the heads at mask resolution; the caller fuses prompts into
     # classes there and upsamples only the class maps (much less GPU memory/time).
     full_resolution = True
+    keep_instances = False
+    instance_query_threshold = 0.5
+    instance_prompt_mask = None
     # Text prompts per grounding pass. The image backbone runs once per tile;
     # many prompts (Nomivox presets: ~160) in one pass exhaust a 24 GB GPU.
     # Measured 2026-11-09 on 3200 px drone images (12 tiles, 169 outdoor prompts,
@@ -236,12 +244,35 @@ class RawHeadSAM3SemanticPredictor(_PromptBatchingMixin, SAM3SemanticPredictor):
                 inst_agg[start:stop] = F.interpolate(low_res[:, None], (tile_h, tile_w), mode="bilinear")[:, 0]
             del weighted, low_res
         semantic = F.interpolate(semantic_seg.float(), (tile_h, tile_w), mode="bilinear").squeeze(1)
+        instances = None
+        if bool(getattr(self, "keep_instances", False)):
+            prompt_mask = getattr(self, "instance_prompt_mask", None)
+            if prompt_mask is None:
+                prompt_mask = torch.zeros(nc, dtype=torch.bool, device=conf_scores.device)
+            else:
+                prompt_mask = torch.as_tensor(prompt_mask, dtype=torch.bool, device=conf_scores.device)
+                if prompt_mask.numel() != nc:
+                    raise ValueError("instance_prompt_mask needs one value per flat prompt")
+            instance_keep = (conf_scores >= float(getattr(self, "instance_query_threshold", query_threshold)))
+            instance_keep &= prompt_mask[:, None]
+            prompt_idx, query_idx = torch.nonzero(instance_keep, as_tuple=True)
+            # Masks are intentionally retained at native mask resolution.  A
+            # tile samples them with the same coordinate scale as the semantic
+            # maps, avoiding a large full-resolution query tensor on the GPU.
+            instances = {
+                "prompt_idx": prompt_idx.detach().to(dtype=torch.int32, device="cpu"),
+                "conf": conf_scores[prompt_idx, query_idx].detach().float().cpu(),
+                "masks": pred_masks[prompt_idx, query_idx].detach().sigmoid().to(
+                    dtype=torch.float16, device="cpu"
+                ),
+            }
         return [_RawHeadResult(
             inst_agg,
             semantic,
             presence_logit_dec.sigmoid().reshape(nc),
             raw_shapes,
             retained_query_counts,
+            instances,
         )]
 
 
@@ -424,7 +455,7 @@ class HeadFusionLabeler:
     def __init__(self, class_names, unknown_id=0,
                  model_path=Path(__file__).resolve().parents[2] / "models" / "sam3.pt", conf=0.4,
                  tile_size=1008, min_overlap_frac=0.2, query_threshold=0.4, prompts=None,
-                 fuse_at_mask_resolution=True, fine_queries=None):
+                 fuse_at_mask_resolution=True, fine_queries=None, instance_classes=None, instance_params=None):
         """``fine_queries`` optionally lists, per fine term, the flat prompt indices that
         answer it; their gated score maps are kept next to the class probabilities (see
         :meth:`score_points`, ``fine_scores_out``). The extra SAM work is zero: the term
@@ -446,6 +477,9 @@ class HeadFusionLabeler:
         self.last_tile_diagnostics = None
         self.fine_queries = [list(map(int, group)) for group in fine_queries] if fine_queries else None
         self.last_fine_probs = None
+        self.instance_classes = {int(value) for value in (instance_classes or [])}
+        self.instance_params = dict(instance_params or {})
+        self.last_instances = None
         overrides = dict(
             conf=conf,
             imgsz=644,
@@ -456,6 +490,13 @@ class HeadFusionLabeler:
         self.predictor = RawHeadSAM3SemanticPredictor(overrides=overrides)
         self.predictor.query_threshold = query_threshold
         self.predictor.full_resolution = not self.fuse_at_mask_resolution
+        self.predictor.keep_instances = bool(self.instance_classes and self.instance_params.get("enabled", True))
+        self.predictor.instance_query_threshold = float(
+            self.instance_params.get("query_threshold", query_threshold)
+        )
+        self.predictor.instance_prompt_mask = np.asarray(
+            [(index + 1) in self.instance_classes for index in self._prompt_owner], dtype=bool
+        )
         # A raw-head result is intentionally not a rendered Ultralytics Results
         # object, so prediction output must remain disabled even if user settings enable it.
         self.predictor.args.save = False
@@ -475,6 +516,7 @@ class HeadFusionLabeler:
         if tuple(final_probs.shape[1:]) != (tile_h, tile_w):
             final_probs = F.interpolate(final_probs[None].float(), (tile_h, tile_w), mode="bilinear")[0]
         self.last_fine_probs = None
+        self.last_instances = getattr(result, "instances", None)
         if self.fine_queries:
             # Fine terms: max over the queries of each term, taken from the same gated maps the class
             # pooling used (no extra SAM call), then upsampled like the class maps.
@@ -504,7 +546,8 @@ class HeadFusionLabeler:
         return img, width, height
 
     def score_points(self, image_path, u, v, image=None, label_threshold=None,
-                     label_exclude_ids=None, return_raw_labels=False, fine_scores_out=None):
+                     label_exclude_ids=None, return_raw_labels=False, fine_scores_out=None,
+                     instances_out=None):
         """Return final probabilities for in-bounds integer (u, v) image coordinates.
 
         With ``label_threshold`` a per-pixel label raster is returned as well.
@@ -528,6 +571,9 @@ class HeadFusionLabeler:
             raise ValueError("score_points requires in-bounds pixel coordinates")
 
         scores = np.zeros((u.size, len(self.class_names)), dtype=np.float32)
+        point_local_instance = np.full(u.size, -1, dtype=np.int32)
+        instance_best = np.zeros(u.size, dtype=np.float32)
+        local_instances = []
         labels = best = raw_labels = raw_best = None
         if label_threshold is not None:
             labels = np.zeros((height, width), dtype=np.uint8)
@@ -549,6 +595,46 @@ class HeadFusionLabeler:
             if fine_tile is not None:
                 fine_sampled = fine_tile[:, local_v, local_u].transpose(0, 1).detach().float().cpu().numpy()
                 fine_scores_out[selected] = np.maximum(fine_scores_out[selected], fine_sampled)
+            if instances_out is not None and self.last_instances is not None:
+                raw_instances = self.last_instances
+                masks = np.asarray(raw_instances.get("masks", ()), dtype=np.float16)
+                prompt_indices = np.asarray(raw_instances.get("prompt_idx", ()), dtype=np.int32)
+                confidences = np.asarray(raw_instances.get("conf", ()), dtype=np.float32)
+                if masks.ndim == 3 and len(masks) == len(prompt_indices) == len(confidences):
+                    threshold = float(self.instance_params.get("mask_threshold", 0.5))
+                    min_pixels = int(self.instance_params.get("min_mask_pixels", 12))
+                    local_positions = np.flatnonzero(selected)
+                    lu = u[selected] - x0
+                    lv = v[selected] - y0
+                    tile_h, tile_w = y1 - y0, x1 - x0
+                    for mask, prompt_idx, confidence in zip(masks, prompt_indices, confidences):
+                        pixel_count = int(np.count_nonzero(mask >= threshold))
+                        if pixel_count < min_pixels:
+                            continue
+                        # Nearest sampling at the mask grid via pixel centres, matching the
+                        # coordinate scale used when mask-resolution semantic
+                        # maps are expanded to the tile.
+                        mx = np.clip(((lu + 0.5) * mask.shape[1] / tile_w).astype(np.int64), 0, mask.shape[1] - 1)
+                        my = np.clip(((lv + 0.5) * mask.shape[0] / tile_h).astype(np.int64), 0, mask.shape[0] - 1)
+                        probabilities = mask[my, mx].astype(np.float32)
+                        belongs = probabilities >= threshold
+                        if not np.any(belongs):
+                            continue
+                        local_id = len(local_instances)
+                        class_id = int(self._prompt_owner[int(prompt_idx)]) + 1
+                        local_instances.append({
+                            "class_id": class_id,
+                            "prompt_idx": int(prompt_idx),
+                            "conf": float(confidence),
+                            "pixel_count": pixel_count,
+                        })
+                        positions = local_positions[belongs]
+                        strength = float(confidence) * probabilities[belongs]
+                        better = strength > instance_best[positions]
+                        if np.any(better):
+                            chosen = positions[better]
+                            point_local_instance[chosen] = local_id
+                            instance_best[chosen] = strength[better]
             if labels is not None:
                 raw_tile_best, raw_tile_class = final_probs.max(dim=0)
                 raw_tile_best = raw_tile_best.detach().float().cpu().numpy()
@@ -572,6 +658,10 @@ class HeadFusionLabeler:
                     raw_better = raw_tile_best > raw_region_best
                     raw_labels[y0:y1, x0:x1][raw_better] = raw_tile_class[raw_better]
                     raw_region_best[raw_better] = raw_tile_best[raw_better]
+        if instances_out is not None:
+            instances_out.clear()
+            instances_out["point_local_instance"] = point_local_instance
+            instances_out["instances"] = local_instances
         if labels is not None:
             if return_raw_labels:
                 return scores, labels, raw_labels

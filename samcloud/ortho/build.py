@@ -78,8 +78,13 @@ def build_orthophoto(project_dir: Path, *, level: Level | None, crop: tuple[floa
     voxel_size = settings.zbuffer.voxel_indoor if level is not None else settings.zbuffer.voxel_outdoor
     check_cancel(cancel)
     read_progress = _progress_wrapper(progress, 0.0, 0.15)
-    cloud = read_cloud(project, point_source, frame, voxel_size=voxel_size, progress=read_progress)
-    if len(cloud) == 6:
+    # With return_instance_ids=True the result has 7 items (instance ids after fine terms);
+    # readers that ignore the keyword return the legacy 6 / 5 item formats.
+    cloud = read_cloud(project, point_source, frame, voxel_size=voxel_size, progress=read_progress, return_instance_ids=True)
+    instance_ids = None
+    if len(cloud) == 7:
+        raw_xyz, local_xyz, classes, rgb, fine_terms, instance_ids, voxel_xyz = cloud
+    elif len(cloud) == 6:
         raw_xyz, local_xyz, classes, rgb, fine_terms, voxel_xyz = cloud
     else:  # Compatibility with callers that provide the pre-fine-term reader result.
         raw_xyz, local_xyz, classes, rgb, voxel_xyz = cloud
@@ -110,7 +115,7 @@ def build_orthophoto(project_dir: Path, *, level: Level | None, crop: tuple[floa
     work_dir = output_dir / "work"
     check_cancel(cancel)
     dsm_progress = _progress_wrapper(progress, 0.15, 0.25)
-    dsm = build_dsm(raw_xyz, local_xyz, classes, grid, level, settings, work_dir, rgb=rgb, fine_terms=fine_terms, voxel_colmap_xyz=voxel_xyz, progress=dsm_progress)
+    dsm = build_dsm(raw_xyz, local_xyz, classes, grid, level, settings, work_dir, rgb=rgb, fine_terms=fine_terms, instance_ids=instance_ids, voxel_colmap_xyz=voxel_xyz, progress=dsm_progress)
     if level is not None and settings.dsm.surface_fill_indoor:
         dsm.full_colmap_xyz = _append_surface_fill_zbuffer_points(dsm.full_colmap_xyz, dsm.colmap_xyz, dsm.validity, settings.zbuffer.voxel_indoor)
     check_cancel(cancel)
@@ -132,7 +137,7 @@ def build_orthophoto(project_dir: Path, *, level: Level | None, crop: tuple[floa
         "affine": {"method": dsm.xyz_method, "residual": dsm.affine_residual}, "settings_fingerprint": fingerprint, "timings": {"seconds": time.perf_counter() - started},
         "world_file_notes": "Written in original CRS with rotated affine terms." if original_world is not None else "Skipped because the DXF frame has non-z tilt.",
     }
-    paths = write_outputs(output_dir, rgba=colours.rgba, dsm=dsm.dsm, dtm=dsm.dtm, classes=dsm.classes, validity=dsm.validity, view_count=colours.view_count, metadata=metadata, fingerprint=fingerprint, local_world_file=grid.local_world_file(), original_world_file=original_world, jpeg_sides=settings.jpeg_long_sides, jpeg_quality=settings.jpeg_quality, fine_pc=dsm.fine_pc, fine_pc_confidence=dsm.fine_pc_confidence, fine_labels_source=fine_labels_source)
+    paths = write_outputs(output_dir, rgba=colours.rgba, dsm=dsm.dsm, dtm=dsm.dtm, classes=dsm.classes, validity=dsm.validity, view_count=colours.view_count, metadata=metadata, fingerprint=fingerprint, local_world_file=grid.local_world_file(), original_world_file=original_world, jpeg_sides=settings.jpeg_long_sides, jpeg_quality=settings.jpeg_quality, fine_pc=dsm.fine_pc, fine_pc_confidence=dsm.fine_pc_confidence, instance_pc=dsm.instance_pc, fine_labels_source=fine_labels_source)
     colour_source_path = output_dir / "colour_source.png"
     if not cv2.imwrite(str(colour_source_path), colours.colour_source, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
         raise OSError(f"Could not write colour source map: {colour_source_path}")
@@ -234,18 +239,26 @@ def _fine_term_stamp(point_source: Path | None) -> dict[str, Any] | None:
         digest.update(b"no-fine-labels")
     count = 0
     present = False
+    instance_digest = hashlib.sha256()
+    instance_count = 0
+    instance_present = False
     if source.suffix.lower() == ".ply":
         from samcloud.engine.export_las import _ply_chunks, read_ply_header
 
         offset, vertex_count = read_ply_header(source)
         with source.open("rb") as handle:
             for points in _ply_chunks(handle, offset, vertex_count, 500_000):
-                if "fine_term" not in (points.dtype.names or ()):
-                    continue
-                values = np.ascontiguousarray(points["fine_term"], dtype=np.uint8)
-                digest.update(values.tobytes())
-                count += len(values)
-                present = True
+                names = points.dtype.names or ()
+                if "fine_term" in names:
+                    values = np.ascontiguousarray(points["fine_term"], dtype=np.uint8)
+                    digest.update(values.tobytes())
+                    count += len(values)
+                    present = True
+                if "instance_id" in names:
+                    values = np.ascontiguousarray(points["instance_id"], dtype=np.uint32)
+                    instance_digest.update(values.tobytes())
+                    instance_count += len(values)
+                    instance_present = True
     else:
         import laspy
 
@@ -257,7 +270,13 @@ def _fine_term_stamp(point_source: Path | None) -> dict[str, Any] | None:
                     digest.update(values.tobytes())
                     count += len(values)
                 present = True
-    return {"present": present, "points": count, "sha256": digest.hexdigest(), "labels": _stamp(labels_path)}
+            if "instance_id" in dimensions:
+                for points in reader.chunk_iterator(500_000):
+                    values = np.ascontiguousarray(points.instance_id, dtype=np.uint32)
+                    instance_digest.update(values.tobytes())
+                    instance_count += len(values)
+                instance_present = True
+    return {"present": present, "points": count, "sha256": digest.hexdigest(), "labels": _stamp(labels_path), "instance_id": {"present": instance_present, "points": instance_count, "sha256": instance_digest.hexdigest()}}
 
 
 def _tree_stamps(path: Path | None) -> list[dict[str, Any]]:

@@ -56,7 +56,10 @@ def render_pointcloud_viewer(
     title: str,
     class_colors: list[list[int]] | None = None,
     class_labels: list[str] | None = None,
+    class_names_de: list[str] | None = None,
+    instance_labels_de: dict[str, str] | None = None,
     marker_endpoint: str | None = None,
+    fine_term_names_de: list[str] | None = None,
 ) -> None:
     """Render a canvas viewer backed by the active project's compact point preview."""
     from samcloud.viewer.potree import potree_available
@@ -66,7 +69,9 @@ def render_pointcloud_viewer(
 
         render_potree_viewer(
             kind, title=title, class_colors=class_colors or default_class_colors(),
-            class_labels=class_labels, marker_endpoint=marker_endpoint,
+            class_labels=class_labels, class_names_de=class_names_de,
+            instance_labels_de=instance_labels_de, marker_endpoint=marker_endpoint,
+            fine_term_names_de=fine_term_names_de,
             camera_endpoint="/api/cameras/sparse" if kind == "sparse" else None,
         )
         return
@@ -269,7 +274,7 @@ def _script(
         }}
         context.fillStyle = `rgb(${{red}},${{green}},${{blue}})`;
         const point = Math.max(.7, size * Math.min(2.5, Math.max(.8, projectedScale / scale * 1.8)));
-        context.fillRect(px, py, point, point);
+        context.beginPath(); context.arc(px, py, point / 2, 0, 2 * Math.PI); context.fill();
       }}
       const projectPosition = coordinates => {{
         const x = coordinates[0] - state.center[0], y = coordinates[1] - state.center[1], z = coordinates[2] - state.center[2];
@@ -327,11 +332,12 @@ def _script(
         }}
         const depthFactor = Math.max(.72, Math.min(1.35, 1.0 - depth / (fitSpan * 7)));
         const px = width * .5 + state.panX + x1 * scale * depthFactor, py = height * .5 + state.panY - y1 * scale * depthFactor;
-        const colors = {{ pass: '#26b7ef', control: '#ffb020', disabled: '#6b7c8a', needs_review: '#ff5a5a' }};
+        const colors = {{ pass: '#26b7ef', control: '#ffb020', disabled: '#6b7c8a', needs_review: '#ff5a5a', apriltag: '#b06cff' }};
         context.save(); context.fillStyle = colors[marker.state_color] || colors.needs_review;
         context.beginPath(); context.moveTo(px, py - 12); context.lineTo(px + 7, py - 2); context.lineTo(px + 2, py - 2); context.lineTo(px + 2, py + 7); context.lineTo(px - 2, py + 7); context.lineTo(px - 2, py - 2); context.lineTo(px - 7, py - 2); context.closePath(); context.fill();
         if (marker.name === state.selectedMarker) {{ context.strokeStyle = '#dcecf6'; context.lineWidth = 1.5; context.stroke(); }}
-        context.font = '12px sans-serif'; context.fillStyle = '#dcecf6'; context.fillText(marker.name, px + 9, py - 7); context.restore();
+        context.font = '12px sans-serif'; context.fillStyle = '#dcecf6'; const tagText = marker.kind === 'apriltag' && Number.isFinite(Number(marker.tag_size_mm)) ? ' ' + Number(marker.tag_size_mm).toFixed(1) + ' mm' + (Number.isFinite(Number(marker.tag_deviation_pct)) ? ' (' + (Number(marker.tag_deviation_pct) >= 0 ? '+' : '') + Number(marker.tag_deviation_pct).toFixed(1) + ' %)' : '') : '';
+        context.fillText(marker.name + (marker.kind === 'apriltag' && marker.status === 'outlier' ? ' (Ausreisser)' : '') + tagText, px + 9, py - 7); context.restore();
       }}
     }};
     const fitAll = () => {{ state.zoom = 1; state.panX = 0; state.panY = 0; state.center = [...state.baseCenter]; draw(); }};
@@ -398,6 +404,12 @@ def _script(
       }}
       if (!chosen) return false; state.selectedMarker = chosen.name; window.dispatchEvent(new CustomEvent('samcloud-marker-selected', {{ detail: chosen }})); draw(); return true;
     }};
+    /* Doppelklick auf einen AprilTag oeffnet die Tag-Pruefung. */
+    canvas.addEventListener('dblclick', event => {{
+      if (!selectMarker(event)) return;
+      const chosen = state.markers.find(marker => marker.name === state.selectedMarker);
+      if (chosen && chosen.kind === 'apriltag' && chosen.tag_id !== undefined) window.location.href = '/control-points?tag=' + encodeURIComponent(chosen.tag_id);
+    }});
     const setRotationPivot = (clientX, clientY) => {{
       if (!state.points) return;
       const rect = canvas.getBoundingClientRect(), width = rect.width, height = rect.height;

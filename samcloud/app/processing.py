@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from samcloud.classification.custom import project_classes_path
 from samcloud.core.configuration import load_global_config
+from samcloud.core.project_manager import apriltags_enabled
 from samcloud.core.storage import ensure_text_model, storage_settings
 from samcloud.pointcloud.georeference import ensure_project_georeference
 
@@ -24,7 +25,7 @@ _WINDOWS_NO_CONSOLE = 0x08000000
 
 def optimize_control_points(project_directory: Path, project: dict[str, Any]) -> bool:
     """Re-run the automatic GCP adjustment from the preserved pristine model only."""
-    from samcloud.engine.pipeline import _automatic_control_points
+    from samcloud.engine.pipeline import _rerun_control_points
 
     project_directory = project_directory.resolve()
     products = project_directory / "products"
@@ -42,10 +43,15 @@ def optimize_control_points(project_directory: Path, project: dict[str, Any]) ->
         if key in project_control:
             control_settings[key] = project_control[key]
     configured_images = project.get("acquisition", {}).get("sources", {}).get("image_directory") or project.get("paths", {}).get("image_directory")
-    image_directory = Path(configured_images) if configured_images else project_directory / "inputs" / "images"
+    cubemap_directory = project_directory / "inputs" / "cubemap"
+    capture_type = project.get("acquisition", {}).get("capture_type") or project.get("acquisition", {}).get("type")
+    if capture_type == "panorama_360" and cubemap_directory.is_dir():
+        image_directory = cubemap_directory
+    else:
+        image_directory = Path(configured_images) if configured_images else project_directory / "inputs" / "images"
     if not image_directory.is_dir():
         raise ValueError("The original project image directory is unavailable")
-    result = _automatic_control_points(
+    result = _rerun_control_points(
         pristine_model,
         pristine_text,
         image_directory,
@@ -185,6 +191,7 @@ class ProcessingManager:
 
         settings = project.get("settings", {})
         classification = settings.get("classification", {})
+        instance_settings = classification.get("instances", {})
         coordinates = settings.get("coordinate_systems", {})
         class_set = classification.get("class_set", "outdoor")
         engine = classification.get("engine", "sam3")
@@ -341,6 +348,7 @@ class ProcessingManager:
         products = project_directory / "products"
         classified_output = products / "classified" / "classified.ply"
         classification = settings.get("classification", {})
+        instance_settings = classification.get("instances", {})
         command = [
             sys.executable,
             "-m",
@@ -369,6 +377,26 @@ class ProcessingManager:
             str(classification.get("background_threshold", 0.4)),
             "--query-threshold",
             str(classification.get("query_threshold", 0.4)),
+            "--instances-enabled",
+            "1" if instance_settings.get("enabled", True) else "0",
+            "--instance-query-threshold",
+            str(instance_settings.get("query_threshold", 0.5)),
+            "--instance-mask-threshold",
+            str(instance_settings.get("mask_threshold", 0.5)),
+            "--instance-min-mask-pixels",
+            str(instance_settings.get("min_mask_pixels", 12)),
+            "--instance-merge-overlap",
+            str(instance_settings.get("merge_overlap", 0.5)),
+            "--instance-min-shared-points",
+            str(instance_settings.get("min_shared_points", 10)),
+            "--instance-min-views",
+            str(instance_settings.get("min_views", 2)),
+            "--instance-min-points",
+            str(instance_settings.get("min_points", 100)),
+            "--instance-split-radius-m",
+            str(instance_settings.get("split_radius_m", 0.05)),
+            "--instance-debug-ply",
+            "1" if instance_settings.get("debug_ply", False) else "0",
             "--geometry-refinement",
             "1" if classification.get("geometry_refinement", True) else "0",
             "--depth-model",
@@ -416,10 +444,12 @@ class ProcessingManager:
             command.extend(["--images", image_directory])
             if acquisition.get("georeferencing", {}).get("rtk_enabled", False):
                 command.append("--rtk")
+        if apriltags_enabled(project):
+            command.append("--apriltags")
+        control_points = settings.get("control_points", {})
+        command.extend(["--control-points-crs", str(control_points.get("crs", "EPSG:2056+5728"))])
         if resume_after_control_points:
-            control_points = settings.get("control_points", {})
-            command.extend(["--resume-after-control-points", "--control-points-dir", str(project_directory / "control_points"),
-                            "--control-points-crs", str(control_points.get("crs", "EPSG:2056+5728"))])
+            command.extend(["--resume-after-control-points", "--control-points-dir", str(project_directory / "control_points")])
         return command
 
     @staticmethod
