@@ -5,25 +5,37 @@
 SAMcloud is a local photogrammetry application. It reconstructs 3D point
 clouds from drone, standard-camera, and 360 degree Insta360 imagery with
 COLMAP. It then assigns semantic LAS classes with SAM3 and checks every class
-geometrically. The project was developed for the Digital Twin Programming
-module at HSLU.
+geometrically. Indoor scans get a metric scale from printed AprilTags, objects
+get instance IDs, and classified clouds can be turned into clean 2D CAD plans
+(DXF). The project was developed for the Digital Twin Programming module at
+HSLU.
 
 ## Contents
 
 1. [Overview](#overview)
 2. [Processing pipeline](#processing-pipeline)
 3. [Semantic classification](#semantic-classification)
-4. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
-5. [DXF export](#dxf-export)
-6. [User interface](#user-interface)
-7. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
-8. [Architecture](#architecture)
-9. [Configuration](#configuration)
-10. [Project files](#project-files)
-11. [Installation and start on Windows](#installation-and-start-on-windows)
-12. [Tests](#tests)
-13. [Scope and independent work](#scope-and-independent-work)
-14. [Author and license](#author-and-license)
+4. [Targets, scale, and control points](#targets-scale-and-control-points)
+5. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
+6. [DXF export](#dxf-export)
+7. [User interface](#user-interface)
+8. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
+9. [Architecture](#architecture)
+10. [Configuration](#configuration)
+11. [Project files](#project-files)
+12. [Installation and start on Windows](#installation-and-start-on-windows)
+13. [Tests](#tests)
+14. [Scope and independent work](#scope-and-independent-work)
+15. [Author and license](#author-and-license)
+
+Further documentation in [`docs/`](docs/):
+
+- [Architecture](docs/architecture.md): packages, data flow, subprocess model
+- [Configuration reference](docs/configuration.md): every `config/` file
+- [AprilTag scale and georeferencing](docs/apriltag_scale.md)
+- [Object instances](docs/instances.md): per-point `instance_id`
+- [Orthophoto clean plan](docs/ortho_plan.md): true orthophoto to clean DXF
+- [Cyclone 3DR classes](docs/cyclone_classes.md): LAS codes and DXF layers
 
 ## Overview
 
@@ -31,11 +43,12 @@ SAMcloud provides a guided workflow comparable to common photogrammetry
 applications:
 
 1. Select images.
-2. Align the cameras.
-3. Optionally define ground control points.
+2. Align the cameras (indoor projects scale the model from AprilTags).
+3. Optionally define ground control points, manually or automatically.
 4. Generate a dense point cloud.
 5. Classify it semantically.
-6. Export a reusable LAS file.
+6. Improve and filter the cloud.
+7. Export a reusable LAS file and, optionally, DXF plans.
 
 Every job is stored as a reopenable local project. Source images stay at their
 original location.
@@ -52,9 +65,24 @@ Main features:
 - **Geometric refinement:** height above ground, flatness, and neighbourhood
   checks. They use the SAM3 confidence, for example to turn flat roofs that
   SAM3 labels as ground into building.
-- **Review before export:** a built-in 3D viewer shows the RGB and class views
-  and can show or hide individual classes. The LAS export (Cyclone 3DR / ASPRS
-  LAS 1.4 codes) is started manually.
+- **Indoor clean-up:** floating points, mirror phantoms and gaps are handled in
+  workflow step 6 (Depth-Anything-V2 prior, TSDF surface fusion, superpoint
+  vote); curtains are suppressed to Unknown.
+- **AprilTags and control points:** printable 150 mm AprilTags give indoor
+  models their metric scale, and with surveyed centres a full georeference.
+  Outdoors, printable cross targets are detected automatically and reviewed on
+  the sparse page (see [Targets, scale, and control points](#targets-scale-and-control-points)).
+- **Object instances:** SAM3 instance masks become a per-point `instance_id`
+  (furniture, doors, windows, fixtures, vehicles, trees, ...). Clicking an
+  object in the viewer highlights it; the LAS and the DXF carry the IDs
+  ([docs/instances.md](docs/instances.md)).
+- **Review before export:** a built-in 3D viewer (Potree when installed, a
+  canvas preview otherwise) shows the RGB and class views and can show or hide
+  individual classes. The LAS export (Cyclone 3DR / ASPRS LAS 1.4 codes) is
+  started manually.
+- **DXF plans:** a fast point-cloud plan and a clean plan from a true
+  orthophoto, per storey (indoor) or as a site plan (outdoor), see
+  [DXF export](#dxf-export) and [docs/ortho_plan.md](docs/ortho_plan.md).
 
 ## Processing pipeline
 
@@ -68,16 +96,20 @@ dashboard and written to `reports/`.
 | 2 | Image matching | COLMAP | feature matches |
 | 3 | Sparse reconstruction | COLMAP mapper | camera poses and sparse cloud (`products/sparse/0`) |
 | 4 | GPS alignment (drone GPS/RTK only) | COLMAP `model_aligner`, ENU | georeferenced model (`products/sparse/0_geo`), metres, z up |
+| – | *AprilTag scale or georeference (when enabled, non-GPS projects)* | OpenCV ArUco `tag36h11`, pycolmap | scaled (`products/sparse/0_tagscale`) or georeferenced model, `reports/apriltag_report.json` |
 | 5 | Dense preparation (undistortion) | COLMAP | undistorted images and PINHOLE TXT model in `products/dense/` |
 | – | *Optional pause for control points* | SAMcloud UI | control point observations; GCP georeferencing is applied on resume |
 | 6 | Dense stereo, fusion | COLMAP | `products/dense/fused.ply` and visibility file `fused.ply.vis` |
 | 7 | Classification | Ultralytics SAM3 or FlurSeg (outdoor) | `classified_raw.ply`, `classified_scores.npz` |
-| 8 | Improve & filter (workflow step 6, see below) | Depth-Anything-V2, depth maps, SAM labels | cleaned and filled `classified_raw.ply` |
+| 8 | Improve & filter (workflow step 6, see below) | Depth-Anything-V2, depth maps, SAM labels | cleaned `classified_raw.ply` |
 | 9 | Geometric refinement (part of step 6) | `samcloud/engine/geometry` | `classified.ply`, `reports/geometry_summary.json` |
 | 10 | LAS export (manual, workflow step 7) | laspy, PyProj | LAS 1.4 with CRS WKT, class mapping, and CRS-appropriate scale |
+| 11 | DXF export (optional, manual) | ezdxf, orthophoto jobs | per-storey or site DXF files, see [DXF export](#dxf-export) |
 
-The dashboard shows seven workflow steps (imagery, alignment, control points,
-dense cloud, SAM3, **improve & filter**, export), each with its own progress
+Classification (stage 7) also writes the per-point fine terms and the object
+`instance_id` (see [Object instances](#object-instances)). The dashboard shows
+the workflow steps imagery, alignment, control points, dense cloud, SAM3,
+**improve & filter**, LAS/PLY export and DXF export, each with its own progress
 and remaining time. Remaining times are learned separately per capture type
 (drone, camera, 360°) in `projects/.samcloud_stage_rates.json`, so 360 runs
 never distort the drone estimate.
@@ -85,29 +117,53 @@ never distort the drone estimate.
 ### Improve & filter (step 6)
 
 COLMAP's depth maps (and indoors the Depth-Anything-V2 depth) are kept until
-this step has finished:
+this step has finished. The stages run in this order
+(`_refine_after_classification` in `samcloud/engine/pipeline.py`); the
+indoor-only ones are skipped for the outdoor class set:
 
-1. **Depth-Anything-V2 (indoor only).** A metric indoor depth is predicted for
-   every dense view and aligned to COLMAP's own depth map per view
+1. **Depth-Anything-V2 prior (indoor only).** A metric indoor depth is predicted
+   for every dense view and aligned to COLMAP's own depth map per view
    (`colmap ≈ scale·DA + shift`, robust fit). Views without enough COLMAP depth
    (white walls) use the median fit of all good views, unless that contradicts
    the COLMAP pixels they do have (`samcloud/colmap/depth_prior.py`).
-2. **Floating points removed (all capture types).** A point is removed when at
+2. **Mirror detection (indoor only).** Planar mirrors are detected from SAM
+   masks (the `mirror` prompts in `config/classes.json`) and the reflected
+   phantom geometry behind them is removed
+   (`samcloud/colmap/mirror_filter.py`).
+3. **Depth fill or surface fusion (indoor only).** With the default
+   `surface_fusion.mode: snap`, all depth maps go into one truncated signed
+   distance field on the GPU. COLMAP depth weighs more; Depth-Anything only adds
+   depth where it agrees with COLMAP. Space a camera looks through is carved
+   empty, points are snapped onto the merged floor, ceiling and wall planes
+   (one ceiling height, building axes only), and a GPU visibility check removes
+   points that cameras look through. A depth-edge filter, a haze filter, and
+   view-count checks for wall planes and points remove walls behind walls
+   (`samcloud/colmap/surface_fusion.py`); the optional hidden-point and
+   behind-wall filters are off by default.
+   Surface fusion can be switched off per project; then the Depth-Anything
+   depth fill (`depth_fill.py`: confirmed by several views, local alignment
+   against COLMAP and sparse points) runs instead. In `extract` mode the cloud
+   is rebuilt from the fused surface.
+4. **Floating points removed (all capture types).** A point is removed when at
    least three cameras reliably measure a surface *behind* it and they
-   outnumber the cameras that measure the point itself. Indoors the aligned
-   Depth-Anything depth fills the pixels COLMAP left empty
-   (`samcloud/colmap/point_cleaning.py`).
-3. **Floors, ceilings and walls filled (indoor only).** Planes are fitted to
-   the points SAM labelled floor, ceiling or wall. Gaps of up to 1.5 m inside a
-   plane are filled on a 1 cm grid where at least three cameras see the spot
-   unoccluded with that SAM class, they are at least 60 % of all cameras seeing
-   it, and neither COLMAP nor Depth-Anything measures a surface behind it, so
-   doors, windows and openings stay open (`samcloud/colmap/plane_fill.py`).
-4. **Geometric refinement** as described below.
+   outnumber the cameras that measure the point itself
+   (`samcloud/colmap/point_cleaning.py`). Indoors with surface fusion this is
+   done by the fusion's visibility check instead.
+5. **Plane grid fill.** Off by default (`plane_fill.enabled: false`); it fills
+   gaps inside fitted planes and looked artificial in tests
+   (`samcloud/colmap/plane_fill.py`).
+6. **Superpoint vote (indoor only).** Geometry and colour form superpoints;
+   broad classes (wall, ceiling, floor, door, window, furniture, unknown,
+   construction material) are decided by the majority inside a superpoint,
+   while fine classes stay protected (`samcloud/colmap/superpoint_vote.py`).
+7. **Geometric refinement** as described below (outdoor, georeferenced).
 
-Settings live in `config/colmap.yml` (`point_cleaning`, `plane_fill`, with a
-separate profile per capture type) and on the project settings page (depth
-model Large / Small / Off).
+Settings live in `config/colmap.yml` (`point_cleaning`, `depth_fill`,
+`surface_fusion`, `superpoint_vote`, `plane_fill`, with a separate profile per
+capture type under `capture_profiles`) and on the project settings page (depth
+model Large / Small / Off, surface fusion on/off). `config/colmap.yml` also
+sets `window_step: 2` for the 360 profile, which makes PatchMatch about 2x
+faster.
 
 ## Semantic classification
 
@@ -129,6 +185,11 @@ prompts. Synonyms must never be joined into one long comma-separated prompt:
 that drives SAM3's presence score towards zero (walls and ceilings were lost).
 The image backbone runs once per tile and the prompts run in batches of 8
 (larger batches overflow 24 GB of VRAM on 3200 px drone photos and get about 10x slower).
+Indoor curtains are not a class: the `suppress` prompts in `config/classes.json`
+are added to SAM3 at run time, and points where they win become
+Unknown/noise (`classified_scores.npz` stores a `suppressed` flag so the
+superpoint vote never relabels them). The `mirror` prompts feed the mirror
+detection of step 6.
 To update the classes from a newer Nomivox preset:
 
 ```bat
@@ -318,12 +379,75 @@ SAM3:
 venv\Scripts\python samcloud\engine\geometry\refine.py --input <classified_raw.ply> --output <classified.ply> --classes-json config\classes.json --class-set outdoor --scores <classified_scores.npz> --summary-file <reports\geometry_summary.json>
 ```
 
+### Object instances
+
+SAM3's instance head also yields object masks. With `classification.instances.enabled`
+(default on, `--no-instances` on the pipeline) every dense point of an
+*instance class* gets an `instance_id` (0 = none): indoor furniture,
+appliances, sanitary fixtures, doors, windows, HVAC, electrical and columns;
+outdoor vehicles, construction machinery, trees, tree trunks, utility poles,
+traffic signs, manholes and columns (`instance_classes` in `config/classes.json`).
+Walls, floors and ceilings never get one. Per-view masks are associated in 3D,
+then merged by label aliases (for example "casement window" to window),
+soft furnishing is absorbed into its bed or sofa, and each object grows over
+connected points of its class by at most 0.6 m (`samcloud/engine/instances.py`).
+The result is `instance_id` in `classified.ply`, the sidecar
+`products/classified/instances.json` (label, class, point count, bounding box,
+views, confidence), an `instance_id` extra dimension in the exported LAS, and
+object labels in the DXF plans. In the viewer a click opens a card with the
+German object name and highlights the whole object. AprilTag squares never
+belong to an instance. Details: [docs/instances.md](docs/instances.md).
+
+## Targets, scale, and control points
+
+Metric scale and georeferencing come from one of four sources.
+
+| Source | Capture types | Result |
+|---|---|---|
+| Image GPS/RTK | drone | automatic georeference (see below) |
+| Manual control points | all | georeference from three or more marked points |
+| Automatic control points | drone with GPS/RTK and a point list | cross targets are detected, a GCP bundle adjustment runs, and a quality gate decides whether review is needed |
+| AprilTags | indoor, non-GPS | scale from tag size, optionally georeference from surveyed tag centres |
+
+**AprilTags (indoor scale).** The AprilTag switch in the project dialog is on
+by default for Indoor and off for Outdoor. Print `tag36h11` tags (IDs 0 to 586) on the
+**Targets** page: one A4 page per tag with a black square of exactly 150 mm
+(print at 100 %), the ID, edge-midpoint ticks that mark the tag centre, and a
+100 mm check bar. Tags are detected with OpenCV ArUco in the COLMAP input images (for 360
+projects, the cubemap faces) and triangulated from at least two images. Scale works from a single tag; with fewer than three tags the report
+warns that no cross-check is possible, and outliers beyond `apriltags.outlier_pct`
+(3 %) are ignored. With at least three non-collinear tags that have surveyed
+coordinates (`control_points/apriltags.csv`, columns `id,x,y,z[,role]`, entered
+on the Control points page or uploaded in the project dialog), the tags act as
+control points and give a full georeference; the tag CRS can also be `LOCAL`
+for a private metric survey system. See
+[docs/apriltag_scale.md](docs/apriltag_scale.md).
+
+**Cross targets (outdoor).** The Targets page also prints numbered 180 mm cross
+targets (two black triangles on white paper, tips meeting at the survey
+point). The automatic detector (`samcloud/control_points/targets.py`, polarity
+`auto`) finds such bow-tie targets sub-pixel in the images. Note that the
+black printed variant is only reliably detected on light ground.
+
+**Automatic control points** (settings page, mode *Automatic*): detected
+targets feed a GCP bundle adjustment (points with role `pass` are held as
+constants, points with role `control` are only checked, and the loss is
+trivial so outliers stay visible). Results show
+in the review workspace on the Sparse page: a marker table with 3D and pixel
+errors, a photo strip filtered by marker, and a pixel-level viewer for
+correcting observations, plus **Optimize** and **Continue processing**. A point
+that cannot be detected stays unrecognised and can be marked by hand.
+
 ## LAS export and coordinate systems
 
 The LAS exporter writes point format 7, LAS 1.4, the output CRS as WKT, and a
 VLR containing the semantic class mapping. It uses millimetre scales for local
 and projected coordinates, and `1e-7` degree horizontal scales for geographic
-coordinates.
+coordinates. When the classified cloud carries them, the LAS also gets two
+extra dimensions: `fine_term` (uint8, fine SAM term id, vocabulary in
+`fine_labels.json`) and `instance_id` (uint32, see
+[Object instances](#object-instances)). A `*.las.profile.json` sidecar records
+the model profile for the DXF page.
 
 | Key | What you get | Requirements |
 |---|---|---|
@@ -365,6 +489,25 @@ only reads cached results from `products/dxf/`; every heavy step starts with a
 button and runs as a background job (`python -m samcloud.dxf.jobs …`) with a
 progress bar and **Cancel**. A cancelled or failed job keeps the previous cache
 and shows the end of `products/dxf/job.log`. Only one DXF job runs per project.
+
+### Plan variants
+
+The DXF page offers two plan variants (selector **Plan variant**):
+
+- **Point cloud (fast):** layers are cut directly from the classified cloud
+  (steps below).
+- **Orthophoto (clean):** a true orthophoto, a semantic segmentation of it, and
+  a height raster are turned into a cleaner CAD plan: straightened walls,
+  catalogue blocks for doors, windows and fixtures, room names and, outdoors,
+  contours and spot heights. Each stage has its own button and cache (**Build
+  orthophoto**, **Segment**, **Generate clean plan**, **Export DXF**), and
+  **Compute everything** runs all stages for the selected level or site.
+  Clean exports are named `<project>_<level>_clean.dxf`. **Compare plans**
+  overlays both variants. See [docs/ortho_plan.md](docs/ortho_plan.md).
+
+Instance labels from `instances.json` (for example *Sofa*, *Tisch*) are written
+as text and block attributes in both variants when the classified cloud has
+instance IDs.
 
 ### Workflow
 
@@ -436,11 +579,15 @@ The UI is built with NiceGUI and opens at `http://127.0.0.1:8080`.
 |---|---|
 | Overview | project dashboard: start processing, progress per stage, manual LAS export |
 | Projects | create, reopen, or delete projects; select images or 360 degree sources |
-| Sparse cloud | inspect the aligned sparse model |
-| Control points | mark ground control points in the images after alignment |
-| Dense cloud | 3D viewer of the classified cloud in RGB or class mode, with class filters and colours |
-| DXF | optional CAD export: preview, scale, alignment, levels, side view, DXF review and export |
-| Settings | coordinate systems, GPU, capture options, classification settings |
+| Sparse cloud | inspect the aligned sparse model (cleaned for display only, `viewer.sparse_cleaning`), cameras, and the control point review workspace (marker table, photo strip, pixel viewer, **Optimize**, **Continue processing**) |
+| Control points | import and mark ground control points in the images; AprilTag print dialog, surveyed tag coordinates (table, CSV import) and the AprilTag report |
+| Targets | printable PDFs: AprilTags (150 mm, `tag36h11`) and numbered 180 mm cross targets; works without an open project |
+| Dense cloud | 3D viewer of the classified cloud in RGB or class mode, with class filters and colours, a height filter, object click and highlight, and AprilTag markers |
+| DXF | optional CAD export: preview, scale, alignment, levels, side view, DXF review, orthophoto clean plan and export |
+| Settings | coordinate systems, GPU, capture options, control point mode, classification settings, Improve & filter switches |
+
+The page texts are partly German (for example *Klassen anpassen*, *AprilTag
+drucken*); the documentation uses English names.
 
 The classification settings per project are:
 
@@ -450,7 +597,15 @@ The classification settings per project are:
 - background threshold
 - geometric refinement on/off (default on)
 
-The 3D viewer works on a downsampled preview of up to 300 000 points.
+The dense and sparse viewers use **Potree 1.8** with PotreeConverter 2.x
+(Poisson sampling, Brotli) when both are installed locally (`assets/potree/` and
+`tools/PotreeConverter/`, see [Installation](#installation-and-start-on-windows));
+the octree is built in the background and cached in `products/viewer/`. The
+default point budget is 5 000 000 (`config/viewer.yml`). Points are drawn round, a
+click on an instance shows its card and highlights the object (original colours,
+bounding box), and a height filter hides points below or above a level. Without
+Potree or the converter the viewer falls back to a downsampled canvas preview
+of up to 300 000 points.
 
 ## Capture types, processing modes, and coordinates
 
@@ -483,7 +638,15 @@ The 3D viewer works on a downsampled preview of up to 300 000 points.
   **Continue processing** after three usable points to resume without repeating
   feature extraction, matching, mapping, or undistortion.
 
-In both modes the classified PLY is produced first. The LAS export is a
+- `automatic` (settings page, drone projects with GPS/RTK and a control point
+  list): targets are detected automatically, a GCP bundle adjustment runs, and
+  the run pauses for review only when the quality gate fails (see
+  [Targets, scale, and control points](#targets-scale-and-control-points)).
+
+AprilTags are independent of this mode: when enabled for a non-GPS project, the
+tag step runs after alignment and before undistortion.
+
+In all modes the classified PLY is produced first. The LAS export is a
 separate manual action, so the result can be reviewed before export.
 
 **Coordinate systems**
@@ -497,19 +660,30 @@ projects can export to the configured WGS84 and LV95 targets just like GPS proje
 ```text
 main.py                          entry point (NiceGUI, port 8080)
 samcloud/
-├── app/                         UI pages, layout, processing jobs, 3D viewer
-│   └── pages/                   overview, projects, sparse, control points, dense, settings
+├── app/                         UI pages, layout, processing jobs, viewers, REST endpoints
+│   └── pages/                   home, projects, sparse (+ GCP review), control points, targets,
+│                                dense, dxf, settings
 ├── acquisition/                 360 degree frame extraction and cubemap preparation
-├── core/                        paths, configuration, project persistence, workflow state
-├── colmap/                      COLMAP command construction
-├── control_points/              control point CSV data and image observations
-├── classification/              SAM3 class definitions
+├── core/                        paths, configuration, project persistence, workflow state, storage
+├── colmap/                      COLMAP commands, alignment, and step 6 modules (depth prior, depth
+│                                fill, surface fusion, mirror filter, point cleaning, plane fill,
+│                                superpoint vote, gravity alignment)
+├── control_points/              CSV data, observations, automatic target detection, GCP adjustment,
+│                                AprilTag detection/scale/printing, cross target printing
+├── classification/              class definitions, per-project custom classes, model profiles
 ├── pointcloud/                  coordinate transformation services
-├── viewer/                      point cloud previews and viewer manifests
+├── viewer/                      point cloud previews, Potree conversion, camera payloads
+├── dxf/                         DXF page backend: LAS source, alignment, levels, plan generation,
+│                                writer, background jobs (python -m samcloud.dxf.jobs)
+├── ortho/                       true orthophoto, segmentation, DSM, clean DXF plan (vector/)
+├── tools/                       command-line helpers (class import, gravity alignment)
 └── engine/                      processing implementation (run as subprocesses)
     ├── pipeline.py              orchestrates all stages
     ├── sam_labeler.py           SAM3 tiling, raw heads, SegEarth-OV3 fusion
+    ├── flurseg_labeler.py       FlurSeg sliding-window inference (outdoor)
     ├── classify.py              projection into cameras, weighted 3D voting, confidence export
+    ├── instances.py             SAM instance association, refinement, instance_id product
+    ├── fine_terms.py            per-point fine SAM terms
     ├── geometry/                geometric refinement
     │   ├── terrain.py           robust terrain model and height above ground
     │   ├── support.py           height above local horizontal support (roofs)
@@ -518,6 +692,8 @@ samcloud/
     │   ├── refine.py            refinement order, reassignment, summary
     │   └── rules/               one rule file per class
     ├── export_las.py            LAS 1.4 export with class mapping and CRS transform
+    ├── processing_cache.py      optional cache that keeps step 6 inputs for re-runs
+    ├── eta.py                   remaining-time estimates learned per capture type
     └── run_summary.py           run reports and stage durations
 ```
 
@@ -527,13 +703,17 @@ More details are in [the architecture documentation](docs/architecture.md).
 
 | File | Purpose |
 |---|---|
-| `config/defaults.yml` | project defaults: coordinate systems, workflow, classification |
+| `config/defaults.yml` | project defaults: coordinate systems, workflow, control points, AprilTags, classification, instances, acquisition, sparse display cleaning |
 | `config/export_crs.yml` | LAS export CRS presets, output height systems, and required PROJ grids |
-| `config/colmap.yml` | camera, matching, GPS/RTK, control point, and dense settings |
-| `config/sam.yml` | SAM3 model, thresholds, tiles, and voting settings |
+| `config/colmap.yml` | camera, matching, GPS/RTK, control point, dense, and step 6 settings (per capture type) |
+| `config/sam.yml` | SAM3 model, thresholds, tiles, voting, and instance settings |
+| `config/flurseg.yml` | FlurSeg model folder, sliding window, and class mapping |
 | `config/geometry.yml` | terrain model, SAM3 confidence use, and per-class geometric rules |
-| `config/classes.json` | semantic prompts and class order |
+| `config/classes.json` | semantic prompts, class order, LAS codes, colours, German labels, suppress/mirror prompts, instance and fine-term vocabularies |
 | `config/viewer.yml` | point cloud viewer and class visibility defaults |
+| `config/dxf_export.yaml`, `config/dxf_layers.yaml` | DXF export defaults and the code-to-layer mapping |
+| `config/cyclone_codes.yaml`, `config/model_profiles/` | Cyclone 3DR classification codes and per-model profiles |
+| `config/ortho.yaml`, `config/ortho_segment.yaml`, `config/ortho_plan.yaml` | orthophoto, orthophoto segmentation, and clean plan settings |
 
 Each new project receives a copy of the defaults in
 `projects/<project-name>/project.samcloud.yml`. Values saved there apply only
@@ -546,18 +726,29 @@ to that project. The complete setting reference is in
 projects/<project-name>/
 ├── project.samcloud.yml         project state and project-specific settings
 ├── inputs/                      imported metadata, 360 degree frames and cubemaps
-├── control_points/              CSV points and image observations
+├── control_points/              CSV points, image observations, detections, apriltags.csv,
+│                                apriltag_detections.json
 ├── colmap/                      COLMAP working files
 ├── products/
-│   ├── sparse/                  sparse model (0) and georeferenced model (0_geo)
+│   ├── sparse/                  sparse model (0), georeferenced model (0_geo), AprilTag-scaled (0_tagscale)
 │   ├── dense/                   fused.ply, visibility file, undistorted images
 │   ├── classified/
-│   │   ├── classified.ply       final (refined) classification
+│   │   ├── classified.ply       final (refined) classification, with fine_term and instance_id
 │   │   ├── classified_raw.ply   SAM3 result before geometric refinement
-│   │   └── classified_scores.npz  SAM3 confidence and second-best class per point
-│   └── viewer/                  viewer previews and manifest
-└── reports/                     pipeline log, run summary, classification and geometry summaries
+│   │   ├── classified_scores.npz  SAM3 confidence and second-best class per point
+│   │   ├── instances.json       object instances (label, class, size, bounding box)
+│   │   └── fine_labels.json     vocabulary of the fine_term property
+│   ├── viewer/                  viewer previews, manifest, potree/ octrees
+│   ├── ortho/<level>|site/      orthophoto, height rasters, segmentation (DXF page)
+│   └── dxf/                     DXF page state and caches, export/, snapshots/
+└── reports/                     pipeline log, run summary, classification, geometry and
+                                 control point summaries, apriltag_report.json
 ```
+
+Which of these folders exist depends on the project and the storage options
+(`storage` in the project file): after a run, regenerable inputs such as depth
+maps can be removed or compressed, and the optional processing cache keeps the
+step 6 inputs so that step 6 can be re-run in minutes.
 
 Source images are referenced at their original location by default. This
 avoids duplicating large drone datasets while preserving the complete project
@@ -576,11 +767,18 @@ state. If images are moved, their path can be updated in the project settings.
 | NumPy | 2.2.6 |
 | NiceGUI | 3.17.1 |
 | Ultralytics | 8.4.138. It is pinned on purpose: the SAM3 raw-head access depends on this version. |
+| pycolmap | 4.2.1 (GCP and tag adjustment, scale transforms) |
+| OpenCV | 4.12.0.88 (`opencv-python`; includes ArUco for AprilTags) |
+| Transformers, SciPy | 5.22.1, 1.18.1 (FlurSeg, spatial and sparse algorithms) |
+| ezdxf, Shapely | 1.4.5, 2.2.0 (DXF export, plan geometry) |
+| scikit-image, scikit-learn | 0.26.0, 1.9.1 (orthophoto and plan processing, clustering) |
 
 The complete pin set is in [`requirements.txt`](requirements.txt). Further
-modules: Pandas (control point CSV), PyProj (CRS validation and transformation),
-PyYAML, laspy, OpenCV, and Matplotlib. Do not replace the CUDA COLMAP build
-with the `nocuda` archive, because dense reconstruction requires CUDA.
+pinned modules: Pandas (control point CSV), PyProj (CRS validation and
+transformation), PyYAML, laspy, plyfile, ExifRead, tqdm, and Matplotlib.
+Pillow is installed as a dependency and used for the printable PDFs. Do not
+replace the CUDA COLMAP build with the `nocuda` archive, because dense
+reconstruction requires CUDA.
 
 ### Setup
 
@@ -604,10 +802,18 @@ with the `nocuda` archive, because dense reconstruction requires CUDA.
      use only); Small is Apache-2.0. Choose the model per project on the
      settings page (Large / Small / Off). Without code or weights the step is
      skipped with a warning and the rest of the pipeline runs normally.
-7. Run `setup.bat` once from the repository root. It creates the Python 3.13
+7. **Potree viewer (optional, recommended).** Without it the viewers fall back to
+   a downsampled canvas preview. Copy a Potree 1.8.x distribution (`build/` and
+   `libs/`, from <https://github.com/potree/potree>) into `assets/potree/` so that
+   `assets/potree/build/potree/potree.js` exists, and PotreeConverter 2.x
+   (<https://github.com/potree/PotreeConverter/releases>) into
+   `tools/PotreeConverter/` so that `PotreeConverter.exe` exists. Both folders are
+   excluded from Git; keep their `LICENSE` files next to them.
+8. Run `setup.bat` once from the repository root. It creates the Python 3.13
    `venv`, checks COLMAP, and installs the pinned CUDA/Python dependencies,
-   with retry-friendly pip timeouts for the large CUDA packages.
-8. Run `start.bat`. Keep its console window open and open
+   with retry-friendly pip timeouts for the large CUDA packages. It also fetches
+   the swisstopo LN02 geoid grid with `pyproj sync` (needed for LV95 exports).
+9. Run `start.bat`. Keep its console window open and open
    `http://127.0.0.1:8080` if the browser does not open automatically.
 
 To verify the installation before starting the UI:
@@ -629,22 +835,30 @@ committed.
 
 ## Tests
 
-`tests/` covers:
+`tests/` holds 1050 tests (1049 passed, 1 skipped on 2026-11-14) covering, among other things:
 
-- project persistence
-- 360 degree acquisition
-- control point CSV files
-- coordinate-system validation
-- run summaries
-- point cloud previews
-- the SegEarth-OV3 fusion and voting functions
+- project persistence, storage compaction, and 360 degree acquisition
+- control points, automatic target detection, GCP adjustment, and the review API
+- AprilTag detection, scale, georeferencing, printing, and viewer markers
+- coordinate-system validation and georeferencing
+- run summaries and remaining-time estimates
+- point cloud previews, Potree conversion, and the viewers
+- the SegEarth-OV3 fusion, voting, instance association, and fine terms
+- step 6: depth prior and fill, surface fusion, mirror filter, plane fill, and superpoint vote
 - the geometric refinement: terrain model, local features, flat-roof and
-  confidence logic, reassignment, and the rules for vegetation, curb, fence,
-  and power lines
+  confidence logic, reassignment, and the class rules
+- the DXF export: LAS source, alignment, levels, geometry, writer, and GUI
+- the orthophoto clean plan: orthophoto, segmentation, vector extraction,
+  symbol catalogue, kitchen, niches, and outdoor contours
 
 The tests use synthetic data and need neither model weights nor a GPU.
 
+`tests/conftest.py` needs the environment variable `SAMCLOUD_TEST_WORKDIR`, a
+writable directory for the per-test work folders (for example outside the
+repository). The folders are kept after the run.
+
 ```bat
+set SAMCLOUD_TEST_WORKDIR=%TEMP%\samcloud_test_work
 venv\Scripts\python -m pytest
 ```
 
@@ -677,9 +891,11 @@ third-party information.
 - **Network use:** anyone who lets other people use a modified version over a
   network must offer them its source code (AGPL section 13).
 - **Third-party components:** COLMAP, Ultralytics, the SAM 3 model weights,
-  Depth-Anything-V2 (code Apache-2.0; Large/Base weights CC-BY-NC-4.0, Small
-  weights Apache-2.0), PyTorch, geodetic grids, and the other dependencies are
-  not part of SAMcloud. The AGPL licence of SAMcloud does not change their
+  the FlurSeg/DINOv3 weights, Depth-Anything-V2 (code Apache-2.0; Large/Base
+  weights CC-BY-NC-4.0, Small weights Apache-2.0), Potree and PotreeConverter,
+  the AprilTag `tag36h11` family, PyTorch, geodetic grids, and the other
+  dependencies are not part of SAMcloud. [NOTICE.md](NOTICE.md) lists them with
+  their licenses. The AGPL licence of SAMcloud does not change their
   terms: the CC-BY-NC weights must not be used commercially.
   Each has its own license and terms, and every user is responsible for
   complying with them. The copyright holder accepts no responsibility for
