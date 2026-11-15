@@ -26,9 +26,11 @@ copyright holder. Each component remains subject exclusively to its own
 license, terms of use, and access conditions. Every user is solely responsible
 for obtaining the required access and licenses and for complying with their
 terms. This applies in particular to commercial use, which may require separate
-licenses from the third parties, for example for the SAM 3 model weights, the
-Depth-Anything-V2 Large and Base weights (CC-BY-NC-4.0), and the DINOv3-based
-FlurSeg weights.
+licenses from the third parties, for example for the Depth-Anything-V2 Large and
+Base weights (CC-BY-NC-4.0, non-commercial use only). The SAM 3 weights (SAM
+License) and the DINOv3-based FlurSeg weights (DINOv3 License) allow commercial
+use but carry use restrictions and the duty to accompany redistributions with a
+copy of the license.
 
 The licenses below were read from the installed package metadata
 (`venv/Lib/site-packages/*.dist-info`), from the license files shipped in
@@ -42,8 +44,8 @@ terms again before you redistribute or use a component commercially.
 | Component | Used for | License |
 |---|---|---|
 | COLMAP 4.2.0 (CUDA build in `colmap/`) | camera alignment and dense reconstruction (called as an external program) | BSD-3-Clause ("new BSD", Copyright ETH Zurich and UNC Chapel Hill, and The COLMAP Contributors), per <https://github.com/colmap/colmap/blob/main/LICENSE>; the version is taken from the README, the folder has no license file of its own |
-| SAM 3 model weights by Meta (`models/sam3.pt`, access via Hugging Face) | semantic segmentation and instance masks | Meta "SAM License" (<https://github.com/facebookresearch/sam3/blob/main/LICENSE>); Hugging Face lists it as "other" and gates the weights behind a login and acceptance of the conditions (<https://huggingface.co/facebook/sam3>). The license grants a non-exclusive, royalty-free right to use, copy, modify and distribute, requires that redistributions carry the license text, and excludes military, trade-control and sanctioned uses; it does not state commercial use explicitly, so check the full text before commercial use |
-| FlurSeg weights by AIhdproduction (EoMT with DINOv3-L backbone, trained on SAM 3 pseudo-labels, `models/flurseg_*`) | fast outdoor classification | own training result, fine-tuned from `tue-mps/eomt-dinov3-ade-semantic-large-512` (MIT, <https://huggingface.co/tue-mps/eomt-dinov3-ade-semantic-large-512>) with a DINOv3 backbone. The published weights are under the DINOv3 License (a custom Meta agreement, <https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md>; see <https://huggingface.co/AIhdproduction/Flurseg>). SAM 3 was used only as a label teacher; its weights are not part of FlurSeg |
+| SAM 3 model weights by Meta (`models/sam3.pt`, access via Hugging Face) | semantic segmentation and instance masks | Meta "SAM License" (<https://github.com/facebookresearch/sam3/blob/main/LICENSE>); Hugging Face lists it as "other" and gates the weights behind a login and acceptance of the conditions (<https://huggingface.co/facebook/sam3>). The license (last updated 2025-11-19; text verified 2026-11-15) grants a non-exclusive, worldwide, royalty-free right to use, reproduce, distribute and create derivative works (§1(a)). It contains no commercial-use restriction and no revenue or user threshold (it does not mention commercial use explicitly). Redistribution must include a copy of the license (§1(b)(i)). Excluded uses are trade-control and sanction targets, ITAR, military and warfare, nuclear, espionage and weapons uses (§1(b)(v)). Outputs (segmentations) are not restricted by the license. Meta may terminate on breach (§6) and modify the terms (§8). SAMcloud does not redistribute the weights |
+| FlurSeg weights by AIhdproduction (EoMT with DINOv3-L backbone, trained on SAM 3 pseudo-labels, `models/flurseg_*`) | fast outdoor classification | own training result, fine-tuned from `tue-mps/eomt-dinov3-ade-semantic-large-512` (MIT, <https://huggingface.co/tue-mps/eomt-dinov3-ade-semantic-large-512>) with a DINOv3 backbone. The published weights are under the DINOv3 License (a custom Meta agreement, <https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md>; see <https://huggingface.co/AIhdproduction/Flurseg>). The weights fall under the DINOv3 License (last updated 2025-08-19) because EoMT's DINOv3 checkpoints are deltas to Meta's DINOv3 weights; the MIT label of the EoMT checkpoint covers the EoMT parts, not the DINOv3 weights. The terms match the SAM License: royalty-free use, distribution and derivative works; no commercial-use restriction or threshold; a copy of the license must accompany redistribution; the same excluded uses (§1(b)(v)); outputs unrestricted. SAM 3 was used only as a label teacher; its weights are not part of FlurSeg. The SAM License contains no clause restricting the training of other models on SAM 3 outputs |
 | Depth-Anything-V2 code (`third_party/Depth-Anything-V2`, only `metric_depth/depth_anything_v2` is used) | indoor metric depth prior | Apache-2.0 (license file in the folder) |
 | Depth-Anything-V2 Metric-Hypersim weights, Large (and Base) | indoor depth prior (default) | CC-BY-NC-4.0, non-commercial use only |
 | Depth-Anything-V2 Metric-Hypersim weights, Small | indoor depth prior (small option) | Apache-2.0 |
@@ -104,7 +106,8 @@ SAMcloud is licensed under AGPL-3.0. Ultralytics and ultralytics-thop are also
 AGPL-3.0. plyfile is GPL-3.0-or-later; section 13 of both the GPL-3.0 and the
 AGPL-3.0 allows such a combination. The MIT, BSD, and Apache-2.0 components are
 compatible with the AGPL-3.0. Non-commercial or access-gated components (the
-Depth-Anything-V2 Large and Base weights, SAM 3, FlurSeg/DINOv3) are not code
+Depth-Anything-V2 Large and Base weights are non-commercial; SAM 3 and
+FlurSeg/DINOv3 allow commercial use under their own licenses) are not code
 that SAMcloud ships, and the AGPL does not relicense them.
 
 Cyclone 3DR is a trademark of Leica Geosystems. SAMcloud only writes
