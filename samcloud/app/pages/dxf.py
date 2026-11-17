@@ -16,22 +16,47 @@ from samcloud.app.dxf_controller import LAYER_MODES, MODEL_PROFILES, DxfPageCont
 from samcloud.app.dxf_review_canvas import DxfReviewCanvas, background_url, ortho_preview_url, payload_url
 from samcloud.app.dxf_side_canvas import DxfSideCanvas
 from samcloud.app.dxf_side_view import encode_png_data_url, render_side_view
+from samcloud.app.i18n import t, translate_or
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
 from samcloud.dxf.job_runner import DxfJobRunner
 
 ACTION_LABELS: dict[str, str] = {
-    "preview": "Create preview",
-    "align": "Align to gravity",
-    "levels": "Detect levels",
-    "generate": "Generate DXF preview",
-    "export": "Export DXF",
-    "ortho": "Building orthophoto",
-    "segment": "Segmenting orthophoto",
-    "clean_plan": "Generating clean plan",
-    "prepare_levels": "Detecting storeys",
-    "run_all": "Compute everything",
+    "preview": "dxf.action.preview",
+    "align": "dxf.action.align",
+    "levels": "dxf.action.levels",
+    "generate": "dxf.action.generate",
+    "export": "dxf.action.export",
+    "ortho": "dxf.action.ortho",
+    "segment": "dxf.action.segment",
+    "clean_plan": "dxf.action.clean_plan",
+    "prepare_levels": "dxf.action.prepare_levels",
+    "run_all": "dxf.action.run_all",
 }
+"""Job action -> translation key of its display label (resolved at render time by _action_label)."""
+
+
+def _action_label(action: str, fallback: str | None = None) -> str:
+    """Translated display label of a DXF job action; unknown actions show ``fallback`` (default: the action itself)."""
+    key = ACTION_LABELS.get(action)
+    if key is None:
+        return action if fallback is None else fallback
+    return t(key)
+
+
+def _job_state_label(job_state: str) -> str:
+    """Translated job state (done, failed, cancelled, ...); unknown states are shown as-is."""
+    return translate_or(f"dxf.job_state.{job_state}", job_state)
+
+
+def _cache_status_label(status: str) -> str:
+    """Translated cache freshness (missing / ok / stale)."""
+    return translate_or(f"dxf.cache_status.{status}", status)
+
+
+def _mode_label(mode: str) -> str:
+    """Translated project mode value (indoor / outdoor)."""
+    return translate_or(f"dxf.mode_value.{mode}", mode)
 
 _RUNNERS: dict[Path, DxfJobRunner] = {}
 
@@ -65,18 +90,15 @@ def render() -> None:
     def content() -> None:
         project_directory = state.active_project_directory
         if project_directory is None or state.active_project() is None:
-            ui.label("Open a project before exporting DXF plans.").classes("sam-muted")
+            ui.label(t("dxf.page.no_project")).classes("sam-muted")
             return
         if dxf_unavailable_reason(project_directory) is not None:
-            ui.label(
-                "DXF export needs a classified point cloud, but this project has none yet. "
-                "Classify the point cloud first, then open this page again."
-            ).classes("sam-muted").mark("dxf-not-ready")
+            ui.label(t("dxf.page.not_ready")).classes("sam-muted").mark("dxf-not-ready")
             return
         controller = DxfPageController(project_directory, runner=runner_for(project_directory))
         DxfPage(controller).build()
 
-    render_page("DXF export", content, current_path="/dxf", wide=True)
+    render_page(t("dxf.page.title"), content, current_path="/dxf", wide=True)
 
 
 def _banner(text: str, kind: str = "warning") -> ui.label:
@@ -140,7 +162,7 @@ class DxfPage:
             return
         self.build_compute_card()
         self.build_result_card()
-        with ui.expansion("Advanced", icon="tune", value=False).classes("w-full").mark("advanced"):
+        with ui.expansion(t("dxf.page.advanced"), icon="tune", value=False).classes("w-full").mark("advanced"):
             self.stale_banner()
             self.build_preparation()
             if self.controller.mode == "indoor":
@@ -167,31 +189,31 @@ class DxfPage:
         with ui.card().classes("w-full"):
             with ui.row().classes("items-center w-full gap-6"):
                 ui.label(controller.project_name).classes("sam-section-title")
-                ui.label(f"Mode: {controller.mode}").classes("sam-muted").props("data-testid=mode")
-                ui.label(f"Model profile: {controller.profile or 'not set'}").classes("sam-muted")
-                ui.label(f"Scale: {controller.scale_status}").classes("sam-muted")
-            ui.label(f"Point source: {controller.source_label}").classes("sam-muted text-sm").mark("point-source")
+                ui.label(t("dxf.header.mode", mode=_mode_label(controller.mode))).classes("sam-muted").props("data-testid=mode")
+                ui.label(t("dxf.header.profile", profile=controller.profile or t("dxf.header.not_set"))).classes("sam-muted")
+                ui.label(t("dxf.header.scale", status=controller.scale_status)).classes("sam-muted")
+            ui.label(t("dxf.header.point_source", source=controller.source_label)).classes("sam-muted text-sm").mark("point-source")
             with ui.row().classes("items-end w-full gap-3"):
                 current = controller.las_path
                 # The classified PLY is used automatically; the field is only for choosing another LAS file.
                 shown = "" if current is None or controller.source_is_ply else str(current)
-                las_input = ui.input("LAS file", value=shown, placeholder="Optional: another classified .las file").classes("flex-1").props("outlined dense").mark("las-path")
-                ui.button("Use this LAS", icon="check", on_click=lambda: self.choose_las(las_input.value)).props("flat no-caps")
+                las_input = ui.input(t("dxf.header.las_file"), value=shown, placeholder=t("dxf.header.las_placeholder")).classes("flex-1").props("outlined dense").mark("las-path")
+                ui.button(t("dxf.header.use_las"), icon="check", on_click=lambda: self.choose_las(las_input.value)).props("flat no-caps")
                 if controller.las_is_custom:
-                    ui.button("Project point cloud", icon="restart_alt", on_click=lambda: self.choose_las(None)).props("flat no-caps")
-                mode_options = {"auto": "Automatic", "indoor": "Indoor", "outdoor": "Outdoor"}
-                ui.select(mode_options, label="Mode", value=controller.state.mode_override or "auto",
+                    ui.button(t("dxf.header.project_cloud"), icon="restart_alt", on_click=lambda: self.choose_las(None)).props("flat no-caps")
+                mode_options = {"auto": t("dxf.header.mode_auto"), "indoor": t("dxf.header.mode_indoor"), "outdoor": t("dxf.header.mode_outdoor")}
+                ui.select(mode_options, label=t("dxf.header.mode_label"), value=controller.state.mode_override or "auto",
                           on_change=lambda event: self.set_mode(event.value)).classes("w-40").props("outlined dense").mark("mode-select")
                 if controller.state.profile_name and not controller.profile_required:
-                    ui.select(list(MODEL_PROFILES), label="Model profile", value=controller.state.profile_name,
+                    ui.select(list(MODEL_PROFILES), label=t("dxf.header.profile_label"), value=controller.state.profile_name,
                               on_change=lambda event: self.set_profile(event.value)).classes("w-48").props("outlined dense").mark("profile-change")
             if current is None or not current.is_file():
-                _banner("No classified point cloud found. Classify the point cloud first or choose an existing .las file.", "warning")
+                _banner(t("dxf.header.no_cloud"), "warning")
 
     def build_profile_required(self) -> None:
         with ui.card().classes("w-full"):
-            _banner("This LAS file carries no model profile. Choose the model that classified it before continuing.", "info")
-            ui.select(list(MODEL_PROFILES), label="Model profile (required)", value=None,
+            _banner(t("dxf.header.profile_missing"), "info")
+            ui.select(list(MODEL_PROFILES), label=t("dxf.header.profile_required"), value=None,
                       on_change=lambda event: self.set_profile(event.value)).classes("w-72").props("outlined dense").mark("profile-required")
 
     def choose_las(self, path: str | None) -> None:
@@ -221,22 +243,24 @@ class DxfPage:
         with ui.row().classes("items-center w-full gap-3 no-wrap"):
             self.job_stage = ui.label("").classes("text-sm").mark("job-stage")
             self.job_progress = ui.linear_progress(value=0.0, show_value=False).classes("flex-1")
-            self.cancel_button = ui.button("Cancel", icon="stop", on_click=self.cancel).props("flat no-caps color=negative")
+            self.cancel_button = ui.button(t("common.cancel"), icon="stop", on_click=self.cancel).props("flat no-caps color=negative")
         self.job_log = ui.label("").classes("sam-dxf-log w-full")
         self.update_job_bar(status, self.controller.is_running())
 
     def update_job_bar(self, status: dict[str, Any], running: bool) -> None:
         if self.job_stage is None or self.job_progress is None or self.job_log is None:
             return
-        action = ACTION_LABELS.get(str(status.get("action", "")), str(status.get("action", "")) or "Job")
+        raw_action = str(status.get("action", ""))
+        action = _action_label(raw_action, raw_action or t("dxf.job.fallback"))
         job_state = str(status.get("state", "idle"))
         if running:
-            self.job_stage.set_text(f"{action}: {status.get('stage', '')} ({float(status.get('fraction', 0.0)) * 100:.0f} %)")
+            self.job_stage.set_text(t("dxf.job.running", action=action, stage=status.get("stage", ""),
+                                      percent=f"{float(status.get('fraction', 0.0)) * 100:.0f}"))
         elif job_state == "idle":
-            self.job_stage.set_text("No DXF job has run yet.")
+            self.job_stage.set_text(t("dxf.job.idle"))
         else:
             message = f" - {status['message']}" if status.get("message") else ""
-            self.job_stage.set_text(f"Last job: {action} {job_state}{message}")
+            self.job_stage.set_text(t("dxf.job.last", action=action, state=_job_state_label(job_state), message=message))
         self.job_progress.set_value(float(status.get("fraction", 0.0)) if running or job_state == "done" else 0.0)
         show_log = not running and job_state in ("failed", "cancelled", "unknown")
         self.job_log.set_text("\n".join(self.controller.log_tail(25)) if show_log else "")
@@ -253,7 +277,7 @@ class DxfPage:
         self.was_running = True
         self.apply_busy(True)
         self.update_job_bar(self.controller.job_status(), True)
-        ui.notify(f"{ACTION_LABELS.get(action, action)} started")
+        ui.notify(t("dxf.job.started", action=_action_label(action)))
 
     async def cancel(self) -> None:
         if self.cancel_button is not None:
@@ -273,9 +297,9 @@ class DxfPage:
             if self.controller.mode == "indoor" and self.compute_level is None and len(levels) == 1:
                 self.compute_level = str(levels[0]["id"])
             job_state = str(status.get("state", ""))
-            action = ACTION_LABELS.get(str(status.get("action", "")), "Job")
+            action = _action_label(str(status.get("action", "")), t("dxf.job.fallback"))
             kind = "positive" if job_state == "done" else ("warning" if job_state == "cancelled" else "negative")
-            ui.notify(f"{action} {job_state or 'finished'}", type=kind)
+            ui.notify(t("dxf.job.finished", action=action, state=_job_state_label(job_state or "finished")), type=kind)
             targets = self.controller.review_targets()
             if self.review_level not in targets:
                 self.review_level = targets[0] if targets else None
@@ -295,11 +319,11 @@ class DxfPage:
     def build_compute_card(self) -> None:
         controller = self.controller
         with ui.card().classes("w-full gap-3"):
-            ui.label("Compute").classes("sam-section-title")
-            force = ui.checkbox("Recompute all (ignore cached steps)", value=False).classes("text-sm")
+            ui.label(t("dxf.compute.title")).classes("sam-section-title")
+            force = ui.checkbox(t("dxf.compute.force"), value=False).classes("text-sm")
             if controller.mode == "outdoor":
                 self.run_all_button = self.primary_job_button(
-                    "Compute everything", "play_arrow", lambda: self.start("run_all", force=bool(force.value)),
+                    t("dxf.compute.run_all"), "play_arrow", lambda: self.start("run_all", force=bool(force.value)),
                 )
                 self.run_all_button.mark("run-all")
                 self.build_step_checklist(None)
@@ -307,7 +331,7 @@ class DxfPage:
                 levels = controller.available_levels()
                 if not levels:
                     self.primary_job_button(
-                        "Detect storeys", "layers", lambda: self.start("prepare_levels", force=bool(force.value)),
+                        t("dxf.compute.detect_storeys"), "layers", lambda: self.start("prepare_levels", force=bool(force.value)),
                     ).mark("prepare-levels")
                     self.build_step_checklist(None)
                 else:
@@ -317,13 +341,13 @@ class DxfPage:
                     }
                     ui.toggle(options, value=self.compute_level if self.compute_level in options else None,
                               on_change=lambda event: self.select_compute_level(event.value)).mark("storey-picker")
-                    label = "Compute everything" if self.compute_level is None else f"Compute everything for {options[self.compute_level]}"
+                    label = t("dxf.compute.run_all") if self.compute_level is None else t("dxf.compute.run_all_for", level=options[self.compute_level])
                     self.run_all_button = self.primary_job_button(
                         label, "play_arrow", lambda: self.start("run_all", self.compute_level, force=bool(force.value)),
                         enabled=self.compute_level is not None,
                     )
                     self.run_all_button.mark("run-all")
-                    self.job_button("Detect storeys again", "refresh", lambda: self.start("prepare_levels", force=bool(force.value))).props("flat")
+                    self.job_button(t("dxf.compute.detect_again"), "refresh", lambda: self.start("prepare_levels", force=bool(force.value))).props("flat")
                     self.build_step_checklist(self.compute_level)
             self.build_job_bar()
 
@@ -334,7 +358,7 @@ class DxfPage:
         if self.run_all_button is None:
             return
         level = next((item for item in self.controller.available_levels() if item["id"] == level_id), None)
-        label = "Compute everything" if level is None else f"Compute everything for {level['name']} ({float(level['floor_z']):.2f} m)"
+        label = t("dxf.compute.run_all") if level is None else t("dxf.compute.run_all_for", level=f"{level['name']} ({float(level['floor_z']):.2f} m)")
         enabled = level is not None
         self.run_all_button.set_text(label)
         self.run_all_button.set_enabled(enabled and not self.controller.is_running())
@@ -345,19 +369,18 @@ class DxfPage:
 
     def build_step_checklist(self, level_id: str | None) -> None:
         controller = self.controller
-        labels = {"missing": "missing", "ok": "up to date", "stale": "stale"}
         if controller.mode == "indoor" and level_id is None:
-            ui.label("Select a storey to see the workflow steps.").classes("sam-muted text-sm")
+            ui.label(t("dxf.compute.select_storey")).classes("sam-muted text-sm")
             return
         rows = [
-            ("Orthophoto", controller.ortho_status(level_id)),
-            ("Segmentation", controller.segment_status(level_id)),
-            ("Clean plan", controller.plan_status(level_id, "ortho")),
-            ("DXF export", controller.plan_status(level_id, "ortho")),
+            (t("dxf.compute.step_ortho"), controller.ortho_status(level_id)),
+            (t("dxf.compute.step_segmentation"), controller.segment_status(level_id)),
+            (t("dxf.compute.step_clean_plan"), controller.plan_status(level_id, "ortho")),
+            (t("dxf.compute.step_export"), controller.plan_status(level_id, "ortho")),
         ]
         with ui.column().classes("gap-1"):
             for name, current in rows:
-                ui.label(f"{name}: {labels[current]}").classes("sam-muted text-sm")
+                ui.label(t("dxf.compute.step_row", name=name, status=_cache_status_label(current))).classes("sam-muted text-sm")
 
     # ------------------------------------------------------------------ stale + preparation
 
@@ -376,29 +399,30 @@ class DxfPage:
         controller = self.controller
         indoor = controller.mode == "indoor"
         with ui.card().classes("w-full"):
-            ui.label("Preparation").classes("sam-section-title")
+            ui.label(t("dxf.prep.title")).classes("sam-section-title")
             with ui.row().classes("items-center gap-3"):
-                self.job_button("Create preview", "grain", lambda: self.start("preview"))
+                self.job_button(t("dxf.action.preview"), "grain", lambda: self.start("preview"))
                 if indoor:
-                    self.job_button("Align to gravity", "straighten", lambda: self.start("align"))
-                    self.job_button("Detect levels", "layers", lambda: self.start("levels"))
-            ui.label("Preview: available" if controller.has_preview else "Preview: not created yet").classes("sam-muted text-sm")
+                    self.job_button(t("dxf.action.align"), "straighten", lambda: self.start("align"))
+                    self.job_button(t("dxf.action.levels"), "layers", lambda: self.start("levels"))
+            ui.label(t("dxf.prep.preview_available") if controller.has_preview else t("dxf.prep.preview_missing")).classes("sam-muted text-sm")
             for warning in controller.plausibility_warnings:
                 _banner(warning, "warning")
             with ui.row().classes("items-end gap-3"):
-                scale_input = ui.number("Scale factor", value=controller.scale_factor, min=0.0, format="%.6g").classes("w-40").props("outlined dense").mark("scale-factor")
-                ui.button("Apply", on_click=lambda: self.apply_scale(scale_input.value)).props("flat no-caps").mark("scale-apply")
-                ui.label(f"{controller.scale_source}: {controller.scale_status}").classes("sam-muted text-sm")
-            ui.label("Or use the Measure tool in the side view or the DXF review and type the real distance.").classes("sam-muted text-xs")
+                scale_input = ui.number(t("dxf.prep.scale_factor"), value=controller.scale_factor, min=0.0, format="%.6g").classes("w-40").props("outlined dense").mark("scale-factor")
+                ui.button(t("common.apply"), on_click=lambda: self.apply_scale(scale_input.value)).props("flat no-caps").mark("scale-apply")
+                scale_source = translate_or(f"dxf.scale_source.{controller.scale_source}", controller.scale_source)
+                ui.label(t("dxf.prep.scale_line", source=scale_source, status=controller.scale_status)).classes("sam-muted text-sm")
+            ui.label(t("dxf.prep.measure_hint")).classes("sam-muted text-xs")
             if indoor:
                 alignment = controller.alignment
                 if alignment is None:
-                    ui.label("Alignment: not estimated (local Z is used as up).").classes("sam-muted text-sm")
+                    ui.label(t("dxf.prep.alignment_none")).classes("sam-muted text-sm")
                 else:
                     with ui.row().classes("items-center gap-4"):
-                        ui.label(f"Alignment: tilt {float(alignment.get('tilt_degrees', 0.0)):.2f}°, "
-                                 f"yaw {float(alignment.get('yaw_degrees', 0.0)):.2f}° ({alignment.get('method', '')})").classes("text-sm")
-                        ui.switch("Align walls to X/Y", value=controller.align_walls,
+                        ui.label(t("dxf.prep.alignment", tilt=f"{float(alignment.get('tilt_degrees', 0.0)):.2f}",
+                                   yaw=f"{float(alignment.get('yaw_degrees', 0.0)):.2f}", method=alignment.get("method", ""))).classes("text-sm")
+                        ui.switch(t("dxf.prep.align_walls"), value=controller.align_walls,
                                   on_change=lambda event: self.set_align_walls(event.value)).mark("align-walls")
 
     def apply_scale(self, value: float | None) -> None:
@@ -407,7 +431,7 @@ class DxfPage:
         except ValueError as error:
             ui.notify(str(error), type="negative")
             return
-        ui.notify("Scale applied. Cached DXF previews are now out of date.")
+        ui.notify(t("dxf.prep.scale_applied"))
         self.body.refresh()
 
     def set_align_walls(self, enabled: bool) -> None:
@@ -424,18 +448,18 @@ class DxfPage:
         controller = self.controller
         view = controller.state.view
         with ui.card().classes("w-full"):
-            ui.label("Side view and levels").classes("sam-section-title")
+            ui.label(t("dxf.side.title")).classes("sam-section-title")
             with ui.row().classes("items-end gap-3 w-full"):
-                ui.toggle({"x": "View along X", "y": "View along Y"}, value=view.get("side_axis", "x"),
+                ui.toggle({"x": t("dxf.side.view_x"), "y": t("dxf.side.view_y")}, value=view.get("side_axis", "x"),
                           on_change=lambda event: self.set_side_option("side_axis", event.value)).mark("side-axis")
-                ui.number("Slab centre (m)", value=view.get("slab_center"),
+                ui.number(t("dxf.side.slab_center"), value=view.get("slab_center"),
                           on_change=lambda event: self.set_side_option("slab_center", event.value)).classes("w-36").props("outlined dense clearable").mark("slab-center")
-                ui.number("Slab thickness (m)", value=view.get("slab_thickness"), min=0.0,
+                ui.number(t("dxf.side.slab_thickness"), value=view.get("slab_thickness"), min=0.0,
                           on_change=lambda event: self.set_side_option("slab_thickness", event.value)).classes("w-36").props("outlined dense clearable").mark("slab-thickness")
-                ui.button("Render side view", icon="visibility", on_click=self.render_side).props("flat no-caps").set_enabled(controller.has_preview)
-                ui.toggle({"pan": "Pan / drag lines", "add": "Add level", "measure": "Measure"}, value="pan",
+                ui.button(t("dxf.side.render"), icon="visibility", on_click=self.render_side).props("flat no-caps").set_enabled(controller.has_preview)
+                ui.toggle({"pan": t("dxf.side.tool_pan"), "add": t("dxf.side.tool_add"), "measure": t("dxf.view.measure")}, value="pan",
                           on_change=lambda event: self.side_canvas.set_tool(event.value) if self.side_canvas else None).mark("side-tool")
-                ui.button("Fit", on_click=lambda: self.side_canvas.fit() if self.side_canvas else None).props("flat no-caps")
+                ui.button(t("dxf.view.fit"), on_click=lambda: self.side_canvas.fit() if self.side_canvas else None).props("flat no-caps")
             with ui.row().classes("w-full gap-4 no-wrap items-stretch"):
                 with ui.element("div").classes("flex-1").style("height:520px"):
                     self.side_canvas = DxfSideCanvas().classes("w-full h-full").mark("side-canvas")
@@ -451,9 +475,9 @@ class DxfPage:
     def levels_panel(self) -> None:
         levels = self.controller.available_levels()
         if not levels:
-            ui.label("No levels yet. Press Detect levels or add one by clicking in the side view.").classes("sam-muted text-sm")
+            ui.label(t("dxf.side.no_levels")).classes("sam-muted text-sm")
             return
-        ui.label("Checked levels are exported (1 = lowest).").classes("sam-muted text-xs")
+        ui.label(t("dxf.side.levels_hint")).classes("sam-muted text-xs")
         for level in sorted(levels, key=lambda item: float(item["floor_z"])):
             level_id = str(level["id"])
             with ui.row().classes("items-center gap-1 no-wrap w-full"):
@@ -462,10 +486,10 @@ class DxfPage:
                 name_input = ui.input(value=str(level["name"])).classes("w-16").props("dense outlined").mark(f"level-name-{level_id}")
                 name_input.on("blur", lambda _event, lid=level_id, field=name_input: self.rename(lid, field.value))
                 name_input.on("keydown.enter", lambda _event, lid=level_id, field=name_input: self.rename(lid, field.value))
-                ui.number(value=round(float(level["floor_z"]), 3), format="%.3f",
-                          on_change=lambda event, lid=level_id: self.level_edit(self.controller.move_level, lid, floor_z=event.value) if event.value is not None else None).classes("w-24").props("dense outlined label=Floor").mark(f"level-floor-{level_id}")
-                ui.number(value=None if level.get("ceiling_z") is None else round(float(level["ceiling_z"]), 3), format="%.3f",
-                          on_change=lambda event, lid=level_id: self.level_edit(self.controller.move_level, lid, ceiling_z=event.value) if event.value is not None else None).classes("w-24").props("dense outlined label=Ceiling").mark(f"level-ceiling-{level_id}")
+                ui.number(t("dxf.side.floor"), value=round(float(level["floor_z"]), 3), format="%.3f",
+                          on_change=lambda event, lid=level_id: self.level_edit(self.controller.move_level, lid, floor_z=event.value) if event.value is not None else None).classes("w-24").props("dense outlined").mark(f"level-floor-{level_id}")
+                ui.number(t("dxf.side.ceiling"), value=None if level.get("ceiling_z") is None else round(float(level["ceiling_z"]), 3), format="%.3f",
+                          on_change=lambda event, lid=level_id: self.level_edit(self.controller.move_level, lid, ceiling_z=event.value) if event.value is not None else None).classes("w-24").props("dense outlined").mark(f"level-ceiling-{level_id}")
                 ui.button(icon="delete", on_click=lambda lid=level_id: self.level_edit(self.controller.delete_level, lid)).props("flat dense round color=negative").mark(f"level-delete-{level_id}")
 
     def level_edit(self, action: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -516,7 +540,7 @@ class DxfPage:
         controller = self.controller
         preview = controller.project_dir / "products" / "dxf" / "preview.npz"
         if not preview.is_file():
-            ui.notify("Create the preview first.", type="warning")
+            ui.notify(t("dxf.side.preview_first"), type="warning")
             return
         view = controller.state.view
         axis = str(view.get("side_axis", "x"))
@@ -537,8 +561,8 @@ class DxfPage:
         measured = float(args.get("distance", 0.0))
         self.measurement = {"p1": args.get("p1"), "p2": args.get("p2"), "distance": measured}
         with ui.dialog() as dialog, ui.card():
-            ui.label(f"Measured distance: {measured:.4f} m").classes("text-md")
-            real = ui.number("Real distance (m)", value=None, min=0.0).props("outlined dense autofocus").mark("real-distance")
+            ui.label(t("dxf.measure.measured_distance", distance=f"{measured:.4f}")).classes("text-md")
+            real = ui.number(t("dxf.measure.real_distance"), value=None, min=0.0).props("outlined dense autofocus").mark("real-distance")
 
             def apply() -> None:
                 try:
@@ -548,12 +572,12 @@ class DxfPage:
                     ui.notify(str(error), type="negative")
                     return
                 dialog.close()
-                ui.notify(f"Scale factor {factor:.6g} applied. Cached DXF previews are now out of date.")
+                ui.notify(t("dxf.measure.scale_applied", factor=f"{factor:.6g}"))
                 self.body.refresh()
 
             with ui.row():
-                ui.button("Use for scale", on_click=apply).props("unelevated no-caps").mark("apply-measure")
-                ui.button("Close", on_click=dialog.close).props("flat no-caps")
+                ui.button(t("dxf.measure.use_for_scale"), on_click=apply).props("unelevated no-caps").mark("apply-measure")
+                ui.button(t("common.close"), on_click=dialog.close).props("flat no-caps")
         dialog.open()
 
     # ------------------------------------------------------------------ review
@@ -563,15 +587,15 @@ class DxfPage:
         level = self.compute_level if controller.mode == "indoor" else None
         result = controller.plan_result(level, "ortho") if (controller.mode != "indoor" or level is not None) else None
         with ui.card().classes("w-full gap-3"):
-            ui.label("Result").classes("sam-section-title")
+            ui.label(t("dxf.result.title")).classes("sam-section-title")
             if result is None:
-                ui.label("Press Compute everything to create the plan.").classes("sam-muted").mark("result-placeholder")
+                ui.label(t("dxf.result.placeholder")).classes("sam-muted").mark("result-placeholder")
                 return
             self.build_result_canvas(result, level)
             with ui.row().classes("items-center gap-2"):
-                ui.button("Open DXF folder", icon="folder_open", on_click=self.open_dxf_folder).props("flat no-caps")
-                ui.button("Download DXF", icon="download", on_click=lambda: self.download_dxf(level)).props("flat no-caps")
-                ui.button("Save snapshot PNG", icon="photo_camera", on_click=lambda: self.save_snapshot("ortho", level)).props("flat no-caps")
+                ui.button(t("dxf.result.open_dxf_folder"), icon="folder_open", on_click=self.open_dxf_folder).props("flat no-caps")
+                ui.button(t("dxf.result.download_dxf"), icon="download", on_click=lambda: self.download_dxf(level)).props("flat no-caps")
+                ui.button(t("dxf.view.save_snapshot"), icon="photo_camera", on_click=lambda: self.save_snapshot("ortho", level)).props("flat no-caps")
 
     def build_result_canvas(self, result: Any, level: str | None) -> None:
         controller = self.controller
@@ -598,21 +622,21 @@ class DxfPage:
                     "flat round dense color=white").classes("absolute").style(
                     "top:8px;left:8px;z-index:10;background:rgba(9,19,29,.65)").mark("result-fullscreen")
                 with self.result_fullscreen_button:
-                    self.result_fullscreen_tooltip = ui.tooltip("Fullscreen")
+                    self.result_fullscreen_tooltip = ui.tooltip(t("dxf.result.fullscreen"))
                 ui.keyboard(on_key=self.on_result_key, ignore=["input", "select", "textarea"])
             with ui.column().classes("w-80 gap-2 sam-result-side"):
                 with ui.row().classes("items-center gap-2"):
-                    ui.button("Fit", on_click=lambda: self.result_canvas.fit() if self.result_canvas else None).props("flat no-caps")
-                    ui.toggle({"pan": "Pan", "measure": "Measure"}, value="pan",
+                    ui.button(t("dxf.view.fit"), on_click=lambda: self.result_canvas.fit() if self.result_canvas else None).props("flat no-caps")
+                    ui.toggle({"pan": t("dxf.view.pan"), "measure": t("dxf.view.measure")}, value="pan",
                               on_change=lambda event: self.result_canvas.set_tool(event.value) if self.result_canvas else None)
-                ui.toggle({"ortho": "Orthophoto", "none": "None", "classes": "Class colours"}, value=background,
+                ui.toggle({"ortho": t("dxf.view.orthophoto"), "none": t("dxf.result.background_none"), "classes": t("dxf.view.class_colours")}, value=background,
                           on_change=lambda event: self.set_result_background(event.value, level)).mark("result-background")
-                ui.label("Orthophoto opacity").classes("text-sm")
+                ui.label(t("dxf.result.ortho_opacity")).classes("text-sm")
                 self.result_opacity_slider = ui.slider(
                     min=0, max=100, step=1, value=round(float(view.get("result_image_opacity", 1.0)) * 100),
                     on_change=lambda event: self.set_result_opacity(event.value)).props("label").mark("result-image-opacity")
                 self.result_opacity_slider.set_enabled(background != "none")
-                ui.label("Layers").classes("text-sm q-mt-sm")
+                ui.label(t("dxf.view.layers")).classes("text-sm q-mt-sm")
                 for name, status in result.statuses.items():
                     color = ",".join(str(value) for value in _layer_rgb(result, name))
                     with ui.row().classes("items-center gap-2 no-wrap w-full"):
@@ -664,7 +688,7 @@ class DxfPage:
         else:
             row.classes(remove="sam-result-fullscreen")
         self.result_fullscreen_button.props(f"icon={'fullscreen_exit' if active else 'fullscreen'}")
-        self.result_fullscreen_tooltip.set_text("Exit fullscreen" if active else "Fullscreen")
+        self.result_fullscreen_tooltip.set_text(t("dxf.result.exit_fullscreen") if active else t("dxf.result.fullscreen"))
 
     def on_result_key(self, event: Any) -> None:
         if self.result_fullscreen and event.action.keydown and event.key.escape:
@@ -681,19 +705,19 @@ class DxfPage:
     def open_dxf_folder(self) -> None:
         folder = self.controller.project_dir / "products" / "dxf" / "export"
         if not folder.is_dir():
-            ui.notify("No DXF export folder exists yet.", type="warning")
+            ui.notify(t("dxf.result.no_export_folder"), type="warning")
             return
         try:
             os.startfile(str(folder))
         except OSError as error:
-            ui.notify(f"Could not open DXF folder: {error}", type="negative")
+            ui.notify(t("dxf.result.open_dxf_folder_failed", error=error), type="negative")
 
     def download_dxf(self, level: str | None) -> None:
         target_name = self.controller.level_label(level)
         export_dir = self.controller.project_dir / "products" / "dxf" / "export"
         matches = sorted(export_dir.glob(f"*{target_name}*clean.dxf")) if export_dir.is_dir() else []
         if not matches:
-            ui.notify("No exported clean DXF is available for this target.", type="warning")
+            ui.notify(t("dxf.result.no_clean_dxf"), type="warning")
             return
         target = matches[-1]
         ui.download(target.read_bytes(), filename=target.name, media_type="application/dxf")
@@ -705,19 +729,20 @@ class DxfPage:
     def review_section(self) -> None:
         controller = self.controller
         with ui.card().classes("w-full"):
-            ui.label("DXF review").classes("sam-section-title")
-            ui.label(f"{controller.project_name} · {controller.mode} · profile {controller.profile or 'not set'} · scale: {controller.scale_status}").classes("sam-muted text-sm")
+            ui.label(t("dxf.review.title")).classes("sam-section-title")
+            ui.label(t("dxf.review.summary", project=controller.project_name, mode=_mode_label(controller.mode),
+                       profile=controller.profile or t("dxf.header.not_set"), scale=controller.scale_status)).classes("sam-muted text-sm")
             with ui.row().classes("items-center gap-3"):
                 self.review_level_select()
-                self.job_button("Generate DXF preview", "auto_fix_high", lambda: self.start("generate", self.review_level),
+                self.job_button(t("dxf.action.generate"), "auto_fix_high", lambda: self.start("generate", self.review_level),
                                 enabled=controller.mode != "indoor" or self.review_level is not None)
             self.review_status()
             result = controller.plan_result(self.review_level, controller.state.plan_variant) if (controller.mode != "indoor" or self.review_level) else None
             if controller.mode == "indoor" and self.review_level is None:
-                ui.label("Detect or add levels and check at least one to review it.").classes("sam-muted")
+                ui.label(t("dxf.review.no_levels")).classes("sam-muted")
             elif result is None:
-                variant_label = "clean orthophoto plan" if controller.state.plan_variant == "ortho" else "point-cloud plan"
-                ui.label(f"No cached {variant_label} exists for this target. Run its explicit workflow step first.").classes("sam-muted").mark("no-cache")
+                no_cache = t("dxf.review.no_cache_ortho") if controller.state.plan_variant == "ortho" else t("dxf.review.no_cache_pointcloud")
+                ui.label(no_cache).classes("sam-muted").mark("no-cache")
             else:
                 self.build_review_canvas(result)
             self.build_review_settings()
@@ -726,11 +751,11 @@ class DxfPage:
     def review_level_select(self) -> None:
         controller = self.controller
         if controller.mode == "indoor":
-            options = {str(level["id"]): f"Level {level['name']}" for level in controller.checked_levels()}
-            ui.select(options, label="Level", value=self.review_level if self.review_level in options else None,
+            options = {str(level["id"]): t("dxf.review.level_option", name=level["name"]) for level in controller.checked_levels()}
+            ui.select(options, label=t("dxf.review.level_label"), value=self.review_level if self.review_level in options else None,
                       on_change=lambda event: self.switch_level(event.value)).classes("w-48").props("outlined dense").mark("review-level")
         else:
-            ui.label("Site plan").classes("text-sm")
+            ui.label(t("dxf.review.site_plan")).classes("text-sm")
 
     def switch_level(self, level_id: str | None) -> None:
         if level_id == self.review_level:
@@ -776,19 +801,19 @@ class DxfPage:
                 self.review_canvas.on("measure", lambda event: self.on_review_measure(event.args, result.scale_factor))
             with ui.column().classes("w-80 gap-2"):
                 with ui.row().classes("items-center gap-2"):
-                    ui.toggle({"pan": "Pan", "measure": "Measure"}, value="pan",
+                    ui.toggle({"pan": t("dxf.view.pan"), "measure": t("dxf.view.measure")}, value="pan",
                               on_change=lambda event: self.review_canvas.set_tool(event.value) if self.review_canvas else None).mark("review-tool")
-                    ui.button("Fit", on_click=lambda: self.review_canvas.fit() if self.review_canvas else None).props("flat no-caps")
-                ui.toggle({"rgb": "RGB", "classes": "Class colours"}, value=source,
+                    ui.button(t("dxf.view.fit"), on_click=lambda: self.review_canvas.fit() if self.review_canvas else None).props("flat no-caps")
+                ui.toggle({"rgb": "RGB", "classes": t("dxf.view.class_colours")}, value=source,
                           on_change=lambda event: self.set_image_source(event.value)).mark("image-source").set_enabled(has_rgb)
-                ui.label("Image opacity").classes("text-sm")
+                ui.label(t("dxf.review.image_opacity")).classes("text-sm")
                 ui.slider(min=0, max=100, step=1, value=round(float(view.get("image_opacity", 1.0)) * 100),
                           on_change=lambda event: self.set_opacity("image_opacity", event.value)).props("label").mark("image-opacity")
-                ui.label("DXF opacity").classes("text-sm")
+                ui.label(t("dxf.review.dxf_opacity")).classes("text-sm")
                 ui.slider(min=0, max=100, step=1, value=round(float(view.get("dxf_opacity", 1.0)) * 100),
                           on_change=lambda event: self.set_opacity("dxf_opacity", event.value)).props("label").mark("dxf-opacity")
                 self.measure_label = ui.label("").classes("text-sm")
-                ui.label("Layers").classes("text-sm q-mt-sm")
+                ui.label(t("dxf.view.layers")).classes("text-sm q-mt-sm")
                 for name, status in result.statuses.items():
                     color = ",".join(str(value) for value in _layer_rgb(result, name))
                     with ui.row().classes("items-center gap-2 no-wrap w-full"):
@@ -797,7 +822,7 @@ class DxfPage:
                                     on_change=lambda event, layer=name: self.toggle_layer(layer, bool(event.value))).mark(f"layer-{name}")
                         ui.label(str(status.entity_count)).classes("sam-muted text-xs")
                     if status.state != "ok" and status.reason:
-                        ui.label(f"{status.state}: {status.reason}").classes("sam-muted text-xs q-ml-lg")
+                        ui.label(f"{translate_or(f'dxf.layer_state.{status.state}', status.state)}: {status.reason}").classes("sam-muted text-xs q-ml-lg")
 
     def set_image_source(self, source: str) -> None:
         self.controller.set_view_option("image_source", source)
@@ -832,7 +857,7 @@ class DxfPage:
     def on_review_measure(self, args: dict[str, Any], points_scale: float) -> None:
         distance = float((args or {}).get("distance", 0.0))
         if self.measure_label is not None and not self.measure_label.is_deleted:
-            self.measure_label.set_text(f"Measured: {distance:.3f} m")
+            self.measure_label.set_text(t("dxf.review.measured", distance=f"{distance:.3f}"))
         self.open_measure_dialog(args or {}, points_scale)
 
     @ui.refreshable_method
@@ -842,67 +867,69 @@ class DxfPage:
         if controller.mode == "indoor" and level is None:
             return
         if controller.is_stale(level):
-            _banner("Settings changed since this preview was generated. Press Generate DXF preview to update.").mark("review-stale")
+            _banner(t("dxf.review.stale")).mark("review-stale")
         ortho_status = controller.ortho_status(level)
         segment_status = controller.segment_status(level)
         clean_status = controller.plan_status(level, "ortho")
         selected_variant = controller.state.plan_variant
-        labels = {"missing": "missing", "ok": "up to date", "stale": "stale"}
         colours = {"missing": "grey", "ok": "positive", "stale": "warning"}
         with ui.row().classes("items-center gap-3"):
-            ui.toggle({"local": "Local coordinates", "original": "Original coordinates"},
+            ui.toggle({"local": t("dxf.review.coords_local"), "original": t("dxf.review.coords_original")},
                       value=str(controller.state.view.get("coordinates", "local")),
                       on_change=lambda event: controller.set_view_option("coordinates", event.value)).mark("coordinates")
             ui.select(
-                {"pointcloud": "Point cloud (fast)", "ortho": "Orthophoto (clean)"},
-                label="Plan variant",
+                {"pointcloud": t("dxf.review.variant_pointcloud"), "ortho": t("dxf.review.variant_ortho")},
+                label=t("dxf.review.plan_variant"),
                 value=selected_variant,
                 on_change=lambda event: self.set_plan_variant(event.value),
             ).classes("w-56").props("outlined dense").mark("plan-variant")
-            ui.switch("Compare plans", value=bool(controller.state.view.get("compare_plans", False)),
+            ui.switch(t("dxf.review.compare_plans"), value=bool(controller.state.view.get("compare_plans", False)),
                       on_change=lambda event: self.set_compare_mode(bool(event.value))).mark("compare-plans")
         with ui.row().classes("items-center gap-3 w-full no-wrap"):
-            self.job_button("Build orthophoto", "satellite_alt", lambda: self.start("ortho", level),
+            self.job_button(t("dxf.review.build_ortho"), "satellite_alt", lambda: self.start("ortho", level),
                             enabled=controller.mode != "indoor" or level is not None).mark("ortho-build")
-            ui.chip(f"Orthophoto: {labels[ortho_status]}", color=colours[ortho_status], text_color="white").mark("ortho-status")
-            source_options = {"pointcloud": "Point cloud", "sam3": "SAM3", "combined": "Combined"}
+            ui.chip(t("dxf.review.chip_ortho", status=_cache_status_label(ortho_status)), color=colours[ortho_status], text_color="white").mark("ortho-status")
+            source_options = {"pointcloud": t("dxf.review.source_pointcloud"), "sam3": "SAM3", "combined": t("dxf.review.source_combined")}
             if controller.mode != "indoor":
                 source_options["flurseg"] = "FlurSeg"
-            ui.select(source_options, label="Segmentation model", value=controller.state.segment_source,
+            ui.select(source_options, label=t("dxf.review.segmentation_model"), value=controller.state.segment_source,
                       on_change=lambda event: self.set_segment_source(event.value)).classes("w-52").props("outlined dense").mark("segment-source")
-            self.job_button("Segment", "category", lambda: self.start("segment", level),
+            self.job_button(t("dxf.review.segment"), "category", lambda: self.start("segment", level),
                             enabled=ortho_status == "ok").mark("segment-build")
-            ui.chip(f"Segment: {labels[segment_status]}", color=colours[segment_status], text_color="white").mark("segment-status")
-            self.job_button("Generate clean plan", "architecture", lambda: self.start("clean_plan", level),
+            ui.chip(t("dxf.review.chip_segment", status=_cache_status_label(segment_status)), color=colours[segment_status], text_color="white").mark("segment-status")
+            self.job_button(t("dxf.review.generate_clean"), "architecture", lambda: self.start("clean_plan", level),
                             enabled=segment_status == "ok").mark("clean-plan-build")
-            ui.chip(f"Clean plan: {labels[clean_status]}", color=colours[clean_status], text_color="white").mark("clean-plan-status")
-            self.job_button("Export DXF", "download", lambda: self.start("export", level),
+            ui.chip(t("dxf.review.chip_clean", status=_cache_status_label(clean_status)), color=colours[clean_status], text_color="white").mark("clean-plan-status")
+            self.job_button(t("dxf.action.export"), "download", lambda: self.start("export", level),
                             enabled=controller.export_enabled(level, selected_variant)).mark("export")
-            ui.chip(f"Export: {labels[controller.plan_status(level, selected_variant)]}", color=colours[controller.plan_status(level, selected_variant)], text_color="white").mark("export-status")
+            export_status = controller.plan_status(level, selected_variant)
+            ui.chip(t("dxf.review.chip_export", status=_cache_status_label(export_status)), color=colours[export_status], text_color="white").mark("export-status")
             if controller.mode == "indoor":
-                self.job_button("Export all checked levels", "download_for_offline", lambda: self.start("export", None),
+                self.job_button(t("dxf.review.export_all"), "download_for_offline", lambda: self.start("export", None),
                                 enabled=all(controller.export_enabled(target, selected_variant) for target in controller.review_targets())).mark("export-all")
-            ui.button("Save snapshot PNG", icon="photo_camera", on_click=self.save_snapshot).props("flat no-caps").set_enabled(controller.cached_result(level) is not None)
+            ui.button(t("dxf.view.save_snapshot"), icon="photo_camera", on_click=self.save_snapshot).props("flat no-caps").set_enabled(controller.cached_result(level) is not None)
         if bool(controller.state.view.get("compare_plans", False)):
             with ui.row().classes("items-center gap-3"):
-                ui.label("Point-cloud overlay opacity").classes("text-sm")
+                ui.label(t("dxf.review.pointcloud_overlay_opacity")).classes("text-sm")
                 ui.slider(min=0, max=100, step=1, value=round(float(controller.state.view.get("pointcloud_opacity", 1.0)) * 100),
                           on_change=lambda event: self.set_compare_opacity("pointcloud_opacity", event.value, False)).props("label").mark("compare-pointcloud-opacity")
-                ui.label("Clean-plan overlay opacity").classes("text-sm")
+                ui.label(t("dxf.review.clean_overlay_opacity")).classes("text-sm")
                 ui.slider(min=0, max=100, step=1, value=round(float(controller.state.view.get("clean_opacity", 1.0)) * 100),
                           on_change=lambda event: self.set_compare_opacity("clean_opacity", event.value, True)).props("label").mark("compare-clean-opacity")
         with ui.row().classes("items-center gap-3"):
             has_ortho = controller.ortho_result(level) is not None
-            ui.toggle({"topview": "Point-cloud top view", "ortho": "Orthophoto"}, value=controller.background_source,
+            ui.toggle({"topview": t("dxf.review.topview"), "ortho": t("dxf.view.orthophoto")}, value=controller.background_source,
                       on_change=lambda event: self.set_background_source(event.value)).mark("ortho-background").set_enabled(has_ortho)
-            self.ortho_link("Orthophoto JPEG (8000 px)", "jpg8000", level, "ortho-link-jpg8000")
-            self.ortho_link("JPEG (4096 px)", "jpg4096", level, "ortho-link-jpg4096")
-            self.ortho_link("Full PNG", "png", level, "ortho-link-png")
-            ui.button("Open folder", icon="folder_open", on_click=lambda: self.open_ortho_folder(level)).props("flat no-caps").mark("ortho-folder").set_enabled(has_ortho)
+            self.ortho_link(t("dxf.review.link_jpg8000"), "jpg8000", level, "ortho-link-jpg8000")
+            self.ortho_link(t("dxf.review.link_jpg4096"), "jpg4096", level, "ortho-link-jpg4096")
+            self.ortho_link(t("dxf.review.link_png"), "png", level, "ortho-link-png")
+            ui.button(t("dxf.review.open_folder"), icon="folder_open", on_click=lambda: self.open_ortho_folder(level)).props("flat no-caps").mark("ortho-folder").set_enabled(has_ortho)
         last = controller.last_export()
         if last:
             with ui.column().classes("gap-0"):
-                ui.label(f"Last export ({last.get('coordinates', 'local')} coordinates), audit {last.get('audit', 'unknown')}: {last.get('audit_detail', '')}").classes("text-sm").mark("last-export")
+                coordinates = str(last.get("coordinates", "local"))
+                ui.label(t("dxf.review.last_export", coordinates=translate_or(f"dxf.review.coordinate_value.{coordinates}", coordinates),
+                           audit=last.get("audit", t("dxf.review.audit_unknown")), detail=last.get("audit_detail", ""))).classes("text-sm").mark("last-export")
                 for path in last.get("files", []):
                     ui.label(str(path)).classes("sam-muted text-xs")
         self.apply_busy(controller.is_running())
@@ -984,12 +1011,12 @@ class DxfPage:
         """Open the existing orthophoto cache folder in Windows Explorer."""
         folder = self.controller.ortho_dir(level)
         if not folder.is_dir():
-            ui.notify("No orthophoto cache folder exists yet.", type="warning")
+            ui.notify(t("dxf.review.no_ortho_folder"), type="warning")
             return
         try:
             os.startfile(str(folder))
         except OSError as error:
-            ui.notify(f"Could not open orthophoto folder: {error}", type="negative")
+            ui.notify(t("dxf.review.open_ortho_folder_failed", error=error), type="negative")
 
     async def save_snapshot(self, variant: str = "pointcloud", level_id: str | None = None) -> None:
         view = self.controller.state.view
@@ -1003,31 +1030,31 @@ class DxfPage:
         except (ValueError, RuntimeError) as error:
             ui.notify(str(error), type="negative")
             return
-        ui.notify(f"Snapshot saved: {path}")
+        ui.notify(t("dxf.review.snapshot_saved", path=path))
 
     def build_review_settings(self) -> None:
         controller = self.controller
         view = controller.state.view
-        with ui.expansion("Generation settings (changes mark the preview stale; nothing is regenerated)", icon="tune").classes("w-full"):
+        with ui.expansion(t("dxf.settings.title"), icon="tune").classes("w-full"):
             with ui.row().classes("items-end gap-4"):
-                ui.number("Cell size (m, empty = default)", value=controller.state.overrides.get("cell_size"), min=0.001, format="%.3f",
+                ui.number(t("dxf.settings.cell_size"), value=controller.state.overrides.get("cell_size"), min=0.001, format="%.3f",
                           on_change=lambda event: self.change_setting(controller.set_cell_size, event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("cell-size")
                 if controller.mode == "indoor":
-                    ui.toggle({"centerlines": "Wall centre-lines", "polygons": "Wall polygons"},
+                    ui.toggle({"centerlines": t("dxf.settings.wall_centerlines"), "polygons": t("dxf.settings.wall_polygons")},
                               value="centerlines" if view.get("wall_centerlines", True) else "polygons",
                               on_change=lambda event: self.change_setting(controller.set_view_option, "wall_centerlines", event.value == "centerlines")).mark("wall-output")
-                    ui.switch("Door swing arc", value=bool(view.get("door_swing_arc", False)),
+                    ui.switch(t("dxf.settings.door_swing"), value=bool(view.get("door_swing_arc", False)),
                                on_change=lambda event: self.change_setting(controller.set_view_option, "door_swing_arc", bool(event.value))).mark("door-swing")
-            ui.label("Orthophoto").classes("text-sm q-mt-md")
+            ui.label(t("dxf.view.orthophoto")).classes("text-sm q-mt-md")
             with ui.row().classes("items-end gap-4"):
                 ortho = controller.state.ortho
-                ui.number("Pixel size outdoor (m, empty = default)", value=ortho.get("pixel_size_outdoor"), min=0.001, format="%.3f",
+                ui.number(t("dxf.settings.pixel_outdoor"), value=ortho.get("pixel_size_outdoor"), min=0.001, format="%.3f",
                           on_change=lambda event: self.change_setting(controller.set_ortho_option, "pixel_size_outdoor", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-pixel-outdoor")
-                ui.number("Pixel size indoor (m, empty = default)", value=ortho.get("pixel_size_indoor"), min=0.001, format="%.3f",
+                ui.number(t("dxf.settings.pixel_indoor"), value=ortho.get("pixel_size_indoor"), min=0.001, format="%.3f",
                           on_change=lambda event: self.change_setting(controller.set_ortho_option, "pixel_size_indoor", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-pixel-indoor")
-                ui.number("Maximum side (px, empty = default)", value=ortho.get("max_side"), min=1000, max=30000, step=1,
+                ui.number(t("dxf.settings.max_side"), value=ortho.get("max_side"), min=1000, max=30000, step=1,
                           on_change=lambda event: self.change_setting(controller.set_ortho_option, "max_side", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-max-side")
-                ui.number("Cut below ceiling (m, empty = default)", value=ortho.get("cut_below_ceiling"), min=0.0, max=1.0, format="%.3f",
+                ui.number(t("dxf.settings.cut_below_ceiling"), value=ortho.get("cut_below_ceiling"), min=0.0, max=1.0, format="%.3f",
                           on_change=lambda event: self.change_setting(controller.set_ortho_option, "cut_below_ceiling", event.value if event.value else None)).classes("w-56").props("outlined dense clearable").mark("ortho-cut")
             for row in controller.layer_settings():
                 name = row["name"]
@@ -1036,12 +1063,12 @@ class DxfPage:
                     ui.label(name).classes("w-24 text-sm")
                     ui.select(list(LAYER_MODES), value=row["mode"] if row["mode"] in LAYER_MODES else None,
                               on_change=lambda event, layer=name: self.change_setting(controller.set_layer_mode, layer, event.value) if event.value else None).classes("w-40").props("outlined dense").mark(f"layer-mode-{name}")
-                    low = ui.number("z min", value=band[0], format="%.2f").classes("w-24").props("outlined dense").mark(f"layer-zmin-{name}")
-                    high = ui.number("z max", value=band[1], format="%.2f").classes("w-24").props("outlined dense").mark(f"layer-zmax-{name}")
+                    low = ui.number(t("dxf.settings.z_min"), value=band[0], format="%.2f").classes("w-24").props("outlined dense").mark(f"layer-zmin-{name}")
+                    high = ui.number(t("dxf.settings.z_max"), value=band[1], format="%.2f").classes("w-24").props("outlined dense").mark(f"layer-zmax-{name}")
                     low.on_value_change(lambda _event, layer=name, a=low, b=high: self.change_band(layer, a.value, b.value))
                     high.on_value_change(lambda _event, layer=name, a=low, b=high: self.change_band(layer, a.value, b.value))
                     if row["overridden"]:
-                        ui.label("project override").classes("sam-muted text-xs")
+                        ui.label(t("dxf.settings.project_override")).classes("sam-muted text-xs")
 
     def change_band(self, layer: str, low: float | None, high: float | None) -> None:
         if low is None or high is None:

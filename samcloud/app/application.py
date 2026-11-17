@@ -10,6 +10,7 @@ from nicegui import app, ui
 from starlette.responses import FileResponse, JSONResponse, Response
 
 from samcloud.app.pages import control_points, dense_cloud, dxf, home, projects, settings, sparse_cloud, targets
+from samcloud.app.i18n import t
 from samcloud.app.state import state
 from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.dxf_review_canvas import review_background, review_payload
@@ -106,7 +107,7 @@ def _instance_index(project_directory: Path) -> tuple[np.ndarray, np.ndarray, np
     """Load or rebuild the cached stable ordering of PLY rows by non-zero instance id."""
     source = _classified_ply_path(project_directory)
     if not source.is_file():
-        raise FileNotFoundError("No classified point cloud is available yet")
+        raise FileNotFoundError(t("app.errors.no_classified_cloud"))
     cache_path = project_directory / "products" / "viewer" / "instance_index.npz"
     source_stat = source.stat()
     signature = (source_stat.st_mtime_ns, source_stat.st_size)
@@ -143,7 +144,7 @@ def instances():
     """Serve recognized dense-cloud object instances for the current project."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     return JSONResponse({"instances": _instance_payload(project_directory)})
 
 
@@ -152,12 +153,12 @@ def instance_points(instance_id: int):
     """Serve one instance's original-colour PLY points in the Potree coordinate frame."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         ids, offsets, indices, dtype, fields = _instance_index(project_directory)
         position = int(np.searchsorted(ids, instance_id))
         if position >= len(ids) or int(ids[position]) != instance_id:
-            return JSONResponse({"error": "Instance not found"}, status_code=404)
+            return JSONResponse({"error": t("app.errors.instance_not_found")}, status_code=404)
         selected = indices[offsets[position]:offsets[position + 1]]
         if len(selected) > _INSTANCE_POINT_LIMIT:
             selected = selected[np.linspace(0, len(selected) - 1, _INSTANCE_POINT_LIMIT, dtype=np.int64)]
@@ -183,7 +184,7 @@ def pointcloud_preview(kind: str):
     """Serve a compact, browser-friendly preview of the active project's cloud."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         preview_path, point_count = ensure_preview(project_directory, kind)
     except (FileNotFoundError, ValueError, OSError) as error:
@@ -203,7 +204,7 @@ def sparse_cameras():
     """Serve final-model camera centres for the sparse-cloud inspector."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         return JSONResponse(camera_payload(project_directory))
     except (FileNotFoundError, OSError, ValueError) as error:
@@ -215,7 +216,7 @@ def sparse_camera_thumbnail(camera_id: str, size: str = "320"):
     """Serve a downscaled, ID-addressed source image for a sparse camera."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         encoded = camera_thumbnail(project_directory, camera_id, size)
     except ValueError as error:
@@ -232,7 +233,7 @@ def potree_build_status(kind: str):
     """Start an octree build when needed and return its current status."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         start_potree_build(project_directory, kind)
         return JSONResponse(potree_status(project_directory, kind))
@@ -245,7 +246,7 @@ def potree_file(kind: str, file_path: str):
     """Serve Potree octree files; converts the active project's cloud on the first metadata request."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         root = ensure_potree(project_directory, kind) if file_path == "metadata.json" else project_directory / "products" / "viewer" / "potree" / kind
     except (FileNotFoundError, ValueError) as error:
@@ -257,9 +258,9 @@ def potree_file(kind: str, file_path: str):
     try:
         candidate.relative_to(root)
     except ValueError:
-        return JSONResponse({"error": "Invalid path"}, status_code=400)
+        return JSONResponse({"error": t("app.errors.invalid_path")}, status_code=400)
     if not candidate.is_file():
-        return JSONResponse({"error": "File not found"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.file_not_found")}, status_code=404)
     return FileResponse(candidate, headers={"Cache-Control": "no-store"})
 
 
@@ -268,7 +269,7 @@ def control_point_image(image_path: str):
     """Serve only a file below the active project's dense image directory."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     image_root = (project_directory / "products" / "dense" / "images").resolve()
     if not image_root.is_dir():
         try:
@@ -277,14 +278,14 @@ def control_point_image(image_path: str):
                 headers={"Cache-Control": "no-store"},
             )
         except (FileNotFoundError, ValueError):
-            return JSONResponse({"error": "Image not found"}, status_code=404)
+            return JSONResponse({"error": t("app.errors.image_not_found")}, status_code=404)
     candidate = (image_root / image_path).resolve()
     try:
         candidate.relative_to(image_root)
     except ValueError:
-        return JSONResponse({"error": "Invalid image path"}, status_code=400)
+        return JSONResponse({"error": t("app.errors.invalid_image_path")}, status_code=400)
     if not candidate.is_file():
-        return JSONResponse({"error": "Image not found"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.image_not_found")}, status_code=404)
     return FileResponse(candidate, headers={"Cache-Control": "no-store"})
 
 
@@ -293,7 +294,7 @@ def control_point_markers():
     """Serve reviewed markers, errors, and final-model coordinates for the sparse view."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     return JSONResponse(marker_payload(project_directory))
 
 
@@ -314,7 +315,7 @@ def control_point_crop(image: str, u: str, v: str, size: str = "96", source: str
     """Serve a small, path-safe original or undistorted marker crop."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         encoded, crop_size, origin_u, origin_v = image_crop(project_directory, image, u, v, size, source)
     except ValueError as error:
@@ -388,7 +389,7 @@ def optimize_reviewed_control_points(payload: dict[str, object] | None = None):
     """Re-run only the GCP adjustment in a background thread."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         state.processing.optimize_control_points(project_directory)
     except (OSError, ValueError) as error:
@@ -401,7 +402,7 @@ def continue_reviewed_control_points(payload: dict[str, object] | None = None):
     """Continue the existing dense-processing phase after a successful review."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         state.processing.continue_after_control_points(project_directory)
     except (OSError, ValueError) as error:
@@ -414,15 +415,15 @@ def dxf_review_payload(level_key: str, variant: str = "pointcloud"):
     """Serve the cached DXF vector payload of a level ('site' for outdoor); never generates."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         if variant not in {"pointcloud", "ortho"}:
-            raise ValueError("Invalid plan variant")
+            raise ValueError(t("app.errors.invalid_plan_variant"))
         payload = review_payload(project_directory, level_key, variant)
     except ValueError as error:
         return JSONResponse({"error": str(error)}, status_code=400)
     if payload is None:
-        return JSONResponse({"error": "No cached DXF preview for this level"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_dxf_preview")}, status_code=404)
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
@@ -431,13 +432,13 @@ def dxf_review_background(level_key: str, source: str):
     """Serve the cached north-up background PNG ('rgb' or 'classes') of a level; never generates."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     try:
         path = review_background(project_directory, level_key, source)
     except ValueError as error:
         return JSONResponse({"error": str(error)}, status_code=400)
     if path is None:
-        return JSONResponse({"error": "No cached background image"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_background")}, status_code=404)
     return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
 
 
@@ -456,9 +457,9 @@ def dxf_ortho_file(level_key: str, kind: str, v: str | None = None):
     """Serve a cached orthophoto artifact; reads only the cache (never creates or generates)."""
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     if kind not in ORTHO_MEDIA_TYPES:
-        return JSONResponse({"error": f"Invalid ortho kind '{kind}'"}, status_code=400)
+        return JSONResponse({"error": t("app.errors.invalid_ortho_kind", kind=kind)}, status_code=400)
     try:
         controller = DxfPageController(project_directory)
         level_id = None if level_key == "site" else level_key
@@ -468,16 +469,16 @@ def dxf_ortho_file(level_key: str, kind: str, v: str | None = None):
     except Exception as error:
         return JSONResponse({"error": str(error)}, status_code=500)
     if path is None or not path.is_file():
-        return JSONResponse({"error": f"No cached orthophoto artifact '{kind}' for level '{level_key}'"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_ortho_artifact", kind=kind, level=level_key)}, status_code=404)
     return FileResponse(path, media_type=ORTHO_MEDIA_TYPES[kind], headers={"Cache-Control": "private, max-age=3600"})
 
 
 def _review_action(payload: dict[str, object], action):
     project_directory = state.active_project_directory
     if project_directory is None:
-        return JSONResponse({"error": "No project is open"}, status_code=404)
+        return JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
     if not isinstance(payload, dict):
-        return JSONResponse({"error": "Request body must be an object"}, status_code=400)
+        return JSONResponse({"error": t("app.errors.invalid_body")}, status_code=400)
     try:
         result = action(project_directory, payload)
     except ValueError as error:
@@ -488,7 +489,7 @@ def _review_action(payload: dict[str, object], action):
 def _required_text(payload: dict[str, object], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} is required")
+        raise ValueError(t("app.errors.field_required", field=key))
     return value
 
 

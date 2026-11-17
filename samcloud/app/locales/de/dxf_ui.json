@@ -1,0 +1,64 @@
+{
+  "unavailable": {
+    "no_project": "Zuerst ein Projekt öffnen",
+    "not_classified": "Zuerst die Punktwolke klassifizieren"
+  },
+  "source": {
+    "none": "keine Punktwolke gefunden",
+    "ply": "klassifizierte Punktwolke (PLY, direkt gelesen): {name}",
+    "chosen_las": "gewählte LAS: {name}",
+    "classified_las": "klassifizierte LAS: {name}"
+  },
+  "blocked": {
+    "flurseg_indoor": "Das Profil FlurSeg v1 unterstützt nur Aussenprojekte. Bitte den Modus auf Aussen stellen oder ein anderes Profil wählen."
+  },
+  "scale": {
+    "none": "Keine Massstabskorrektur angewendet."
+  },
+  "level": {
+    "site": "Gelände"
+  },
+  "stale": {
+    "dxf": "DXF-Vorschau ist veraltet ({levels})",
+    "ortho": "Orthofoto ist veraltet ({levels})",
+    "segment": "Orthofoto-Segmentierung ist veraltet ({levels})",
+    "clean": "bereinigter Plan ist veraltet ({levels})",
+    "joiner": " und ",
+    "banner": "Einstellungen geändert: {messages}. In der DXF-Prüfung neu erzeugen."
+  },
+  "errors": {
+    "las_not_supported": "Nur unkomprimierte .las-Dateien werden unterstützt (kein LAZ).",
+    "las_not_found": "LAS-Datei wurde nicht gefunden: {path}",
+    "invalid_mode": "Ungültiger Modus '{mode}'. Erlaubt sind 'indoor', 'outdoor' oder None.",
+    "picked_scale_invalid": "Der Massstab der gewählten Punkte muss eine endliche positive Zahl sein",
+    "level_not_found": "Ebene '{level}' wurde nicht gefunden",
+    "align_first": "Vor der Wandausrichtung zuerst 'An Schwerkraft ausrichten' ausführen",
+    "unknown_ortho_option": "Unbekannte Orthofoto-Option '{name}'. Erlaubt: {allowed}",
+    "pixel_size_positive": "{name} muss eine positive Zahl grösser als 0 sein",
+    "max_side_range": "max_side muss eine ganze Zahl zwischen 1000 und 30000 sein",
+    "cut_below_range": "cut_below_ceiling muss zwischen 0.0 und 1.0 m liegen",
+    "invalid_background_source": "Ungültige Hintergrundquelle '{source}'. Erlaubt sind 'topview' oder 'ortho'.",
+    "unsupported_segment_source": "Nicht unterstützte Segmentierungsquelle",
+    "flurseg_outdoor_only": "FlurSeg-Segmentierung ist nur für Aussen-Orthofotos verfügbar",
+    "plan_variant_invalid": "Die Planvariante muss 'pointcloud' oder 'ortho' sein",
+    "profile_required": "Vor dem Start eines Jobs muss ein Modellprofil gewählt werden",
+    "no_las": "Keine gültige LAS-Datei für '{action}' gefunden",
+    "unsupported_action": "Nicht unterstützte DXF-Job-Aktion '{action}'",
+    "unsupported_layer_mode": "Nicht unterstützter Layer-Modus '{mode}'",
+    "unknown_layer": "Unbekannter Layer '{layer}'",
+    "z_band_order": "Beim Höhenband muss der untere Wert kleiner als der obere sein",
+    "no_cached_plan": "Für dieses Ziel gibt es keinen gespeicherten DXF-Plan. Zuerst berechnen.",
+    "png_encoding_failed": "PNG-Kodierung des Schnappschusses ist fehlgeschlagen"
+  },
+  "review_canvas": {
+    "hint": "Mausrad: Zoom · Ziehen: Verschieben · H halten: DXF ausblenden",
+    "no_preview": "Keine gespeicherte DXF-Vorschau.",
+    "loading": "Gespeicherte DXF-Vorschau wird geladen...",
+    "load_failed": "Die gespeicherte DXF-Vorschau konnte nicht geladen werden ({error})."
+  },
+  "side_canvas": {
+    "empty": "\"Seitenansicht rendern\" drücken, um die Vorschauwolke zu zeichnen.",
+    "level_floor": "Ebene {name} · Boden {z} m",
+    "ceiling": "Decke {z} m"
+  }
+}

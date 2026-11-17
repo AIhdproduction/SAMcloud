@@ -1,0 +1,15 @@
+{
+  "page_title": "Dense Cloud",
+  "no_project": "Open a project before viewing dense point cloud results.",
+  "viewer_title": "Dense point cloud",
+  "classes": {
+    "title": "Classification visibility and colors",
+    "description": "Switch classes on or off, isolate one class, and edit its color. Color changes are saved in this project.",
+    "isolate": "Isolate",
+    "color": "Color",
+    "show_all": "Show all",
+    "hide_all": "Hide all",
+    "restore_colors": "Restore default colors",
+    "invalid_color": "Select a valid color."
+  }
+}

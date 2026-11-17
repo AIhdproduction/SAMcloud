@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from nicegui import ui
 
+from samcloud.app.i18n import t
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
 from samcloud.control_points.apriltag_print import build_apriltag_pdf
@@ -30,21 +31,17 @@ def render() -> None:
     """Render the targets printable templates page."""
 
     def content() -> None:
-        ui.label(
-            "Druckvorlagen für Passpunkte. Funktioniert auch ohne geöffnetes Projekt."
-        ).classes("sam-muted text-sm q-mb-md")
+        ui.label(t("targets.intro")).classes("sam-muted text-sm q-mb-md")
 
         with ui.card().classes("w-full q-mb-md"):
-            ui.label("AprilTags (150 mm, tag36h11)").classes("text-lg font-medium")
-            ui.label(
-                "Für Innenräume: Maßstab und optional Georeferenzierung. Mit 100 % drucken."
-            ).classes("sam-muted text-sm")
+            ui.label(t("targets.apriltag.title")).classes("text-lg font-medium")
+            ui.label(t("targets.apriltag.hint")).classes("sam-muted text-sm")
             with ui.row().classes("w-full items-center gap-4 q-mt-sm"):
                 tag_count = ui.number(
-                    "Anzahl", value=10, min=1, max=100, step=1, precision=0
+                    t("targets.apriltag.count"), value=10, min=1, max=100, step=1, precision=0
                 ).classes("w-32").mark("targets-apriltag-count")
                 tag_start = ui.number(
-                    "Start-ID",
+                    t("targets.apriltag.start_id"),
                     value=_default_apriltag_start(),
                     min=0,
                     max=APRILTAG_ID_MAX,
@@ -74,17 +71,15 @@ def render() -> None:
                         tag_start.value = end + 1
 
                 ui.button(
-                    "PDF erstellen", on_click=create_apriltag_pdf
+                    t("targets.create_pdf"), on_click=create_apriltag_pdf
                 ).classes("sam-button-primary").mark("targets-apriltag-pdf")
 
         with ui.card().classes("w-full"):
-            ui.label("Kreuz-Targets (180 mm, nummeriert)").classes("text-lg font-medium")
-            ui.label(
-                "Für Drohnenflüge und aussen: zwei schwarze Dreiecke auf weissem Papier, Spitzen = Messpunkt. Ganzes Blatt oder Quadrat an den Marken ausgeschnitten flach auf den Untergrund legen. Funktioniert auf hellem und dunklem Untergrund."
-            ).classes("sam-muted text-sm")
+            ui.label(t("targets.cross.title")).classes("text-lg font-medium")
+            ui.label(t("targets.cross.hint")).classes("sam-muted text-sm")
             with ui.row().classes("w-full items-center gap-4 q-mt-sm"):
                 cross_count = ui.number(
-                    "Anzahl",
+                    t("targets.cross.count"),
                     value=10,
                     min=1,
                     max=CROSS_MAX_COUNT,
@@ -92,7 +87,7 @@ def render() -> None:
                     precision=0,
                 ).classes("w-32").mark("targets-cross-count")
                 cross_start = ui.number(
-                    "Start-Nr.",
+                    t("targets.cross.start_number"),
                     value=1,
                     min=1,
                     max=CROSS_MAX_NUMBER,
@@ -115,7 +110,7 @@ def render() -> None:
                     )
 
                 ui.button(
-                    "PDF erstellen", on_click=create_cross_pdf
+                    t("targets.create_pdf"), on_click=create_cross_pdf
                 ).classes("sam-button-primary").mark("targets-cross-pdf")
 
-    render_page("Targets", content, current_path="/targets")
+    render_page(t("nav.targets"), content, current_path="/targets")

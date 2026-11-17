@@ -1,6 +1,7 @@
 application:
   projects_directory: projects
-  language: en
+  # UI language default (de|en). A choice saved in Settings overrides it.
+  language: de
 
 project:
   image_storage: external_reference

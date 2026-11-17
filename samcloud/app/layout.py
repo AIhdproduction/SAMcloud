@@ -5,25 +5,36 @@ from pathlib import Path
 
 from nicegui import ui
 
+from samcloud.app.i18n import t
 
+
+# (translation key, path, icon); labels are translated when the page is rendered.
 _NAVIGATION = (
-    ("Overview", "/", "home"),
-    ("Projects", "/projects", "folder"),
-    ("Sparse cloud", "/sparse", "hub"),
-    ("Control points", "/control-points", "my_location"),
-    ("Targets", "/targets", "qr_code_2"),
-    ("Dense cloud", "/dense", "view_in_ar"),
-    ("DXF", "/dxf", "architecture"),
-    ("Settings", "/settings", "tune"),
+    ("nav.overview", "/", "home"),
+    ("nav.projects", "/projects", "folder"),
+    ("nav.sparse", "/sparse", "hub"),
+    ("nav.control_points", "/control-points", "my_location"),
+    ("nav.targets", "/targets", "qr_code_2"),
+    ("nav.dense", "/dense", "view_in_ar"),
+    ("nav.dxf", "/dxf", "architecture"),
+    ("nav.settings", "/settings", "tune"),
 )
 
 
 _PROJECT_PAGES = {"/sparse", "/control-points", "/dense", "/dxf"}
 
+_TECHNOLOGIES = ("COLMAP", "SAM3", "FlurSeg", "Depth Anything")
+
 
 def _visible_navigation(project_open: bool) -> list[tuple[str, str, str]]:
-    """Hide project-specific pages until a project is open."""
-    return [item for item in _NAVIGATION if project_open or item[1] not in _PROJECT_PAGES]
+    """Hide project-specific pages until a project is open; returns (translated label, path, icon)."""
+    return [(t(key), path, icon) for key, path, icon in _NAVIGATION if project_open or path not in _PROJECT_PAGES]
+
+
+def _tech_footer_html() -> str:
+    """Technology names for the sidebar footer (proper names, never translated)."""
+    separator = '<span class="sam-tech-sep">|</span>'
+    return separator.join(f'<span class="sam-tech">{name}</span>' for name in _TECHNOLOGIES)
 
 
 def _navigation_disabled_reason(path: str, project_directory: Path | None) -> str | None:
@@ -45,7 +56,7 @@ body { background:var(--sam-bg)!important; color:var(--sam-text); }
 .sam-nav { width:100%; min-height:52px; padding:0 14px; margin:3px 0; justify-content:flex-start; color:#d5e1eb!important; border-radius:8px; font-size:15px; }.sam-nav .q-icon { margin-right:13px; font-size:21px; color:#a8bfd1; }.sam-nav:hover { background:rgba(55,137,182,.14); }
 .sam-nav-active { color:#effbff!important; background:rgba(36,150,207,.22); border-left:3px solid var(--sam-accent); border-radius:0 8px 8px 0; padding-left:11px; }.sam-nav-active .q-icon { color:var(--sam-accent); }
 .sam-nav-slot { width:100%; }.sam-nav-disabled { opacity:.42!important; cursor:not-allowed!important; }.sam-nav-disabled:hover { background:transparent; }
-.sam-sidebar-footer { margin:auto 11px 0; padding-top:24px; color:#7890a5; font-size:10px; letter-spacing:1.5px; }
+.sam-sidebar-footer { margin:auto 11px 0; padding-top:24px; color:#7890a5; font-size:10px; letter-spacing:1.5px; display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px; line-height:1.5; }.sam-tech { white-space:nowrap; }.sam-tech-sep { opacity:.55; }
 .sam-main { min-width:0; flex:1 1 auto; }.sam-topbar { height:32px; border-bottom:1px solid var(--sam-line-soft); }.sam-page { width:min(1220px,100%); margin:0 auto; padding:46px clamp(22px,4vw,58px) 64px; }
 .sam-page-wide { width:100%; max-width:none; padding:18px clamp(12px,1.6vw,26px) 24px; }.sam-page-wide .sam-page-title { margin:0 0 10px; font-size:clamp(24px,2.2vw,32px); }
 .sam-page-title { margin:0 0 31px; font-size:clamp(30px,3vw,42px); font-weight:650; letter-spacing:-.8px; line-height:1.12; color:var(--sam-text); }.sam-section-title { color:var(--sam-text); font-size:20px; font-weight:600; letter-spacing:-.2px; }.sam-muted { color:var(--sam-muted); }
@@ -91,7 +102,8 @@ def render_page(
                 with ui.element("div").classes("sam-nav-slot") as slot:
                     ui.button(label, icon=icon).props("flat no-caps disable").classes(f"{classes} sam-nav-disabled").mark(marker)
                 slot.tooltip(reason)
-            ui.label("COLMAP · SAM3").classes("sam-sidebar-footer")
+            # The html element itself is the footer div, so the spans are direct flex items.
+            ui.html(_tech_footer_html(), tag="div").classes("sam-sidebar-footer").mark("sidebar-tech")
         with ui.element("main").classes("sam-main"):
             ui.element("div").classes("sam-topbar")
             with ui.element("section").classes("sam-page sam-page-wide" if wide else "sam-page"):

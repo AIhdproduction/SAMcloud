@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from nicegui import ui
 
+from samcloud.app.i18n import t
+
 SideTool = Literal["pan", "add", "measure"]
 
 
@@ -14,7 +16,8 @@ class DxfSideCanvas(ui.element, component="dxf_side_canvas.js"):
 
     Python -> JS (props): ``image`` (PNG data URL or ""), ``bounds`` ([h_min, h_max, z_min, z_max] in
     metres), ``levels`` (list of {id, name, floor_z, ceiling_z, checked}), ``tool`` ("pan" | "add" |
-    "measure"), ``axis-label`` (horizontal axis name). Method ``fit()`` resets the view.
+    "measure"), ``axis-label`` (horizontal axis name), ``strings`` (translated UI texts, resolved at
+    creation; the JS falls back to English). Method ``fit()`` resets the view.
 
     JS -> Python (events): ``level_move`` {id, edge: "floor" | "ceiling", z}, ``add_level`` {z},
     ``measure`` {p1: [h, z], p2: [h, z], distance}.
@@ -27,6 +30,11 @@ class DxfSideCanvas(ui.element, component="dxf_side_canvas.js"):
         self._props["levels"] = []
         self._props["tool"] = "pan"
         self._props["axis-label"] = "Y"
+        self._props["strings"] = {
+            "empty": t("dxf_ui.side_canvas.empty"),
+            "level_floor": t("dxf_ui.side_canvas.level_floor"),
+            "ceiling": t("dxf_ui.side_canvas.ceiling"),
+        }
 
     def set_image(self, data_url: str, bounds: tuple[float, float, float, float], axis_label: str) -> None:
         """Show a rendered side view; bounds are (horizontal min, horizontal max, z min, z max)."""

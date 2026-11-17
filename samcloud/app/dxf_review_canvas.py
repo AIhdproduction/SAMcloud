@@ -9,6 +9,7 @@ from urllib.parse import quote
 from nicegui import ui
 
 from samcloud.app.dxf_controller import REVIEW_BACKGROUND, DxfPageController
+from samcloud.app.i18n import t
 
 ReviewTool = Literal["pan", "measure"]
 
@@ -67,7 +68,8 @@ class DxfReviewCanvas(ui.element, component="dxf_review_canvas.js"):
     samcloud.dxf.result.vector_payload),
     ``image-url`` (north-up PNG), ``image-bounds`` ([min_x, min_y, max_x, max_y] local metres),
     ``image-opacity``, ``dxf-opacity`` and ``compare-opacity`` (0..1, canvas globalAlpha),
-    ``hidden-layers`` (layer names), ``tool`` ("pan" | "measure"), ``background`` ([r, g, b]).
+    ``hidden-layers`` (layer names), ``tool`` ("pan" | "measure"), ``background`` ([r, g, b]),
+    ``strings`` (translated UI texts, resolved at creation; the JS falls back to English).
     Method ``fit()`` resets the view.
 
     JS -> Python (events): ``measure`` {p1: [x, y], p2: [x, y], distance}, ``loaded`` {entities, layers}.
@@ -86,6 +88,12 @@ class DxfReviewCanvas(ui.element, component="dxf_review_canvas.js"):
         self._props["hidden-layers"] = []
         self._props["tool"] = "pan"
         self._props["background"] = list(REVIEW_BACKGROUND)
+        self._props["strings"] = {
+            "hint": t("dxf_ui.review_canvas.hint"),
+            "no_preview": t("dxf_ui.review_canvas.no_preview"),
+            "loading": t("dxf_ui.review_canvas.loading"),
+            "load_failed": t("dxf_ui.review_canvas.load_failed"),
+        }
 
     def show(
         self,

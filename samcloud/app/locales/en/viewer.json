@@ -1,0 +1,60 @@
+{
+  "number_locale": "en-US",
+  "toolbar": {
+    "fit": "Show all",
+    "classification": "Classes",
+    "class_toggle": "Classes on/off",
+    "cameras": "Camera positions",
+    "camera_colour": "Reprojection error",
+    "camera_sphere_texture": "Panorama on sphere",
+    "camera_size": "Camera size",
+    "terrain": "Terrain",
+    "orbit": "Orbit",
+    "shading": "Shading",
+    "fullscreen": "Fullscreen",
+    "point_size": "Point size",
+    "height": "Height",
+    "height_tooltip": "Height filter: the left handle hides points below, the right handle hides points above",
+    "height_lower": "Lower height limit",
+    "height_upper": "Upper height limit"
+  },
+  "status": {
+    "preparing": "Preparing point cloud …",
+    "preparing_elapsed": "Preparing point cloud … {elapsed}",
+    "unavailable": "Point cloud not available: {message}",
+    "prepare_failed": "Preparation failed",
+    "ready_count": "{title}: {count} points. Left drag: rotate around the clicked point, right drag: pan, mouse wheel: zoom, double-click: zoom to point.",
+    "ready": "{title}. Left drag: rotate around the clicked point, right drag: pan, mouse wheel: zoom, double-click: zoom to point."
+  },
+  "classes": {
+    "fallback": "Class {index}",
+    "other": "Other"
+  },
+  "markers": {
+    "open_review": "Double-click: open in the control point review"
+  },
+  "camera": {
+    "fallback_title": "Camera",
+    "details": "Image {index} · {points} 3D points · reprojection error {error}",
+    "photo_alt": "Camera photo",
+    "photo_open": "Click: open photo in full size",
+    "show_photo": "Show photo"
+  },
+  "tag": {
+    "size": "Size {size} mm",
+    "seen_in": "Seen in {count} images",
+    "error": "Error {error} mm",
+    "outlier": "Outlier",
+    "ok": "ok",
+    "no_check": "no check possible"
+  },
+  "server": {
+    "not_installed": "Potree or PotreeConverter is not installed",
+    "not_prepared": "Point cloud has not been prepared yet",
+    "preparing": "Preparing point cloud",
+    "no_sparse": "No sparse point cloud is available yet",
+    "no_dense": "No dense point cloud is available yet",
+    "unsupported_kind": "Unsupported point cloud kind",
+    "converter_failed": "PotreeConverter failed: {details}"
+  }
+}

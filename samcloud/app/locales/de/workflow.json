@@ -1,0 +1,49 @@
+{
+  "status": {
+    "not_started": "Nicht gestartet",
+    "queued": "In Warteschlange",
+    "running": "Läuft",
+    "completed": "Abgeschlossen",
+    "failed": "Fehlgeschlagen",
+    "skipped": "Übersprungen",
+    "waiting": "Wartet",
+    "ready": "Bereit",
+    "done": "Fertig",
+    "cancelled": "Abgebrochen",
+    "pending": "Ausstehend",
+    "idle": "Bereit",
+    "stale": "Veraltet",
+    "missing": "Fehlt",
+    "ok": "OK",
+    "unknown": "Unbekannt"
+  },
+  "step": {
+    "acquisition": "Bilder erfassen",
+    "alignment": "Kameras ausrichten",
+    "control_points": "Passpunkte hinzufügen",
+    "dense_cloud": "Dichte Punktwolke erstellen",
+    "classification": "Klassifizieren",
+    "refinement": "Verbessern & filtern",
+    "export": "LAS / PLY exportieren",
+    "dxf": "DXF-Export"
+  },
+  "stage": {
+    "prepare_images": "Bilder vorbereiten",
+    "feature_extraction": "Merkmale extrahieren",
+    "matching": "Bilder verknüpfen",
+    "mapping": "Kameras ausrichten",
+    "tiepoint_filtering": "Verknüpfungspunkte filtern",
+    "control_points": "Passpunkte",
+    "undistortion": "Bilder entzerren",
+    "dense_stereo": "Tiefenkarten",
+    "dense_fusion": "Dichte Punktwolke fusionieren",
+    "classification": "SAM-Klassifizierung",
+    "depth_prior": "Tiefenschätzung (Depth Anything V2)",
+    "point_cleaning": "Streupunkte entfernen",
+    "plane_fill": "Flächen auffüllen",
+    "depth_fill": "Auffüllen mit Depth Anything",
+    "surface_fusion": "Oberflächen zusammenführen",
+    "superpoint_vote": "Superpoint-Abstimmung",
+    "geometry_refinement": "Geometrische Verfeinerung"
+  }
+}

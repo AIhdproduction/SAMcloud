@@ -1,14 +1,26 @@
 """Project coordinate and processing settings page."""
 
-from nicegui import ui
+from typing import Any
+
+from nicegui import app, ui
 
 from samcloud.acquisition import (
     CaptureValidationError,
     prepare_project_panorama,
     validate_capture_configuration,
 )
+from samcloud.app.i18n import (
+    DEFAULT_LANGUAGE,
+    SUPPORTED_LANGUAGES,
+    clear_user_language,
+    config_language,
+    current_language,
+    set_language,
+    t,
+    user_language,
+)
 from samcloud.app.layout import render_page
-from samcloud.app.pages.projects import ENGINE_OPTIONS
+from samcloud.app.pages.projects import CAPTURE_TYPE_OPTIONS, CLASS_SET_OPTIONS, ENGINE_OPTIONS, TranslatedOptions
 from samcloud.app.state import state
 from samcloud.core.configuration import load_export_crs_presets
 from samcloud.core.storage import storage_settings
@@ -16,11 +28,28 @@ from samcloud.app.pages.projects import STORAGE_OPTIONS
 from samcloud.core.storage import DEFAULT_STORAGE
 
 
-CONTROL_POINTS_MODE_OPTIONS = {
-    "none": "No control points - continue automatically",
-    "after_alignment": "Use control points after alignment",
-    "automatic": "Automatic (detect targets)",
-}
+CONTROL_POINTS_MODE_OPTIONS = TranslatedOptions({
+    "none": "settings.control_points_mode.none",
+    "after_alignment": "settings.control_points_mode.after_alignment",
+    "automatic": "settings.control_points_mode.automatic",
+})
+CLASSIFICATION_MODE_OPTIONS = TranslatedOptions({
+    "legacy": "settings.classification.mode_legacy",
+    "segearth_ov3": "settings.classification.mode_segearth_ov3",
+})
+TILE_SIZE_OPTIONS = TranslatedOptions({
+    768: "settings.classification.tile_768",
+    1008: "settings.classification.tile_1008",
+    1280: "settings.classification.tile_1280",
+})
+DEPTH_MODEL_OPTIONS = TranslatedOptions({
+    "large": "settings.refinement.depth_large",
+    "small": "settings.refinement.depth_small",
+    "off": "settings.refinement.depth_off",
+})
+
+# Unsaved form values survive the page reload that applies a new UI language.
+DRAFT_STORAGE_KEY = "settings_draft"
 
 
 def _export_crs_options() -> dict[str, str]:
@@ -28,13 +57,87 @@ def _export_crs_options() -> dict[str, str]:
     return {key: str(preset["label"]) for key, preset in load_export_crs_presets().items()}
 
 
+def _snapshot_draft(controls: dict[str, Any]) -> dict[str, Any]:
+    """Return the current (possibly unsaved) value of every registered settings control."""
+    return {key: control.value for key, control in controls.items() if control is not None}
+
+
+def _apply_draft(controls: dict[str, Any], draft: Any, owner: str) -> None:
+    """Put snapshot values back into the freshly rendered controls; unknown keys and invalid values are skipped.
+
+    A draft only applies to the project it was taken from (``owner``).
+    """
+    if not isinstance(draft, dict) or draft.get("project") != owner or not isinstance(draft.get("values"), dict):
+        return
+    for key, value in draft["values"].items():
+        control = controls.get(key)
+        if control is None:
+            continue
+        try:
+            control.value = value
+        except Exception:  # e.g. an option that no longer exists; keep the rendered value
+            continue
+
+
+def _reload_keeping_draft(controls: dict[str, Any], owner: str) -> None:
+    """Store the unsaved form values in the tab storage, then reload the page in the new language."""
+    try:
+        app.storage.tab[DRAFT_STORAGE_KEY] = {"project": owner, "values": _snapshot_draft(controls)}
+    except Exception:  # no client connection or tab storage not ready: reload without a draft
+        pass
+    ui.navigate.reload()
+
+
+def _render_language_card(controls: dict[str, Any], owner: str) -> None:
+    """Language selector: the choice is stored immediately and the page re-renders in the new language."""
+    with ui.card().classes("w-full"):
+        ui.label(t("settings.language.title")).classes("text-lg font-medium")
+
+        def change_language(event: Any) -> None:
+            value = event.value
+            if not value or value == current_language():
+                return
+            try:
+                set_language(value)
+            except (OSError, ValueError) as error:
+                ui.notify(t("settings.language.failed", error=error), type="negative")
+                return
+            _reload_keeping_draft(controls, owner)
+
+        def reset_language() -> None:
+            try:
+                clear_user_language()
+            except OSError as error:
+                ui.notify(t("settings.language.failed", error=error), type="negative")
+                return
+            _reload_keeping_draft(controls, owner)
+
+        ui.select(
+            dict(SUPPORTED_LANGUAGES),
+            label=t("settings.language.label"),
+            value=current_language(),
+            on_change=change_language,
+        ).classes("min-w-[16rem]").mark("settings-language")
+        default_language = config_language() or DEFAULT_LANGUAGE
+        ui.label(
+            t("settings.language.config_default", language=SUPPORTED_LANGUAGES.get(default_language, default_language))
+        ).classes("sam-muted text-sm")
+        ui.label(t("settings.language.hint")).classes("sam-muted text-sm")
+        reset = ui.button(t("settings.language.reset"), on_click=reset_language).props("flat no-caps")
+        reset.mark("settings-language-reset")
+        reset.set_enabled(user_language() is not None)
+
+
 def render() -> None:
     """Render editable coordinate system and workflow settings."""
     def content() -> None:
+        draft_controls: dict[str, Any] = {}
         project_directory = state.active_project_directory
+        draft_owner = str(project_directory)
+        _render_language_card(draft_controls, draft_owner)
         project = state.active_project()
         if project_directory is None or project is None:
-            ui.label("Open a project before editing settings.")
+            ui.label(t("settings.no_project"))
             return
 
         settings = project["settings"]
@@ -70,28 +173,26 @@ def render() -> None:
         georeferencing = acquisition.setdefault("georeferencing", {})
         capture_type = acquisition.get("type", "drone_gps")
         acquisition_locked = bool(acquisition.get("locked", False))
-        capture_label = {
-            "drone_gps": "Drone with GPS / RTK",
-            "camera": "Standard camera without GPS",
-            "panorama_360": "360 degree camera / Insta360",
-        }.get(capture_type, "Unknown")
+        capture_label = (
+            CAPTURE_TYPE_OPTIONS[capture_type] if capture_type in CAPTURE_TYPE_OPTIONS else t("common.unknown")
+        )
         control_points_mode = project.get("workflow", {}).get(
             "control_points_mode",
             "after_alignment" if workflow.get("control_points_enabled", False) else "none",
         )
 
         with ui.card().classes("w-full"):
-            ui.label("Capture sources").classes("text-lg font-medium")
-            ui.label(f"Capture type: {capture_label}")
+            ui.label(t("settings.capture.title")).classes("text-lg font-medium")
+            ui.label(t("settings.capture.type", type=capture_label))
             if acquisition_locked:
-                ui.label("Capture settings are locked because processing has started.").classes("text-sm")
+                ui.label(t("settings.capture.locked")).classes("text-sm")
             if capture_type in {"drone_gps", "camera"}:
                 image_directory = ui.input(
-                    "Image directory", value=sources.get("image_directory", "")
+                    t("settings.capture.image_directory"), value=sources.get("image_directory", "")
                 ).classes("w-full")
                 image_directory.set_enabled(not acquisition_locked)
                 rtk_enabled = ui.switch(
-                    "Images use RTK GPS", value=bool(georeferencing.get("rtk_enabled", False))
+                    t("settings.capture.rtk"), value=bool(georeferencing.get("rtk_enabled", False))
                 )
                 rtk_enabled.set_visibility(capture_type == "drone_gps")
                 rtk_enabled.set_enabled(not acquisition_locked)
@@ -100,14 +201,14 @@ def render() -> None:
                 frame_interval_seconds = None
             else:
                 panorama_video_path = ui.input(
-                    "360 degree MP4 video", value=sources.get("panorama_video_path", "")
+                    t("settings.capture.panorama_video"), value=sources.get("panorama_video_path", "")
                 ).classes("w-full")
                 panorama_image_directory = ui.input(
-                    "360 degree JPG panorama directory",
+                    t("settings.capture.panorama_directory"),
                     value=sources.get("panorama_image_directory", ""),
                 ).classes("w-full")
                 frame_interval_seconds = ui.number(
-                    "Video frame interval in seconds",
+                    t("settings.capture.frame_interval"),
                     value=panorama.get("frame_interval_seconds", 1.0),
                     min=0.1,
                     step=0.1,
@@ -117,55 +218,55 @@ def render() -> None:
                 image_directory = None
                 rtk_enabled = None
         with ui.card().classes("w-full"):
-            ui.label("Coordinate systems").classes("text-lg font-medium")
-            input_crs = ui.input("Image/GNSS CRS", value=coordinates["input_crs"])
-            working_crs = ui.input("Working CRS", value=coordinates["working_crs"])
+            ui.label(t("settings.coordinates.title")).classes("text-lg font-medium")
+            input_crs = ui.input(t("settings.coordinates.input"), value=coordinates["input_crs"])
+            working_crs = ui.input(t("settings.coordinates.working"), value=coordinates["working_crs"])
             export_crs_options = _export_crs_options()
             export_crs_value = str(coordinates.get("export_crs", "EPSG:2056")).upper()
             if export_crs_value not in export_crs_options:
                 export_crs_value = "EPSG:2056"
             export_crs = ui.select(
                 export_crs_options,
-                label="Export CRS",
+                label=t("settings.coordinates.export"),
                 value=export_crs_value,
             )
-            ui.label("Choose the output coordinate system configured in config/export_crs.yml.").classes("text-sm")
+            ui.label(t("settings.coordinates.hint")).classes("text-sm")
         with ui.card().classes("w-full"):
-            ui.label("Processing settings").classes("text-lg font-medium")
-            use_gpu = ui.switch("Use GPU", value=workflow["use_gpu"])
+            ui.label(t("settings.processing.title")).classes("text-lg font-medium")
+            use_gpu = ui.switch(t("settings.processing.use_gpu"), value=workflow["use_gpu"])
             control_points = ui.select(
-                CONTROL_POINTS_MODE_OPTIONS,
-                label="Ground control points",
+                dict(CONTROL_POINTS_MODE_OPTIONS),
+                label=t("settings.processing.control_points"),
                 value=control_points_mode,
             )
             control_points.set_enabled(not acquisition_locked)
         with ui.card().classes("w-full"):
-            ui.label("Speicher").classes("text-lg font-medium")
+            ui.label(t("settings.storage.title")).classes("text-lg font-medium")
             storage_switches = {
                 key: ui.switch(label, value=bool(storage.get(key, DEFAULT_STORAGE.get(key, True))))
                 for key, label in STORAGE_OPTIONS.items()
             }
         with ui.card().classes("w-full"):
-            ui.label("Classification").classes("text-lg font-medium")
-            ui.label("These values apply to the next classification run.").classes("text-sm")
+            ui.label(t("settings.classification.title")).classes("text-lg font-medium")
+            ui.label(t("settings.classification.hint")).classes("text-sm")
             class_set = ui.select(
-                {"outdoor": "Outdoor", "indoor": "Indoor"},
+                dict(CLASS_SET_OPTIONS),
                 value=classification["class_set"],
-                label="Semantic class set",
+                label=t("settings.classification.class_set"),
             )
             min_votes = ui.number(
-                "Minimum agreeing images per point",
+                t("settings.classification.min_votes"),
                 value=int(classification["min_votes"]),
                 min=1,
                 max=20,
                 step=1,
             )
             engine = ui.select(
-                ENGINE_OPTIONS,
+                dict(ENGINE_OPTIONS),
                 value=classification["engine"] if classification["engine"] in {"sam3", "flurseg"} else "sam3",
-                label="Klassifizierungsmodell (Aussenbereich)",
+                label=t("settings.classification.engine"),
             ).classes("w-full")
-            engine_hint = ui.label("Innenbereich wird immer mit SAM3 klassifiziert.").classes("text-sm")
+            engine_hint = ui.label(t("settings.classification.engine_hint")).classes("text-sm")
 
             def update_engine_visibility() -> None:
                 outdoor = class_set.value == "outdoor"
@@ -175,15 +276,12 @@ def render() -> None:
             class_set.on_value_change(lambda _event: update_engine_visibility())
             update_engine_visibility()
             classification_mode = ui.select(
-                {
-                    "legacy": "Legacy (instance masks, majority vote)",
-                    "segearth_ov3": "SegEarth-OV3 (head fusion, presence gate, weighted voting)",
-                },
+                dict(CLASSIFICATION_MODE_OPTIONS),
                 value=classification["mode"],
-                label="Classification mode",
+                label=t("settings.classification.mode"),
             )
             background_threshold = ui.number(
-                "SegEarth-OV3 background threshold",
+                t("settings.classification.background_threshold"),
                 value=float(classification["background_threshold"]),
                 min=0.0,
                 max=1.0,
@@ -191,16 +289,12 @@ def render() -> None:
                 format="%.2f",
             )
             tile_size = ui.select(
-                {
-                    768: "768 px - faster, lower detail",
-                    1008: "1008 px - balanced",
-                    1280: "1280 px - higher detail, more GPU memory",
-                },
+                dict(TILE_SIZE_OPTIONS),
                 value=int(classification["tile_size"]),
-                label="SAM3 tile size",
+                label=t("settings.classification.tile_size"),
             )
             tile_min_overlap = ui.number(
-                "Tile overlap",
+                t("settings.classification.tile_overlap"),
                 value=float(classification["tile_min_overlap"]),
                 min=0.0,
                 max=0.8,
@@ -208,31 +302,60 @@ def render() -> None:
                 format="%.2f",
             )
             geometry_refinement = ui.switch(
-                "Geometric refinement (height & flatness check)",
+                t("settings.classification.geometry_refinement"),
                 value=bool(classification["geometry_refinement"]),
             )
-            ui.label("Improve & filter (step 6)").classes("text-lg font-medium q-mt-md")
-            ui.label(
-                "Indoor only: Depth-Anything-V2 predicts depth where COLMAP finds no texture (white walls) "
-                "and helps to remove floating points and to fill floors, ceilings and walls."
-            ).classes("text-sm")
+            ui.label(t("settings.refinement.title")).classes("text-lg font-medium q-mt-md")
+            ui.label(t("settings.refinement.hint")).classes("text-sm")
             depth_model = ui.select(
-                {
-                    "large": "Depth-Anything-V2 Large (best, CC-BY-NC-4.0 weights)",
-                    "small": "Depth-Anything-V2 Small (faster, Apache-2.0 weights)",
-                    "off": "Off",
-                },
-                label="Depth model",
+                dict(DEPTH_MODEL_OPTIONS),
+                label=t("settings.refinement.depth_model"),
                 value=str(refinement.get("depth_model", "large")),
             ).classes("w-full")
             depth_fill = ui.switch(
-                "Lücken mit Depth-Anything füllen (nur wo es mit den COLMAP-Tiefenkarten übereinstimmt)",
+                t("settings.refinement.depth_fill"),
                 value=bool(refinement.get("depth_fill", True)),
             )
             surface_fusion = ui.switch(
-                "Oberflächen zusammenführen: alle Tiefenkarten zu einer Punktlage (Wand, Decke, Boden je eine Ebene)",
+                t("settings.refinement.surface_fusion"),
                 value=bool(refinement.get("surface_fusion", True)),
             )
+
+        draft_controls.update({
+            "image_directory": image_directory,
+            "rtk_enabled": rtk_enabled,
+            "panorama_video_path": panorama_video_path,
+            "panorama_image_directory": panorama_image_directory,
+            "frame_interval_seconds": frame_interval_seconds,
+            "input_crs": input_crs,
+            "working_crs": working_crs,
+            "export_crs": export_crs,
+            "use_gpu": use_gpu,
+            "control_points": control_points,
+            "class_set": class_set,
+            "min_votes": min_votes,
+            "engine": engine,
+            "classification_mode": classification_mode,
+            "background_threshold": background_threshold,
+            "tile_size": tile_size,
+            "tile_min_overlap": tile_min_overlap,
+            "geometry_refinement": geometry_refinement,
+            "depth_model": depth_model,
+            "depth_fill": depth_fill,
+            "surface_fusion": surface_fusion,
+            **{f"storage.{key}": control for key, control in storage_switches.items()},
+        })  # None entries (controls of the other capture type) are skipped by snapshot and restore
+
+        async def restore_draft() -> None:
+            """Re-apply unsaved values kept across a language reload (tab storage needs a connected client)."""
+            try:
+                await ui.context.client.connected(timeout=10)
+                draft = app.storage.tab.pop(DRAFT_STORAGE_KEY, None)
+            except Exception:  # no connection or tab storage unavailable: keep the saved values
+                return
+            _apply_draft(draft_controls, draft, draft_owner)
+
+        ui.timer(0, restore_draft, once=True)
 
         def save_settings() -> None:
             try:
@@ -263,33 +386,33 @@ def render() -> None:
                 classification["mode"] = classification_mode.value
                 classification["engine"] = engine.value if class_set.value == "outdoor" else "sam3"
                 if classification["engine"] not in {"sam3", "flurseg"}:
-                    raise ValueError("Select a supported classification model")
+                    raise ValueError(t("settings.errors.unsupported_engine"))
                 classification["background_threshold"] = float(background_threshold.value or 0)
                 classification["tile_size"] = int(tile_size.value or 0)
                 classification["tile_min_overlap"] = float(tile_min_overlap.value or 0)
                 classification["geometry_refinement"] = bool(geometry_refinement.value)
                 if depth_model.value not in {"large", "small", "off"}:
-                    raise ValueError("Select a supported depth model")
+                    raise ValueError(t("settings.errors.unsupported_depth_model"))
                 refinement["depth_model"] = depth_model.value
                 refinement["depth_fill"] = bool(depth_fill.value)
                 refinement["surface_fusion"] = bool(surface_fusion.value)
                 storage.update({key: bool(control.value) for key, control in storage_switches.items()})
                 if classification["min_votes"] < 1:
-                    raise ValueError("Minimum agreeing images must be at least 1")
+                    raise ValueError(t("settings.errors.min_votes"))
                 if classification["mode"] not in {"legacy", "segearth_ov3"}:
-                    raise ValueError("Select a supported classification mode")
+                    raise ValueError(t("settings.errors.unsupported_mode"))
                 if not 0.0 <= classification["background_threshold"] <= 1.0:
-                    raise ValueError("Background threshold must be between 0.00 and 1.00")
+                    raise ValueError(t("settings.errors.background_threshold"))
                 if classification["tile_size"] not in {768, 1008, 1280}:
-                    raise ValueError("Select a supported SAM3 tile size")
+                    raise ValueError(t("settings.errors.tile_size"))
                 if not 0.0 <= classification["tile_min_overlap"] <= 0.8:
-                    raise ValueError("Tile overlap must be between 0.00 and 0.80")
+                    raise ValueError(t("settings.errors.tile_overlap"))
                 state.projects.save(project_directory, project)
-                ui.notify("Project settings saved")
+                ui.notify(t("settings.saved"))
             except (CaptureValidationError, ValueError) as error:
                 ui.notify(str(error), type="negative")
 
-        ui.button("Save settings", on_click=save_settings)
+        ui.button(t("settings.save"), on_click=save_settings)
 
         if capture_type == "panorama_360" and not acquisition_locked:
             def prepare_inputs() -> None:
@@ -305,14 +428,15 @@ def render() -> None:
                     )
                     prepared = prepare_project_panorama(project_directory, project)
                     state.projects.save(project_directory, project)
-                    ui.notify(
-                        f"Prepared {prepared.panorama_count} panoramas and "
-                        f"{prepared.cubemap_image_count} virtual camera images"
-                    )
+                    ui.notify(t(
+                        "settings.panorama.prepared",
+                        panoramas=prepared.panorama_count,
+                        images=prepared.cubemap_image_count,
+                    ))
                     ui.navigate.to("/")
                 except (CaptureValidationError, ValueError) as error:
                     ui.notify(str(error), type="negative")
 
-            ui.button("Prepare 360 degree inputs", on_click=prepare_inputs).props("outline")
+            ui.button(t("settings.panorama.prepare"), on_click=prepare_inputs).props("outline")
 
-    render_page("Settings", content, current_path="/settings")
+    render_page(t("nav.settings"), content, current_path="/settings")

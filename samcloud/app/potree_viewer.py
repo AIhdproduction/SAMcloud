@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import html
 import json
 
 from nicegui import ui
+
+from samcloud.app.i18n import current_language, t, translate_or
 
 _LIB = "/assets-static/potree"
 
@@ -84,7 +87,7 @@ def render_potree_viewer(
             show_classes=config["show_classes"],
             show_markers=config["show_markers"],
             show_cameras=config["show_cameras"],
-            markers_label="AprilTags" if kind == "dense" else "Passpunkte",
+            markers_label="AprilTags" if kind == "dense" else t("nav.control_points"),
         ),
         sanitize=False,
     ).classes("w-full")
@@ -103,6 +106,11 @@ def _viewer_config(
     fine_term_names_de: list[str] | None = None,
 ) -> dict:
     """Build the browser configuration for one Potree cloud."""
+    language = current_language()
+    labels = class_labels or []
+    names_de = class_names_de or []
+    terms_de = fine_term_names_de or []
+    instance_names = instance_labels_de or {}
     return {
         "element_id": f"sam-potree-{kind}",
         "kind": kind,
@@ -114,6 +122,10 @@ def _viewer_config(
         "class_names_de": class_names_de or [],
         "instance_labels_de": instance_labels_de or {},
         "fine_term_names_de": fine_term_names_de or [],
+        "language": language,
+        "class_display_labels": [_class_display_label(label) for label in labels],
+        "class_display_names": _class_display_names(labels, names_de, language),
+        "fine_term_display_names": _fine_term_display_names(terms_de, instance_names, language),
         "enable_point_info": kind == "dense",
         "marker_endpoint": marker_endpoint,
         "camera_endpoint": camera_endpoint,
@@ -123,35 +135,138 @@ def _viewer_config(
     }
 
 
+def _split_class_label(label: str) -> tuple[str, str]:
+    """Split an optional "<LAS code>: " prefix from a class label (e.g. "2: Ground" -> ("2: ", "Ground"))."""
+    prefix, separator, name = label.partition(": ")
+    if separator and prefix.strip().isdigit():
+        return prefix + separator, name
+    return "", label
+
+
+def _class_display_name(name: str) -> str:
+    """Translated display name of one class; unknown names are shown unchanged."""
+    text = str(name)
+    translated = translate_or(f"classes.{text}", "")
+    if not translated:
+        translated = translate_or(f"classes.{text.strip().lower()}", "")
+    return translated or text
+
+
+def _class_display_label(label: str) -> str:
+    """Display label for the class legend; keeps the LAS code prefix and translates the class name."""
+    prefix, name = _split_class_label(str(label))
+    return prefix + _class_display_name(name)
+
+
+def _class_display_names(labels: list[str], names_de: list[str], language: str) -> list[str]:
+    """Class names for the point info card in the UI language (German keeps the configured German names)."""
+    names: list[str] = []
+    for index in range(max(len(labels), len(names_de))):
+        label_name = _split_class_label(str(labels[index]))[1] if index < len(labels) else ""
+        german = str(names_de[index]) if index < len(names_de) and names_de[index] else ""
+        if language == "de":
+            names.append(german or (_class_display_name(label_name) if label_name else ""))
+        else:
+            names.append(_class_display_name(label_name) if label_name else german)
+    return names
+
+
+def _fine_term_display_names(names_de: list[str], instance_labels_de: dict[str, str], language: str) -> list[str]:
+    """Fine-term names for the point info card; non-German UIs map the German names back to the English terms."""
+    if language == "de":
+        return [str(name) for name in names_de]
+    english_by_german: dict[str, str] = {}
+    for english, german in instance_labels_de.items():
+        english_by_german.setdefault(str(german), str(english))
+    return [english_by_german.get(str(name), str(name)) if name else "" for name in names_de]
+
+
+# Status/error texts returned by samcloud.viewer through the API. They stay English on the wire (the
+# scripts compare against them); the viewers translate them only for display.
+_SERVER_MESSAGE_KEYS = {
+    "Potree or PotreeConverter is not installed": "viewer.server.not_installed",
+    "Point cloud has not been prepared yet": "viewer.server.not_prepared",
+    "Preparing point cloud": "viewer.server.preparing",
+    "No sparse point cloud is available yet": "viewer.server.no_sparse",
+    "No dense point cloud is available yet": "viewer.server.no_dense",
+    "Unsupported point cloud kind": "viewer.server.unsupported_kind",
+}
+_SERVER_MESSAGE_PREFIX_KEYS = {
+    "PotreeConverter failed: ": "viewer.server.converter_failed",
+}
+
+
+def server_message_strings() -> dict[str, dict[str, str]]:
+    """Display texts of known server messages: exact raw text, and raw prefixes whose rest fills {details}."""
+    return {
+        "server_messages": {raw: t(key) for raw, key in _SERVER_MESSAGE_KEYS.items()},
+        "server_prefixes": {raw: t(key) for raw, key in _SERVER_MESSAGE_PREFIX_KEYS.items()},
+    }
+
+
+def _viewer_strings() -> dict[str, object]:
+    """Translated texts used by the viewer script (placeholders are filled in the browser)."""
+    return {
+        **server_message_strings(),
+        "class_fallback": t("viewer.classes.fallback"),
+        "class_other": t("viewer.classes.other"),
+        "unavailable": t("viewer.status.unavailable"),
+        "prepare_failed": t("viewer.status.prepare_failed"),
+        "preparing_elapsed": t("viewer.status.preparing_elapsed"),
+        "ready_count": t("viewer.status.ready_count"),
+        "ready": t("viewer.status.ready"),
+        "retry": t("common.retry"),
+        "points": t("common.points"),
+        "number_locale": t("viewer.number_locale"),
+        "marker_open_review": t("viewer.markers.open_review"),
+        "camera_fallback_title": t("viewer.camera.fallback_title"),
+        "camera_details": t("viewer.camera.details"),
+        "camera_photo_alt": t("viewer.camera.photo_alt"),
+        "camera_photo_open": t("viewer.camera.photo_open"),
+        "camera_show_photo": t("viewer.camera.show_photo"),
+        "tag_size": t("viewer.tag.size"),
+        "tag_seen_in": t("viewer.tag.seen_in"),
+        "tag_error": t("viewer.tag.error"),
+        "tag_outlier": t("viewer.tag.outlier"),
+        "tag_ok": t("viewer.tag.ok"),
+        "tag_no_check": t("viewer.tag.no_check"),
+    }
+
+
 def _html(
     element_id: str,
     *,
     show_classes: bool = True,
     show_markers: bool = False,
     show_cameras: bool = False,
-    markers_label: str = "Passpunkte",
+    markers_label: str | None = None,
 ) -> str:
+    def esc(value: str) -> str:
+        return html.escape(value, quote=True)
+
+    if markers_label is None:
+        markers_label = t("nav.control_points")
     markers_btn = (
-        f'    <button data-action="markers" class="is-selected">{markers_label}</button>\n'
+        f'    <button data-action="markers" class="is-selected">{esc(markers_label)}</button>\n'
         if show_markers
         else ""
     )
     classes_btns = (
         '    <button data-action="rgb" class="is-selected">RGB</button>\n'
-        '    <button data-action="classification">Klassen</button>\n'
-        '    <button data-action="classes">Klassen ein/aus</button>\n'
+        f'    <button data-action="classification">{esc(t("viewer.toolbar.classification"))}</button>\n'
+        f'    <button data-action="classes">{esc(t("viewer.toolbar.class_toggle"))}</button>\n'
         if show_classes
         else ""
     )
     cameras_btns = (
-        '    <button data-action="cameras" class="is-selected">Kamerapositionen</button>\n'
-        '    <button data-action="camera-colour">Reprojektionsfehler</button>\n'
-        '    <button data-action="camera-sphere-texture" style="display:none">Panorama auf Kugel</button>\n'
+        f'    <button data-action="cameras" class="is-selected">{esc(t("viewer.toolbar.cameras"))}</button>\n'
+        f'    <button data-action="camera-colour">{esc(t("viewer.toolbar.camera_colour"))}</button>\n'
+        f'    <button data-action="camera-sphere-texture" style="display:none">{esc(t("viewer.toolbar.camera_sphere_texture"))}</button>\n'
         if show_cameras
         else ""
     )
     camera_sliders = (
-        '    <label>Kameragrösse <input data-action="camera-size" type="range" min="0.25" max="0.75" step="0.25" value="0.5"></label>\n'
+        f'    <label>{esc(t("viewer.toolbar.camera_size"))} <input data-action="camera-size" type="range" min="0.25" max="0.75" step="0.25" value="0.5"></label>\n'
         if show_cameras
         else ""
     )
@@ -159,19 +274,19 @@ def _html(
 <div id="{element_id}" class="sam-potree">
   <div class="sam-potree-area"></div>
   <div class="sam-potree-toolbar">
-    <button data-action="fit">Alles zeigen</button>
-{markers_btn}{cameras_btns}{classes_btns}    <button data-action="earth" class="is-selected">Terrain</button>
-    <button data-action="orbit">Orbit</button>
-    <button data-action="edl" class="is-selected">Schattierung</button>
-    <button data-action="fullscreen">Vollbild</button>
-    <label>Punktgrösse <input data-action="size" type="range" min="0.5" max="6" step="0.25" value="1.5"></label>
-    <div class="sam-potree-height" title="Höhenfilter: linker Knopf blendet Punkte unten aus, rechter Knopf oben">Höhe <span class="sam-potree-clip-value" data-clip-label="min">–</span><span class="sam-potree-range"><span class="sam-potree-range-fill"></span><input data-action="clip-min" type="range" min="0" max="1000" step="1" value="0" aria-label="Höhe unten"><input data-action="clip-max" type="range" min="0" max="1000" step="1" value="1000" aria-label="Höhe oben"></span><span class="sam-potree-clip-value" data-clip-label="max">–</span></div>
+    <button data-action="fit">{esc(t("viewer.toolbar.fit"))}</button>
+{markers_btn}{cameras_btns}{classes_btns}    <button data-action="earth" class="is-selected">{esc(t("viewer.toolbar.terrain"))}</button>
+    <button data-action="orbit">{esc(t("viewer.toolbar.orbit"))}</button>
+    <button data-action="edl" class="is-selected">{esc(t("viewer.toolbar.shading"))}</button>
+    <button data-action="fullscreen">{esc(t("viewer.toolbar.fullscreen"))}</button>
+    <label>{esc(t("viewer.toolbar.point_size"))} <input data-action="size" type="range" min="0.5" max="6" step="0.25" value="1.5"></label>
+    <div class="sam-potree-height" title="{esc(t("viewer.toolbar.height_tooltip"))}">{esc(t("viewer.toolbar.height"))} <span class="sam-potree-clip-value" data-clip-label="min">–</span><span class="sam-potree-range"><span class="sam-potree-range-fill"></span><input data-action="clip-min" type="range" min="0" max="1000" step="1" value="0" aria-label="{esc(t("viewer.toolbar.height_lower"))}"><input data-action="clip-max" type="range" min="0" max="1000" step="1" value="1000" aria-label="{esc(t("viewer.toolbar.height_upper"))}"></span><span class="sam-potree-clip-value" data-clip-label="max">–</span></div>
 {camera_sliders}
   </div>
   <div class="sam-potree-classes"></div>
   <aside class="sam-potree-camera-card"></aside>
   <aside class="sam-potree-point-card"></aside>
-  <div class="sam-potree-status">Punktwolke wird vorbereitet …</div>
+  <div class="sam-potree-status">{esc(t("viewer.status.preparing"))}</div>
 </div>
 """
 
@@ -181,6 +296,18 @@ def _script(config: dict) -> str:
 <script type="module">
 import * as THREE from "/assets-static/potree/libs/three.js/build/three.module.js";
 const config = __CONFIG__;
+const viewerText = __STRINGS__;
+const tr = (key, params) => String(viewerText[key] ?? key).replace(/\\{(\\w+)\\}/g, (match, name) => (params && params[name] !== undefined && params[name] !== null ? String(params[name]) : match));
+const numberLocale = viewerText.number_locale || "en-US";
+const serverText = message => {
+  const raw = String(message ?? "");
+  const exact = (viewerText.server_messages || {})[raw];
+  if (exact) return exact;
+  for (const [prefix, template] of Object.entries(viewerText.server_prefixes || {})) {
+    if (raw.startsWith(prefix)) return String(template).split("{details}").join(raw.slice(prefix.length));
+  }
+  return raw;
+};
 const start = () => {
   const root = document.getElementById(config.element_id);
   if (!root || root.dataset.ready === "1" || typeof Potree === "undefined") { setTimeout(start, 200); return; }
@@ -207,9 +334,9 @@ const start = () => {
   viewer.setControls(earth);
   const scheme = {};
   config.class_colors.forEach((colour, index) => {
-    scheme[index] = { visible: true, name: config.class_labels[index] || `Klasse ${index}`, color: [colour[0] / 255, colour[1] / 255, colour[2] / 255, 1.0] };
+    scheme[index] = { visible: true, name: (config.class_display_labels || [])[index] || config.class_labels[index] || tr("class_fallback", { index }), color: [colour[0] / 255, colour[1] / 255, colour[2] / 255, 1.0] };
   });
-  scheme.DEFAULT = { visible: true, name: "Andere", color: [0.7, 0.7, 0.7, 1.0] };
+  scheme.DEFAULT = { visible: true, name: tr("class_other"), color: [0.7, 0.7, 0.7, 1.0] };
   viewer.setClassifications(scheme);
   const panel = root.querySelector(".sam-potree-classes");
   panel.innerHTML = Object.keys(scheme).filter(key => key !== "DEFAULT").map(key => {
@@ -336,10 +463,10 @@ const start = () => {
   };
   const showError = message => {
     status.innerHTML = "";
-    status.append(`Punktwolke nicht verfügbar: ${message} `);
+    status.append(`${tr("unavailable", { message })} `);
     const retry = document.createElement("button");
     retry.type = "button";
-    retry.textContent = "Erneut versuchen";
+    retry.textContent = tr("retry");
     retry.className = "sam-potree-retry";
     retry.style.cssText = "margin-left:8px;padding:2px 8px;border-radius:4px;border:1px solid #3a5a74;background:#16324a;color:#e6f1f8;cursor:pointer;";
     retry.addEventListener("click", () => { loadAttempts = 0; pollStatus(); });
@@ -357,9 +484,9 @@ const start = () => {
       setTimeout(() => viewer.fitToScreen(0.55), 1500);
       fetch(config.metadata_url, { cache: "no-store" }).then(response => response.json()).then(metadata => {
         initHeightClip(metadata);
-        const count = Number(metadata.points || 0).toLocaleString("de-CH");
-        status.textContent = `${config.title}: ${count} Punkte. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`;
-      }).catch(() => { status.textContent = `${config.title}. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.`; });
+        const count = Number(metadata.points || 0).toLocaleString(numberLocale);
+        status.textContent = tr("ready_count", { title: config.title, count });
+      }).catch(() => { status.textContent = tr("ready", { title: config.title }); });
       loadMarkers();
       loadCameras();
     }).catch(error => {
@@ -378,13 +505,13 @@ const start = () => {
       return;
     }
     if (state.state === "ready") { loadCloud(); return; }
-    if (state.state === "error") { showError(state.message || "Fehler beim Vorbereiten"); return; }
+    if (state.state === "error") { showError(serverText(state.message) || tr("prepare_failed")); return; }
     if (state.state === "missing" && state.message && !String(state.message).includes("not been prepared")) {
-      status.textContent = `Punktwolke nicht verfügbar: ${state.message}`;
+      status.textContent = tr("unavailable", { message: serverText(state.message) });
       return;
     }
     const startedMs = state.started_at ? state.started_at * 1000 : pageStarted;
-    status.textContent = `Punktwolke wird vorbereitet … ${formatElapsed((Date.now() - startedMs) / 1000)}`;
+    status.textContent = tr("preparing_elapsed", { elapsed: formatElapsed((Date.now() - startedMs) / 1000) });
     setTimeout(pollStatus, 2000);
   };
   pollStatus();
@@ -511,7 +638,7 @@ const start = () => {
         const element = annotation.domElement && annotation.domElement[0];
         if (element) {
           element.style.setProperty("--sam-marker", colour);
-          element.title = "Doppelklick: in der Passpunkt-Prüfung öffnen";
+          element.title = tr("marker_open_review");
           const titlebar = element.querySelector(".annotation-titlebar");
           if (titlebar) { titlebar.style.background = colour; }
           element.addEventListener("click", () => window.dispatchEvent(new CustomEvent("samcloud-marker-selected", { detail: { name: marker.name } })));
@@ -568,25 +695,25 @@ const start = () => {
      if (includeImage) cameraCardPinned = true;
     cameraCard.innerHTML = "";
     const title = document.createElement("strong");
-    title.textContent = camera.source_name || camera.image_name || "Kamera";
+    title.textContent = camera.source_name || camera.image_name || tr("camera_fallback_title");
     cameraCard.append(title);
     const details = document.createElement("div");
     const error = Number.isFinite(camera.mean_reprojection_error) ? `${Number(camera.mean_reprojection_error).toFixed(2)} px` : "–";
-    details.textContent = `Aufnahme ${Number(camera.index) + 1} · ${camera.points3d || 0} 3D-Punkte · Reprojektionsfehler ${error}`;
+    details.textContent = tr("camera_details", { index: Number(camera.index) + 1, points: camera.points3d || 0, error });
     cameraCard.append(details);
     if (includeImage && camera.id) {
       const imageUrl = `/api/camera-thumbnail/${encodeURIComponent(camera.id)}?size=320`;
       const image = document.createElement("img");
-      image.alt = camera.source_name || camera.image_name || "Kamerafoto";
+      image.alt = camera.source_name || camera.image_name || tr("camera_photo_alt");
       image.src = imageUrl;
-      image.title = "Klicken: Foto gross öffnen";
+      image.title = tr("camera_photo_open");
       image.addEventListener("click", () => window.open(imageUrl.replace("size=320", "size=1024"), "_blank", "noopener"));
       cameraCard.append(image);
       const link = document.createElement("a");
       link.href = imageUrl;
       link.target = "_blank";
       link.rel = "noopener";
-      link.textContent = "Foto anzeigen";
+      link.textContent = tr("camera_show_photo");
       cameraCard.append(link);
     }
     cameraCard.classList.add("is-open");
@@ -726,14 +853,15 @@ const start = () => {
     const lines = [];
     if (Number.isFinite(Number(marker.tag_size_mm))) {
       const deviation = Number(marker.tag_deviation_pct);
-      lines.push(`Größe ${Number(marker.tag_size_mm).toFixed(1)} mm` + (Number.isFinite(deviation) ? ` (${deviation >= 0 ? "+" : ""}${deviation.toFixed(1)} %)` : ""));
+      lines.push(tr("tag_size", { size: Number(marker.tag_size_mm).toFixed(1) }) + (Number.isFinite(deviation) ? ` (${deviation >= 0 ? "+" : ""}${deviation.toFixed(1)} %)` : ""));
     }
     const imageCount = Array.isArray(marker.images) ? marker.images.length : Number(marker.images);
-    if (Number.isFinite(imageCount)) lines.push(`Gesehen in ${imageCount} Bildern`);
+    if (Number.isFinite(imageCount)) lines.push(tr("tag_seen_in", { count: imageCount }));
     const totalError = marker.errors ? marker.errors.total_m : null;
-    if (totalError !== null && totalError !== undefined && Number.isFinite(Number(totalError))) lines.push(`Fehler ${(Number(totalError) * 1000).toFixed(0)} mm`);
-    let statusText = marker.status === "outlier" ? "Ausreißer" : "ok";
-    if (markerWarnings.some(text => String(text).includes("keine Kontrolle möglich"))) statusText += ", keine Kontrolle möglich";
+    if (totalError !== null && totalError !== undefined && Number.isFinite(Number(totalError))) lines.push(tr("tag_error", { error: (Number(totalError) * 1000).toFixed(0) }));
+    let statusText = marker.status === "outlier" ? tr("tag_outlier") : tr("tag_ok");
+    /* The server warning text is matched literally (data, not UI text); only the displayed suffix is translated. */
+    if (markerWarnings.some(text => String(text).includes("keine Kontrolle möglich"))) statusText += `, ${tr("tag_no_check")}`;
     lines.push(statusText);
     if (item.square) { item.square.material.color.set(0xffffff); highlightedTag = item; }
     if (Array.isArray(marker.corners) && marker.corners.length === 4) {
@@ -753,9 +881,9 @@ const start = () => {
     if (!point) { clearPointInfo(); return; }
     const classId = readPickedValue(point, ["classification", "class", "scalar_class"]);
     const instanceId = readPickedValue(point, ["pointSourceID", "pointSourceId", "point_source_id", "source id", "point source id"]);
-    const className = config.class_names_de[classId] || config.class_labels[classId] || `Klasse ${classId}`;
+    const className = (config.class_display_names || [])[classId] || config.class_names_de[classId] || config.class_labels[classId] || tr("class_fallback", { index: classId });
     const fineTerm = readPickedValue(point, ["user data", "userData", "user_data", "userdata", "user_data_8"]);
-    const fineName = fineTerm > 0 ? ((config.fine_term_names_de || [])[fineTerm] || "") : "";
+    const fineName = fineTerm > 0 ? ((config.fine_term_display_names || config.fine_term_names_de || [])[fineTerm] || "") : "";
     const showFallback = () => {
       if (fineName) showPointCard(event, fineName, [className]); else showPointCard(event, className, []);
     };
@@ -765,12 +893,17 @@ const start = () => {
       const payload = response.ok ? await response.json() : { instances: [] };
       const instance = (payload.instances || []).find(item => Number(item.id) === instanceId);
       if (!instance) { clearPointInfo(); showFallback(); return; }
-      const label = config.instance_labels_de[instance.label] || instance.label_de || instance.label || className;
-      const sameLabel = (payload.instances || []).filter(item => (config.instance_labels_de[item.label] || item.label_de || item.label || className) === label).length;
+      /* German UI: configured German object names; other languages: the detector's (English) object label. */
+      const instanceLabel = item => (config.language === "de" || !item.label
+        ? config.instance_labels_de[item.label] || item.label_de || item.label
+        : item.label) || className;
+      const label = instanceLabel(instance);
+      const sameLabel = (payload.instances || []).filter(item => instanceLabel(item) === label).length;
       const title = sameLabel > 1 && Number(instance.label_index) > 0 ? `${label} ${instance.label_index}` : label;
-      showPointCard(event, title, [className, `${Number(instance.point_count || 0).toLocaleString("de-CH")} Punkte`]);
+      const pointCount = tr("points", { count: Number(instance.point_count || 0).toLocaleString(numberLocale) });
+      showPointCard(event, title, [className, pointCount]);
       await showInstanceOverlay(instance);
-      showPointCard(event, title, [className, `${Number(instance.point_count || 0).toLocaleString("de-CH")} Punkte`]);
+      showPointCard(event, title, [className, pointCount]);
     } catch (_error) { clearPointInfo(); showFallback(); }
   };
   area.addEventListener("pointerdown", event => { pointerDown = { x: event.clientX, y: event.clientY }; });
@@ -817,4 +950,4 @@ const start = () => {
 };
 start();
 </script>
-""".replace("__CONFIG__", json.dumps(config))
+""".replace("__STRINGS__", json.dumps(_viewer_strings()).replace("</", "<\\/")).replace("__CONFIG__", json.dumps(config))

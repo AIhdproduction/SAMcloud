@@ -1,0 +1,42 @@
+{
+  "toolbar": {
+    "reset_view": "Reset view",
+    "fit_all": "Fit all",
+    "fullscreen": "Fullscreen",
+    "terrain_view": "Terrain view",
+    "orbit_view": "Orbit view",
+    "classification": "Classification",
+    "point_size": "Point size",
+    "zoom_in": "Zoom in",
+    "zoom_out": "Zoom out"
+  },
+  "camera": {
+    "positions": "Camera positions",
+    "path": "Camera path",
+    "photos": "Photo views",
+    "reprojection_colours": "Reprojection error",
+    "size": "Camera size",
+    "path_width": "Path line width",
+    "photo_size": "Photo size",
+    "fallback_title": "Camera",
+    "photo_alt": "Camera photo",
+    "show_photo": "Show photo",
+    "details": "Shot {index} · {points} 3D points · reprojection error {error}"
+  },
+  "classes": {
+    "title": "Class visibility",
+    "isolate": "Isolate",
+    "show_all": "Show all",
+    "hide_all": "Hide all"
+  },
+  "status": {
+    "loading": "Loading point cloud preview...",
+    "ready": "Preview: {count} points. Left drag rotates around the nearest point, right drag moves, wheel zooms.",
+    "unavailable": "Point cloud unavailable: {error}",
+    "not_available": "Point cloud is not available",
+    "invalid": "Invalid point cloud preview"
+  },
+  "marker": {
+    "outlier": " (outlier)"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "error": {
+    "job_running": "Für dieses Projekt läuft bereits eine Berechnung",
+    "job_still_running": "Für dieses Projekt läuft noch eine Berechnung",
+    "already_running": "Die Verarbeitung läuft für dieses Projekt bereits",
+    "detections_missing": "Automatische Passpunkt-Erkennungen sind nicht verfügbar",
+    "invalid_control_point_mode": "Ungültiger Passpunkt-Modus in den Projekteinstellungen",
+    "classified_missing": "Die klassifizierte PLY ist noch nicht verfügbar",
+    "no_cache": "Kein Zwischenstand vorhanden: in den Einstellungen aktivieren und das Projekt einmal verarbeiten",
+    "dense_not_kept": "Die dichte Punktwolke wurde für dieses Projekt nicht aufbewahrt; bitte von Anfang an neu verarbeiten",
+    "control_points_not_waiting": "Die Passpunkte warten nicht auf eine Fortsetzung",
+    "control_points_insufficient": "Mindestens {points} Passpunkte mit je {observations} Beobachtungen sind erforderlich",
+    "pipeline_exit": "Die Pipeline wurde mit Exit-Code {code} beendet. Siehe reports/pipeline.log.",
+    "export_exit": "Der LAS-Export wurde mit Exit-Code {code} beendet. Siehe reports/export.log."
+  },
+  "stage": {
+    "optimizing_control_points": "Passpunkte werden optimiert",
+    "control_points_optimized": "Passpunkte optimiert",
+    "control_point_optimization_failed": "Passpunkt-Optimierung fehlgeschlagen",
+    "exporting_las": "LAS wird exportiert",
+    "improving_and_filtering": "Verbessern und filtern",
+    "reclassifying": "Neu klassifizieren",
+    "applying_control_points": "Passpunkte werden angewendet",
+    "complete": "Abgeschlossen",
+    "failed": "Fehlgeschlagen"
+  }
+}

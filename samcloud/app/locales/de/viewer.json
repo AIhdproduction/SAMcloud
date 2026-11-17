@@ -1,0 +1,60 @@
+{
+  "number_locale": "de-CH",
+  "toolbar": {
+    "fit": "Alles zeigen",
+    "classification": "Klassen",
+    "class_toggle": "Klassen ein/aus",
+    "cameras": "Kamerapositionen",
+    "camera_colour": "Reprojektionsfehler",
+    "camera_sphere_texture": "Panorama auf Kugel",
+    "camera_size": "Kameragrösse",
+    "terrain": "Terrain",
+    "orbit": "Orbit",
+    "shading": "Schattierung",
+    "fullscreen": "Vollbild",
+    "point_size": "Punktgrösse",
+    "height": "Höhe",
+    "height_tooltip": "Höhenfilter: linker Knopf blendet Punkte unten aus, rechter Knopf oben",
+    "height_lower": "Höhe unten",
+    "height_upper": "Höhe oben"
+  },
+  "status": {
+    "preparing": "Punktwolke wird vorbereitet …",
+    "preparing_elapsed": "Punktwolke wird vorbereitet … {elapsed}",
+    "unavailable": "Punktwolke nicht verfügbar: {message}",
+    "prepare_failed": "Fehler beim Vorbereiten",
+    "ready_count": "{title}: {count} Punkte. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen.",
+    "ready": "{title}. Links ziehen: um den angeklickten Punkt drehen, rechts ziehen: verschieben, Mausrad: Zoom, Doppelklick: auf Punkt zoomen."
+  },
+  "classes": {
+    "fallback": "Klasse {index}",
+    "other": "Andere"
+  },
+  "markers": {
+    "open_review": "Doppelklick: in der Passpunkt-Prüfung öffnen"
+  },
+  "camera": {
+    "fallback_title": "Kamera",
+    "details": "Aufnahme {index} · {points} 3D-Punkte · Reprojektionsfehler {error}",
+    "photo_alt": "Kamerafoto",
+    "photo_open": "Klicken: Foto gross öffnen",
+    "show_photo": "Foto anzeigen"
+  },
+  "tag": {
+    "size": "Grösse {size} mm",
+    "seen_in": "Gesehen in {count} Bildern",
+    "error": "Fehler {error} mm",
+    "outlier": "Ausreisser",
+    "ok": "ok",
+    "no_check": "keine Kontrolle möglich"
+  },
+  "server": {
+    "not_installed": "Potree oder PotreeConverter ist nicht installiert",
+    "not_prepared": "Die Punktwolke wurde noch nicht vorbereitet",
+    "preparing": "Punktwolke wird vorbereitet",
+    "no_sparse": "Noch keine Sparse-Punktwolke vorhanden",
+    "no_dense": "Noch keine Dense-Punktwolke vorhanden",
+    "unsupported_kind": "Nicht unterstützter Punktwolkentyp",
+    "converter_failed": "PotreeConverter fehlgeschlagen: {details}"
+  }
+}

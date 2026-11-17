@@ -1,0 +1,27 @@
+{
+  "error": {
+    "job_running": "A processing job is already running for this project",
+    "job_still_running": "A processing job is still running for this project",
+    "already_running": "Processing is already running for this project",
+    "detections_missing": "Automatic control-point detections are not available",
+    "invalid_control_point_mode": "Invalid control-point mode in project settings",
+    "classified_missing": "Classified PLY is not available yet",
+    "no_cache": "No processing cache: enable it in the settings and process the project once",
+    "dense_not_kept": "The dense cloud was not kept for this project; process it again from the start",
+    "control_points_not_waiting": "Control points are not waiting for continuation",
+    "control_points_insufficient": "At least {points} control points with {observations} observations are required",
+    "pipeline_exit": "Pipeline ended with exit code {code}. See reports/pipeline.log.",
+    "export_exit": "LAS export ended with exit code {code}. See reports/export.log."
+  },
+  "stage": {
+    "optimizing_control_points": "Optimizing control points",
+    "control_points_optimized": "Control points optimized",
+    "control_point_optimization_failed": "Control-point optimization failed",
+    "exporting_las": "Exporting LAS",
+    "improving_and_filtering": "Improving and filtering",
+    "reclassifying": "Reclassifying",
+    "applying_control_points": "Applying control points",
+    "complete": "Complete",
+    "failed": "Failed"
+  }
+}

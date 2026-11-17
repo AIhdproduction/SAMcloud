@@ -6,6 +6,7 @@ from pathlib import Path
 
 from nicegui import ui
 
+from samcloud.app.i18n import t, translate_or
 from samcloud.app.layout import render_page
 from samcloud.app.pointcloud_viewer import default_class_colors, render_pointcloud_viewer
 from samcloud.app.state import state
@@ -27,13 +28,13 @@ def render() -> None:
         ui.add_head_html(_COLOR_INPUT_STYLE)
         project = state.active_project()
         if project is None:
-            ui.label("Open a project before viewing dense point cloud results.")
+            ui.label(t("dense.no_project"))
             return
         class_set = project["settings"].get("classification", {}).get("class_set", "outdoor")
         classes = _load_classes(class_set)
         color_hexes = _class_color_hexes(project, len(classes) + 1, class_set)
         las_codes = class_las_codes(class_set, _class_config())
-        labels = ["Unknown / noise", *[name.split(",")[0].title() for name in classes]]
+        labels = [t("classes.Unknown / noise"), *[_class_label(name) for name in classes]]
         class_names_de = _class_config().get("labels_de", {}).get(class_set) or labels
         instance_labels_de = _class_config().get("instance_labels_de", {})
         fine_term_names_de = _fine_term_names_de(_fine_labels_path(project), _class_config())
@@ -41,7 +42,7 @@ def render() -> None:
             with ui.card().classes("w-full"):
                 render_pointcloud_viewer(
                     "dense",
-                    title="Dense point cloud",
+                    title=t("dense.viewer_title"),
                     class_colors=[_hex_to_rgb(color) for color in color_hexes],
                     class_labels=[
                         f"{las_codes[class_id]}: {label}"
@@ -53,10 +54,8 @@ def render() -> None:
                     marker_endpoint="/api/apriltags/markers",
                 )
             with ui.card().classes("w-full"):
-                ui.label("Classification visibility and colors").classes("text-lg font-medium")
-                ui.label(
-                    "Switch classes on or off, isolate one class, and edit its color. Color changes are saved in this project."
-                ).classes("sam-muted")
+                ui.label(t("dense.classes.title")).classes("text-lg font-medium")
+                ui.label(t("dense.classes.description")).classes("sam-muted")
                 visibility = [True] * len(labels)
                 visibility_controls = []
 
@@ -85,13 +84,13 @@ def render() -> None:
                             ).classes("w-72")
                             visibility_controls.append(visibility_control)
                             ui.button(
-                                "Isolate",
+                                t("dense.classes.isolate"),
                                 on_click=lambda index=class_id: set_visibility(
                                     [item == index for item in range(len(labels))]
                                 ),
                             ).props("outline dense")
                             ui.color_input(
-                                "Color",
+                                t("dense.classes.color"),
                                 value=color_hexes[class_id],
                                 preview=True,
                                 on_change=lambda event, index=class_id: _save_class_color(
@@ -99,16 +98,22 @@ def render() -> None:
                                 ),
                             ).classes("w-40 sam-class-color")
                 with ui.row().classes("gap-2"):
-                    ui.button("Show all", on_click=lambda: set_visibility([True] * len(labels)))
-                    ui.button("Hide all", on_click=lambda: set_visibility([False] * len(labels))).props(
+                    ui.button(t("dense.classes.show_all"), on_click=lambda: set_visibility([True] * len(labels)))
+                    ui.button(t("dense.classes.hide_all"), on_click=lambda: set_visibility([False] * len(labels))).props(
                         "outline"
                     )
                 ui.button(
-                    "Restore default colors",
+                    t("dense.classes.restore_colors"),
                     on_click=lambda: _restore_default_colors(class_set, len(labels)),
                 ).props("outline")
 
-    render_page("Dense Cloud", content, current_path="/dense", wide=True)
+    render_page(t("dense.page_title"), content, current_path="/dense", wide=True)
+
+
+def _class_label(name: str) -> str:
+    """Display name of one configured class (translated when known, else its title-cased prompt head)."""
+    base = name.split(",")[0]
+    return translate_or(f"classes.{base}", base.title())
 
 
 def _fine_labels_path(project: dict):
@@ -179,7 +184,7 @@ def _class_color_hexes(project: dict, count: int, class_set: str | None = None) 
 def _save_class_color(class_id: int, color: str | None, class_set: str, count: int) -> None:
     """Persist one class color and update the open dense viewer immediately."""
     if not _is_hex_color(color):
-        ui.notify("Select a valid color.", type="negative")
+        ui.notify(t("dense.classes.invalid_color"), type="negative")
         return
     project_directory = state.active_project_directory
     if project_directory is None:

@@ -1,0 +1,16 @@
+{
+  "intro": "Print templates for control points. Works without an open project as well.",
+  "apriltag": {
+    "title": "AprilTags (150 mm, tag36h11)",
+    "hint": "For indoor use: scale and optional georeferencing. Print at 100 %.",
+    "count": "Count",
+    "start_id": "Start ID"
+  },
+  "cross": {
+    "title": "Cross targets (180 mm, numbered)",
+    "hint": "For drone flights and outdoor use: two black triangles on white paper, tips = survey point. Lay the whole sheet, or the square cut out along the marks, flat on the ground. Works on light and dark ground.",
+    "count": "Count",
+    "start_number": "Start no."
+  },
+  "create_pdf": "Create PDF"
+}

@@ -1,0 +1,8 @@
+{
+  "title": "Dünne Punktwolke",
+  "no_project": "Öffnen Sie zuerst ein Projekt, um die Ausrichtung anzuzeigen.",
+  "subtitle": "COLMAP Sparse-Rekonstruktion",
+  "viewer_title": "Sparse Punktwolke",
+  "alignment_status": "Ausrichtungsstatus",
+  "hint": "Die Ansicht zeigt eine Browser-Vorschau der rekonstruierten COLMAP-Punkte. Das Originalmodell bleibt unter products/sparse erhalten."
+}

@@ -110,7 +110,7 @@ def test_dense_page_passes_apriltag_marker_endpoint(tmp_path: Path, monkeypatch)
     assert kind == "dense" and kwargs["marker_endpoint"] == "/api/apriltags/markers"
 
 
-def test_potree_dense_viewer_has_tag_colour_click_priority_and_label() -> None:
+def test_potree_dense_viewer_has_tag_colour_click_priority_and_label(german_ui: None) -> None:
     from samcloud.app import potree_viewer
 
     config = potree_viewer._viewer_config("dense", "Dense", [[1, 2, 3]], marker_endpoint="/api/apriltags/markers")
@@ -120,7 +120,7 @@ def test_potree_dense_viewer_has_tag_colour_click_priority_and_label() -> None:
     assert "/control-points?tag=${encodeURIComponent(marker.tag_id)}" in script
     assert "/control-points?marker=${encodeURIComponent(marker.name)}" in script  # non-tag behaviour unchanged
     assert "THREE.LineLoop" in script and "SphereGeometry(radius" in script and 'marker.kind === "apriltag"' in script
-    assert "`AprilTag ${marker.tag_id}`" in script and "Gesehen in" in script and "Ausreißer" in script
+    assert "`AprilTag ${marker.tag_id}`" in script and "Gesehen in" in script and "Ausreisser" in script
     click = script[script.index('area.addEventListener("click"'):]
     assert click.index("tagAt(event)") < click.index("pickCamera(event, true)") < click.index("handlePointClick(event)")
     clear = script[script.index("const clearPointInfo"):script.index("const readPickedValue")]
@@ -131,7 +131,7 @@ def test_potree_dense_viewer_has_tag_colour_click_priority_and_label() -> None:
     assert ">Passpunkte</button>" in potree_viewer._html("sam-potree-sparse", show_markers=True)
 
 
-def test_render_potree_dense_toolbar_label_is_apriltags(monkeypatch) -> None:
+def test_render_potree_dense_toolbar_label_is_apriltags(monkeypatch, german_ui: None) -> None:
     from samcloud.app import potree_viewer
 
     html_calls: list[str] = []

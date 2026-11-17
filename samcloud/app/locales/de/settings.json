@@ -1,0 +1,84 @@
+{
+  "language": {
+    "title": "Sprache / Language",
+    "label": "Sprache der Oberfläche",
+    "config_default": "Standard aus config/defaults.yml: {language}",
+    "hint": "Die Auswahl wird sofort gespeichert und hat Vorrang vor dem Standard aus der Konfiguration. Laufende Berechnungen und Projekte bleiben unverändert.",
+    "reset": "Auf Konfigurations-Standard zurücksetzen",
+    "failed": "Die Sprache konnte nicht gespeichert werden: {error}"
+  },
+  "no_project": "Öffnen Sie ein Projekt, um die Einstellungen zu bearbeiten.",
+  "capture": {
+    "title": "Aufnahmequellen",
+    "type": "Aufnahmeart: {type}",
+    "locked": "Die Aufnahme-Einstellungen sind gesperrt, weil die Verarbeitung bereits begonnen hat.",
+    "image_directory": "Bildordner",
+    "rtk": "Bilder mit RTK-GPS",
+    "panorama_video": "360°-MP4-Video",
+    "panorama_directory": "Ordner mit 360°-JPG-Panoramen",
+    "frame_interval": "Bildintervall im Video (Sekunden)"
+  },
+  "coordinates": {
+    "title": "Koordinatensysteme",
+    "input": "CRS der Bilder/GNSS",
+    "working": "Arbeits-CRS",
+    "export": "Export-CRS",
+    "hint": "Wählen Sie das Ausgabe-Koordinatensystem, das in config/export_crs.yml konfiguriert ist."
+  },
+  "processing": {
+    "title": "Verarbeitung",
+    "use_gpu": "GPU verwenden",
+    "control_points": "Passpunkte"
+  },
+  "control_points_mode": {
+    "none": "Keine Passpunkte – automatisch fortfahren",
+    "after_alignment": "Passpunkte nach der Ausrichtung verwenden",
+    "automatic": "Automatisch (Targets erkennen)"
+  },
+  "storage": {
+    "title": "Speicher"
+  },
+  "classification": {
+    "title": "Klassifizierung",
+    "hint": "Diese Werte gelten für den nächsten Klassifizierungslauf.",
+    "class_set": "Semantischer Klassensatz",
+    "min_votes": "Mindestanzahl übereinstimmender Bilder pro Punkt",
+    "engine": "Klassifizierungsmodell (Aussenbereich)",
+    "engine_hint": "Innenbereich wird immer mit SAM3 klassifiziert.",
+    "mode": "Klassifizierungsmodus",
+    "mode_legacy": "Legacy (Instanzmasken, Mehrheitsentscheid)",
+    "mode_segearth_ov3": "SegEarth-OV3 (Head-Fusion, Presence-Gate, gewichtete Abstimmung)",
+    "background_threshold": "SegEarth-OV3-Hintergrundschwelle",
+    "tile_size": "SAM3-Kachelgrösse",
+    "tile_768": "768 px – schneller, weniger Details",
+    "tile_1008": "1008 px – ausgewogen",
+    "tile_1280": "1280 px – mehr Details, mehr GPU-Speicher",
+    "tile_overlap": "Kachelüberlappung",
+    "geometry_refinement": "Geometrische Verfeinerung (Höhen- und Ebenheitsprüfung)"
+  },
+  "refinement": {
+    "title": "Verbessern & filtern (Schritt 6)",
+    "hint": "Nur innen: Depth-Anything-V2 schätzt die Tiefe dort, wo COLMAP keine Textur findet (weisse Wände), und hilft, schwebende Punkte zu entfernen sowie Böden, Decken und Wände zu füllen.",
+    "depth_model": "Tiefenmodell",
+    "depth_large": "Depth-Anything-V2 Large (beste Qualität, Gewichte CC-BY-NC-4.0)",
+    "depth_small": "Depth-Anything-V2 Small (schneller, Gewichte Apache-2.0)",
+    "depth_off": "Aus",
+    "depth_fill": "Lücken mit Depth-Anything füllen (nur wo es mit den COLMAP-Tiefenkarten übereinstimmt)",
+    "surface_fusion": "Oberflächen zusammenführen: alle Tiefenkarten zu einer Punktlage (Wand, Decke, Boden je eine Ebene)"
+  },
+  "errors": {
+    "unsupported_engine": "Wählen Sie ein unterstütztes Klassifizierungsmodell",
+    "unsupported_depth_model": "Wählen Sie ein unterstütztes Tiefenmodell",
+    "min_votes": "Die Mindestanzahl übereinstimmender Bilder muss mindestens 1 sein",
+    "unsupported_mode": "Wählen Sie einen unterstützten Klassifizierungsmodus",
+    "background_threshold": "Die Hintergrundschwelle muss zwischen 0.00 und 1.00 liegen",
+    "tile_size": "Wählen Sie eine unterstützte SAM3-Kachelgrösse",
+    "tile_overlap": "Die Kachelüberlappung muss zwischen 0.00 und 0.80 liegen"
+  },
+  "save": "Einstellungen speichern",
+  "saved": "Projekteinstellungen gespeichert",
+  "panorama": {
+    "prepare": "360°-Eingaben vorbereiten",
+    "prepared": "{panoramas} Panoramen und {images} virtuelle Kamerabilder vorbereitet"
+  }
+}

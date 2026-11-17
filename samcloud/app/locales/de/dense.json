@@ -1,0 +1,15 @@
+{
+  "page_title": "Dichte Punktwolke",
+  "no_project": "Öffne ein Projekt, um die Ergebnisse der dichten Punktwolke anzuzeigen.",
+  "viewer_title": "Dichte Punktwolke",
+  "classes": {
+    "title": "Sichtbarkeit und Farben der Klassen",
+    "description": "Klassen ein- oder ausblenden, eine Klasse isolieren und ihre Farbe ändern. Farbänderungen werden in diesem Projekt gespeichert.",
+    "isolate": "Isolieren",
+    "color": "Farbe",
+    "show_all": "Alle anzeigen",
+    "hide_all": "Alle ausblenden",
+    "restore_colors": "Standardfarben wiederherstellen",
+    "invalid_color": "Wähle eine gültige Farbe."
+  }
+}

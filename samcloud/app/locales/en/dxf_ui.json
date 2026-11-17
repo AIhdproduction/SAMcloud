@@ -1,0 +1,64 @@
+{
+  "unavailable": {
+    "no_project": "Open a project first",
+    "not_classified": "Classify the point cloud first"
+  },
+  "source": {
+    "none": "no point cloud found",
+    "ply": "classified point cloud (PLY, read directly): {name}",
+    "chosen_las": "chosen LAS: {name}",
+    "classified_las": "classified LAS: {name}"
+  },
+  "blocked": {
+    "flurseg_indoor": "The FlurSeg v1 profile supports outdoor projects only. Please switch mode to outdoor or select another profile."
+  },
+  "scale": {
+    "none": "No scale adjustment applied."
+  },
+  "level": {
+    "site": "Site"
+  },
+  "stale": {
+    "dxf": "DXF preview is out of date ({levels})",
+    "ortho": "orthophoto is out of date ({levels})",
+    "segment": "orthophoto segmentation is out of date ({levels})",
+    "clean": "clean plan is out of date ({levels})",
+    "joiner": " and ",
+    "banner": "Settings changed: {messages}. Regenerate in the DXF review."
+  },
+  "errors": {
+    "las_not_supported": "Only uncompressed .las files are supported (no LAZ).",
+    "las_not_found": "LAS file was not found: {path}",
+    "invalid_mode": "Invalid mode override '{mode}'. Must be 'indoor', 'outdoor', or None.",
+    "picked_scale_invalid": "The scale of the picked points must be a finite positive number",
+    "level_not_found": "Level '{level}' not found in state levels",
+    "align_first": "Run 'Align to gravity' before choosing the wall alignment",
+    "unknown_ortho_option": "Unknown orthophoto option '{name}'. Allowed: {allowed}",
+    "pixel_size_positive": "{name} must be a positive number greater than 0",
+    "max_side_range": "max_side must be an integer between 1000 and 30000",
+    "cut_below_range": "cut_below_ceiling must be between 0.0 and 1.0 m",
+    "invalid_background_source": "Invalid background source '{source}'. Must be 'topview' or 'ortho'.",
+    "unsupported_segment_source": "Unsupported segmentation source",
+    "flurseg_outdoor_only": "FlurSeg segmentation is only available for outdoor orthophotos",
+    "plan_variant_invalid": "Plan variant must be 'pointcloud' or 'ortho'",
+    "profile_required": "A model profile must be selected before starting a job",
+    "no_las": "No valid LAS file found to execute '{action}'",
+    "unsupported_action": "Unsupported DXF job action '{action}'",
+    "unsupported_layer_mode": "Unsupported layer mode '{mode}'",
+    "unknown_layer": "Unknown layer '{layer}'",
+    "z_band_order": "The z band needs a lower value below the upper value",
+    "no_cached_plan": "No cached DXF plan exists for this target. Compute it first.",
+    "png_encoding_failed": "PNG encoding of the snapshot failed"
+  },
+  "review_canvas": {
+    "hint": "Wheel: zoom · drag: pan · hold H: hide DXF",
+    "no_preview": "No cached DXF preview.",
+    "loading": "Loading cached DXF preview...",
+    "load_failed": "Could not load the cached DXF preview ({error})."
+  },
+  "side_canvas": {
+    "empty": "Press \"Render side view\" to draw the preview cloud.",
+    "level_floor": "Level {name} · floor {z} m",
+    "ceiling": "ceiling {z} m"
+  }
+}

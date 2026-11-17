@@ -128,7 +128,7 @@ async def test_print_dialog_rejects_ids_beyond_family(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.anyio
-async def test_report_table_shows_scale_and_tags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_report_table_shows_scale_and_tags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, german_ui: None) -> None:
     project = _make_project(tmp_path, "report")
     report = {
         "mode": "scale", "scale_factor": 2.3712, "scale_applied": 2.3712,
@@ -144,9 +144,18 @@ async def test_report_table_shows_scale_and_tags(tmp_path: Path, monkeypatch: py
         assert [row["id"] for row in table.rows] == [11, 12]
         assert table.rows[1]["after"] == "149.2"
         assert table.rows[1]["deviation"] == "-0.53"
-        assert [column["label"] for column in table.columns] == ["ID", "Bilder", "Größe vorher mm", "Größe nachher mm", "Abweichung %", "Status"]
+        assert [column["label"] for column in table.columns] == ["ID", "Bilder", "Grösse vorher mm", "Grösse nachher mm", "Abweichung %", "Status"]
         await user.should_see("Faktor 2.3712")
         await user.should_see("keine Kontrolle möglich")
+
+
+@pytest.mark.anyio
+async def test_tag_project_without_detections_json_shows_review_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, german_ui: None) -> None:
+    project = _make_project(tmp_path, "tagreview")
+    (project / "reports" / "apriltag_report.json").write_text(json.dumps({"mode": "scale", "tags": []}), encoding="utf-8")
+    assert not (project / "control_points" / "detections.json").exists()
+    async with _page_user("/control-points", _control_points_route, project, monkeypatch) as user:
+        await user.should_see("Passpunkt- und Kontrollpunktprüfung")
 
 
 @pytest.mark.anyio
@@ -288,9 +297,9 @@ async def test_coords_warning_shown_with_two_pass_tags_hidden_with_three(tmp_pat
 
 
 @pytest.mark.anyio
-async def test_projects_page_coords_upload_and_crs_follow_switch_for_both_class_sets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_projects_page_coords_upload_and_crs_follow_switch_for_both_class_sets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, german_ui: None) -> None:
     async with _page_user("/projects", _projects_route, None, monkeypatch) as user:
-        class_set = _select_by_label(user, "Semantic class set")
+        class_set = _select_by_label(user, "Semantischer Klassensatz")
         await asyncio.sleep(0.3)
         for chosen in ("outdoor", "indoor"):
             with user:
@@ -311,9 +320,9 @@ async def test_projects_page_coords_upload_and_crs_follow_switch_for_both_class_
 
 
 @pytest.mark.anyio
-async def test_projects_page_tag_crs_select_offers_local_and_shows_hint_only_for_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_projects_page_tag_crs_select_offers_local_and_shows_hint_only_for_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, german_ui: None) -> None:
     async with _page_user("/projects", _projects_route, None, monkeypatch) as user:
-        class_set = _select_by_label(user, "Semantic class set")
+        class_set = _select_by_label(user, "Semantischer Klassensatz")
         await asyncio.sleep(0.3)
         with user:
             class_set.value = "indoor"
@@ -333,7 +342,7 @@ async def test_projects_page_tag_crs_select_offers_local_and_shows_hint_only_for
 
 
 @pytest.mark.anyio
-async def test_control_points_page_crs_select_offers_local_and_hint_follows_selection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_control_points_page_crs_select_offers_local_and_hint_follows_selection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, german_ui: None) -> None:
     project = _make_project(tmp_path, "localcrs")
     async with _page_user("/control-points", _control_points_route, project, monkeypatch) as user:
         crs = _element(user, "control-points-crs")

@@ -1,0 +1,18 @@
+{
+  "errors": {
+    "no_project": "Kein Projekt geöffnet",
+    "no_classified_cloud": "Es ist noch keine klassifizierte Punktwolke vorhanden",
+    "instance_not_found": "Objekt nicht gefunden",
+    "invalid_path": "Ungültiger Pfad",
+    "file_not_found": "Datei nicht gefunden",
+    "image_not_found": "Bild nicht gefunden",
+    "invalid_image_path": "Ungültiger Bildpfad",
+    "invalid_plan_variant": "Ungültige Planvariante",
+    "no_dxf_preview": "Für diese Ebene gibt es keine zwischengespeicherte DXF-Vorschau",
+    "no_background": "Kein zwischengespeichertes Hintergrundbild vorhanden",
+    "invalid_ortho_kind": "Ungültiger Orthofoto-Typ '{kind}'",
+    "no_ortho_artifact": "Kein zwischengespeichertes Orthofoto '{kind}' für Ebene '{level}' vorhanden",
+    "invalid_body": "Der Anfrageinhalt muss ein Objekt sein",
+    "field_required": "{field} ist erforderlich"
+  }
+}

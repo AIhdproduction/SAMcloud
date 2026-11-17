@@ -1,37 +1,69 @@
 """Agisoft-style browser controls for reviewing automatic control points."""
 
+import html
+import json
+import re
+
 from nicegui import ui
+
+from samcloud.app.i18n import FALLBACK_LANGUAGE, catalogue, t
+
+
+_JS_PREFIX = "gcp_review.js."
+_HTML_TOKEN = re.compile(r"\[\[([A-Za-z0-9_.]+)\]\]")
 
 
 def render_review_workspace() -> None:
     """Render the marker table, filtered photo strip, and pixel-level viewer."""
     with ui.card().classes("w-full"):
-        ui.label("Passpunkt- und Kontrollpunktprüfung").classes("text-lg font-medium")
+        ui.label(t("gcp_review.title")).classes("text-lg font-medium")
         ui.html(_workspace_html(), sanitize=False).classes("w-full")
     ui.add_body_html(_workspace_script())
 
 
 def _workspace_html() -> str:
-    return """
+    """Workspace markup with every [[translation.key]] token replaced by its escaped text."""
+    return _HTML_TOKEN.sub(lambda match: html.escape(t(match.group(1))), _WORKSPACE_HTML)
+
+
+def _script_json(value: dict[str, str]) -> str:
+    """JSON for an inline <script> (no premature </script> end)."""
+    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
+
+
+def _script_strings() -> tuple[str, str]:
+    """(English fallback, current language) JS strings of the review workspace as JSON objects."""
+    english = {key[len(_JS_PREFIX):]: text for key, text in catalogue(FALLBACK_LANGUAGE).items() if key.startswith(_JS_PREFIX)}
+    current = {name: t(_JS_PREFIX + name) for name in english}
+    return _script_json(english), _script_json(current)
+
+
+def _workspace_script() -> str:
+    fallback, strings = _script_strings()
+    return _WORKSPACE_SCRIPT.replace("__SAM_GCP_REVIEW_FALLBACK__", fallback).replace("__SAM_GCP_REVIEW_STRINGS__", strings)
+
+
+_WORKSPACE_HTML = """
 <style>
 .sam-gcp-review { color:#dcecf6; }.sam-gcp-banner { margin:8px 0 14px; padding:10px 12px; border:1px solid #47718a; border-radius:6px; background:#102131; }.sam-gcp-banner.failed { border-color:#ff5a5a; }.sam-gcp-actions { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }.sam-gcp-actions button,.sam-gcp-table button { border:1px solid #47718a; background:#102131; color:#dcecf6; border-radius:5px; padding:5px 8px; cursor:pointer; }.sam-gcp-actions button.primary { border-color:#26b7ef; background:#16516c; }.sam-gcp-grid { display:grid; grid-template-columns:minmax(520px,1fr) minmax(360px,1fr); gap:14px; }.sam-gcp-table-wrap { overflow:auto; max-height:calc(45vh - 40px); min-height:260px; border:1px solid #28475b; border-radius:6px; }.sam-gcp-table { width:100%; border-collapse:collapse; font-size:12px; }.sam-gcp-table th,.sam-gcp-table td { border-bottom:1px solid #28475b; padding:6px; text-align:right; white-space:nowrap; }.sam-gcp-table th:first-child,.sam-gcp-table td:first-child,.sam-gcp-table td:nth-child(3) { text-align:left; }.sam-gcp-table tr { cursor:pointer; }.sam-gcp-table tr.selected { background:#16516c; }.sam-gcp-table th { position:sticky; top:0; background:#102131; }.sam-gcp-photos { min-height:260px; max-height:calc(45vh - 40px); overflow:auto; border:1px solid #28475b; border-radius:6px; padding:8px; }.sam-gcp-photos-head { display:flex; justify-content:space-between; gap:8px; }.sam-gcp-strip { display:flex; gap:9px; overflow:auto; padding-top:8px; }.sam-gcp-thumb { width:clamp(150px,11vw,240px); flex:0 0 clamp(150px,11vw,240px); border:1px solid #28475b; border-radius:5px; padding:5px; background:#050b12; cursor:pointer; text-align:left; }.sam-gcp-thumb img { width:100%; image-rendering:pixelated; display:block; }.sam-gcp-thumb.muted { opacity:.45; }.sam-gcp-thumb small { display:block; margin-top:4px; color:#b9ccda; }.sam-gcp-viewer { margin-top:14px; border:1px solid #28475b; border-radius:6px; padding:9px; }.sam-gcp-photo-canvas { height:max(430px, calc(100vh - 140px)); overflow:hidden; background:#050b12; position:relative; cursor:crosshair; user-select:none; }.sam-gcp-photo-canvas img { image-rendering:pixelated; }.sam-gcp-info { color:#b9ccda; font-size:12px; margin-bottom:7px; }.sam-gcp-empty { color:#b9ccda; padding:16px 0; } @media (max-width:900px) { .sam-gcp-grid { grid-template-columns:1fr; } }
 </style>
 <section id="sam-gcp-review" class="sam-gcp-review">
-  <div class="sam-gcp-banner" data-gate>Kontrollpunkte werden geladen.</div>
-  <div class="sam-gcp-actions"><button class="primary" data-optimize>Optimieren</button><button data-continue>Weiter verarbeiten</button><button data-reload>Aktualisieren</button></div>
+  <div class="sam-gcp-banner" data-gate>[[gcp_review.html.loading]]</div>
+  <div class="sam-gcp-actions"><button class="primary" data-optimize>[[gcp_review.html.optimize]]</button><button data-continue>[[gcp_review.html.continue]]</button><button data-reload>[[common.refresh]]</button></div>
   <div class="sam-gcp-grid">
-    <div class="sam-gcp-table-wrap"><table class="sam-gcp-table"><thead><tr><th>Aktiv</th><th>Name</th><th>Rolle</th><th>X</th><th>Y</th><th>Z</th><th>Fehler X</th><th>Fehler Y</th><th>Fehler Z</th><th>Fehler</th><th>Projektionen</th><th>Fehler px</th><th>Tag mm</th><th>Abw. %</th></tr></thead><tbody data-table></tbody></table></div>
-    <div class="sam-gcp-photos"><div class="sam-gcp-photos-head"><strong data-title>Fotos nach Marker filtern</strong><button data-sort>Nach Restfehler sortieren</button></div><div class="sam-gcp-strip" data-photos></div></div>
+    <div class="sam-gcp-table-wrap"><table class="sam-gcp-table"><thead><tr><th>[[gcp_review.html.col_active]]</th><th>[[common.name]]</th><th>[[gcp_review.html.col_role]]</th><th>X</th><th>Y</th><th>Z</th><th>[[gcp_review.html.col_error_x]]</th><th>[[gcp_review.html.col_error_y]]</th><th>[[gcp_review.html.col_error_z]]</th><th>[[gcp_review.html.col_error]]</th><th>[[gcp_review.html.col_projections]]</th><th>[[gcp_review.html.col_error_px]]</th><th>[[gcp_review.html.col_tag_mm]]</th><th>[[gcp_review.html.col_deviation]]</th></tr></thead><tbody data-table></tbody></table></div>
+    <div class="sam-gcp-photos"><div class="sam-gcp-photos-head"><strong data-title>[[gcp_review.html.filter_photos]]</strong><button data-sort>[[gcp_review.html.sort_residual]]</button></div><div class="sam-gcp-strip" data-photos></div></div>
   </div>
-  <div class="sam-gcp-viewer"><div class="sam-gcp-info" data-info>Ein Foto auswählen. Mausrad: Zoom, ziehen: Verschieben, Klick: Marker setzen. Pfeiltasten wechseln Fotos, Entf entfernt die Projektion, Leertaste aktiviert/deaktiviert sie.</div><div class="sam-gcp-photo-canvas" data-viewer></div></div>
+  <div class="sam-gcp-viewer"><div class="sam-gcp-info" data-info>[[gcp_review.html.viewer_help]]</div><div class="sam-gcp-photo-canvas" data-viewer></div></div>
 </section>
 """
 
 
-def _workspace_script() -> str:
-    return """
+_WORKSPACE_SCRIPT = """
 <script>
 (() => {
+  const L = Object.assign({}, __SAM_GCP_REVIEW_FALLBACK__, __SAM_GCP_REVIEW_STRINGS__);
+  const fmt = (text, values) => String(text).replace(/[{]([A-Za-z_]+)[}]/g, (match, key) => values[key] !== undefined ? String(values[key]) : match);
   const init = () => {
     const root = document.getElementById('sam-gcp-review');
     if (!root || root.dataset.ready === '1') return;
@@ -86,7 +118,7 @@ def _workspace_script() -> str:
         body: JSON.stringify(value)
       });
       if (!response.ok) {
-        throw new Error((await response.json()).error || 'Aktion fehlgeschlagen');
+        throw new Error((await response.json()).error || L.action_failed);
       }
       return response.json();
     };
@@ -140,6 +172,10 @@ def _workspace_script() -> str:
         const h = r * 2.2;
         const w = r * 1.6;
         const f = r * 1.1;
+        if (Array.isArray(photo.corners) && photo.corners.length === 4) {
+          const pts = photo.corners.map(c => `${c[0] - originU},${c[1] - originV}`).join(' ');
+          elements.push(`<polygon points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" style="vector-effect:non-scaling-stroke;" />`);
+        }
         elements.push(`<line x1="${x - r}" y1="${y}" x2="${x + r}" y2="${y}" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" style="vector-effect:non-scaling-stroke;" />`);
         elements.push(`<line x1="${x}" y1="${y - r}" x2="${x}" y2="${y + r}" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" style="vector-effect:non-scaling-stroke;" />`);
         elements.push(`<line x1="${x}" y1="${y}" x2="${x}" y2="${y - h}" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke" style="vector-effect:non-scaling-stroke;" />`);
@@ -162,7 +198,7 @@ def _workspace_script() -> str:
       const accepted = value.gate && value.gate.passed;
       gate.classList.toggle('failed', !accepted);
       const reasons = (value.gate && value.gate.reasons || []).join('; ');
-      gate.textContent = accepted ? 'Qualitätsprüfung bestanden.' : `Qualitätsprüfung fehlgeschlagen${reasons ? ': ' + reasons : ''}`;
+      gate.textContent = accepted ? L.quality_passed : `${L.quality_failed}${reasons ? ': ' + reasons : ''}`;
     };
 
     const renderTable = () => {
@@ -181,7 +217,7 @@ def _workspace_script() -> str:
           root.querySelector('[data-photos]').scrollIntoView({behavior: 'smooth', block: 'nearest'});
         };
         const e = item.errors || {};
-        row.innerHTML = `<td><input type="checkbox" ${item.enabled ? 'checked' : ''}></td><td>${item.name}</td><td><button>${item.role === 'pass' ? 'Passpunkt' : 'Kontrollpunkt'}</button></td><td>${number(item.coordinates && item.coordinates[0])}</td><td>${number(item.coordinates && item.coordinates[1])}</td><td>${number(item.coordinates && item.coordinates[2])}</td><td>${number(e.x_m)}</td><td>${number(e.y_m)}</td><td>${number(e.z_m)}</td><td>${number(e.total_m)}</td><td>${item.projections}</td><td>${number(e.reprojection_px)}</td><td>${item.kind === 'apriltag' ? number1(item.tag_size_mm) : ''}</td><td>${item.kind === 'apriltag' ? number1(item.tag_deviation_pct) : ''}</td>`;
+        row.innerHTML = `<td><input type="checkbox" ${item.enabled ? 'checked' : ''}></td><td>${item.name}</td><td><button>${item.role === 'pass' ? L.role_pass : L.role_control}</button></td><td>${number(item.coordinates && item.coordinates[0])}</td><td>${number(item.coordinates && item.coordinates[1])}</td><td>${number(item.coordinates && item.coordinates[2])}</td><td>${number(e.x_m)}</td><td>${number(e.y_m)}</td><td>${number(e.z_m)}</td><td>${number(e.total_m)}</td><td>${item.projections}</td><td>${number(e.reprojection_px)}</td><td>${item.kind === 'apriltag' ? number1(item.tag_size_mm) : ''}</td><td>${item.kind === 'apriltag' ? number1(item.tag_deviation_pct) : ''}</td>`;
         const enabled = row.querySelector('input');
         enabled.onclick = event => event.stopPropagation();
         enabled.onchange = async () => {
@@ -221,9 +257,12 @@ def _workspace_script() -> str:
       }
 
       const active = marker();
-      root.querySelector('[data-title]').textContent = active ? `Fotos: ${active.name}` : 'Fotos nach Marker filtern';
+      root.querySelector('[data-title]').textContent = active ? fmt(L.photos_for, {name: active.name}) : L.filter_photos;
       if (!state.photos.length) {
-        photos.innerHTML = '<div class="sam-gcp-empty">Für diesen Marker sind keine Projektionen gespeichert.</div>';
+        const empty = document.createElement('div');
+        empty.className = 'sam-gcp-empty';
+        empty.textContent = L.no_projections;
+        photos.replaceChildren(empty);
         return;
       }
 
@@ -242,10 +281,10 @@ def _workspace_script() -> str:
 
         const label2 = document.createElement('small');
         if (photo.kind === 'predicted') {
-          label2.textContent = 'nicht erkannt';
+          label2.textContent = L.not_detected;
         } else {
-          const kindLabel = photo.kind === 'manual' ? 'manuell' : 'automatisch';
-          label2.textContent = `${number(photo.reprojection_px)} px · ${kindLabel}`;
+          const kindLabel = photo.kind === 'manual' ? L.manual : L.automatic;
+          label2.textContent = photo.source === 'apriltag' ? L.apriltag_detected : `${number(photo.reprojection_px)} px · ${kindLabel}`;
         }
 
         thumb.append(mediaWrap, label1, label2);
@@ -291,7 +330,7 @@ def _workspace_script() -> str:
       if (!photo) return;
       const liveU = state.currentU !== null && !isNaN(state.currentU) ? state.currentU.toFixed(2) : Number(photo.u).toFixed(2);
       const liveV = state.currentV !== null && !isNaN(state.currentV) ? state.currentV.toFixed(2) : Number(photo.v).toFixed(2);
-      const reproj = photo.reprojection_px !== null && photo.reprojection_px !== undefined ? `, Restfehler ${number(photo.reprojection_px)} px` : '';
+      const reproj = photo.reprojection_px !== null && photo.reprojection_px !== undefined ? ', ' + fmt(L.residual, {value: number(photo.reprojection_px)}) : '';
       const score = photo.score !== null && photo.score !== undefined ? `, Score ${number(photo.score)}` : '';
       info.textContent = `${photo.image}: u ${liveU}, v ${liveV}${reproj}${score}. Zoom ${state.zoom.toFixed(1)}×`;
     };
@@ -371,7 +410,7 @@ def _workspace_script() -> str:
       const photo = state.photos[state.current];
       if (!selected || !photo) {
         viewer.replaceChildren();
-        info.textContent = 'Ein Foto auswählen. Mausrad: Zoom, ziehen: Verschieben, Klick: Marker setzen. Pfeiltasten wechseln Fotos, Entf entfernt die Projektion, Leertaste aktiviert/deaktiviert sie.';
+        info.textContent = L.viewer_help;
         return;
       }
 
@@ -434,6 +473,7 @@ def _workspace_script() -> str:
       if (!selected || !photo) return;
 
       if (!state.moved) {
+        if (photo.source === 'apriltag') return;
         const canvasRect = viewer.getBoundingClientRect();
         const mouseCanvasX = event.clientX - canvasRect.left;
         const mouseCanvasY = event.clientY - canvasRect.top;
@@ -516,7 +556,7 @@ def _workspace_script() -> str:
     const load = async () => {
       try {
         const response = await fetch('/api/control-points/markers', {cache: 'no-store'});
-        if (!response.ok) throw new Error((await response.json()).error || 'Marker konnten nicht geladen werden');
+        if (!response.ok) throw new Error((await response.json()).error || L.markers_failed);
         const value = await response.json();
         state.markers = value.markers || [];
         if (!state.requestedHandled) {
@@ -547,7 +587,7 @@ def _workspace_script() -> str:
     root.querySelector('[data-optimize]').onclick = async () => {
       try {
         await post('/api/control-points/optimize');
-        info.textContent = 'Optimierung läuft. Die Werte werden nach Abschluss aktualisiert.';
+        info.textContent = L.optimizing;
       } catch (error) {
         info.textContent = error.message;
       }
@@ -556,7 +596,7 @@ def _workspace_script() -> str:
     root.querySelector('[data-continue]').onclick = async () => {
       try {
         await post('/api/control-points/continue');
-        info.textContent = 'Verarbeitung wurde fortgesetzt.';
+        info.textContent = L.continued;
       } catch (error) {
         info.textContent = error.message;
       }
@@ -587,7 +627,7 @@ def _workspace_script() -> str:
       }
       const selected = marker(), photo = state.photos[state.current];
       if (!selected || !photo) return;
-      if (photo.kind === 'predicted') return;
+      if (photo.kind === 'predicted' || photo.source === 'apriltag') return;
       try {
         if (event.key === 'Delete') {
           event.preventDefault();

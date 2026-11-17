@@ -1,0 +1,42 @@
+{
+  "toolbar": {
+    "reset_view": "Ansicht zurücksetzen",
+    "fit_all": "Alles einpassen",
+    "fullscreen": "Vollbild",
+    "terrain_view": "Geländeansicht",
+    "orbit_view": "Orbit-Ansicht",
+    "classification": "Klassifizierung",
+    "point_size": "Punktgrösse",
+    "zoom_in": "Vergrössern",
+    "zoom_out": "Verkleinern"
+  },
+  "camera": {
+    "positions": "Kamerapositionen",
+    "path": "Kamerapfad",
+    "photos": "Foto-Ansichten",
+    "reprojection_colours": "Reprojektionsfehler",
+    "size": "Kameragrösse",
+    "path_width": "Pfad-Linienbreite",
+    "photo_size": "Foto-Grösse",
+    "fallback_title": "Kamera",
+    "photo_alt": "Kamerafoto",
+    "show_photo": "Foto anzeigen",
+    "details": "Aufnahme {index} · {points} 3D-Punkte · Reprojektionsfehler {error}"
+  },
+  "classes": {
+    "title": "Sichtbarkeit der Klassen",
+    "isolate": "Isolieren",
+    "show_all": "Alle anzeigen",
+    "hide_all": "Alle ausblenden"
+  },
+  "status": {
+    "loading": "Vorschau der Punktwolke wird geladen …",
+    "ready": "Vorschau: {count} Punkte. Linke Maustaste dreht um den nächsten Punkt, rechte Maustaste verschiebt, Mausrad zoomt.",
+    "unavailable": "Punktwolke nicht verfügbar: {error}",
+    "not_available": "Die Punktwolke ist nicht verfügbar",
+    "invalid": "Ungültige Punktwolken-Vorschau"
+  },
+  "marker": {
+    "outlier": " (Ausreisser)"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "title": "Sparse Cloud",
+  "no_project": "Open a project first to view the alignment.",
+  "subtitle": "COLMAP sparse reconstruction",
+  "viewer_title": "Sparse point cloud",
+  "alignment_status": "Alignment status",
+  "hint": "This view shows a browser preview of the reconstructed COLMAP points. The original model is kept under products/sparse."
+}

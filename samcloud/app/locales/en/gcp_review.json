@@ -1,0 +1,40 @@
+{
+  "title": "Control and check point review",
+  "html": {
+    "loading": "Loading control points.",
+    "optimize": "Optimize",
+    "continue": "Continue processing",
+    "col_active": "Active",
+    "col_role": "Role",
+    "col_error_x": "Error X",
+    "col_error_y": "Error Y",
+    "col_error_z": "Error Z",
+    "col_error": "Error",
+    "col_projections": "Projections",
+    "col_error_px": "Error px",
+    "col_deviation": "Dev. %",
+    "filter_photos": "Filter photos by marker",
+    "sort_residual": "Sort by residual",
+    "viewer_help": "Select a photo. Mouse wheel: zoom, drag: pan, click: set marker. Arrow keys switch photos, Delete removes the projection, Space enables/disables it.",
+    "col_tag_mm": "Tag size mm"
+  },
+  "js": {
+    "action_failed": "Action failed",
+    "quality_passed": "Quality check passed.",
+    "quality_failed": "Quality check failed",
+    "role_pass": "Control point",
+    "role_control": "Check point",
+    "photos_for": "Photos: {name}",
+    "filter_photos": "Filter photos by marker",
+    "no_projections": "No projections are stored for this marker.",
+    "not_detected": "not detected",
+    "manual": "manual",
+    "automatic": "automatic",
+    "apriltag_detected": "AprilTag detected",
+    "residual": "residual {value} px",
+    "viewer_help": "Select a photo. Mouse wheel: zoom, drag: pan, click: set marker. Arrow keys switch photos, Delete removes the projection, Space enables/disables it.",
+    "markers_failed": "Markers could not be loaded",
+    "optimizing": "Optimization is running. The values will be updated when it finishes.",
+    "continued": "Processing has been resumed."
+  }
+}

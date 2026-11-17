@@ -1,0 +1,85 @@
+{
+  "page_title": "Passpunkte",
+  "no_project": "Öffne ein Projekt, um Passpunkte zu verwalten.",
+  "coordinates": {
+    "title": "Passpunkt-Koordinaten",
+    "hint": "Name sowie x-, y- und z-Koordinaten importieren. Standard ist Schweizer LV95 + LN02.",
+    "crs_label": "Koordinatensystem der Passpunkte",
+    "import_upload": "Punktdatei importieren"
+  },
+  "crs": {
+    "lv95_ln02": "LV95 + LN02",
+    "lv95_ellipsoidal": "LV95 ellipsoidisch",
+    "wgs84_ellipsoidal": "WGS84 ellipsoidisch",
+    "local": "Lokal (eigenes System, Meter)",
+    "local_hint": "Lokal: Die Punktwolke wird direkt in diese Koordinaten gelegt (Meter). Kein Export in LV95/WGS84 möglich."
+  },
+  "apriltags": {
+    "title": "AprilTags",
+    "hint": "150 mm Tags (tag36h11). Mit 100 % drucken, Kontrollstrecke nachmessen. Mindestens 3 Tags pro Projekt empfohlen.",
+    "print_title": "AprilTags drucken",
+    "count": "Anzahl",
+    "start_id": "Start-ID",
+    "create_pdf": "PDF erstellen",
+    "print_button": "AprilTag drucken",
+    "coords_title": "Tag-Koordinaten",
+    "coords_hint": "Optional: Koordinaten der Tag-Mitte je ID. Die ID auf dem Ausdruck muss mit der ID in der Datei übereinstimmen.",
+    "missing_values": "ID, X, Y und Z angeben",
+    "apply_row": "Zeile übernehmen",
+    "remove_row": "Zeile entfernen",
+    "coords_warning": "Für die Georeferenzierung mindestens 3 eingemessene Tags (nicht auf einer Linie) – sonst nur Massstab",
+    "no_coords": "Keine Tag-Koordinaten zum Speichern",
+    "coords_saved": "Tag-Koordinaten gespeichert",
+    "import_coords": "Tag-Koordinaten importieren",
+    "save_coords": "Tag-Koordinaten speichern",
+    "scale_factor": "Massstab aus AprilTags: Faktor {factor}",
+    "scale_not_applied": "Massstab aus AprilTags: nicht angewendet",
+    "col_images": "Bilder",
+    "col_size_before": "Grösse vorher mm",
+    "col_size_after": "Grösse nachher mm",
+    "col_deviation": "Abweichung %",
+    "warning_no_tags": "Keine AprilTags gefunden – Modell bleibt unskaliert",
+    "warning_no_control": "Nur {count} AprilTag(s) gefunden – keine Kontrolle möglich",
+    "warning_georef_unavailable": "Weniger als 3 eingemessene AprilTags – nur Massstab",
+    "warning_outliers_ignored": "AprilTag-Ausreisser ignoriert: {ids}"
+  },
+  "role": {
+    "label": "Rolle",
+    "pass": "Passpunkt",
+    "control": "Kontrollpunkt"
+  },
+  "import": {
+    "title": "Rollen vor dem Import festlegen",
+    "all_pass": "Alle als Passpunkte",
+    "cp_prefix": "CP-Präfix automatisch zuordnen"
+  },
+  "table": {
+    "empty": "Noch keine Passpunkt-CSV importiert.",
+    "col_images": "Bilder",
+    "col_residual": "Restfehler m",
+    "col_leave_one_out": "Leave-one-out m",
+    "status_ready": "Bereit",
+    "status_needs_images": "Braucht zwei Bilder",
+    "change_role": "Rolle vor der Verarbeitung ändern"
+  },
+  "mark": {
+    "images_removed": "Entzerrte Bilder wurden zum Speicher sparen entfernt.",
+    "no_images": "Noch keine entzerrten Bilder verfügbar.",
+    "title": "Passpunkte markieren",
+    "active_point": "Aktiver Passpunkt",
+    "image": "Entzerrtes Bild",
+    "remove": "Marker entfernen",
+    "hint": "Klicken, um den aktiven Marker zu setzen oder zu verschieben. Zum Zoomen die Bildsteuerung des Browsers verwenden.",
+    "click_failed": "Die Klickposition im Bild konnte nicht gelesen werden.",
+    "continue": "Verarbeitung fortsetzen",
+    "check": "Passpunkte prüfen"
+  },
+  "check": {
+    "title": "Passpunktprüfung",
+    "point": "{name}: Restfehler {residual} m",
+    "leave_one_out": ", Leave-one-out {value} m",
+    "warning": "Warnung",
+    "local_crs_gps": "Lokale Koordinaten sind nur für AprilTag-Projekte ohne GPS möglich"
+  },
+  "started": "Georeferenzierung mit Passpunkten und Verarbeitung gestartet."
+}

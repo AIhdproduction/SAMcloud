@@ -70,7 +70,7 @@ def _response_json(response) -> dict[str, object]:
     return json.loads(response.body)
 
 
-def test_sparse_viewer_exposes_camera_controls() -> None:
+def test_sparse_viewer_exposes_camera_controls(german_ui: None) -> None:
     from samcloud.app import pointcloud_viewer, potree_viewer
 
     config = potree_viewer._viewer_config("sparse", "Sparse", [], camera_endpoint="/api/cameras/sparse")

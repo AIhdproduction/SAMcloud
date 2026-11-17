@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import yaml
 
+from samcloud.control_points.apriltags import load_tag_detections
 from samcloud.control_points.repository import load_detections
 
 
@@ -141,12 +142,17 @@ def marker_payload(project_directory: Path) -> dict[str, object]:
 def apriltag_marker_payload(project_directory: Path) -> list[dict[str, Any]]:
     """One marker per usable AprilTag of reports/apriltag_report.json (empty without a report).
 
-    Coordinate frame: centre and corners are stored in the final sparse-model frame. The sparse viewer
-    places its points and the GCP markers (triangulated_model_xyz) raw in this frame, and the dense viewer
-    LAS (samcloud/viewer/potree.py write_viewer_las from classified.ply) only quantises with a header offset
-    and applies no shift or export transform, so the coordinates are served unchanged for both viewers.
+    Coordinate frame: centre and corners are stored in the frame of the final model. For scale-only
+    panorama runs the pipeline moves the report into the gravity-aligned frame right after the gravity
+    step (report["frame"] == "gravity_aligned", see transform_tag_report); in georeference mode the
+    report is already in the final frame. The viewers place their points raw in the final frame, so the
+    coordinates are served unchanged.
+
+    Photos: every image of control_points/apriltag_detections.json that shows the tag becomes a
+    read-only photo entry (source "apriltag"); a missing or corrupt detections file yields no photos.
     """
     tag_report = _load_report(Path(project_directory) / "reports" / "apriltag_report.json")
+    tag_photos = _apriltag_photos(Path(project_directory))
     markers: list[dict[str, Any]] = []
     for tag in tag_report.get("tags", []):
         if not isinstance(tag, dict) or tag.get("status") == "insufficient":
@@ -160,18 +166,45 @@ def apriltag_marker_payload(project_directory: Path) -> list[dict[str, Any]]:
             continue
         state = "needs_review" if tag.get("status") == "outlier" else "apriltag"
         error_total = _finite_or_none(tag.get("error_3d_m"))
+        photos = tag_photos.get(tag_id, [])
         marker: dict[str, Any] = {
             "name": f"TAG{tag_id}", "kind": "apriltag", "tag_id": tag_id, "role": "apriltag", "enabled": True,
             "state": state, "state_color": state,
             "coordinates": [float(value) for value in center], "corners": tag.get("corners_xyz"),
             "tag_size_mm": tag.get("size_mm_after"), "tag_deviation_pct": tag.get("deviation_pct"),
             "images": tag.get("images"), "status": tag.get("status"),
-            "photos": [], "observations": [],
+            "photos": [dict(photo) for photo in photos], "observations": [dict(photo) for photo in photos],
         }
         if error_total is not None:
             marker["errors"] = {"total_m": error_total}
         markers.append(marker)
     return _json_safe(markers)
+
+
+def _apriltag_photos(project_directory: Path) -> dict[int, list[dict[str, Any]]]:
+    """Photo entries per tag id from control_points/apriltag_detections.json (empty on any problem)."""
+    path = project_directory / "control_points" / "apriltag_detections.json"
+    if not path.is_file():
+        return {}
+    try:
+        detections = load_tag_detections(path)
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return {}
+    by_tag: dict[int, list[dict[str, Any]]] = {}
+    for image_name in sorted(detections):
+        for observation in detections[image_name]:
+            by_tag.setdefault(observation.tag_id, []).append({
+                "image": image_name, "u": observation.center[0], "v": observation.center[1],
+                "kind": "auto", "enabled": True,
+                "corners": [[float(u), float(v)] for u, v in observation.corners], "source": "apriltag",
+            })
+    return by_tag
+
+
+def has_apriltag_review_data(project_directory: Path) -> bool:
+    """True when an AprilTag report or detection file exists, so the tag photos can be reviewed."""
+    root = Path(project_directory)
+    return (root / "reports" / "apriltag_report.json").is_file() or (root / "control_points" / "apriltag_detections.json").is_file()
 
 
 def apriltag_warnings(project_directory: Path) -> list[str]:

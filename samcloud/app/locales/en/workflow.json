@@ -1,0 +1,49 @@
+{
+  "status": {
+    "not_started": "Not started",
+    "queued": "Queued",
+    "running": "Running",
+    "completed": "Completed",
+    "failed": "Failed",
+    "skipped": "Skipped",
+    "waiting": "Waiting",
+    "ready": "Ready",
+    "done": "Done",
+    "cancelled": "Cancelled",
+    "pending": "Pending",
+    "idle": "Idle",
+    "stale": "Stale",
+    "missing": "Missing",
+    "ok": "OK",
+    "unknown": "Unknown"
+  },
+  "step": {
+    "acquisition": "Acquire imagery",
+    "alignment": "Align cameras",
+    "control_points": "Add control points",
+    "dense_cloud": "Build dense cloud",
+    "classification": "Classify",
+    "refinement": "Improve & filter",
+    "export": "Export LAS / PLY",
+    "dxf": "DXF export"
+  },
+  "stage": {
+    "prepare_images": "Preparing images",
+    "feature_extraction": "Feature extraction",
+    "matching": "Image matching",
+    "mapping": "Sparse reconstruction",
+    "tiepoint_filtering": "Tie point filtering",
+    "control_points": "Control points",
+    "undistortion": "Image undistortion",
+    "dense_stereo": "Depth maps",
+    "dense_fusion": "Dense fusion",
+    "classification": "SAM classification",
+    "depth_prior": "Depth estimation (Depth Anything V2)",
+    "point_cleaning": "Removing stray points",
+    "plane_fill": "Plane filling",
+    "depth_fill": "Depth Anything fill",
+    "surface_fusion": "Surface fusion",
+    "superpoint_vote": "Superpoint voting",
+    "geometry_refinement": "Geometric refinement"
+  }
+}

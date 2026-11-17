@@ -1,0 +1,85 @@
+{
+  "page_title": "Control points",
+  "no_project": "Open a project before managing control points.",
+  "coordinates": {
+    "title": "Control point coordinates",
+    "hint": "Import name, x, y, z coordinates. The default is Swiss LV95 + LN02.",
+    "crs_label": "Control-point CRS",
+    "import_upload": "Import point file"
+  },
+  "crs": {
+    "lv95_ln02": "LV95 + LN02",
+    "lv95_ellipsoidal": "LV95 ellipsoidal",
+    "wgs84_ellipsoidal": "WGS84 ellipsoidal",
+    "local": "Local (own system, metres)",
+    "local_hint": "Local: the point cloud is placed directly in these coordinates (metres). No export to LV95/WGS84 possible."
+  },
+  "apriltags": {
+    "title": "AprilTags",
+    "hint": "150 mm tags (tag36h11). Print at 100 % and measure the check distance. At least 3 tags per project are recommended.",
+    "print_title": "Print AprilTags",
+    "count": "Count",
+    "start_id": "Start ID",
+    "create_pdf": "Create PDF",
+    "print_button": "Print AprilTag",
+    "coords_title": "Tag coordinates",
+    "coords_hint": "Optional: coordinates of the tag centre per ID. The ID on the printout must match the ID in the file.",
+    "missing_values": "Enter ID, X, Y and Z",
+    "apply_row": "Apply row",
+    "remove_row": "Remove row",
+    "coords_warning": "Georeferencing needs at least 3 surveyed tags (not on one line) – otherwise scale only",
+    "no_coords": "No tag coordinates to save",
+    "coords_saved": "Tag coordinates saved",
+    "import_coords": "Import tag coordinates",
+    "save_coords": "Save tag coordinates",
+    "scale_factor": "Scale from AprilTags: factor {factor}",
+    "scale_not_applied": "Scale from AprilTags: not applied",
+    "col_images": "Images",
+    "col_size_before": "Size before mm",
+    "col_size_after": "Size after mm",
+    "col_deviation": "Deviation %",
+    "warning_no_tags": "No AprilTags found – the model stays unscaled",
+    "warning_no_control": "Only {count} AprilTag(s) found – no check possible",
+    "warning_georef_unavailable": "Fewer than 3 surveyed AprilTags – scale only",
+    "warning_outliers_ignored": "AprilTag outliers ignored: {ids}"
+  },
+  "role": {
+    "label": "Role",
+    "pass": "Control point",
+    "control": "Check point"
+  },
+  "import": {
+    "title": "Set roles before importing",
+    "all_pass": "All as control points",
+    "cp_prefix": "Assign CP prefix automatically"
+  },
+  "table": {
+    "empty": "No control-point CSV imported yet.",
+    "col_images": "Images",
+    "col_residual": "Residual m",
+    "col_leave_one_out": "Leave-one-out m",
+    "status_ready": "Ready",
+    "status_needs_images": "Needs two images",
+    "change_role": "Change role before processing"
+  },
+  "mark": {
+    "images_removed": "Undistorted images were removed to save storage.",
+    "no_images": "No undistorted images are available yet.",
+    "title": "Mark control points",
+    "active_point": "Active control point",
+    "image": "Undistorted image",
+    "remove": "Remove marker",
+    "hint": "Click to set or move the active marker. Use browser image controls to zoom.",
+    "click_failed": "Could not read the image click position.",
+    "continue": "Continue processing",
+    "check": "Check control points"
+  },
+  "check": {
+    "title": "Control-point check",
+    "point": "{name}: residual {residual} m",
+    "leave_one_out": ", leave-one-out {value} m",
+    "warning": "warning",
+    "local_crs_gps": "Local coordinates are only possible for AprilTag projects without GPS"
+  },
+  "started": "Control-point georeferencing and processing started."
+}

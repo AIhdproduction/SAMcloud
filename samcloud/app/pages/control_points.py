@@ -9,22 +9,61 @@ from urllib.parse import quote
 import pandas as pd
 from nicegui import events, ui
 
+from samcloud.app.i18n import t
 from samcloud.app.layout import render_page
+from samcloud.app.gcp_review import has_apriltag_review_data
 from samcloud.app.pages.gcp_review import render_review_workspace
 from samcloud.app.state import state
 from samcloud.control_points.repository import APRILTAG_CSV_NAME, apply_roles, read_apriltag_coordinates, load_observations, read_control_points, save_observations, write_control_points
 from samcloud.control_points.apriltag_print import build_apriltag_pdf
-from samcloud.control_points.apriltags import APRILTAG_ID_MAX
+from samcloud.control_points.apriltags import APRILTAG_ID_MAX, WARNING_GEOREF_UNAVAILABLE, WARNING_NO_CONTROL, WARNING_NO_TAGS
 from samcloud.control_points.georeference import georeference_from_control_points
-from samcloud.core.project_manager import LOCAL_CRS_GPS_MESSAGE, set_apriltag_coordinates
+from samcloud.core.project_manager import set_apriltag_coordinates
 from samcloud.engine.pipeline import _create_pristine_gcp_backups
 
 
-_CRS_OPTIONS = {
-    "EPSG:2056+5728": "LV95 + LN02", "EPSG:2056": "LV95 ellipsoidal", "EPSG:4979": "WGS84 ellipsoidal",
-    "LOCAL": "Lokal (eigenes System, Meter)",
+# CRS option value -> translation key of its label (values are stored in the project and stay unchanged).
+_CRS_OPTION_KEYS = {
+    "EPSG:2056+5728": "control_points.crs.lv95_ln02", "EPSG:2056": "control_points.crs.lv95_ellipsoidal",
+    "EPSG:4979": "control_points.crs.wgs84_ellipsoidal", "LOCAL": "control_points.crs.local",
 }
-LOCAL_CRS_HINT = "Lokal: Die Punktwolke wird direkt in diese Koordinaten gelegt (Meter). Kein Export in LV95/WGS84 möglich."
+
+
+def crs_options() -> dict[str, str]:
+    """CRS select options {value: translated label} in the current UI language."""
+    return {value: t(key) for value, key in _CRS_OPTION_KEYS.items()}
+
+
+def local_crs_hint() -> str:
+    """Translated hint shown when the local CRS is selected."""
+    return t("control_points.crs.local_hint")
+
+
+_APRILTAG_OUTLIER_WARNING_PREFIX = "AprilTag-Ausreißer ignoriert: "
+
+
+def apriltag_warning_text(warning: object) -> str:
+    """Display text of a warning stored in reports/apriltag_report.json (the stored text stays unchanged).
+
+    Known engine warnings are translated; any other text is shown as it is.
+    """
+    text = str(warning)
+    if text == WARNING_NO_TAGS:
+        return t("control_points.apriltags.warning_no_tags")
+    if text == WARNING_GEOREF_UNAVAILABLE:
+        return t("control_points.apriltags.warning_georef_unavailable")
+    prefix, _, suffix = WARNING_NO_CONTROL.partition("{n}")
+    count = text[len(prefix):len(text) - len(suffix)] if text.startswith(prefix) and text.endswith(suffix) else ""
+    if count.isdigit():
+        return t("control_points.apriltags.warning_no_control", count=count)
+    if text.startswith(_APRILTAG_OUTLIER_WARNING_PREFIX):
+        return t("control_points.apriltags.warning_outliers_ignored", ids=text[len(_APRILTAG_OUTLIER_WARNING_PREFIX):])
+    return text
+
+
+def _role_options() -> dict[str, str]:
+    """Role select options {internal role: translated label}."""
+    return {"pass": t("control_points.role.pass"), "control": t("control_points.role.control")}
 
 
 def render() -> None:
@@ -33,7 +72,7 @@ def render() -> None:
         project_directory = state.active_project_directory
         project = state.active_project()
         if project_directory is None or project is None:
-            ui.label("Open a project before managing control points.")
+            ui.label(t("control_points.no_project"))
             return
         control_directory = project_directory / "control_points"
         csv_path, observations_path = control_directory / "control_points.csv", control_directory / "observations.json"
@@ -56,10 +95,10 @@ def render() -> None:
                 table.refresh()
 
         with ui.card().classes("w-full"):
-            ui.label("Control point coordinates").classes("text-lg font-medium")
-            ui.label("Import name, x, y, z coordinates. The default is Swiss LV95 + LN02.").classes("sam-muted text-sm")
-            ui.select(_CRS_OPTIONS, label="Control-point CRS", value=settings["crs"], on_change=save_crs).classes("w-full max-w-md").mark("control-points-crs")
-            local_hint = ui.label(LOCAL_CRS_HINT).classes("sam-muted text-sm").mark("control-points-crs-local-hint")
+            ui.label(t("control_points.coordinates.title")).classes("text-lg font-medium")
+            ui.label(t("control_points.coordinates.hint")).classes("sam-muted text-sm")
+            ui.select(crs_options(), label=t("control_points.coordinates.crs_label"), value=settings["crs"], on_change=save_crs).classes("w-full max-w-md").mark("control-points-crs")
+            local_hint = ui.label(local_crs_hint()).classes("sam-muted text-sm").mark("control-points-crs-local-hint")
             local_hint.set_visibility(settings["crs"] == "LOCAL")
             async def import_csv(event: events.UploadEventArguments) -> None:
                 upload = control_directory / ".uploaded_control_points"
@@ -68,16 +107,16 @@ def render() -> None:
                     pending_import["points"] = read_control_points(upload)
                 except ValueError as error: ui.notify(str(error), type="negative")
                 import_table.refresh()
-            ui.upload(on_upload=import_csv, auto_upload=True, label="Punktdatei importieren").props("accept=.csv,.txt,.dat").classes("q-mt-md")
+            ui.upload(on_upload=import_csv, auto_upload=True, label=t("control_points.coordinates.import_upload")).props("accept=.csv,.txt,.dat").classes("q-mt-md")
         with ui.card().classes("w-full"):
-            ui.label("AprilTags").classes("text-lg font-medium")
-            ui.label("150 mm Tags (tag36h11). Mit 100 % drucken, Kontrollstrecke nachmessen. Mindestens 3 Tags pro Projekt empfohlen.").classes("sam-muted text-sm")
+            ui.label(t("control_points.apriltags.title")).classes("text-lg font-medium")
+            ui.label(t("control_points.apriltags.hint")).classes("sam-muted text-sm")
             tag_settings = project.setdefault("settings", {}).setdefault("apriltags", {})
             tag_settings.setdefault("last_printed_id", -1)
             with ui.dialog() as tag_dialog, ui.card():
-                ui.label("AprilTags drucken").classes("text-lg font-medium")
-                tag_count = ui.number("Anzahl", value=10, min=1, max=100, step=1, precision=0).mark("apriltag-count")
-                tag_start = ui.number("Start-ID", value=int(tag_settings["last_printed_id"]) + 1, min=0, max=APRILTAG_ID_MAX, step=1, precision=0).mark("apriltag-start")
+                ui.label(t("control_points.apriltags.print_title")).classes("text-lg font-medium")
+                tag_count = ui.number(t("control_points.apriltags.count"), value=10, min=1, max=100, step=1, precision=0).mark("apriltag-count")
+                tag_start = ui.number(t("control_points.apriltags.start_id"), value=int(tag_settings["last_printed_id"]) + 1, min=0, max=APRILTAG_ID_MAX, step=1, precision=0).mark("apriltag-start")
 
                 def create_tag_pdf() -> None:
                     try:
@@ -93,17 +132,17 @@ def render() -> None:
                     tag_dialog.close()
 
                 with ui.row().classes("justify-end w-full gap-2"):
-                    ui.button("Abbrechen", on_click=tag_dialog.close).props("flat")
-                    ui.button("PDF erstellen", on_click=create_tag_pdf).classes("sam-button-primary").mark("apriltag-pdf")
+                    ui.button(t("common.cancel"), on_click=tag_dialog.close).props("flat")
+                    ui.button(t("control_points.apriltags.create_pdf"), on_click=create_tag_pdf).classes("sam-button-primary").mark("apriltag-pdf")
 
             def open_tag_dialog() -> None:
                 tag_start.value = int(tag_settings.get("last_printed_id", -1)) + 1
                 tag_dialog.open()
 
-            ui.button("AprilTag drucken", icon="print", on_click=open_tag_dialog).classes("sam-button-primary q-mt-sm").mark("apriltag-print")
+            ui.button(t("control_points.apriltags.print_button"), icon="print", on_click=open_tag_dialog).classes("sam-button-primary q-mt-sm").mark("apriltag-print")
             ui.separator().classes("q-my-md")
-            ui.label("Tag-Koordinaten").classes("text-base font-medium")
-            ui.label("Optional: Koordinaten der Tag-Mitte je ID. Die ID auf dem Ausdruck muss mit der ID in der Datei übereinstimmen.").classes("sam-muted text-sm")
+            ui.label(t("control_points.apriltags.coords_title")).classes("text-base font-medium")
+            ui.label(t("control_points.apriltags.coords_hint")).classes("sam-muted text-sm")
             tag_csv_path = control_directory / APRILTAG_CSV_NAME
             tag_state: dict[str, list[dict]] = {"rows": []}
             if tag_csv_path.is_file():
@@ -115,7 +154,7 @@ def render() -> None:
             @ui.refreshable
             def tag_coords() -> None:
                 rows = sorted(tag_state["rows"], key=lambda row: row["id"])
-                columns = [{"name": key, "label": label, "field": key, "align": "left"} for key, label in (("id", "ID"), ("x", "X"), ("y", "Y"), ("z", "Z"), ("role", "Rolle"))]
+                columns = [{"name": key, "label": label, "field": key, "align": "left"} for key, label in (("id", "ID"), ("x", "X"), ("y", "Y"), ("z", "Z"), ("role", t("control_points.role.label")))]
                 coords_table = ui.table(columns=columns, rows=rows, row_key="id", selection="single").classes("w-full q-mt-sm").mark("apriltag-coords-table")
 
                 def load_selected() -> None:
@@ -128,11 +167,11 @@ def render() -> None:
                     edit_x = ui.number("X", format="%.4f").classes("w-36").mark("apriltag-coords-x")
                     edit_y = ui.number("Y", format="%.4f").classes("w-36").mark("apriltag-coords-y")
                     edit_z = ui.number("Z", format="%.4f").classes("w-36").mark("apriltag-coords-z")
-                    edit_role = ui.select({"pass": "pass", "control": "control"}, value="pass", label="Rolle").classes("w-32").mark("apriltag-coords-role")
+                    edit_role = ui.select(_role_options(), value="pass", label=t("control_points.role.label")).classes("w-32").mark("apriltag-coords-role")
 
                     def upsert_row() -> None:
                         if None in (edit_id.value, edit_x.value, edit_y.value, edit_z.value):
-                            ui.notify("ID, X, Y und Z angeben", type="negative")
+                            ui.notify(t("control_points.apriltags.missing_values"), type="negative")
                             return
                         entry = {"id": int(edit_id.value), "x": float(edit_x.value), "y": float(edit_y.value), "z": float(edit_z.value), "role": edit_role.value or "pass"}
                         tag_state["rows"] = [row for row in tag_state["rows"] if row["id"] != entry["id"]] + [entry]
@@ -143,10 +182,10 @@ def render() -> None:
                             tag_state["rows"] = [row for row in tag_state["rows"] if row["id"] != int(edit_id.value)]
                             tag_coords.refresh()
 
-                    ui.button("Zeile übernehmen", on_click=upsert_row).props("outline").mark("apriltag-coords-apply")
-                    ui.button("Zeile entfernen", on_click=remove_row).props("outline").mark("apriltag-coords-remove")
+                    ui.button(t("control_points.apriltags.apply_row"), on_click=upsert_row).props("outline").mark("apriltag-coords-apply")
+                    ui.button(t("control_points.apriltags.remove_row"), on_click=remove_row).props("outline").mark("apriltag-coords-remove")
                 if tag_state["rows"] and sum(1 for row in tag_state["rows"] if row["role"] == "pass") < 3:
-                    ui.label("Für die Georeferenzierung mindestens 3 eingemessene Tags (nicht auf einer Linie) – sonst nur Maßstab").classes("text-red-4 text-sm q-mt-sm").mark("apriltag-coords-warning")
+                    ui.label(t("control_points.apriltags.coords_warning")).classes("text-red-4 text-sm q-mt-sm").mark("apriltag-coords-warning")
 
             tag_coords()
 
@@ -164,17 +203,17 @@ def render() -> None:
 
             def save_tag_coords() -> None:
                 if not tag_state["rows"]:
-                    ui.notify("Keine Tag-Koordinaten zum Speichern", type="negative")
+                    ui.notify(t("control_points.apriltags.no_coords"), type="negative")
                     return
                 try:
                     set_apriltag_coordinates(project_directory, project, pd.DataFrame(tag_state["rows"]), settings["crs"])
                 except ValueError as error:
                     ui.notify(str(error), type="negative")
                     return
-                ui.notify("Tag-Koordinaten gespeichert")
+                ui.notify(t("control_points.apriltags.coords_saved"))
 
-            ui.upload(on_upload=import_tag_coords, auto_upload=True, label="Tag-Koordinaten importieren").props("accept=.csv,.txt").classes("q-mt-sm").mark("apriltag-coords-import")
-            ui.button("Tag-Koordinaten speichern", icon="save", on_click=save_tag_coords).classes("sam-button-primary q-mt-sm").mark("apriltag-coords-save")
+            ui.upload(on_upload=import_tag_coords, auto_upload=True, label=t("control_points.apriltags.import_coords")).props("accept=.csv,.txt").classes("q-mt-sm").mark("apriltag-coords-import")
+            ui.button(t("control_points.apriltags.save_coords"), icon="save", on_click=save_tag_coords).classes("sam-button-primary q-mt-sm").mark("apriltag-coords-save")
             tag_report_path = project_directory / "reports" / "apriltag_report.json"
             if tag_report_path.is_file():
                 try:
@@ -183,11 +222,11 @@ def render() -> None:
                     tag_report = None
                 if isinstance(tag_report, dict):
                     scale_applied = tag_report.get("scale_applied")
-                    ui.label("Maßstab aus AprilTags: " + (f"Faktor {float(scale_applied):.4f}" if scale_applied is not None else "nicht angewendet")).classes("q-mt-md")
+                    ui.label(t("control_points.apriltags.scale_factor", factor=f"{float(scale_applied):.4f}") if scale_applied is not None else t("control_points.apriltags.scale_not_applied")).classes("q-mt-md")
                     for warning in tag_report.get("warnings", []):
-                        ui.label(str(warning)).classes("text-red-4 text-sm")
+                        ui.label(apriltag_warning_text(warning)).classes("text-red-4 text-sm")
                     tag_rows = [{"id": tag["id"], "images": tag["images"], "before": f"{float(tag['size_mm_before']):.1f}", "after": f"{float(tag['size_mm_after']):.1f}", "deviation": "" if tag.get("deviation_pct") is None else f"{float(tag['deviation_pct']):+.2f}", "status": tag.get("status", "")} for tag in tag_report.get("tags", [])]
-                    tag_columns = [{"name": key, "label": label, "field": key} for key, label in (("id", "ID"), ("images", "Bilder"), ("before", "Größe vorher mm"), ("after", "Größe nachher mm"), ("deviation", "Abweichung %"), ("status", "Status"))]
+                    tag_columns = [{"name": key, "label": label, "field": key} for key, label in (("id", "ID"), ("images", t("control_points.apriltags.col_images")), ("before", t("control_points.apriltags.col_size_before")), ("after", t("control_points.apriltags.col_size_after")), ("deviation", t("control_points.apriltags.col_deviation")), ("status", t("common.status")))]
                     ui.table(columns=tag_columns, rows=tag_rows, row_key="id").classes("w-full q-mt-sm").mark("apriltag-report")
 
 
@@ -197,7 +236,7 @@ def render() -> None:
             if imported is None:
                 return
             control_points = imported
-            ui.label("Rollen vor dem Import festlegen").classes("text-lg font-medium q-mt-md")
+            ui.label(t("control_points.import.title")).classes("text-lg font-medium q-mt-md")
             with ui.row().classes("gap-2 q-mb-sm"):
                 def set_all_pass() -> None:
                     current = pending_import["points"]
@@ -207,12 +246,12 @@ def render() -> None:
                     current = pending_import["points"]
                     pending_import["points"] = apply_roles(current, {str(name): "control" for name in current["name"] if str(name).casefold().startswith("cp")})
                     import_table.refresh()
-                ui.button("Alle als Passpunkte", on_click=set_all_pass).props("outline")
-                ui.button("CP-Präfix automatisch zuordnen", on_click=assign_cp_prefix).props("outline")
+                ui.button(t("control_points.import.all_pass"), on_click=set_all_pass).props("outline")
+                ui.button(t("control_points.import.cp_prefix"), on_click=assign_cp_prefix).props("outline")
             with ui.element("table").classes("w-full"):
                 with ui.element("thead"):
                     with ui.element("tr"):
-                        for label in ("Name", "X", "Y", "Z", "Rolle"):
+                        for label in (t("common.name"), "X", "Y", "Z", t("control_points.role.label")):
                             with ui.element("th"):
                                 ui.label(label)
                 with ui.element("tbody"):
@@ -224,12 +263,12 @@ def render() -> None:
                             with ui.element("td"):
                                 def set_role(event: events.ValueChangeEventArguments, name: str = str(row["name"])) -> None:
                                     pending_import["points"] = apply_roles(control_points, {name: event.value})
-                                ui.select({"pass": "Passpunkt", "control": "Kontrollpunkt"}, value=row["role"], on_change=set_role).classes("w-48")
+                                ui.select(_role_options(), value=row["role"], on_change=set_role).classes("w-48")
             def commit_import() -> None:
                 write_control_points(pending_import["points"], csv_path)
                 pending_import["points"] = None
                 import_table.refresh(); table.refresh(); workspace.refresh()
-            ui.button("Import", on_click=commit_import).classes("sam-button-primary q-mt-sm")
+            ui.button(t("common.import"), on_click=commit_import).classes("sam-button-primary q-mt-sm")
 
         @ui.refreshable
         def table() -> None:
@@ -237,61 +276,65 @@ def render() -> None:
                 return
             control_points = points()
             if control_points is None:
-                ui.label("No control-point CSV imported yet.").classes("sam-muted q-mt-md"); return
+                ui.label(t("control_points.table.empty")).classes("sam-muted q-mt-md"); return
             current = clicks()
             report_path = project_directory / "reports" / "control_points_report.json"
             residuals = {}
             if report_path.exists():
                 try: residuals = {item["name"]: item for item in json.loads(report_path.read_text(encoding="utf-8")).get("points", [])}
                 except (OSError, ValueError): pass
-            rows = [{**row, "observations": len(current.get(str(row["name"]), [])), "status": "Ready" if len(current.get(str(row["name"]), [])) >= int(settings["min_observations_per_point"]) else "Needs two images", "residual_m": residuals.get(str(row["name"]), {}).get("residual_m", ""), "leave_one_out_m": residuals.get(str(row["name"]), {}).get("leave_one_out_residual_m", "")} for row in control_points.to_dict("records")]
-            columns = [{"name": key, "label": label, "field": key} for key, label in (("name", "Name"), ("x", "X"), ("y", "Y"), ("z", "Z"), ("role", "Rolle"), ("observations", "Images"), ("status", "Status"), ("residual_m", "Residual m"), ("leave_one_out_m", "Leave-one-out m"))]
+            rows = [{**row, "observations": len(current.get(str(row["name"]), [])), "status": t("control_points.table.status_ready") if len(current.get(str(row["name"]), [])) >= int(settings["min_observations_per_point"]) else t("control_points.table.status_needs_images"), "residual_m": residuals.get(str(row["name"]), {}).get("residual_m", ""), "leave_one_out_m": residuals.get(str(row["name"]), {}).get("leave_one_out_residual_m", "")} for row in control_points.to_dict("records")]
+            columns = [{"name": key, "label": label, "field": key} for key, label in (("name", t("common.name")), ("x", "X"), ("y", "Y"), ("z", "Z"), ("role", t("control_points.role.label")), ("observations", t("control_points.table.col_images")), ("status", t("common.status")), ("residual_m", t("control_points.table.col_residual")), ("leave_one_out_m", t("control_points.table.col_leave_one_out")))]
             ui.table(columns=columns, rows=rows, row_key="name").classes("w-full q-mt-md")
-            ui.label("Rolle vor der Verarbeitung ändern").classes("sam-muted text-sm q-mt-sm")
+            ui.label(t("control_points.table.change_role")).classes("sam-muted text-sm q-mt-sm")
             for row in control_points.to_dict("records"):
                 with ui.row().classes("items-center gap-2"):
                     ui.label(str(row["name"])).classes("w-40")
-                    ui.select({"pass": "Passpunkt", "control": "Kontrollpunkt"}, value=row["role"], on_change=lambda event, name=str(row["name"]): save_role(name, event.value)).classes("w-48")
+                    ui.select(_role_options(), value=row["role"], on_change=lambda event, name=str(row["name"]): save_role(name, event.value)).classes("w-48")
 
         @ui.refreshable
         def workspace() -> None:
             if (control_directory / "detections.json").is_file():
                 render_review_workspace()
                 return
+            if points() is None and has_apriltag_review_data(project_directory):
+                # Tag-only (indoor) project: inspect the tag photos like the outdoor GCP review (read-only).
+                render_review_workspace()
+                return
             control_points = points(); image_root = project_directory / "products" / "dense" / "images"
             if control_points is None: return
             if not image_root.is_dir():
-                ui.label("Entzerrte Bilder wurden zum Speicher sparen entfernt.").classes("sam-muted q-mt-md"); return
+                ui.label(t("control_points.mark.images_removed")).classes("sam-muted q-mt-md"); return
             images = sorted(path.relative_to(image_root).as_posix() for path in image_root.rglob("*") if path.is_file())
-            if not images: ui.label("No undistorted images are available yet.").classes("sam-muted q-mt-md"); return
+            if not images: ui.label(t("control_points.mark.no_images")).classes("sam-muted q-mt-md"); return
             selected["name"] = selected["name"] or str(control_points.iloc[0]["name"]); selected["image"] = selected["image"] or images[0]
-            ui.label("Mark control points").classes("text-lg font-medium q-mt-lg")
+            ui.label(t("control_points.mark.title")).classes("text-lg font-medium q-mt-lg")
             with ui.row().classes("w-full gap-4 items-start"):
                 with ui.column().classes("w-72"):
-                    ui.select(control_points["name"].tolist(), label="Active control point", value=selected["name"], on_change=lambda event: (selected.update(name=event.value), workspace.refresh()))
-                    ui.select(images, label="Undistorted image", value=selected["image"], on_change=lambda event: (selected.update(image=event.value), workspace.refresh())).classes("w-full")
+                    ui.select(control_points["name"].tolist(), label=t("control_points.mark.active_point"), value=selected["name"], on_change=lambda event: (selected.update(name=event.value), workspace.refresh()))
+                    ui.select(images, label=t("control_points.mark.image"), value=selected["image"], on_change=lambda event: (selected.update(image=event.value), workspace.refresh())).classes("w-full")
                     def remove() -> None:
                         current = clicks(); name, image = str(selected["name"]), str(selected["image"])
                         current[name] = [click for click in current.get(name, []) if click["image"] != image]
                         save_observations(observations_path, current); table.refresh(); workspace.refresh()
-                    ui.button("Remove marker", on_click=remove).props("outline").classes("sam-button-secondary")
+                    ui.button(t("control_points.mark.remove"), on_click=remove).props("outline").classes("sam-button-secondary")
                 with ui.column().classes("flex-1"):
-                    ui.label("Click to set or move the active marker. Use browser image controls to zoom.").classes("sam-muted text-sm")
+                    ui.label(t("control_points.mark.hint")).classes("sam-muted text-sm")
                     def mark(event) -> None:
                         u, v = getattr(event, "image_x", None), getattr(event, "image_y", None)
-                        if u is None or v is None: ui.notify("Could not read the image click position.", type="negative"); return
+                        if u is None or v is None: ui.notify(t("control_points.mark.click_failed"), type="negative"); return
                         current = clicks(); name, image = str(selected["name"]), str(selected["image"])
                         current[name] = [click for click in current.get(name, []) if click["image"] != image]
                         current[name].append({"image": image, "u": float(u), "v": float(v)})
                         save_observations(observations_path, current); table.refresh(); workspace.refresh()
                     ui.interactive_image("/api/control-point-image/" + quote(str(selected["image"]), safe="/"), on_mouse=mark).classes("w-full").style("max-height:70vh;object-fit:contain")
             usable = sum(len(clicks().get(str(name), [])) >= int(settings["min_observations_per_point"]) for name in control_points["name"])
-            button = ui.button("Continue processing", icon="play_arrow", on_click=lambda: _continue(project_directory)).classes("sam-button-primary q-mt-md")
+            button = ui.button(t("control_points.mark.continue"), icon="play_arrow", on_click=lambda: _continue(project_directory)).classes("sam-button-primary q-mt-md")
             button.set_enabled(usable >= int(settings["min_points"]))
             def check_control_points() -> None:
                 try:
                     if settings["crs"] == "LOCAL":
-                        raise ValueError(LOCAL_CRS_GPS_MESSAGE)
+                        raise ValueError(t("control_points.check.local_crs_gps"))
                     dense = project_directory / "products" / "dense"
                     _create_pristine_gcp_backups(dense / "sparse", dense / "sparse_txt", dense / "sparse_pre_gcp", dense / "sparse_txt_pre_gcp")
                     _, preview["report"], _ = georeference_from_control_points(
@@ -301,7 +344,7 @@ def render() -> None:
                 except (OSError, ValueError) as error:
                     preview["report"] = None; preview["error"] = str(error)
                 preview_panel.refresh()
-            ui.button("Check control points", icon="rule", on_click=check_control_points).props("outline").classes("sam-button-secondary q-mt-md q-ml-sm")
+            ui.button(t("control_points.mark.check"), icon="rule", on_click=check_control_points).props("outline").classes("sam-button-secondary q-mt-md q-ml-sm")
 
         @ui.refreshable
         def preview_panel() -> None:
@@ -312,19 +355,19 @@ def render() -> None:
             if report is None:
                 return
             threshold = float(settings.get("max_residual_warning_m", 0.10))
-            ui.label("Control-point check").classes("text-lg font-medium q-mt-md")
+            ui.label(t("control_points.check.title")).classes("text-lg font-medium q-mt-md")
             for point in report["points"]:
-                warning = " warning" if point["residual_m"] > threshold else ""
+                warning = " " + t("control_points.check.warning") if point["residual_m"] > threshold else ""
                 leave_one_out = point.get("leave_one_out_residual_m")
-                suffix = f", leave-one-out {leave_one_out:.3f} m" if leave_one_out is not None else ""
-                ui.label(f"{point['name']}: residual {point['residual_m']:.3f} m{suffix}{warning}").classes("text-red-4" if warning else "sam-muted")
+                suffix = t("control_points.check.leave_one_out", value=f"{leave_one_out:.3f}") if leave_one_out is not None else ""
+                ui.label(t("control_points.check.point", name=point["name"], residual=f"{point['residual_m']:.3f}") + f"{suffix}{warning}").classes("text-red-4" if warning else "sam-muted")
         import_table(); table(); workspace(); preview_panel()
-    render_page("Control points", content, current_path="/control-points", wide=True)
+    render_page(t("control_points.page_title"), content, current_path="/control-points", wide=True)
 
 
 def _continue(project_directory: Path) -> None:
     try:
         state.processing.continue_after_control_points(project_directory)
-        ui.notify("Control-point georeferencing and processing started."); ui.navigate.to("/")
+        ui.notify(t("control_points.started")); ui.navigate.to("/")
     except (OSError, ValueError) as error:
         ui.notify(str(error), type="negative")

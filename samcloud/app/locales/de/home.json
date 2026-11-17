@@ -1,0 +1,95 @@
+{
+  "title_empty": "Bereit für die nächste Rekonstruktion?",
+  "workspace": {
+    "drop_title": "Drohnenbilder oder eine 360°-Quelle hier ablegen",
+    "drop_hint": "Erstelle zuerst ein Projekt und wähle dann den Bildordner oder die Panoramaquelle.",
+    "create_project": "Projekt erstellen",
+    "open_project": "Projekt öffnen",
+    "ready": "Der Projektarbeitsbereich ist bereit",
+    "no_source": "Noch keine Bildquelle ausgewählt",
+    "review_settings": "Projekteinstellungen prüfen",
+    "open_sparse": "Dünne Punktwolke öffnen",
+    "processing_running": "Die Verarbeitung läuft. Der Status wird im Projekt gespeichert.",
+    "continue_processing": "Verarbeitung fortsetzen",
+    "review_control_points": "Passpunkte prüfen",
+    "start_after_alignment": "Ausrichtung starten und auf Passpunkte warten",
+    "start_automatic": "Automatische Verarbeitung starten",
+    "export_las": "LAS manuell exportieren",
+    "refine_from_cache": "Schritt 6 neu rechnen (aus Zwischenstand)",
+    "refine_from_cache_tooltip": "Verbessern & filtern mit den aktuellen Einstellungen wiederholen – ohne COLMAP und SAM neu zu rechnen",
+    "reclassify": "Klassifizierung neu rechnen ({engine})",
+    "reclassify_tooltip": "Dieselbe Dense-Wolke mit dem in den Einstellungen gewählten Modell neu klassifizieren (SAM3 oder FlurSeg) – ohne Ausrichtung und Dense-Rekonstruktion neu zu rechnen"
+  },
+  "progress": {
+    "stage_with_eta": "{stage} · {percent}% · Schritt noch {time}",
+    "stage_percent": "{stage} · {percent}%",
+    "photos": "Fotos: {processed} / {total} ({percent}%)",
+    "elapsed_eta": "Verstrichen: {elapsed} · Gesamt-ETA: {eta}"
+  },
+  "duration": {
+    "calculating": "wird berechnet...",
+    "hours_minutes": "{hours} h {minutes} min",
+    "minutes_seconds": "{minutes} min {seconds} s"
+  },
+  "stage": {
+    "processing": "Verarbeitung",
+    "preparing_images": "Bilder vorbereiten",
+    "extracting_features": "Merkmale extrahieren",
+    "matching_images": "Bilder verknüpfen",
+    "aligning_cameras": "Kameras ausrichten",
+    "waiting_for_control_points": "Warten auf Passpunkte",
+    "optimizing_control_points": "Passpunkte optimieren",
+    "control_points_optimized": "Passpunkte optimiert",
+    "control_point_optimization_failed": "Passpunkt-Optimierung fehlgeschlagen",
+    "applying_control_points": "Passpunkte anwenden",
+    "preparing_dense_reconstruction": "Dichte Rekonstruktion vorbereiten",
+    "building_dense_cloud": "Dichte Punktwolke erstellen",
+    "fusing_dense_cloud": "Dichte Punktwolke fusionieren",
+    "preparing_classification": "Klassifizierung vorbereiten",
+    "classifying_point_cloud": "Punktwolke klassifizieren",
+    "reclassifying": "Neu klassifizieren",
+    "improving_and_filtering": "Verbessern und filtern",
+    "exporting_las": "LAS exportieren",
+    "complete": "Abgeschlossen",
+    "failed": "Fehlgeschlagen",
+    "finished": "Fertig"
+  },
+  "status": {
+    "not_started": "Nicht gestartet",
+    "queued": "In Warteschlange",
+    "running": "Läuft",
+    "completed": "Abgeschlossen",
+    "failed": "Fehlgeschlagen",
+    "skipped": "Übersprungen",
+    "waiting": "Wartet",
+    "ready": "Bereit"
+  },
+  "workflow": {
+    "title": "Projektablauf",
+    "open_dxf": "DXF öffnen",
+    "total_time": "Rechenzeit gesamt: {time}",
+    "storage": "Speicher: {size} GB"
+  },
+  "time_group": {
+    "prepare_images": "Bilder vorbereiten",
+    "alignment": "Ausrichtung",
+    "control_points": "Passpunkte",
+    "dense_cloud": "Dichte Punktwolke",
+    "classification": "Klassifizierung",
+    "refinement": "Verbessern & filtern",
+    "export": "Export",
+    "other": "Übrige Schritte"
+  },
+  "recent": {
+    "title": "Zuletzt verwendete Projekte",
+    "view_all": "Alle Projekte anzeigen",
+    "empty": "Noch keine gespeicherten Projekte. Erstelle dein erstes Projekt, um mit dem Ablauf zu beginnen."
+  },
+  "notify": {
+    "processing_started": "Verarbeitung gestartet. Lass SAMcloud geöffnet, während COLMAP und die Klassifizierung laufen.",
+    "control_points_started": "Passpunkt-Georeferenzierung und Verarbeitung gestartet.",
+    "reclassify_started": "Klassifizierung wird neu gerechnet.",
+    "refine_started": "Schritt 6 wird aus dem Zwischenstand neu gerechnet.",
+    "las_export_started": "LAS-Export gestartet. Das Ergebnis wird unter products/classified gespeichert."
+  }
+}

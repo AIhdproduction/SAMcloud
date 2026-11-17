@@ -1,0 +1,78 @@
+{
+  "storage": {
+    "keep_control_point_inputs": "Passpunkte später neu optimieren können",
+    "keep_classification_inputs": "Klassifizierung später neu rechnen können",
+    "keep_refinement_inputs": "Geometrie-Verfeinerung später neu rechnen können",
+    "keep_processing_cache": "Schritt 6 (Verbessern & filtern) später schnell neu rechnen können – behält Tiefenkarten, SAM-Bilder und Depth-Anything (braucht viel Speicher)"
+  },
+  "engine": {
+    "sam3": "SAM3 – Klassen anpassbar und erweiterbar (Standard)",
+    "flurseg": "FlurSeg – ca. 15× schneller, 11 feste Klassen"
+  },
+  "capture_type": {
+    "drone_gps": "Drohne mit GPS / RTK",
+    "camera": "Normale Kamera ohne GPS",
+    "panorama_360": "360°-Kamera / Insta360",
+    "legacy": "Älteres Projekt"
+  },
+  "class_set": {
+    "outdoor": "Aussenbereich",
+    "indoor": "Innenbereich"
+  },
+  "control_points_mode": {
+    "none": "Keine Passpunkte – automatisch fortfahren",
+    "after_alignment": "Passpunkte nach der Ausrichtung verwenden"
+  },
+  "class_editor": {
+    "flurseg_summary": "Boden, versiegelte Fläche (Strasse, Gehweg, Markierung → road), Randstein, niedrige Vegetation, Baum, Gebäude, Fahrzeug, Baustelle (→ construction machinery), Schachtdeckel (→ manhole); alles andere → unknown",
+    "flurseg_note": "FlurSeg ist etwa 15× schneller als SAM3, die Klassen sind aber durch das Training fest und nicht anpassbar: {summary}.",
+    "title": "Klassen anpassen (SAM3)",
+    "hint": "Prompts sind englische Begriffe, mit Komma getrennt. Die Standardklassen bleiben erhalten (Schritt 6 und die Geometrie-Regeln nutzen sie), eigene Klassen werden hinten angehängt und bekommen LAS-Codes ab 64.",
+    "custom_classes": "Eigene Klassen",
+    "add": "Klasse hinzufügen",
+    "name": "Name (englisch)",
+    "name_placeholder": "solar panel",
+    "label": "Bezeichnung",
+    "label_placeholder": "Solaranlage",
+    "prompts": "Prompts",
+    "prompts_placeholder": "solar panel, photovoltaic module",
+    "color": "Farbe"
+  },
+  "create": {
+    "title": "Projekt erstellen",
+    "name": "Projektname",
+    "name_placeholder": "beispiel-projekt",
+    "capture_type": "Aufnahmeart",
+    "class_set": "Semantischer Klassensatz",
+    "engine": "Klassifizierungsmodell (Aussenbereich)",
+    "apriltags": "AprilTags suchen (Massstab)",
+    "tag_coordinates": "Tag-Koordinaten (optional)",
+    "tag_crs": "Koordinatensystem der Tags",
+    "tag_hint": "Optional: Koordinaten der Tag-Mitte je ID. Die ID auf dem Ausdruck muss mit der ID in der Datei übereinstimmen.",
+    "control_points": "Passpunkte",
+    "storage": "Speicher",
+    "image_directory": "Bildordner",
+    "rtk": "Bilder mit RTK-GPS",
+    "select_directory": "Bildordner auswählen",
+    "dialog_failed": "Der Ordnerdialog konnte nicht geöffnet werden: {error}",
+    "panorama_hint": "Verwenden Sie ein exportiertes äquirektanguläres 2:1-MP4-Video, einen Ordner mit JPG-Panoramen oder beides.",
+    "panorama_video": "360°-MP4-Video (optional)",
+    "panorama_directory": "Ordner mit 360°-JPG-Panoramen (optional)",
+    "frame_interval": "Bildintervall im Video (Sekunden)",
+    "select_capture_type": "Wählen Sie eine Aufnahmeart",
+    "select_class_set": "Wählen Sie den Klassensatz für den Innen- oder Aussenbereich",
+    "created": "Projekt erstellt: {name}",
+    "button": "Projekt erstellen"
+  },
+  "existing": {
+    "title": "Vorhandene Projekte",
+    "empty": "Keine gespeicherten Projekte gefunden."
+  },
+  "delete": {
+    "busy": "Dieses Projekt wird noch verarbeitet und kann nicht gelöscht werden.",
+    "title": "Projekt löschen?",
+    "message": "Dadurch werden {name} und alle erzeugten Dateien endgültig entfernt.",
+    "confirm": "Endgültig löschen",
+    "done": "Projekt gelöscht: {name}"
+  }
+}

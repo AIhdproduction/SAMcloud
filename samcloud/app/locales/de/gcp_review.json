@@ -1,0 +1,40 @@
+{
+  "title": "Passpunkt- und Kontrollpunktprüfung",
+  "html": {
+    "loading": "Kontrollpunkte werden geladen.",
+    "optimize": "Optimieren",
+    "continue": "Weiter verarbeiten",
+    "col_active": "Aktiv",
+    "col_role": "Rolle",
+    "col_error_x": "Fehler X",
+    "col_error_y": "Fehler Y",
+    "col_error_z": "Fehler Z",
+    "col_error": "Fehler",
+    "col_projections": "Projektionen",
+    "col_error_px": "Fehler px",
+    "col_deviation": "Abw. %",
+    "filter_photos": "Fotos nach Marker filtern",
+    "sort_residual": "Nach Restfehler sortieren",
+    "viewer_help": "Ein Foto auswählen. Mausrad: Zoom, ziehen: Verschieben, Klick: Marker setzen. Pfeiltasten wechseln Fotos, Entf entfernt die Projektion, Leertaste aktiviert/deaktiviert sie.",
+    "col_tag_mm": "Tag-Grösse mm"
+  },
+  "js": {
+    "action_failed": "Aktion fehlgeschlagen",
+    "quality_passed": "Qualitätsprüfung bestanden.",
+    "quality_failed": "Qualitätsprüfung fehlgeschlagen",
+    "role_pass": "Passpunkt",
+    "role_control": "Kontrollpunkt",
+    "photos_for": "Fotos: {name}",
+    "filter_photos": "Fotos nach Marker filtern",
+    "no_projections": "Für diesen Marker sind keine Projektionen gespeichert.",
+    "not_detected": "nicht erkannt",
+    "manual": "manuell",
+    "automatic": "automatisch",
+    "apriltag_detected": "AprilTag erkannt",
+    "residual": "Restfehler {value} px",
+    "viewer_help": "Ein Foto auswählen. Mausrad: Zoom, ziehen: Verschieben, Klick: Marker setzen. Pfeiltasten wechseln Fotos, Entf entfernt die Projektion, Leertaste aktiviert/deaktiviert sie.",
+    "markers_failed": "Marker konnten nicht geladen werden",
+    "optimizing": "Optimierung läuft. Die Werte werden nach Abschluss aktualisiert.",
+    "continued": "Verarbeitung wurde fortgesetzt."
+  }
+}

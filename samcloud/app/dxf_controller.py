@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import yaml
 
+from samcloud.app.i18n import t
 from samcloud.classification.profiles import ProfileInfo
 from samcloud.core.configuration import load_yaml
 from samcloud.dxf.config import load_dxf_config
@@ -57,10 +58,10 @@ def _level_from_dict(item: dict[str, Any]) -> Level:
 
 
 DXF_NO_PROJECT_HINT = "Open a project first"
-"""Shown on disabled DXF entry points while no project is open."""
+"""English text of the hint on disabled DXF entry points while no project is open (shown via dxf_ui.unavailable.*)."""
 
 DXF_NOT_CLASSIFIED_HINT = "Classify the point cloud first"
-"""Shown on disabled DXF entry points while the project has no classified point cloud (PLY or LAS)."""
+"""English text of the hint while the project has no classified point cloud (PLY or LAS) (shown via dxf_ui.unavailable.*)."""
 
 
 def classified_las_path(project_dir: Path | str) -> Path | None:
@@ -107,13 +108,13 @@ def dxf_unavailable_reason(project_dir: Path | str | None) -> str | None:
     state.json are checked, no point data is read.
     """
     if project_dir is None:
-        return DXF_NO_PROJECT_HINT
+        return t("dxf_ui.unavailable.no_project")
     chosen = chosen_las_path(project_dir)
     if chosen is not None and chosen.is_file():
         return None
     if project_point_source(project_dir) is not None:
         return None
-    return DXF_NOT_CLASSIFIED_HINT
+    return t("dxf_ui.unavailable.not_classified")
 
 
 class DxfPageController:
@@ -218,9 +219,9 @@ class DxfPageController:
         if path is not None:
             candidate = Path(path)
             if candidate.suffix.lower() != ".las":
-                raise ValueError("Only uncompressed .las files are supported (no LAZ).")
+                raise ValueError(t("dxf_ui.errors.las_not_supported"))
             if not candidate.is_file():
-                raise ValueError(f"LAS file was not found: {candidate}")
+                raise ValueError(t("dxf_ui.errors.las_not_found", path=candidate))
         self.las_path = path
         if path is None:
             self.state.view.pop("las_path", None)
@@ -244,12 +245,12 @@ class DxfPageController:
         """Human-readable description of the point source the DXF jobs read."""
         current = self.las_path
         if current is None or not current.is_file():
-            return "no point cloud found"
+            return t("dxf_ui.source.none")
         if is_ply_source(current):
-            return f"classified point cloud (PLY, read directly): {current.name}"
+            return t("dxf_ui.source.ply", name=current.name)
         if self.las_is_custom:
-            return f"chosen LAS: {current.name}"
-        return f"classified LAS: {current.name}"
+            return t("dxf_ui.source.chosen_las", name=current.name)
+        return t("dxf_ui.source.classified_las", name=current.name)
 
     @property
     def profile(self) -> str | None:
@@ -309,13 +310,15 @@ class DxfPageController:
     def blocked_message(self) -> str | None:
         """Return an explanation if current configuration is blocked, otherwise None."""
         if self.profile == "flurseg_v1" and self.mode == "indoor":
-            return "The FlurSeg v1 profile supports outdoor projects only. Please switch mode to outdoor or select another profile."
+            return t("dxf_ui.blocked.flurseg_indoor")
         return None
 
     @property
     def scale_status(self) -> str:
         """Human-readable description of current scale factor and source."""
-        return str(self.state.scale.get("status_text", "No scale adjustment applied."))
+        # A stored status_text comes from samcloud.dxf.scale and is shown as-is; only the default is translated.
+        stored = self.state.scale.get("status_text")
+        return t("dxf_ui.scale.none") if stored is None else str(stored)
 
     @property
     def scale_factor(self) -> float:
@@ -365,7 +368,7 @@ class DxfPageController:
     def set_mode_override(self, mode: str | None) -> None:
         """Set project mode override ('indoor', 'outdoor', or None for auto)."""
         if mode is not None and mode not in ("indoor", "outdoor"):
-            raise ValueError(f"Invalid mode override '{mode}'. Must be 'indoor', 'outdoor', or None.")
+            raise ValueError(t("dxf_ui.errors.invalid_mode", mode=mode))
         self.state.mode_override = mode
         save_state(self.project_dir, self.state)
 
@@ -406,7 +409,7 @@ class DxfPageController:
             pt2 = np.array([pt2[0], pt2[1], 0.0], dtype=np.float64)
         applied = float(points_scale) if points_scale is not None else self.scale_factor
         if not np.isfinite(applied) or applied <= 0:
-            raise ValueError("The scale of the picked points must be a finite positive number")
+            raise ValueError(t("dxf_ui.errors.picked_scale_invalid"))
         state_obj = two_point_scale(pt1 / applied, pt2 / applied, float(real_distance))
         self._rescale_levels(state_obj.factor)
         self.state.scale = {
@@ -425,7 +428,7 @@ class DxfPageController:
                 lvl["checked"] = new_val
                 save_state(self.project_dir, self.state)
                 return new_val
-        raise ValueError(f"Level '{level_id}' not found in state levels")
+        raise ValueError(t("dxf_ui.errors.level_not_found", level=level_id))
 
     def set_level_checked(self, level_id: str, checked: bool) -> None:
         """Explicitly set level export selection flag."""
@@ -438,7 +441,7 @@ class DxfPageController:
                 lvl["name"] = str(new_name).strip()
                 save_state(self.project_dir, self.state)
                 return
-        raise ValueError(f"Level '{level_id}' not found in state levels")
+        raise ValueError(t("dxf_ui.errors.level_not_found", level=level_id))
 
     def move_level(self, level_id: str, floor_z: float | None = None, ceiling_z: float | None = None) -> None:
         """Adjust floor and/or ceiling elevations for an indoor level."""
@@ -450,7 +453,7 @@ class DxfPageController:
                     lvl["ceiling_z"] = float(ceiling_z)
                 save_state(self.project_dir, self.state)
                 return
-        raise ValueError(f"Level '{level_id}' not found in state levels")
+        raise ValueError(t("dxf_ui.errors.level_not_found", level=level_id))
 
     def add_level(self, floor_z: float, ceiling_z: float | None = None, name: str | None = None) -> dict[str, Any]:
         """Add a new indoor level to state with unique ID."""
@@ -488,7 +491,7 @@ class DxfPageController:
         """Apply or remove the wall yaw of the stored alignment without recomputing it."""
         alignment = self.state.alignment
         if alignment is None or "rotation" not in alignment:
-            raise ValueError("Run 'Align to gravity' before choosing the wall alignment")
+            raise ValueError(t("dxf_ui.errors.align_first"))
         full = np.asarray(alignment.get("full_rotation", alignment["rotation"]), dtype=np.float64)
         yaw = np.radians(float(alignment.get("yaw_degrees", 0.0)))
         undo_yaw = np.array(((np.cos(-yaw), -np.sin(-yaw), 0.0), (np.sin(-yaw), np.cos(-yaw), 0.0), (0.0, 0.0, 1.0)))
@@ -503,7 +506,7 @@ class DxfPageController:
         orig_len = len(self.state.levels)
         self.state.levels = [lvl for lvl in self.state.levels if lvl["id"] != level_id]
         if len(self.state.levels) == orig_len:
-            raise ValueError(f"Level '{level_id}' not found in state levels")
+            raise ValueError(t("dxf_ui.errors.level_not_found", level=level_id))
         save_state(self.project_dir, self.state)
 
     def set_view_option(self, key: str, value: Any) -> None:
@@ -522,24 +525,24 @@ class DxfPageController:
         """
         allowed = {"pixel_size_outdoor", "pixel_size_indoor", "max_side", "cut_below_ceiling"}
         if name not in allowed:
-            raise ValueError(f"Unknown orthophoto option '{name}'. Allowed: {', '.join(sorted(allowed))}")
+            raise ValueError(t("dxf_ui.errors.unknown_ortho_option", name=name, allowed=", ".join(sorted(allowed))))
 
         if value is None or value == "":
             self.state.ortho[name] = None
         elif name in ("pixel_size_outdoor", "pixel_size_indoor"):
             val = float(value)
             if not np.isfinite(val) or val <= 0:
-                raise ValueError(f"{name} must be a positive number greater than 0")
+                raise ValueError(t("dxf_ui.errors.pixel_size_positive", name=name))
             self.state.ortho[name] = val
         elif name == "max_side":
             val = int(value)
             if not (1000 <= val <= 30000):
-                raise ValueError("max_side must be an integer between 1000 and 30000")
+                raise ValueError(t("dxf_ui.errors.max_side_range"))
             self.state.ortho[name] = val
         elif name == "cut_below_ceiling":
             val = float(value)
             if not np.isfinite(val) or not (0.0 <= val <= 1.0):
-                raise ValueError("cut_below_ceiling must be between 0.0 and 1.0 m")
+                raise ValueError(t("dxf_ui.errors.cut_below_range"))
             self.state.ortho[name] = val
 
         save_state(self.project_dir, self.state)
@@ -547,23 +550,23 @@ class DxfPageController:
     def set_background_source(self, source: str) -> None:
         """Set the review canvas background source: 'topview' or 'ortho'."""
         if source not in ("topview", "ortho"):
-            raise ValueError(f"Invalid background source '{source}'. Must be 'topview' or 'ortho'.")
+            raise ValueError(t("dxf_ui.errors.invalid_background_source", source=source))
         self.state.view["background_source"] = source
         save_state(self.project_dir, self.state)
 
     def set_segment_source(self, source: str) -> None:
         """Select the cached orthophoto segmentation source without starting a job."""
         if source not in {"pointcloud", "sam3", "flurseg", "combined"}:
-            raise ValueError("Unsupported segmentation source")
+            raise ValueError(t("dxf_ui.errors.unsupported_segment_source"))
         if source == "flurseg" and self.mode == "indoor":
-            raise ValueError("FlurSeg segmentation is only available for outdoor orthophotos")
+            raise ValueError(t("dxf_ui.errors.flurseg_outdoor_only"))
         self.state.segment_source = source
         save_state(self.project_dir, self.state)
 
     def set_plan_variant(self, variant: str) -> None:
         """Select the cached plan variant used for review and export without starting a job."""
         if variant not in {"pointcloud", "ortho"}:
-            raise ValueError("Plan variant must be 'pointcloud' or 'ortho'")
+            raise ValueError(t("dxf_ui.errors.plan_variant_invalid"))
         self.state.plan_variant = variant
         save_state(self.project_dir, self.state)
 
@@ -808,12 +811,12 @@ class DxfPageController:
         if self.blocked_message is not None:
             raise ValueError(self.blocked_message)
         if self.profile_required:
-            raise ValueError("A model profile must be selected before starting a job")
+            raise ValueError(t("dxf_ui.errors.profile_required"))
         las = self.las_path
         if las is None or not Path(las).is_file():
-            raise ValueError(f"No valid LAS file found to execute '{action}'")
+            raise ValueError(t("dxf_ui.errors.no_las", action=action))
         if action not in {"preview", "align", "levels", "generate", "export", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"}:
-            raise ValueError(f"Unsupported DXF job action '{action}'")
+            raise ValueError(t("dxf_ui.errors.unsupported_action", action=action))
         options: dict[str, str] = {}
         if action in {"segment", "clean_plan", "run_all"}:
             options["source"] = self.state.segment_source
@@ -850,6 +853,12 @@ class DxfPageController:
         matched = next((lvl for lvl in self.state.levels if lvl["id"] == level_id), None)
         return str(matched["name"]) if matched is not None else str(level_id)
 
+    def level_display_label(self, level_id: str | None) -> str:
+        """Level name for UI text: like level_label, but 'Site' is translated (level_label also feeds file names)."""
+        if level_id is None:
+            return t("dxf_ui.level.site")
+        return self.level_label(level_id)
+
     def review_targets(self) -> list[str | None]:
         """Level ids offered in the DXF review: checked levels (indoor) or [None] for the outdoor site."""
         if self.mode == "indoor":
@@ -858,27 +867,27 @@ class DxfPageController:
 
     def stale_levels(self) -> list[str]:
         """Display names of review targets whose cached DXF preview no longer matches the settings."""
-        return [self.level_label(level_id) for level_id in self.review_targets() if self.is_stale(level_id)]
+        return [self.level_display_label(level_id) for level_id in self.review_targets() if self.is_stale(level_id)]
 
     def stale_ortho_levels(self) -> list[str]:
         """Display names of review targets whose cached orthophoto exists but is stale."""
-        return [self.level_label(level_id) for level_id in self.review_targets() if self.ortho_status(level_id) == "stale"]
+        return [self.level_display_label(level_id) for level_id in self.review_targets() if self.ortho_status(level_id) == "stale"]
 
     def stale_banner_messages(self) -> list[str]:
         """Human-readable messages for the stale banner covering DXF and orthophoto staleness."""
         messages: list[str] = []
         dxf_stale = self.stale_levels()
         if dxf_stale:
-            messages.append(f"DXF preview is out of date ({', '.join(dxf_stale)})")
+            messages.append(t("dxf_ui.stale.dxf", levels=", ".join(dxf_stale)))
         ortho_stale = self.stale_ortho_levels()
         if ortho_stale:
-            messages.append(f"orthophoto is out of date ({', '.join(ortho_stale)})")
-        segment_stale = [self.level_label(level_id) for level_id in self.review_targets() if self.segment_status(level_id) == "stale"]
+            messages.append(t("dxf_ui.stale.ortho", levels=", ".join(ortho_stale)))
+        segment_stale = [self.level_display_label(level_id) for level_id in self.review_targets() if self.segment_status(level_id) == "stale"]
         if segment_stale:
-            messages.append(f"orthophoto segmentation is out of date ({', '.join(segment_stale)})")
-        clean_stale = [self.level_label(level_id) for level_id in self.review_targets() if self.plan_status(level_id, "ortho") == "stale"]
+            messages.append(t("dxf_ui.stale.segment", levels=", ".join(segment_stale)))
+        clean_stale = [self.level_display_label(level_id) for level_id in self.review_targets() if self.plan_status(level_id, "ortho") == "stale"]
         if clean_stale:
-            messages.append(f"clean plan is out of date ({', '.join(clean_stale)})")
+            messages.append(t("dxf_ui.stale.clean", levels=", ".join(clean_stale)))
         return messages
 
     def stale_banner_text(self) -> str | None:
@@ -886,7 +895,7 @@ class DxfPageController:
         messages = self.stale_banner_messages()
         if not messages:
             return None
-        return f"Settings changed: {' and '.join(messages)}. Regenerate in the DXF review."
+        return t("dxf_ui.stale.banner", messages=t("dxf_ui.stale.joiner").join(messages))
 
     def all_exports_enabled(self) -> bool:
         """True when every review target has a fresh cached preview, so a batch export can run."""
@@ -1086,10 +1095,10 @@ class DxfPageController:
     def set_layer_mode(self, layer_name: str, mode: str) -> None:
         """Override a layer's extraction mode; cut_band without a band gets DEFAULT_CUT_BAND."""
         if mode not in LAYER_MODES:
-            raise ValueError(f"Unsupported layer mode '{mode}'")
+            raise ValueError(t("dxf_ui.errors.unsupported_layer_mode", mode=mode))
         current = next((row for row in self.layer_settings() if row["name"] == layer_name), None)
         if current is None:
-            raise ValueError(f"Unknown layer '{layer_name}'")
+            raise ValueError(t("dxf_ui.errors.unknown_layer", layer=layer_name))
         z_band = DEFAULT_CUT_BAND if mode == "cut_band" and current["z_band"] is None else None
         self.set_layer_override(layer_name, z_band=z_band, mode=mode)
 
@@ -1097,7 +1106,7 @@ class DxfPageController:
         """Override a layer's height band in metres above the level floor."""
         low, high = float(lower), float(upper)
         if not (np.isfinite(low) and np.isfinite(high)) or low >= high:
-            raise ValueError("The z band needs a lower value below the upper value")
+            raise ValueError(t("dxf_ui.errors.z_band_order"))
         self.set_layer_override(layer_name, z_band=(low, high))
 
     def reset_layer_override(self, layer_name: str) -> None:
@@ -1133,7 +1142,7 @@ class DxfPageController:
         """Write a PNG of the cached review (background + DXF) with the same compositing as the canvas."""
         result = self.plan_result(level_id, variant)
         if result is None:
-            raise ValueError("No cached DXF plan exists for this target. Compute it first.")
+            raise ValueError(t("dxf_ui.errors.no_cached_plan"))
         png = result.background.rgb_png if image_source == "rgb" else result.background.class_png
         png = png or result.background.rgb_png or result.background.class_png
         image: np.ndarray | None = None
@@ -1166,7 +1175,7 @@ class DxfPageController:
         target = directory / f"{sanitize_dxf_name(self.level_label(level_id))}_{stamp}.png"
         success, encoded = cv2.imencode(".png", cv2.cvtColor(merged, cv2.COLOR_RGB2BGR))
         if not success:
-            raise RuntimeError("PNG encoding of the snapshot failed")
+            raise RuntimeError(t("dxf_ui.errors.png_encoding_failed"))
         temporary = target.with_name(f".{target.name}.tmp")
         temporary.write_bytes(encoded.tobytes())
         temporary.replace(target)

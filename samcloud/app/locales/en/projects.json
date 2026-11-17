@@ -1,0 +1,78 @@
+{
+  "storage": {
+    "keep_control_point_inputs": "Allow re-optimising the control points later",
+    "keep_classification_inputs": "Allow re-running the classification later",
+    "keep_refinement_inputs": "Allow re-running the geometry refinement later",
+    "keep_processing_cache": "Allow fast re-runs of step 6 (improve & filter) later – keeps depth maps, SAM images and Depth Anything (needs a lot of disk space)"
+  },
+  "engine": {
+    "sam3": "SAM3 – customisable and extensible classes (default)",
+    "flurseg": "FlurSeg – approx. 15× faster, 11 fixed classes"
+  },
+  "capture_type": {
+    "drone_gps": "Drone with GPS / RTK",
+    "camera": "Standard camera without GPS",
+    "panorama_360": "360 degree camera / Insta360",
+    "legacy": "Legacy project"
+  },
+  "class_set": {
+    "outdoor": "Outdoor",
+    "indoor": "Indoor"
+  },
+  "control_points_mode": {
+    "none": "No control points - continue automatically",
+    "after_alignment": "Use control points after alignment"
+  },
+  "class_editor": {
+    "flurseg_summary": "ground, sealed surface (road, sidewalk, marking → road), curb, low vegetation, tree, building, vehicle, construction site (→ construction machinery), manhole cover (→ manhole); everything else → unknown",
+    "flurseg_note": "FlurSeg is about 15× faster than SAM3, but its classes are fixed by training and cannot be customised: {summary}.",
+    "title": "Customise classes (SAM3)",
+    "hint": "Prompts are English terms separated by commas. The standard classes are kept (step 6 and the geometry rules use them); custom classes are appended and get LAS codes from 64.",
+    "custom_classes": "Custom classes",
+    "add": "Add class",
+    "name": "Name (English)",
+    "name_placeholder": "solar panel",
+    "label": "Label",
+    "label_placeholder": "Solar panel",
+    "prompts": "Prompts",
+    "prompts_placeholder": "solar panel, photovoltaic module",
+    "color": "Color"
+  },
+  "create": {
+    "title": "Create project",
+    "name": "Project name",
+    "name_placeholder": "example-site",
+    "capture_type": "Capture type",
+    "class_set": "Semantic class set",
+    "engine": "Classification model (outdoor)",
+    "apriltags": "Detect AprilTags (scale)",
+    "tag_coordinates": "Tag coordinates (optional)",
+    "tag_crs": "Tag coordinate system",
+    "tag_hint": "Optional: coordinates of the tag centre per ID. The ID on the printout must match the ID in the file.",
+    "control_points": "Ground control points",
+    "storage": "Storage",
+    "image_directory": "Image directory",
+    "rtk": "Images use RTK GPS",
+    "select_directory": "Select image directory",
+    "dialog_failed": "Could not open the folder dialog: {error}",
+    "panorama_hint": "Use an exported 2:1 equirectangular MP4 video, a JPG panorama directory, or both.",
+    "panorama_video": "360 degree MP4 video (optional)",
+    "panorama_directory": "360 degree JPG panorama directory (optional)",
+    "frame_interval": "Video frame interval in seconds",
+    "select_capture_type": "Select a capture type",
+    "select_class_set": "Select the indoor or outdoor semantic class set",
+    "created": "Project created: {name}",
+    "button": "Create project"
+  },
+  "existing": {
+    "title": "Existing projects",
+    "empty": "No saved projects found."
+  },
+  "delete": {
+    "busy": "This project is still processing and cannot be deleted.",
+    "title": "Delete project?",
+    "message": "This permanently removes {name} and all generated files.",
+    "confirm": "Delete permanently",
+    "done": "Project deleted: {name}"
+  }
+}

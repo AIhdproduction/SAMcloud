@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any
 
+from samcloud.app.i18n import catalogue, t
 from samcloud.classification.custom import project_classes_path
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_manager import apriltags_enabled
@@ -92,10 +94,10 @@ class ProcessingManager:
         """Start only the reviewed GCP adjustment, never a new dense pipeline."""
         project_directory = project_directory.resolve()
         if self.is_running(project_directory):
-            raise ValueError("A processing job is already running for this project")
+            raise ValueError(t("processing.error.job_running"))
         project = self._state.projects.load(project_directory)
         if not (project_directory / "control_points" / "detections.json").is_file():
-            raise ValueError("Automatic control-point detections are not available")
+            raise ValueError(t("processing.error.detections_missing"))
         project.setdefault("workflow", {})["control_points"] = "running"
         project.setdefault("processing", {}).update({
             "last_error": "",
@@ -133,7 +135,7 @@ class ProcessingManager:
         """Run alignment, dense reconstruction, and SAM3, leaving LAS manual."""
         project_directory = project_directory.resolve()
         if self.is_running(project_directory):
-            raise ValueError("Processing is already running for this project")
+            raise ValueError(t("processing.error.already_running"))
 
         project = self._state.projects.load(project_directory)
         workflow = project.setdefault("workflow", {})
@@ -144,7 +146,7 @@ class ProcessingManager:
             else "none",
         )
         if mode not in {"none", "after_alignment", "automatic"}:
-            raise ValueError("Invalid control-point mode in project settings")
+            raise ValueError(t("processing.error.invalid_control_point_mode"))
 
         workflow["alignment"] = "running"
         workflow["control_points"] = "not_started" if mode in {"after_alignment", "automatic"} else "skipped"
@@ -182,12 +184,12 @@ class ProcessingManager:
         """Export the classified PLY to LAS as a separate manual action."""
         project_directory = project_directory.resolve()
         if self.is_running(project_directory):
-            raise ValueError("A processing job is still running for this project")
+            raise ValueError(t("processing.error.job_still_running"))
 
         project = self._state.projects.load(project_directory)
         classified = project_directory / "products" / "classified" / "classified.ply"
         if not classified.exists():
-            raise ValueError("Classified PLY is not available yet")
+            raise ValueError(t("processing.error.classified_missing"))
 
         settings = project.get("settings", {})
         classification = settings.get("classification", {})
@@ -244,9 +246,9 @@ class ProcessingManager:
 
         project_directory = project_directory.resolve()
         if self.is_running(project_directory):
-            raise ValueError("Processing is already running for this project")
+            raise ValueError(t("processing.error.already_running"))
         if load_manifest(project_directory) is None:
-            raise ValueError("No processing cache: enable it in the settings and process the project once")
+            raise ValueError(t("processing.error.no_cache"))
         project = self._state.projects.load(project_directory)
         workflow = project.setdefault("workflow", {})
         workflow["refinement"] = "running"
@@ -271,9 +273,9 @@ class ProcessingManager:
         """Re-run only the classification (and step 6) on the finished dense cloud with the current settings."""
         project_directory = project_directory.resolve()
         if self.is_running(project_directory):
-            raise ValueError("Processing is already running for this project")
+            raise ValueError(t("processing.error.already_running"))
         if not reclassification_available(project_directory):
-            raise ValueError("The dense cloud was not kept for this project; process it again from the start")
+            raise ValueError(t("processing.error.dense_not_kept"))
         project = self._state.projects.load(project_directory)
         workflow = project.setdefault("workflow", {})
         workflow["classification"] = "running"
@@ -298,10 +300,10 @@ class ProcessingManager:
         """Start Phase B after validating that enough GCP clicks are available."""
         project_directory = project_directory.resolve()
         if self.is_running(project_directory):
-            raise ValueError("Processing is already running for this project")
+            raise ValueError(t("processing.error.already_running"))
         project = self._state.projects.load(project_directory)
         if project.get("workflow", {}).get("control_points") != "waiting":
-            raise ValueError("Control points are not waiting for continuation")
+            raise ValueError(t("processing.error.control_points_not_waiting"))
         from samcloud.control_points.repository import load_detections, load_observations, read_control_points
 
         settings = project.get("settings", {}).get("control_points", {})
@@ -317,7 +319,7 @@ class ProcessingManager:
             for name in points["name"]
         )
         if usable < minimum_points:
-            raise ValueError(f"At least {minimum_points} control points with {minimum_observations} observations are required")
+            raise ValueError(t("processing.error.control_points_insufficient", points=minimum_points, observations=minimum_observations))
         workflow = project.setdefault("workflow", {})
         workflow.update({"control_points": "running", "dense_cloud": "running", "classification": "queued", "refinement": "queued"})
         project.setdefault("processing", {}).update({"last_error": "", "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": "", "progress": {"percent": 57, "stage": "Applying control points", "detail": ""}})
@@ -580,3 +582,44 @@ def reclassification_available(project_directory: Path) -> bool:
         return (dense / name).is_file() or (dense / f"{name}.gz").is_file()
 
     return kept("fused.ply") and kept("fused.ply.vis") and (dense / "sparse").is_dir()
+
+
+# Progress texts persisted by this module (project JSON / progress.json stay English); translated only for display.
+_PROGRESS_TEXT_KEYS = {
+    "Optimizing control points": "processing.stage.optimizing_control_points",
+    "Control points optimized": "processing.stage.control_points_optimized",
+    "Control-point optimization failed": "processing.stage.control_point_optimization_failed",
+    "Exporting LAS": "processing.stage.exporting_las",
+    "Improving and filtering": "processing.stage.improving_and_filtering",
+    "Reclassifying": "processing.stage.reclassifying",
+    "Applying control points": "processing.stage.applying_control_points",
+    "Complete": "processing.stage.complete",
+    "Failed": "processing.stage.failed",
+}
+_EXIT_MESSAGES = (
+    (re.compile(r"Pipeline ended with exit code (-?\d+)\. See reports/pipeline\.log\."), "processing.error.pipeline_exit"),
+    (re.compile(r"LAS export ended with exit code (-?\d+)\. See reports/export\.log\."), "processing.error.export_exit"),
+)
+_KNOWN_TEXT_PREFIXES = ("workflow.stage.", "workflow.step.")
+
+
+def display_progress_text(text: object) -> object:
+    """Translate a persisted progress stage or error message for the UI; unknown free text is returned unchanged.
+
+    Known texts are the stages/errors written above and the English labels of the ``workflow.stage``/
+    ``workflow.step`` keys (estimator stage names written by the engine). The stored value is never changed.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    key = _PROGRESS_TEXT_KEYS.get(text)
+    if key is not None:
+        return t(key)
+    for pattern, message_key in _EXIT_MESSAGES:
+        match = pattern.fullmatch(text)
+        if match is not None:
+            return t(message_key, code=match.group(1))
+    english = catalogue("en")
+    for catalogue_key, value in english.items():
+        if value == text and catalogue_key.startswith(_KNOWN_TEXT_PREFIXES):
+            return t(catalogue_key)
+    return text

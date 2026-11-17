@@ -1,0 +1,84 @@
+{
+  "language": {
+    "title": "Sprache / Language",
+    "label": "Interface language",
+    "config_default": "Default from config/defaults.yml: {language}",
+    "hint": "Your choice is saved immediately and overrides the configured default. Running jobs and projects are not affected.",
+    "reset": "Reset to configured default",
+    "failed": "Could not save the language: {error}"
+  },
+  "no_project": "Open a project before editing settings.",
+  "capture": {
+    "title": "Capture sources",
+    "type": "Capture type: {type}",
+    "locked": "Capture settings are locked because processing has started.",
+    "image_directory": "Image directory",
+    "rtk": "Images use RTK GPS",
+    "panorama_video": "360 degree MP4 video",
+    "panorama_directory": "360 degree JPG panorama directory",
+    "frame_interval": "Video frame interval in seconds"
+  },
+  "coordinates": {
+    "title": "Coordinate systems",
+    "input": "Image/GNSS CRS",
+    "working": "Working CRS",
+    "export": "Export CRS",
+    "hint": "Choose the output coordinate system configured in config/export_crs.yml."
+  },
+  "processing": {
+    "title": "Processing settings",
+    "use_gpu": "Use GPU",
+    "control_points": "Ground control points"
+  },
+  "control_points_mode": {
+    "none": "No control points - continue automatically",
+    "after_alignment": "Use control points after alignment",
+    "automatic": "Automatic (detect targets)"
+  },
+  "storage": {
+    "title": "Storage"
+  },
+  "classification": {
+    "title": "Classification",
+    "hint": "These values apply to the next classification run.",
+    "class_set": "Semantic class set",
+    "min_votes": "Minimum agreeing images per point",
+    "engine": "Classification model (outdoor)",
+    "engine_hint": "Indoor scenes are always classified with SAM3.",
+    "mode": "Classification mode",
+    "mode_legacy": "Legacy (instance masks, majority vote)",
+    "mode_segearth_ov3": "SegEarth-OV3 (head fusion, presence gate, weighted voting)",
+    "background_threshold": "SegEarth-OV3 background threshold",
+    "tile_size": "SAM3 tile size",
+    "tile_768": "768 px - faster, lower detail",
+    "tile_1008": "1008 px - balanced",
+    "tile_1280": "1280 px - higher detail, more GPU memory",
+    "tile_overlap": "Tile overlap",
+    "geometry_refinement": "Geometric refinement (height & flatness check)"
+  },
+  "refinement": {
+    "title": "Improve & filter (step 6)",
+    "hint": "Indoor only: Depth-Anything-V2 predicts depth where COLMAP finds no texture (white walls) and helps to remove floating points and to fill floors, ceilings and walls.",
+    "depth_model": "Depth model",
+    "depth_large": "Depth-Anything-V2 Large (best, CC-BY-NC-4.0 weights)",
+    "depth_small": "Depth-Anything-V2 Small (faster, Apache-2.0 weights)",
+    "depth_off": "Off",
+    "depth_fill": "Fill gaps with Depth Anything (only where it agrees with the COLMAP depth maps)",
+    "surface_fusion": "Merge surfaces: fuse all depth maps into one point layer (one plane each for wall, ceiling and floor)"
+  },
+  "errors": {
+    "unsupported_engine": "Select a supported classification model",
+    "unsupported_depth_model": "Select a supported depth model",
+    "min_votes": "Minimum agreeing images must be at least 1",
+    "unsupported_mode": "Select a supported classification mode",
+    "background_threshold": "Background threshold must be between 0.00 and 1.00",
+    "tile_size": "Select a supported SAM3 tile size",
+    "tile_overlap": "Tile overlap must be between 0.00 and 0.80"
+  },
+  "save": "Save settings",
+  "saved": "Project settings saved",
+  "panorama": {
+    "prepare": "Prepare 360 degree inputs",
+    "prepared": "Prepared {panoramas} panoramas and {images} virtual camera images"
+  }
+}

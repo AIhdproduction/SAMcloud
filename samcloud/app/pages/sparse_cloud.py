@@ -2,6 +2,7 @@
 
 from nicegui import ui
 
+from samcloud.app.i18n import t, translate_or
 from samcloud.app.pages.gcp_review import render_review_workspace
 from samcloud.app.layout import render_page
 from samcloud.app.pointcloud_viewer import render_pointcloud_viewer
@@ -13,18 +14,22 @@ def render() -> None:
     def content() -> None:
         project = state.active_project()
         if project is None:
-            ui.label("Öffnen Sie zuerst ein Projekt, um die Ausrichtung anzuzeigen.")
+            ui.label(t("sparse.no_project"))
             return
-        ui.label("COLMAP Sparse-Rekonstruktion").classes("sam-muted")
+        ui.label(t("sparse.subtitle")).classes("sam-muted")
         with ui.column().classes("w-full gap-4"):
             with ui.card().classes("w-full"):
-                render_pointcloud_viewer("sparse", title="Sparse Punktwolke", marker_endpoint="/api/control-points/markers")
+                render_pointcloud_viewer("sparse", title=t("sparse.viewer_title"), marker_endpoint="/api/control-points/markers")
             if (state.active_project_directory / "control_points" / "detections.json").is_file():
                 render_review_workspace()
             with ui.card().classes("w-full"):
-                ui.label("Ausrichtungsstatus").classes("text-lg font-medium")
-                ui.label(project["workflow"]["alignment"].replace("_", " ").title())
+                ui.label(t("sparse.alignment_status")).classes("text-lg font-medium")
+                alignment_status = str(project["workflow"]["alignment"])
+                ui.label(translate_or(
+                    f"workflow.status.{alignment_status.replace(' ', '_')}",
+                    alignment_status.replace("_", " ").title(),
+                ))
                 ui.separator()
-                ui.label("Die Ansicht zeigt eine Browser-Vorschau der rekonstruierten COLMAP-Punkte. Das Originalmodell bleibt unter products/sparse erhalten.").classes("sam-muted")
+                ui.label(t("sparse.hint")).classes("sam-muted")
 
-    render_page("Sparse Cloud", content, current_path="/sparse", wide=True)
+    render_page(t("sparse.title"), content, current_path="/sparse", wide=True)

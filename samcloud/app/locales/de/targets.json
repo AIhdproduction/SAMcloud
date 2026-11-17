@@ -1,0 +1,16 @@
+{
+  "intro": "Druckvorlagen für Passpunkte. Funktioniert auch ohne geöffnetes Projekt.",
+  "apriltag": {
+    "title": "AprilTags (150 mm, tag36h11)",
+    "hint": "Für Innenräume: Massstab und optional Georeferenzierung. Mit 100 % drucken.",
+    "count": "Anzahl",
+    "start_id": "Start-ID"
+  },
+  "cross": {
+    "title": "Kreuz-Targets (180 mm, nummeriert)",
+    "hint": "Für Drohnenflüge und aussen: zwei schwarze Dreiecke auf weissem Papier, Spitzen = Messpunkt. Ganzes Blatt oder Quadrat an den Marken ausgeschnitten flach auf den Untergrund legen. Funktioniert auf hellem und dunklem Untergrund.",
+    "count": "Anzahl",
+    "start_number": "Start-Nr."
+  },
+  "create_pdf": "PDF erstellen"
+}

@@ -5,7 +5,7 @@ export default {
       <canvas ref="canvas" style="display:block;width:100%;height:100%;touch-action:none"
         @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointerleave="onLeave" @wheel.prevent="onWheel"></canvas>
       <div ref="status" style="position:absolute;left:10px;bottom:8px;padding:4px 8px;border-radius:5px;background:rgba(9,19,29,.86);color:#b9ccda;font-size:12px;pointer-events:none"></div>
-      <div v-if="!image" style="position:absolute;inset:0;display:grid;place-items:center;color:#96aabe;font-size:14px;pointer-events:none">Press "Render side view" to draw the preview cloud.</div>
+      <div v-if="!image" style="position:absolute;inset:0;display:grid;place-items:center;color:#96aabe;font-size:14px;pointer-events:none">{{ (strings && strings.empty) || 'Press "Render side view" to draw the preview cloud.' }}</div>
     </div>
   `,
   props: {
@@ -14,6 +14,7 @@ export default {
     levels: Array,
     tool: String,
     axisLabel: String,
+    strings: Object,
   },
   data() {
     return { localLevels: [], measurePoints: [] };
@@ -236,8 +237,10 @@ export default {
           ctx.setLineDash([]);
         }
         ctx.fillStyle = `rgba(${colour},1)`;
-        ctx.fillText(`Level ${level.name} · floor ${Number(level.floor_z).toFixed(2)} m`, 8, yFloor - 5);
-        if (hasCeiling) ctx.fillText(`ceiling ${Number(level.ceiling_z).toFixed(2)} m`, 8, yCeiling + 14);
+        const floorText = (this.strings && this.strings.level_floor) || "Level {name} · floor {z} m";
+        ctx.fillText(floorText.replace("{z}", Number(level.floor_z).toFixed(2)).replace("{name}", level.name), 8, yFloor - 5);
+        const ceilingText = (this.strings && this.strings.ceiling) || "ceiling {z} m";
+        if (hasCeiling) ctx.fillText(ceilingText.replace("{z}", Number(level.ceiling_z).toFixed(2)), 8, yCeiling + 14);
       }
       if (this.measurePoints.length) {
         ctx.strokeStyle = "#ffd23f";

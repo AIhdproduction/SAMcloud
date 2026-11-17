@@ -1,37 +1,71 @@
 """Project creation and reopening page."""
 
 import tempfile
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from tkinter import TclError, Tk, filedialog
+from typing import Any
 
 from nicegui import events, ui
 
+from samcloud.app.i18n import t, translate_or
 from samcloud.app.layout import render_page
-from samcloud.app.pages.control_points import _CRS_OPTIONS, LOCAL_CRS_HINT
+from samcloud.app.pages.control_points import crs_options, local_crs_hint
 from samcloud.app.state import state
 from samcloud.classification.custom import standard_classes
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_deletion import delete_project
 from samcloud.core.storage import DEFAULT_STORAGE
 
-STORAGE_OPTIONS = {
-    "keep_control_point_inputs": "Passpunkte später neu optimieren können",
-    "keep_classification_inputs": "Klassifizierung später neu rechnen können",
-    "keep_refinement_inputs": "Geometrie-Verfeinerung später neu rechnen können",
-    "keep_processing_cache": "Schritt 6 (Verbessern & filtern) später schnell neu rechnen können – "
-                             "behält Tiefenkarten, SAM-Bilder und Depth-Anything (braucht viel Speicher)",
-}
+
+class TranslatedOptions(Mapping):
+    """Option mapping with fixed values whose labels resolve in the current UI language on every access.
+
+    Keys (the internal option values) never change; only the displayed labels are translated.
+    Pass ``dict(options)`` to ``ui.select`` so the labels are resolved at render time.
+    """
+
+    def __init__(self, label_keys: Mapping[Any, str]) -> None:
+        self.label_keys = dict(label_keys)
+
+    def __getitem__(self, value: Any) -> str:
+        return t(self.label_keys[value])
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.label_keys)
+
+    def __len__(self) -> int:
+        return len(self.label_keys)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self)!r})"
 
 
-ENGINE_OPTIONS = {
-    "sam3": "SAM3 – Klassen anpassbar und erweiterbar (Standard)",
-    "flurseg": "FlurSeg – ca. 15× schneller, 11 feste Klassen",
-}
-FLURSEG_CLASS_SUMMARY = (
-    "Boden, versiegelte Fläche (Strasse, Gehweg, Markierung → road), Randstein, niedrige Vegetation, "
-    "Baum, Gebäude, Fahrzeug, Baustelle (→ construction machinery), Schachtdeckel (→ manhole); "
-    "alles andere → unknown"
-)
+STORAGE_OPTIONS = TranslatedOptions({
+    "keep_control_point_inputs": "projects.storage.keep_control_point_inputs",
+    "keep_classification_inputs": "projects.storage.keep_classification_inputs",
+    "keep_refinement_inputs": "projects.storage.keep_refinement_inputs",
+    "keep_processing_cache": "projects.storage.keep_processing_cache",
+})
+
+
+ENGINE_OPTIONS = TranslatedOptions({
+    "sam3": "projects.engine.sam3",
+    "flurseg": "projects.engine.flurseg",
+})
+CAPTURE_TYPE_OPTIONS = TranslatedOptions({
+    "drone_gps": "projects.capture_type.drone_gps",
+    "camera": "projects.capture_type.camera",
+    "panorama_360": "projects.capture_type.panorama_360",
+})
+CLASS_SET_OPTIONS = TranslatedOptions({
+    "outdoor": "projects.class_set.outdoor",
+    "indoor": "projects.class_set.indoor",
+})
+CONTROL_POINTS_MODE_OPTIONS = TranslatedOptions({
+    "none": "projects.control_points_mode.none",
+    "after_alignment": "projects.control_points_mode.after_alignment",
+})
 
 
 class _ClassEditor:
@@ -43,20 +77,15 @@ class _ClassEditor:
         self.prompt_inputs: dict[str, tuple[ui.input, list[str]]] = {}
         self.added: list[dict] = []
         self.flurseg_note = ui.label(
-            "FlurSeg ist etwa 15× schneller als SAM3, die Klassen sind aber durch das Training fest "
-            f"und nicht anpassbar: {FLURSEG_CLASS_SUMMARY}."
+            t("projects.class_editor.flurseg_note", summary=t("projects.class_editor.flurseg_summary"))
         ).classes("text-sm text-slate-400 max-w-[52rem]")
-        self.expansion = ui.expansion("Klassen anpassen (SAM3)", icon="tune").classes("w-full")
+        self.expansion = ui.expansion(t("projects.class_editor.title"), icon="tune").classes("w-full")
         with self.expansion:
-            ui.label(
-                "Prompts sind englische Begriffe, mit Komma getrennt. Die Standardklassen bleiben erhalten "
-                "(Schritt 6 und die Geometrie-Regeln nutzen sie), eigene Klassen werden hinten angehängt "
-                "und bekommen LAS-Codes ab 64."
-            ).classes("text-sm text-slate-400")
+            ui.label(t("projects.class_editor.hint")).classes("text-sm text-slate-400")
             self.standard_column = ui.column().classes("w-full gap-1")
-            ui.label("Eigene Klassen").classes("text-base font-medium q-mt-md")
+            ui.label(t("projects.class_editor.custom_classes")).classes("text-base font-medium q-mt-md")
             self.added_column = ui.column().classes("w-full gap-2")
-            ui.button("Klasse hinzufügen", icon="add", on_click=self.add_class).props("outline")
+            ui.button(t("projects.class_editor.add"), icon="add", on_click=self.add_class).props("outline")
 
     def update(self, class_set: str, engine: str) -> None:
         sam = class_set == "indoor" or engine == "sam3"
@@ -75,7 +104,8 @@ class _ClassEditor:
         with self.standard_column:
             for item in standard_classes(self.class_set):
                 with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                    ui.label(f"{item['label']} ({item['name']})").classes("text-sm w-64 shrink-0")
+                    label = translate_or(f"classes.{item['name']}", item["label"])
+                    ui.label(f"{label} ({item['name']})").classes("text-sm w-64 shrink-0")
                     control = ui.input(value=", ".join(item["prompts"])).props("dense").classes("grow")
                 self.prompt_inputs[item["name"]] = (control, item["prompts"])
 
@@ -83,11 +113,17 @@ class _ClassEditor:
         entry: dict = {}
         with self.added_column:
             with ui.row().classes("w-full items-center gap-2 no-wrap") as row:
-                entry["name"] = ui.input("Name (englisch)", placeholder="solar panel").props("dense").classes("w-44")
-                entry["label"] = ui.input("Bezeichnung", placeholder="Solaranlage").props("dense").classes("w-44")
-                entry["prompts"] = ui.input("Prompts", placeholder="solar panel, photovoltaic module").props(
-                    "dense").classes("grow")
-                entry["color"] = ui.color_input("Farbe", value="#FF00FF").props("dense").classes("w-36")
+                entry["name"] = ui.input(
+                    t("projects.class_editor.name"), placeholder=t("projects.class_editor.name_placeholder")
+                ).props("dense").classes("w-44")
+                entry["label"] = ui.input(
+                    t("projects.class_editor.label"), placeholder=t("projects.class_editor.label_placeholder")
+                ).props("dense").classes("w-44")
+                entry["prompts"] = ui.input(
+                    t("projects.class_editor.prompts"), placeholder=t("projects.class_editor.prompts_placeholder")
+                ).props("dense").classes("grow")
+                entry["color"] = ui.color_input(t("projects.class_editor.color"), value="#FF00FF").props(
+                    "dense").classes("w-36")
                 ui.button(icon="delete", on_click=lambda: self._remove(entry, row)).props("flat round dense")
         self.added.append(entry)
 
@@ -118,29 +154,25 @@ def render() -> None:
     def content() -> None:
         panorama_defaults = load_global_config("defaults.yml").get("acquisition", {}).get("panorama", {})
         with ui.card().classes("w-full"):
-            ui.label("Create project").classes("text-lg font-medium")
-            name = ui.input("Project name", placeholder="example-site")
+            ui.label(t("projects.create.title")).classes("text-lg font-medium")
+            name = ui.input(t("projects.create.name"), placeholder=t("projects.create.name_placeholder"))
             capture_type = ui.select(
-                {
-                    "drone_gps": "Drone with GPS / RTK",
-                    "camera": "Standard camera without GPS",
-                    "panorama_360": "360 degree camera / Insta360",
-                },
-                label="Capture type",
+                dict(CAPTURE_TYPE_OPTIONS),
+                label=t("projects.create.capture_type"),
                 value="drone_gps",
             )
             class_set = ui.select(
-                {"outdoor": "Outdoor", "indoor": "Indoor"},
-                label="Semantic class set",
+                dict(CLASS_SET_OPTIONS),
+                label=t("projects.create.class_set"),
                 value="outdoor",
             )
             classification_engine = ui.select(
-                ENGINE_OPTIONS,
-                label="Klassifizierungsmodell (Aussenbereich)",
+                dict(ENGINE_OPTIONS),
+                label=t("projects.create.engine"),
                 value="sam3",
             ).classes("min-w-[26rem]").bind_visibility_from(class_set, "value", lambda value: value == "outdoor")
             apriltag_switch = ui.switch(
-                "AprilTags suchen (Maßstab)", value=class_set.value == "indoor"
+                t("projects.create.apriltags"), value=class_set.value == "indoor"
             ).mark("apriltag-switch")
             capture_type.on_value_change(
                 lambda event: setattr(class_set, "value", "indoor") if event.value == "panorama_360" else None
@@ -155,17 +187,17 @@ def render() -> None:
                         tag_upload["path"] = str(target)
 
                     ui.upload(
-                        on_upload=receive_tag_coordinates, auto_upload=True, label="Tag-Koordinaten (optional)"
+                        on_upload=receive_tag_coordinates,
+                        auto_upload=True,
+                        label=t("projects.create.tag_coordinates"),
                     ).props("accept=.csv,.txt").classes("w-full max-w-md").mark("apriltag-coords-upload")
                     tag_crs = ui.select(
-                        _CRS_OPTIONS, label="Koordinatensystem der Tags", value="EPSG:2056+5728"
+                        crs_options(), label=t("projects.create.tag_crs"), value="EPSG:2056+5728"
                     ).classes("w-full max-w-md").mark("apriltag-crs")
-                    tag_crs_hint = ui.label(LOCAL_CRS_HINT).classes("sam-muted text-sm").mark("apriltag-crs-local-hint")
+                    tag_crs_hint = ui.label(local_crs_hint()).classes("sam-muted text-sm").mark("apriltag-crs-local-hint")
                     tag_crs_hint.set_visibility(False)
                     tag_crs.on_value_change(lambda event: tag_crs_hint.set_visibility(event.value == "LOCAL"))
-                    ui.label(
-                        "Optional: Koordinaten der Tag-Mitte je ID. Die ID auf dem Ausdruck muss mit der ID in der Datei übereinstimmen."
-                    ).classes("sam-muted text-sm")
+                    ui.label(t("projects.create.tag_hint")).classes("sam-muted text-sm")
             class_editor = _ClassEditor()
 
             def update_class_editor() -> None:
@@ -175,15 +207,12 @@ def render() -> None:
             classification_engine.on_value_change(lambda _: update_class_editor())
             update_class_editor()
             control_points_mode = ui.select(
-                {
-                    "none": "No control points - continue automatically",
-                    "after_alignment": "Use control points after alignment",
-                },
-                label="Ground control points",
+                dict(CONTROL_POINTS_MODE_OPTIONS),
+                label=t("projects.create.control_points"),
                 value="none",
             )
             with ui.card().classes("w-full"):
-                ui.label("Speicher").classes("text-base font-medium")
+                ui.label(t("projects.create.storage")).classes("text-base font-medium")
                 storage_switches = {
                     key: ui.switch(label, value=DEFAULT_STORAGE[key])
                     for key, label in STORAGE_OPTIONS.items()
@@ -193,9 +222,9 @@ def render() -> None:
                 capture_type, "value", lambda value: value in {"drone_gps", "camera"}
             ):
                 image_directory = ui.input(
-                    "Image directory", placeholder="D:\\data\\camera-images"
+                    t("projects.create.image_directory"), placeholder="D:\\data\\camera-images"
                 ).classes("w-full")
-                rtk_enabled = ui.switch("Images use RTK GPS", value=True)
+                rtk_enabled = ui.switch(t("projects.create.rtk"), value=True)
 
                 def choose_image_directory() -> None:
                     """Open the native Windows folder dialog for the image source."""
@@ -208,11 +237,11 @@ def render() -> None:
                         selected_directory = filedialog.askdirectory(
                             initialdir=current_directory if current_directory.is_dir() else None,
                             parent=dialog_root,
-                            title="Select image directory",
+                            title=t("projects.create.select_directory"),
                             mustexist=True,
                         )
                     except TclError as error:
-                        ui.notify(f"Could not open the folder dialog: {error}", type="negative")
+                        ui.notify(t("projects.create.dialog_failed", error=error), type="negative")
                         return
                     finally:
                         if dialog_root is not None:
@@ -224,7 +253,7 @@ def render() -> None:
                     ui.button(
                         icon="folder_open",
                         on_click=choose_image_directory,
-                    ).props("flat round dense aria-label='Select image directory'")
+                    ).props(f"flat round dense aria-label='{t('projects.create.select_directory')}'")
 
                 def update_rtk_option() -> None:
                     is_rtk_capture = capture_type.value == "drone_gps"
@@ -237,16 +266,16 @@ def render() -> None:
             with ui.column().classes("w-full gap-3").bind_visibility_from(
                 capture_type, "value", lambda value: value == "panorama_360"
             ):
-                ui.label("Use an exported 2:1 equirectangular MP4 video, a JPG panorama directory, or both.").classes("text-sm")
+                ui.label(t("projects.create.panorama_hint")).classes("text-sm")
                 panorama_video_path = ui.input(
-                    "360 degree MP4 video (optional)", placeholder="D:\\data\\tour.mp4"
+                    t("projects.create.panorama_video"), placeholder="D:\\data\\tour.mp4"
                 ).classes("w-full")
                 panorama_image_directory = ui.input(
-                    "360 degree JPG panorama directory (optional)",
+                    t("projects.create.panorama_directory"),
                     placeholder="D:\\data\\insta360-photos",
                 ).classes("w-full")
                 frame_interval_seconds = ui.number(
-                    "Video frame interval in seconds",
+                    t("projects.create.frame_interval"),
                     value=panorama_defaults.get("frame_interval_seconds", 1.0),
                     min=0.1,
                     step=0.1,
@@ -255,9 +284,9 @@ def render() -> None:
             def create_project() -> None:
                 try:
                     if capture_type.value is None:
-                        raise ValueError("Select a capture type")
+                        raise ValueError(t("projects.create.select_capture_type"))
                     if class_set.value is None:
-                        raise ValueError("Select the indoor or outdoor semantic class set")
+                        raise ValueError(t("projects.create.select_class_set"))
                     project_directory = state.projects.create_project(
                         name.value,
                         image_directory.value or "",
@@ -277,20 +306,20 @@ def render() -> None:
                         apriltag_crs=tag_crs.value if tag_upload["path"] else None,
                     )
                     state.open_project(project_directory)
-                    ui.notify(f"Project created: {project_directory.name}")
+                    ui.notify(t("projects.create.created", name=project_directory.name))
                     ui.navigate.to("/")
                 except (FileExistsError, ValueError) as error:
                     ui.notify(str(error), type="negative")
 
-            ui.button("Create project", on_click=create_project)
+            ui.button(t("projects.create.button"), on_click=create_project)
 
-        ui.label("Existing projects").classes("text-lg font-medium")
+        ui.label(t("projects.existing.title")).classes("text-lg font-medium")
 
         @ui.refreshable
         def render_existing_projects() -> None:
             projects = state.projects.discover_projects()
             if not projects:
-                ui.label("No saved projects found.")
+                ui.label(t("projects.existing.empty"))
                 return
             for project_directory in projects:
                 project = state.projects.load(project_directory)
@@ -300,19 +329,20 @@ def render() -> None:
                             ui.label(project["project"]["name"]).classes("font-medium")
                             ui.label(str(project_directory)).classes("text-xs text-slate-500")
                             acquisition = project.get("acquisition", {})
-                            capture_label = {
-                                "drone_gps": "Drone with GPS / RTK",
-                                "camera": "Standard camera without GPS",
-                                "panorama_360": "360 degree camera / Insta360",
-                            }.get(acquisition.get("type"), "Legacy project")
+                            capture_type_value = acquisition.get("type")
+                            capture_label = (
+                                CAPTURE_TYPE_OPTIONS[capture_type_value]
+                                if capture_type_value in CAPTURE_TYPE_OPTIONS
+                                else t("projects.capture_type.legacy")
+                            )
                             ui.label(capture_label).classes("text-xs text-slate-500")
                         with ui.row().classes("items-center gap-2"):
                             ui.button(
-                                "Open",
+                                t("common.open"),
                                 on_click=lambda path=project_directory: _open_project(path),
                             )
                             ui.button(
-                                "Delete",
+                                t("common.delete"),
                                 icon="delete",
                                 on_click=lambda path=project_directory: _confirm_delete(
                                     path, render_existing_projects.refresh
@@ -321,7 +351,7 @@ def render() -> None:
 
         render_existing_projects()
 
-    render_page("Projects", content, current_path="/projects")
+    render_page(t("nav.projects"), content, current_path="/projects")
 
 
 def _open_project(project_directory: Path) -> None:
@@ -344,16 +374,14 @@ def _project_is_processing(project_directory: Path) -> bool:
 def _confirm_delete(project_directory: Path, refresh_projects) -> None:
     """Ask for confirmation before deleting a project and all its outputs."""
     if _project_is_processing(project_directory):
-        ui.notify("This project is still processing and cannot be deleted.", type="warning")
+        ui.notify(t("projects.delete.busy"), type="warning")
         return
 
     with ui.dialog() as dialog, ui.card().classes("w-full"):
-        ui.label("Delete project?").classes("text-lg font-medium")
-        ui.label(
-            f"This permanently removes {project_directory.name} and all generated files."
-        ).classes("text-sm")
+        ui.label(t("projects.delete.title")).classes("text-lg font-medium")
+        ui.label(t("projects.delete.message", name=project_directory.name)).classes("text-sm")
         with ui.row().classes("justify-end w-full gap-2 q-mt-md"):
-            ui.button("Cancel", on_click=dialog.close).props("flat")
+            ui.button(t("common.cancel"), on_click=dialog.close).props("flat")
 
             def delete_confirmed() -> None:
                 try:
@@ -362,11 +390,11 @@ def _confirm_delete(project_directory: Path, refresh_projects) -> None:
                         state.active_project_directory = None
                     dialog.close()
                     refresh_projects()
-                    ui.notify(f"Project deleted: {project_directory.name}")
+                    ui.notify(t("projects.delete.done", name=project_directory.name))
                 except (OSError, ValueError) as error:
                     ui.notify(str(error), type="negative")
 
-            ui.button("Delete permanently", icon="delete", on_click=delete_confirmed).props(
+            ui.button(t("projects.delete.confirm"), icon="delete", on_click=delete_confirmed).props(
                 "color=negative"
             )
     dialog.open()

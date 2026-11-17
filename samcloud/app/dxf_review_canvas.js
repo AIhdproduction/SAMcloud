@@ -7,7 +7,7 @@ export default {
       <canvas ref="canvas" tabindex="0" style="display:block;width:100%;height:100%;touch-action:none;outline:none"
         @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointerleave="onLeave" @wheel.prevent="onWheel"></canvas>
       <div ref="status" style="position:absolute;left:10px;bottom:8px;padding:4px 8px;border-radius:5px;background:rgba(9,19,29,.86);color:#b9ccda;font-size:12px;pointer-events:none"></div>
-      <div ref="hint" style="position:absolute;right:10px;bottom:8px;padding:4px 8px;border-radius:5px;background:rgba(9,19,29,.86);color:#7f97ab;font-size:11px;pointer-events:none">Wheel: zoom · drag: pan · hold H: hide DXF</div>
+      <div ref="hint" style="position:absolute;right:10px;bottom:8px;padding:4px 8px;border-radius:5px;background:rgba(9,19,29,.86);color:#7f97ab;font-size:11px;pointer-events:none">{{ (strings && strings.hint) || 'Wheel: zoom · drag: pan · hold H: hide DXF' }}</div>
       <div v-if="message" style="position:absolute;inset:0;display:grid;place-items:center;color:#96aabe;font-size:14px;pointer-events:none">{{ message }}</div>
     </div>
   `,
@@ -22,6 +22,7 @@ export default {
     hiddenLayers: Array,
     tool: String,
     background: Array,
+    strings: Object,
   },
   data() {
     return { message: "" };
@@ -128,11 +129,11 @@ export default {
     async loadPayload() {
       this.layers = [];
       if (!this.payloadUrl) {
-        this.message = "No cached DXF preview.";
+        this.message = (this.strings && this.strings.no_preview) || "No cached DXF preview.";
         this.requestDraw();
         return;
       }
-      this.message = "Loading cached DXF preview...";
+      this.message = (this.strings && this.strings.loading) || "Loading cached DXF preview...";
       const url = this.payloadUrl;
       try {
         const response = await fetch(this.absoluteUrl(url), { cache: "no-store" });
@@ -145,7 +146,7 @@ export default {
         for (const layer of this.layers) entities += layer.entities.length;
         this.$emit("loaded", { entities, layers: this.layers.length });
       } catch (error) {
-        this.message = `Could not load the cached DXF preview (${error.message}).`;
+        this.message = ((this.strings && this.strings.load_failed) || "Could not load the cached DXF preview ({error}).").replace("{error}", error.message);
       }
       if (!this.view.fitted) this.fit();
       this.requestDraw();

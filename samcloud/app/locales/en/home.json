@@ -1,0 +1,95 @@
+{
+  "title_empty": "Ready for your next reconstruction?",
+  "workspace": {
+    "drop_title": "Drop drone images or a 360° source here",
+    "drop_hint": "Create a project first, then select the image directory or panorama source.",
+    "create_project": "Create project",
+    "open_project": "Open project",
+    "ready": "Project workspace is ready",
+    "no_source": "No image source selected yet",
+    "review_settings": "Review project settings",
+    "open_sparse": "Open sparse cloud",
+    "processing_running": "Processing is running. The status is saved in the project.",
+    "continue_processing": "Continue processing",
+    "review_control_points": "Review control points",
+    "start_after_alignment": "Start alignment and wait for control points",
+    "start_automatic": "Start automatic processing",
+    "export_las": "Export LAS manually",
+    "refine_from_cache": "Recompute step 6 (from intermediate state)",
+    "refine_from_cache_tooltip": "Repeat improve & filter with the current settings – without recomputing COLMAP and SAM",
+    "reclassify": "Recompute classification ({engine})",
+    "reclassify_tooltip": "Reclassify the same dense cloud with the model selected in the settings (SAM3 or FlurSeg) – without recomputing alignment and dense reconstruction"
+  },
+  "progress": {
+    "stage_with_eta": "{stage} · {percent}% · step {time} remaining",
+    "stage_percent": "{stage} · {percent}%",
+    "photos": "Photos: {processed} / {total} ({percent}%)",
+    "elapsed_eta": "Elapsed: {elapsed} · Total ETA: {eta}"
+  },
+  "duration": {
+    "calculating": "calculating...",
+    "hours_minutes": "{hours}h {minutes}m",
+    "minutes_seconds": "{minutes}m {seconds}s"
+  },
+  "stage": {
+    "processing": "Processing",
+    "preparing_images": "Preparing images",
+    "extracting_features": "Extracting features",
+    "matching_images": "Matching images",
+    "aligning_cameras": "Aligning cameras",
+    "waiting_for_control_points": "Waiting for control points",
+    "optimizing_control_points": "Optimizing control points",
+    "control_points_optimized": "Control points optimized",
+    "control_point_optimization_failed": "Control-point optimization failed",
+    "applying_control_points": "Applying control points",
+    "preparing_dense_reconstruction": "Preparing dense reconstruction",
+    "building_dense_cloud": "Building dense cloud",
+    "fusing_dense_cloud": "Fusing dense cloud",
+    "preparing_classification": "Preparing classification",
+    "classifying_point_cloud": "Classifying point cloud",
+    "reclassifying": "Reclassifying",
+    "improving_and_filtering": "Improving and filtering",
+    "exporting_las": "Exporting LAS",
+    "complete": "Complete",
+    "failed": "Failed",
+    "finished": "Finished"
+  },
+  "status": {
+    "not_started": "not started",
+    "queued": "queued",
+    "running": "running",
+    "completed": "completed",
+    "failed": "failed",
+    "skipped": "skipped",
+    "waiting": "waiting",
+    "ready": "ready"
+  },
+  "workflow": {
+    "title": "Project workflow",
+    "open_dxf": "Open DXF",
+    "total_time": "Total processing time: {time}",
+    "storage": "Storage: {size} GB"
+  },
+  "time_group": {
+    "prepare_images": "Prepare images",
+    "alignment": "Alignment",
+    "control_points": "Control points",
+    "dense_cloud": "Dense cloud",
+    "classification": "Classification",
+    "refinement": "Improve & filter",
+    "export": "Export",
+    "other": "Other steps"
+  },
+  "recent": {
+    "title": "Recent projects",
+    "view_all": "View all projects",
+    "empty": "No saved projects yet. Create your first project to begin the workflow."
+  },
+  "notify": {
+    "processing_started": "Processing started. Keep SAMcloud open while COLMAP and the classification run.",
+    "control_points_started": "Control-point georeferencing and processing started.",
+    "reclassify_started": "Classification is being recomputed.",
+    "refine_started": "Step 6 is being recomputed from the intermediate state.",
+    "las_export_started": "LAS export started. The result will be saved in products/classified."
+  }
+}

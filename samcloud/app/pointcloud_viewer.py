@@ -7,6 +7,9 @@ from html import escape
 
 from nicegui import ui
 
+from samcloud.app.i18n import t
+from samcloud.app.potree_viewer import server_message_strings
+
 
 DEFAULT_CLASS_COLORS = (
     (189, 189, 189),  # Unknown / noise
@@ -80,16 +83,16 @@ def render_pointcloud_viewer(
     endpoint = f"/api/pointcloud/{kind}"
     class_panel = _class_panel_html(class_labels or [])
     camera_controls = (
-        '<button type="button" data-action="cameras" class="is-selected">Kamerapositionen</button>'
-        '<button type="button" data-action="camera-path">Kamerapfad</button>'
-        '<button type="button" data-action="camera-photos">Foto-Ansichten</button>'
-        '<button type="button" data-action="camera-colour">Reprojektionsfehler</button>'
+        f'<button type="button" data-action="cameras" class="is-selected">{_text("preview.camera.positions")}</button>'
+        f'<button type="button" data-action="camera-path">{_text("preview.camera.path")}</button>'
+        f'<button type="button" data-action="camera-photos">{_text("preview.camera.photos")}</button>'
+        f'<button type="button" data-action="camera-colour">{_text("preview.camera.reprojection_colours")}</button>'
         if kind == "sparse" else ""
     )
     camera_sliders = (
-        '<label>Kameragrösse <input data-action="camera-size" type="range" min="0.25" max="8" step="0.25" value="1"></label>'
-        '<label>Pfad-Linienbreite <input data-action="camera-path-width" type="range" min="0.5" max="8" step="0.5" value="1.5"></label>'
-        '<label>Foto-Grösse <input data-action="camera-photo-size" type="range" min="0.25" max="5" step="0.25" value="1"></label>'
+        f'<label>{_text("preview.camera.size")} <input data-action="camera-size" type="range" min="0.25" max="8" step="0.25" value="1"></label>'
+        f'<label>{_text("preview.camera.path_width")} <input data-action="camera-path-width" type="range" min="0.5" max="8" step="0.5" value="1.5"></label>'
+        f'<label>{_text("preview.camera.photo_size")} <input data-action="camera-photo-size" type="range" min="0.25" max="5" step="0.25" value="1"></label>'
         if kind == "sparse" else ""
     )
     camera_card = '<aside class="sam-cloud-camera-card"></aside>' if kind == "sparse" else ""
@@ -99,22 +102,22 @@ def render_pointcloud_viewer(
         <div id="{element_id}" class="sam-cloud-viewer">
           <canvas aria-label="{title}"></canvas>
           <div class="sam-cloud-toolbar">
-            <button type="button" data-action="reset">Reset view</button>
-            <button type="button" data-action="zoom-out">−</button>
-            <button type="button" data-action="zoom-in">+</button>
-            <button type="button" data-action="fit">Fit all</button>
+            <button type="button" data-action="reset">{_text("preview.toolbar.reset_view")}</button>
+            <button type="button" data-action="zoom-out" title="{_text("preview.toolbar.zoom_out")}">−</button>
+            <button type="button" data-action="zoom-in" title="{_text("preview.toolbar.zoom_in")}">+</button>
+            <button type="button" data-action="fit">{_text("preview.toolbar.fit_all")}</button>
             {camera_controls}
-            <button type="button" data-action="fullscreen">Fullscreen</button>
-            <button type="button" data-view="terrain" class="is-selected">Terrain view</button>
-            <button type="button" data-view="orbit">Orbit view</button>
+            <button type="button" data-action="fullscreen">{_text("preview.toolbar.fullscreen")}</button>
+            <button type="button" data-view="terrain" class="is-selected">{_text("preview.toolbar.terrain_view")}</button>
+            <button type="button" data-view="orbit">{_text("preview.toolbar.orbit_view")}</button>
              <button type="button" data-mode="rgb" class="is-selected">RGB</button>
-             <button type="button" data-mode="class">Classification</button>
-             <label>Point size <input data-action="size" type="range" min="1" max="6" step="0.5" value="1"></label>
+             <button type="button" data-mode="class">{_text("preview.toolbar.classification")}</button>
+             <label>{_text("preview.toolbar.point_size")} <input data-action="size" type="range" min="1" max="6" step="0.5" value="1"></label>
              {camera_sliders}
           </div>
           {class_panel}
           {camera_card}
-          <div class="sam-cloud-status">Loading point cloud preview...</div>
+          <div class="sam-cloud-status">{_text("preview.status.loading")}</div>
         </div>
         """,
         sanitize=False,
@@ -123,6 +126,27 @@ def render_pointcloud_viewer(
         _script(element_id, endpoint, class_colors or default_class_colors(), marker_endpoint=marker_endpoint,
                 camera_endpoint="/api/cameras/sparse" if kind == "sparse" else None)
     )
+
+
+def _text(key: str) -> str:
+    """Translated, HTML-escaped viewer text."""
+    return escape(t(key))
+
+
+def _js_strings() -> dict[str, object]:
+    """Translated texts the canvas viewer script shows (it falls back to English per entry)."""
+    return {
+        **server_message_strings(),
+        "not_available": t("preview.status.not_available"),
+        "invalid": t("preview.status.invalid"),
+        "ready": t("preview.status.ready"),
+        "unavailable": t("preview.status.unavailable"),
+        "outlier": t("preview.marker.outlier"),
+        "camera_title": t("preview.camera.fallback_title"),
+        "camera_details": t("preview.camera.details"),
+        "camera_photo_alt": t("preview.camera.photo_alt"),
+        "show_photo": t("preview.camera.show_photo"),
+    }
 
 
 def default_class_colors(count: int = len(DEFAULT_CLASS_COLORS)) -> list[list[int]]:
@@ -137,16 +161,16 @@ def _class_panel_html(class_labels: list[str]) -> str:
     rows = "".join(
         "<div class=\"sam-cloud-class-row\">"
         f"<label><input type=\"checkbox\" data-class-visible=\"{index}\" checked>{escape(label)}</label>"
-        f"<button type=\"button\" data-class-isolate=\"{index}\">Isolate</button>"
+        f"<button type=\"button\" data-class-isolate=\"{index}\">{_text('preview.classes.isolate')}</button>"
         "</div>"
         for index, label in enumerate(class_labels)
     )
     return (
         "<aside class=\"sam-cloud-class-panel\">"
-        "<h3>Class visibility</h3>"
+        f"<h3>{_text('preview.classes.title')}</h3>"
         "<div class=\"sam-cloud-class-actions\">"
-        "<button type=\"button\" data-class-show-all>Show all</button>"
-        "<button type=\"button\" data-class-hide-all>Hide all</button>"
+        f"<button type=\"button\" data-class-show-all>{_text('preview.classes.show_all')}</button>"
+        f"<button type=\"button\" data-class-hide-all>{_text('preview.classes.hide_all')}</button>"
         "</div>"
         f"{rows}</aside>"
     )
@@ -163,12 +187,27 @@ def _script(
             "class_colors": class_colors or default_class_colors(),
             "marker_endpoint": marker_endpoint,
             "camera_endpoint": camera_endpoint,
+            "strings": _js_strings(),
         }
     )
     return f"""
 <script>
 (() => {{
   const config = {config};
+  const text = (key, fallback, values) => {{
+    const template = (config.strings && config.strings[key]) || fallback;
+    return Object.keys(values || {{}}).reduce((result, name) => result.split('{{' + name + '}}').join(String(values[name])), template);
+  }};
+  const serverText = message => {{
+    const raw = String(message ?? '');
+    const strings = config.strings || {{}};
+    const exact = (strings.server_messages || {{}})[raw];
+    if (exact) return exact;
+    for (const [prefix, template] of Object.entries(strings.server_prefixes || {{}})) {{
+      if (raw.startsWith(prefix)) return String(template).split('{{details}}').join(raw.slice(prefix.length));
+    }}
+    return raw;
+  }};
   const init = () => {{
     const root = document.getElementById(config.element_id);
     if (!root || root.dataset.ready === '1') return;
@@ -337,17 +376,17 @@ def _script(
         context.beginPath(); context.moveTo(px, py - 12); context.lineTo(px + 7, py - 2); context.lineTo(px + 2, py - 2); context.lineTo(px + 2, py + 7); context.lineTo(px - 2, py + 7); context.lineTo(px - 2, py - 2); context.lineTo(px - 7, py - 2); context.closePath(); context.fill();
         if (marker.name === state.selectedMarker) {{ context.strokeStyle = '#dcecf6'; context.lineWidth = 1.5; context.stroke(); }}
         context.font = '12px sans-serif'; context.fillStyle = '#dcecf6'; const tagText = marker.kind === 'apriltag' && Number.isFinite(Number(marker.tag_size_mm)) ? ' ' + Number(marker.tag_size_mm).toFixed(1) + ' mm' + (Number.isFinite(Number(marker.tag_deviation_pct)) ? ' (' + (Number(marker.tag_deviation_pct) >= 0 ? '+' : '') + Number(marker.tag_deviation_pct).toFixed(1) + ' %)' : '') : '';
-        context.fillText(marker.name + (marker.kind === 'apriltag' && marker.status === 'outlier' ? ' (Ausreisser)' : '') + tagText, px + 9, py - 7); context.restore();
+        context.fillText(marker.name + (marker.kind === 'apriltag' && marker.status === 'outlier' ? text('outlier', ' (outlier)') : '') + tagText, px + 9, py - 7); context.restore();
       }}
     }};
     const fitAll = () => {{ state.zoom = 1; state.panX = 0; state.panY = 0; state.center = [...state.baseCenter]; draw(); }};
     const load = async () => {{
       try {{
         const response = await fetch(config.endpoint, {{ cache: 'no-store' }});
-        if (!response.ok) throw new Error((await response.json()).error || 'Point cloud is not available');
+        if (!response.ok) throw new Error(serverText((await response.json()).error) || text('not_available', 'Point cloud is not available'));
         const buffer = await response.arrayBuffer();
         const view = new DataView(buffer);
-        if (view.getUint8(0) !== 83 || view.getUint8(1) !== 65 || view.getUint8(2) !== 77 || view.getUint8(3) !== 86) throw new Error('Invalid point cloud preview');
+        if (view.getUint8(0) !== 83 || view.getUint8(1) !== 65 || view.getUint8(2) !== 77 || view.getUint8(3) !== 86) throw new Error(text('invalid', 'Invalid point cloud preview'));
         const count = view.getUint32(8, true), stride = 16, points = new Float32Array(count * 3), colors = new Uint8Array(count * 3), classes = new Uint8Array(count);
         let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
         for (let i = 0, offset = 16; i < count; i++, offset += stride) {{
@@ -361,9 +400,9 @@ def _script(
         state.baseCenter = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
         state.center = [...state.baseCenter];
         state.span3D = Math.max(Math.hypot(spanX, spanY, spanZ), .001);
-        status.textContent = `Preview: ${{count.toLocaleString()}} points. Left drag rotates around the nearest point, right drag moves, wheel zooms.`;
+        status.textContent = text('ready', 'Preview: {{count}} points. Left drag rotates around the nearest point, right drag moves, wheel zooms.', {{ count: count.toLocaleString() }});
         await loadMarkers(); await loadCameras(); resize();
-      }} catch (error) {{ status.textContent = `Point cloud unavailable: ${{error.message}}`; }}
+      }} catch (error) {{ status.textContent = text('unavailable', 'Point cloud unavailable: {{error}}', {{ error: error.message }}); }}
     }};
     const loadMarkers = async () => {{
       if (!config.marker_endpoint) return;
@@ -375,10 +414,10 @@ def _script(
     }};
     const showCamera = camera => {{
       if (!cameraCard || !state.cameraPhotosVisible) return;
-      cameraCard.innerHTML = ''; const title = document.createElement('strong'); title.textContent = camera.source_name || camera.image_name || 'Kamera'; cameraCard.append(title);
-      const details = document.createElement('div'); const error = Number.isFinite(camera.mean_reprojection_error) ? `${{Number(camera.mean_reprojection_error).toFixed(2)}} px` : '–'; details.textContent = `Aufnahme ${{Number(camera.index) + 1}} · ${{camera.points3d || 0}} 3D-Punkte · Reprojektionsfehler ${{error}}`; cameraCard.append(details);
-      const imageUrl = `/api/camera-thumbnail/${{encodeURIComponent(camera.id)}}?size=320`; const image = document.createElement('img'); image.src = imageUrl; image.alt = camera.source_name || camera.image_name || 'Kamerafoto'; cameraCard.append(image);
-      const link = document.createElement('a'); link.href = imageUrl; link.target = '_blank'; link.rel = 'noopener'; link.textContent = 'Foto anzeigen'; cameraCard.append(link); cameraCard.classList.add('is-open');
+      cameraCard.innerHTML = ''; const title = document.createElement('strong'); title.textContent = camera.source_name || camera.image_name || text('camera_title', 'Camera'); cameraCard.append(title);
+      const details = document.createElement('div'); const error = Number.isFinite(camera.mean_reprojection_error) ? `${{Number(camera.mean_reprojection_error).toFixed(2)}} px` : '–'; details.textContent = text('camera_details', 'Shot {{index}} · {{points}} 3D points · reprojection error {{error}}', {{ index: Number(camera.index) + 1, points: camera.points3d || 0, error }}); cameraCard.append(details);
+      const imageUrl = `/api/camera-thumbnail/${{encodeURIComponent(camera.id)}}?size=320`; const image = document.createElement('img'); image.src = imageUrl; image.alt = camera.source_name || camera.image_name || text('camera_photo_alt', 'Camera photo'); cameraCard.append(image);
+      const link = document.createElement('a'); link.href = imageUrl; link.target = '_blank'; link.rel = 'noopener'; link.textContent = text('show_photo', 'Show photo'); cameraCard.append(link); cameraCard.classList.add('is-open');
     }};
     const selectCamera = event => {{
       if (!state.camerasVisible || !state.cameraPhotosVisible || !state.cameras.length || !state.points) return false;
