@@ -150,6 +150,10 @@ def build_kitchen_run(
     for bar in bars:
         _snap_to_walls(bar, segments, settings, upm)
     attached = _attached_bars(bars, settings.run_gap_m * upm)
+    if not attached:
+        # Ragged evidence (diagonal corner fill, merged perpendicular legs) defeats the raster-shape extraction:
+        # measure the legs from the walls instead.
+        attached = _wall_anchored_bars(raster, u_min, v_min, res, segments, (dmin, dmax, lmin, opening), settings, upm)
     _bridge_gaps(attached, settings.run_gap_m * upm)
     if not attached:
         return None
@@ -272,6 +276,136 @@ def _extract_bars(raster: np.ndarray, dmin: int, dmax: int, lmin: int, flag_leng
     # Horizontal legs: transpose so that the same routine measures rows (thickness = rows, length = columns).
     horizontal = [(c0, c1, r0, r1) for r0, r1, c0, c1 in _bar_groups(rest.T, lmin, gap, dmin, dmax)]
     return vertical + horizontal
+
+
+def _perpendicular_depths(plane: np.ndarray, boundary: float, forward: bool, reach: int, bridge: int) -> np.ndarray:
+    """Evidence depth (pixels) from a wall line into the room for every column of ``plane`` (rows = across the wall).
+
+    ``boundary`` is the wall line as a fractional row edge.  The first evidence pixel must lie within ``reach``
+    pixels of the wall; gaps up to ``bridge`` pixels inside the evidence are bridged.  0 where there is no leg.
+    """
+    edge = int(round(boundary))
+    part = plane[edge:] if forward else plane[:edge][::-1]
+    depths = np.zeros(plane.shape[1], dtype=np.int32)
+    if part.shape[0] == 0:
+        return depths
+    for column in range(plane.shape[1]):
+        indices = np.flatnonzero(part[:, column])
+        if len(indices) == 0 or indices[0] > reach:
+            continue
+        breaks = np.flatnonzero(np.diff(indices) > bridge + 1)
+        stop = indices[breaks[0]] if len(breaks) else indices[-1]
+        depths[column] = int(stop) + 1
+    return depths
+
+
+def _depth_intervals(depths: np.ndarray, min_depth: int, gap: int) -> list[tuple[int, int]]:
+    """Index intervals [start, stop) of columns that are at least ``min_depth`` deep; gaps up to ``gap`` are bridged."""
+    good = np.flatnonzero(depths >= min_depth)
+    if len(good) == 0:
+        return []
+    breaks = np.flatnonzero(np.diff(good) > gap + 1)
+    starts = np.concatenate(([good[0]], good[breaks + 1]))
+    stops = np.concatenate((good[breaks], [good[-1]])) + 1
+    return [(int(a), int(b)) for a, b in zip(starts, stops, strict=True)]
+
+
+def _wall_anchored_bars(
+    raster: np.ndarray,
+    u_min: float,
+    v_min: float,
+    res: float,
+    segments: list[tuple[str, float, float, float]],
+    pixels: tuple[int, int, int, int],
+    settings: KitchenRunSettings,
+    upm: float,
+) -> list[_Bar]:
+    """Wall-attached legs measured from the walls, plus peninsulas attached to them (fallback for ragged evidence).
+
+    Along every axis-parallel wall (extended by the corner reach) the evidence depth into the room is measured
+    perpendicular to the wall.  Stretches that are deep enough and long enough become legs whose back edge is the wall
+    line and whose depth is the median measured depth, so a perpendicular leg or a peninsula crossing the profile and
+    a diagonal corner fill do not inflate it.  What remains of the evidence after the legs are removed is searched
+    for peninsulas with the regular extraction; only those touching a wall leg are kept.
+    """
+    dmin, dmax, lmin, opening = pixels
+    plane = np.asarray(raster, dtype=bool)
+    bridge = max(1, int(round(settings.bridge_m * upm / res)))
+    reach = max(1, int(round(settings.wall_reach_m * upm / res))) + bridge  # the no-data gap before the counter is bridged too
+    gap = max(1, int(round(settings.run_gap_m * upm / res)))
+    extension = settings.corner_reach_m * upm
+    pad = reach + 2  # a wall may lie outside the evidence raster (counter set back from the wall)
+    plane = np.pad(plane, pad)
+    u_min, v_min = u_min - pad * res, v_min - pad * res
+    legs: list[_Bar] = []
+    for kind, coordinate, lo, hi in segments:
+        view, along_min, across_min = (plane, u_min, v_min) if kind == "h" else (plane.T, v_min, u_min)
+        first = max(0, int(math.floor((lo - extension - along_min) / res)))
+        last = min(view.shape[1], int(math.ceil((hi + extension - along_min) / res)))
+        boundary = (coordinate - across_min) / res
+        if last - first < lmin or not 0.0 <= boundary <= view.shape[0]:
+            continue
+        for forward in (True, False):
+            depths = np.zeros(view.shape[1], dtype=np.int32)
+            depths[first:last] = _perpendicular_depths(view[:, first:last], boundary, forward, reach, bridge)
+            for start, stop in _depth_intervals(depths, dmin, gap):
+                length = stop - start
+                if length < lmin:
+                    continue
+                measured = depths[start:stop]
+                plausible = measured[(measured >= dmin) & (measured <= dmax)]  # deeper columns are a crossing leg, not this one
+                depth = float(np.clip(np.median(plausible if len(plausible) else measured[measured >= dmin]), dmin, dmax)) * res
+                if length * res < 1.25 * depth:
+                    continue
+                a0, a1 = along_min + start * res, along_min + stop * res
+                side = depth if forward else -depth
+                if kind == "h":
+                    bar = _Bar(a0, a1, coordinate + min(0.0, side), coordinate + max(0.0, side), "v0" if forward else "v1")
+                else:
+                    bar = _Bar(coordinate + min(0.0, side), coordinate + max(0.0, side), a0, a1, "u0" if forward else "u1")
+                bar.fixed.add(bar.back)  # type: ignore[arg-type]
+                legs.append(bar)
+    legs = _drop_redundant(legs)
+    if not legs:
+        return []
+    # Peninsulas: evidence left over after the wall legs are cut out (a little wider than the legs themselves).
+    rest = plane.copy()
+    margin = max(1, int(round(settings.close_m * upm / res)))
+    for bar in legs:
+        c0, c1 = int((bar.u0 - u_min) / res) - margin, int(math.ceil((bar.u1 - u_min) / res)) + margin
+        r0, r1 = int((bar.v0 - v_min) / res) - margin, int(math.ceil((bar.v1 - v_min) / res)) + margin
+        rest[max(0, r0):max(0, r1), max(0, c0):max(0, c1)] = False
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * opening + 1, 2 * opening + 1))
+    rest = cv2.morphologyEx(np.pad(rest.astype(np.uint8), opening + 1), cv2.MORPH_OPEN, kernel)[opening + 1:-(opening + 1), opening + 1:-(opening + 1)].astype(bool)
+    boxes = _extract_bars(rest, dmin, dmax, lmin, max(lmin, int(round(settings.long_leg_m * upm / res))), gap)
+    extra = [_Bar(u_min + c0 * res, u_min + c1 * res, v_min + r0 * res, v_min + r1 * res) for r0, r1, c0, c1 in boxes]
+    for bar in extra:
+        _grow_to_evidence(bar, rest, u_min, v_min, res, dmax)
+        _snap_to_walls(bar, segments, settings, upm)
+    return _attached_bars(legs + extra, settings.run_gap_m * upm)
+
+
+def _grow_to_evidence(bar: _Bar, plane: np.ndarray, u_min: float, v_min: float, res: float, max_depth: int) -> None:
+    """Move both thickness edges of a peninsula outwards while at least half of the bar's length is still evidence.
+
+    The extraction trusts only rows that are as long as the median row, so rounded or ragged long edges make the
+    bar thinner than the counter; this puts the edge where the evidence thins out to half.
+    """
+    horizontal = bar.horizontal
+    c0, c1 = int(round((bar.u0 - u_min) / res)), int(round((bar.u1 - u_min) / res))
+    r0, r1 = int(round((bar.v0 - v_min) / res)), int(round((bar.v1 - v_min) / res))
+    view = plane[:, c0:c1] if horizontal else plane[r0:r1, :].T  # lines across the thickness axis
+    low, high = (r0, r1) if horizontal else (c0, c1)
+    if view.shape[1] == 0:
+        return
+    while high - low < max_depth and low > 0 and view[low - 1].mean() >= 0.5:
+        low -= 1
+    while high - low < max_depth and high < view.shape[0] and view[high].mean() >= 0.5:
+        high += 1
+    if horizontal:
+        bar.v0, bar.v1 = v_min + low * res, v_min + high * res
+    else:
+        bar.u0, bar.u1 = u_min + low * res, u_min + high * res
 
 
 def _drop_redundant(bars: list[_Bar]) -> list[_Bar]:

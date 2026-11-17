@@ -355,7 +355,7 @@ def test_semantic_room_names_and_text_format() -> None:
     assert classify_room({"toilet", "washbasin"}, 6.0) == "Bad"
     assert classify_room({"shower"}, 4.0) == "Bad"
     assert classify_room({"kitchen"}, 12.4) == "Küche"
-    assert classify_room({"kitchen", "living"}, 30.0) == "Wohnen / Essen"
+    assert classify_room({"kitchen", "living"}, 30.0) == "Wohnen / Küche"
     assert classify_room({"bed", "wardrobe"}, 14.0) == "Schlafen"
     assert classify_room({"wardrobe"}, 9.0) == "Zimmer"
     assert classify_room({"living"}, 20.0) == "Wohnen"

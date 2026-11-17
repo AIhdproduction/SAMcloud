@@ -73,6 +73,12 @@ layers:
     lineweight: 18
     linetype: DASHED
     description: "Indoor overhead elements (upper cabinets 1.80-2.20 m), dashed"
+  A-WALL-PATT:
+    color: 253
+    true_color: [200, 200, 200]
+    lineweight: 0
+    hatch_pattern: SOLID
+    description: "Indoor wall poche: solid fill of the double-line wall bodies (walls.hatch)"
 
 indoor_vertical:
   bins: 16
@@ -170,10 +176,133 @@ indoor_upper_cabinets:
   gap_fill_m: 0.15
   bins: 16
 
+# Double-line indoor walls (both faces of every wall, default). false = the single measured face lines.
+# Thicknesses in metres, scaled by the project units per metre. Interior thickness classes are
+# learned from measured face pairs and room edges; exterior walls use measured exterior pairs or
+# exterior_thickness_m. See docs/ortho_plan.md "Double-line walls".
+walls:
+  double_line: true
+  min_thickness_m: 0.06
+  max_thickness_m: 0.45
+  exterior_thickness_m: 0.30
+  interior_thickness_m: 0.12
+  probe_m: 0.80
+  side_probe_m: 0.25
+  sample_step_m: 0.05
+  min_run_m: 1.0
+  pair_min_overlap_m: 0.10
+  pair_gap_m: 1.0
+  pair_angle_deg: 3.0
+  collinear_offset_m: 0.04
+  cluster_gap_m: 0.04
+  cluster_snap_m: 0.04
+  joint_tolerance_m: 0.04
+  joint_reach_m: 0.35
+  jamb_reach_m: 0.15
+  min_face_m: 0.10
+  jog_m: 0.04
+  min_piece_area_m2: 0.003
+  isolated_max_length_m: 1.2
+  keep_isolated_faces: false
+  room_edge_walls: true
+  room_edge_min_area_m2: 2.0
+  room_edge_min_length_m: 0.30
+  hatch: true
+  bound_rooms: true
+  room_gap_m: 0.20
+  room_merge_max_area_m2: 2.0
+  room_fill_min_share: 0.25
+  # Evidence checks: a face in front of furniture whose data never forms a wall (wall points over
+  # face_min_height_m reaching face_reach_m, or a floor-connected surface) is dropped; a face no
+  # camera of the level can see (mirror phantom behind a wall) is dropped.
+  face_test: true
+  face_min_height_m: 1.0
+  face_reach_m: 1.7
+  face_min_share: 0.25
+  visibility_test: true
+  visibility_max_m: 12.0
+  visibility_min_share: 0.15
+  # Doors: a door detected as its open leaf becomes the opening in the wall at its hinge; doorways
+  # (no sill/mid-height points, floor through the wall) are detected in the wall bodies; a door
+  # span that is solid wall is dropped; stubs shorter than min_stub_m beside an opening are not built.
+  door_leaf_reorient: true
+  door_detect: true
+  door_min_width_m: 0.55
+  door_max_width_m: 1.40
+  door_floor_share: 0.15
+  min_stub_m: 0.15
+  # Tall built-in units: a wall face at the front of a fridge / oven tower / tall kitchen cabinet (fine labels)
+  # with a wall behind at unit depth and no floor or low surfaces in between becomes an A-EINB unit ("KS"/"HS");
+  # the wall behind stays or is continued behind the unit.
+  tall_units: true
+  tall_unit_band_m: 0.12
+  tall_unit_min_m: 0.45
+  tall_unit_gap_m: 0.30
+  tall_unit_reach_m: 1.0
+  tall_unit_min_depth_m: 0.40
+  tall_unit_max_depth_m: 0.90
+  tall_unit_side_gap_m: 0.60
+  tall_unit_neighbour_gap_m: 0.40
+  tall_unit_room_m: 0.40
+  tall_unit_room_free: 0.50
+  tall_unit_max_free: 0.15
+  tall_unit_max_low: 0.25
+  tall_unit_fridge_m: 0.60
+
+# Plan polish (after the double-line walls): rooms = wall cells, regular furniture, wall-hugging kitchen, clean labels.
+plan_polish:
+  enabled: true
+  # Every wall-enclosed cell with floor is one room (open plan = one room); a cell holding several measured
+  # ceiling rooms is split only at a passage between two wall corners no wider than room_split_max_m.
+  cell_rooms: true
+  room_min_area_m2: 1.0
+  room_min_floor_share: 0.10
+  room_split_max_m: 2.4
+  room_split_min_area_m2: 2.0
+  room_jog_m: 0.04
+  room_step_m: 0.30
+  # Furniture: rectangle along the wall axes when it covers the footprint (IoU), else a rectilinear outline
+  # with steps >= furniture_step_m and at most furniture_max_vertices corners; clipped out of the walls.
+  furniture: true
+  furniture_rect_iou: 0.75
+  furniture_snap_deg: 15.0
+  furniture_step_m: 0.15
+  furniture_max_vertices: 8
+  furniture_min_area_m2: 0.06
+  furniture_nested_share: 0.80
+  furniture_merge_gap_m: 0.10
+  furniture_detail_tolerance_m: 0.03
+  # Shape recognition per object: rectangle, L (corner sofa, L desk), U, round, rectilinear, chosen by
+  # (1 - IoU) + class-dependent complexity penalty against the traced footprint; sofas get backrest/armrest lines.
+  furniture_shapes: true
+  furniture_sliver_m: 0.15
+  # Object labels: inside the object, else beside it inside the room; none for objects below this area.
+  label_min_object_area_m2: 0.15
+  label_min_height_m: 0.06
+  label_char_width: 0.62
+  label_margin_m: 0.04
+  # Kitchen run: legs flush on the final inner wall faces, one depth (kitchen_depth_m within the tolerance).
+  kitchen: true
+  kitchen_wall_reach_m: 0.45
+  kitchen_depth_m: 0.60
+  kitchen_depth_tol_m: 0.15
+  kitchen_end_reach_m: 0.30
+  kitchen_segment_reach_m: 0.15
+  # CAD kitchen (kitchen_layout.py): legs extended along measured counter heights, raised bar on a peninsula,
+  # cooktop / sink mounted on the counter at their labels, tall units with a cross, upper cabinets with a cross,
+  # counter drawn by its front and end lines.
+  kitchen_layout: true
+
 # Semantic room names; rooms below min_room_area_m2 without sanitary fixtures are dropped.
 indoor_room_names:
   min_room_area_m2: 2.0
   guest_wc_max_area_m2: 4.0
+  # An unnamed room with the entrance door plus one more door, or with hall_min_doors doors, is a "Flur"
+  # (also a corridor of at least min_hall_area_m2); office_min_items desks/monitors name a room "Büro".
+  hall_max_area_m2: 15.0
+  hall_min_doors: 3
+  min_hall_area_m2: 1.0
+  office_min_items: 2
 
 # Kitchen run along the walls (straight / L / U) with cooktop and sink inserts from fine labels.
 indoor_kitchen_run:

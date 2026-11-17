@@ -482,6 +482,65 @@ def _fit_footprint_primitive(mask: np.ndarray, grid: RasterGrid, hm: np.ndarray,
 _TABLE_LABELS = {"table", "dining table", "desk"}
 
 
+def _merge_split_tables(
+    instances: list[ObjectInstance], classes: np.ndarray, hm: np.ndarray, grid: RasterGrid, units_per_metre: float, stats: dict[str, Any], theta: float = 0.0,
+) -> list[ObjectInstance]:
+    """One table seen as several touching instances (instance over-segmentation) becomes one instance.
+
+    Instances with the same table label whose masks come within 0.20 m of each
+    other are merged, so one table yields one outline instead of overlapping ones.
+    """
+    stats.setdefault("tables_merged", 0)
+    tables = [index for index, item in enumerate(instances) if str(item.label or "").strip().lower() in _TABLE_LABELS]
+    if len(tables) < 2:
+        return instances
+    radius = max(1, int(round(0.10 * units_per_metre / grid.pixel_size)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    grown = {index: cv2.dilate(instances[index].mask.astype(np.uint8), kernel).astype(bool) for index in tables}
+    parent = {index: index for index in tables}
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for position, first in enumerate(tables):
+        for second in tables[position + 1:]:
+            if str(instances[first].label).strip().lower() != str(instances[second].label).strip().lower():
+                continue
+            if np.any(grown[first] & grown[second]):
+                parent[find(second)] = find(first)
+    groups: dict[int, list[int]] = {}
+    for index in tables:
+        groups.setdefault(find(index), []).append(index)
+    replaced: dict[int, ObjectInstance] = {}
+    dropped: set[int] = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        mask = np.zeros_like(instances[members[0]].mask)
+        for member in members:
+            mask |= instances[member].mask
+        template = max((instances[member] for member in members), key=lambda item: int(np.count_nonzero(item.mask)))
+        merged = _make_instance(mask, template.label, classes, hm, grid, instance_id=template.instance_id)
+        if merged is None:
+            continue
+        merged.code = template.code
+        merged.has_fine_label = template.has_fine_label
+        # The union of table pieces is irregular: its footprint is the wall-axis rectangle,
+        # not a free minimum-area rectangle that may come out diagonal.
+        outlines = mask_to_polygons(mask, grid)
+        if outlines:
+            rectangle = _single_polygon(_wall_rectangle(unary_union(outlines).convex_hull, theta))
+            if rectangle is not None and rectangle.area > 0.0:
+                merged.polygon = rectangle
+        replaced[members[0]] = merged
+        dropped.update(members[1:])
+        stats["tables_merged"] += len(members) - 1
+    return [replaced.get(index, item) for index, item in enumerate(instances) if index not in dropped]
+
+
 def refine_dining_instances(
     instances: list[ObjectInstance],
     classes: np.ndarray,
@@ -510,7 +569,8 @@ def refine_dining_instances(
     def label_of(item: ObjectInstance) -> str:
         return str(item.label or "").strip().lower()
 
-    active = list(instances)
+    active = _split_dining_groups(list(instances), hm, grid, theta, upm, stats)
+    active = _merge_split_tables(active, classes, hm, grid, upm, stats, theta)
     absorbed: set[int] = set()
     table_polygons: list[Polygon] = []
     for index in range(len(active)):
@@ -518,9 +578,9 @@ def refine_dining_instances(
         if label_of(table) not in _TABLE_LABELS:
             continue
         fit = fit_footprint(table.mask, grid, hm, theta, upm, fine_label=True, semantic_label=table.label)
-        if fit is None:
+        if fit is None and table.polygon is None:
             continue
-        rectangle = fit.polygon
+        rectangle = table.polygon if table.polygon is not None else fit.polygon
         rectangle_mask = _polygon_mask(rectangle, grid)
         merged_mask = table.mask.copy()
         for other_index, other in enumerate(active):
@@ -536,9 +596,14 @@ def refine_dining_instances(
             if rebuilt is not None:
                 rebuilt.code = table.code
                 active[index] = rebuilt
-                refit = fit_footprint(rebuilt.mask, grid, hm, theta, upm, fine_label=True, semantic_label=rebuilt.label)
-                if refit is not None:
-                    rectangle = refit.polygon
+                if table.polygon is not None:
+                    outlines = mask_to_polygons(rebuilt.mask, grid)
+                    rebuilt.polygon = _single_polygon(_wall_rectangle(unary_union(outlines).convex_hull, theta)) if outlines else table.polygon
+                    rectangle = rebuilt.polygon or rectangle
+                else:
+                    refit = fit_footprint(rebuilt.mask, grid, hm, theta, upm, fine_label=True, semantic_label=rebuilt.label)
+                    if refit is not None:
+                        rectangle = refit.polygon
         table_polygons.append(rectangle)
     active = [item for index, item in enumerate(active) if index not in absorbed]
     table_union = unary_union(table_polygons) if table_polygons else Polygon()
@@ -552,8 +617,12 @@ def refine_dining_instances(
         return active
     radius = max(1, int(round(0.075 * upm / pixel)))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
-    grown = {index: cv2.dilate(active[index].mask.astype(np.uint8), kernel).astype(bool) for index in chair_positions}
+    # Chair pieces are clipped by the table tops first; pieces of one chair (< 0.15 m apart) merge only while the
+    # merged piece still fits one chair - neighbouring chairs around a table stay separate.
+    clipped = {index: _without_slivers(active[index].mask & ~table_mask, 0.05 * upm / pixel) if table_mask is not None else active[index].mask.copy() for index in chair_positions}
+    grown = {index: cv2.dilate(clipped[index].astype(np.uint8), kernel).astype(bool) for index in chair_positions}
     parent = {index: index for index in chair_positions}
+    merged_masks = {index: clipped[index].copy() for index in chair_positions}
 
     def find(index: int) -> int:
         while parent[index] != index:
@@ -563,21 +632,24 @@ def refine_dining_instances(
 
     for first_at, first in enumerate(chair_positions):
         for second in chair_positions[first_at + 1:]:
-            if np.any(grown[first] & grown[second]):
-                parent[find(second)] = find(first)
+            root_first, root_second = find(first), find(second)
+            if root_first == root_second or not np.any(grown[first] & grown[second]):
+                continue
+            union = merged_masks[root_first] | merged_masks[root_second]
+            if not _fits_one_chair(union, grid, theta, _CHAIR_MAX_M * upm):
+                continue
+            parent[root_second] = root_first
+            merged_masks[root_first] = union
     groups: dict[int, list[int]] = {}
     for index in chair_positions:
         groups.setdefault(find(index), []).append(index)
     result = [item for index, item in enumerate(active) if index not in parent]
     low, high = 0.35 * upm, 0.65 * upm
     wall_band = unary_union([line.buffer(0.03 * upm) for line in walls]) if walls else Polygon()
-    for members in groups.values():
-        mask = np.zeros_like(active[members[0]].mask)
-        for member in members:
-            mask |= active[member].mask
+    chairs: list[tuple[ObjectInstance, float]] = []
+    for root, members in groups.items():
+        mask = merged_masks[root]
         stats["chairs_merged"] += len(members) - 1
-        if table_mask is not None:
-            mask &= ~table_mask
         if not np.any(mask):
             stats["chairs_dropped"] += 1
             continue
@@ -592,30 +664,46 @@ def refine_dining_instances(
             stats["chairs_implausible"] += 1
             continue
         polygons = mask_to_polygons(mask, grid)
-        if float(np.count_nonzero(mask)) * pixel**2 < 0.08 * upm**2 or not polygons:
+        shape = unary_union(polygons) if polygons else Polygon()
+        table = min(table_polygons, key=lambda item: item.distance(shape)) if table_polygons and not shape.is_empty else None
+        at_table = table is not None and table.distance(shape) <= _CHAIR_TABLE_REACH_M * upm
+        # A chair at a table is often traced only in part (its seat under the top): a smaller piece suffices there.
+        minimum = (_CHAIR_AT_TABLE_MIN_M2 if at_table else 0.08) * upm**2
+        if float(np.count_nonzero(mask)) * pixel**2 < minimum or not polygons:
             stats["chairs_dropped"] += 1
             continue
-        rectangle = _clamped_rectangle(unary_union(polygons), low, high)
+        if at_table:
+            # A chair at a table: a seat-sized box on the table's axes.
+            rectangle = _axis_box(shape, table, _CHAIR_SIDE_M[0] * upm, _CHAIR_SIDE_M[1] * upm)
+        else:
+            rectangle = _clamped_rectangle(shape, low, high)
         if rectangle is None:
             stats["chairs_dropped"] += 1
             continue
         obstacle = unary_union([table_union, wall_band]) if not wall_band.is_empty else table_union
-        moved = _move_clear(rectangle, obstacle)
-        inside = room is None or room.is_empty or room.buffer(0.02 * upm).contains(moved)
+        # a chair at a table slides straight out from under its top (walls and other tables are checked below)
+        moved = _move_clear(rectangle, table if at_table else obstacle)
+        # (ceiling rooms leave holes under furniture: a chair at a table only has to lie mostly in the room)
+        if room is None or room.is_empty:
+            inside = True
+        elif at_table:
+            inside = moved.intersection(room).area >= 0.5 * moved.area
+        else:
+            inside = room.buffer(0.02 * upm).contains(moved)
         if (
             moved.intersection(obstacle).area <= 1e-9 and inside
             and moved.centroid.distance(rectangle.centroid) <= 0.45 * upm
         ):
             rectangle = moved
         else:
-            clipped = clip_to_room(rectangle, obstacle, room, upm)
-            if clipped is not None and clipped is not rectangle:
+            clipped_rectangle = clip_to_room(rectangle, obstacle, room, upm)
+            if clipped_rectangle is not None and clipped_rectangle is not rectangle:
                 stats["chairs_wall_clipped"] += 1
-                clipped = refit_clipped(clipped, rectangle, walls, upm, force_rectangle=True)
-            if clipped is None:
+                clipped_rectangle = refit_clipped(clipped_rectangle, rectangle, walls, upm, force_rectangle=True)
+            if clipped_rectangle is None:
                 stats["chairs_dropped"] += 1
                 continue
-            rectangle = clipped
+            rectangle = clipped_rectangle
         template = active[members[0]]
         instance = _make_instance(mask, template.label, classes, hm, grid)
         if instance is None:
@@ -623,8 +711,160 @@ def refine_dining_instances(
             continue
         instance.code = template.code
         instance.polygon = rectangle
+        chairs.append((instance, float(np.count_nonzero(mask))))
+    # Two boxes for one seat (pieces that did not merge): the smaller one goes, a slight overlap is pushed apart.
+    placed: list[Polygon] = []
+    for instance, _size in sorted(chairs, key=lambda item: -item[1]):
+        rectangle = instance.polygon
+        others = unary_union(placed) if placed else Polygon()
+        if not others.is_empty and rectangle.intersection(others).area > 0.40 * rectangle.area:
+            stats["chairs_dropped"] += 1
+            stats["chairs_duplicate"] = stats.get("chairs_duplicate", 0) + 1
+            continue
+        if not others.is_empty and rectangle.intersection(others).area > 1e-9:
+            moved = _move_clear(rectangle, unary_union([others, table_union]))
+            if moved.centroid.distance(rectangle.centroid) <= 0.20 * upm:
+                rectangle = moved
+                instance.polygon = moved
+        placed.append(rectangle)
         result.append(instance)
     return result
+
+
+_CHAIR_MAX_M = 0.70  # a merged chair piece never exceeds this extent along either wall axis
+_CHAIR_SIDE_M = (0.40, 0.55)  # seat box of a chair at a table
+_CHAIR_TABLE_REACH_M = 0.60
+_CHAIR_AT_TABLE_MIN_M2 = 0.04
+
+
+def _without_slivers(mask: np.ndarray, radius_px: float) -> np.ndarray:
+    """A chair piece clipped by a table keeps no thin strip along the table edge (morphological opening)."""
+    radius = max(1, int(round(radius_px)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    opened = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel).astype(bool)
+    return opened if opened.any() else mask
+
+
+def _fits_one_chair(mask: np.ndarray, grid: RasterGrid, theta: float, limit: float) -> bool:
+    rows, cols = np.nonzero(mask)
+    if len(rows) == 0:
+        return True
+    x = grid.min_x + (cols + 0.5) * grid.pixel_size
+    y = grid.max_y - (rows + 0.5) * grid.pixel_size
+    u = x * math.cos(theta) + y * math.sin(theta)
+    v = -x * math.sin(theta) + y * math.cos(theta)
+    return float(u.max() - u.min()) <= limit and float(v.max() - v.min()) <= limit
+
+
+def _axis_box(shape: Any, table: Polygon, low: float, high: float) -> Polygon | None:
+    """Box on the axes of ``table`` around ``shape`` (its extent clamped to low..high on both axes)."""
+    rectangle = _single_polygon(table.minimum_rotated_rectangle)
+    if rectangle is None or rectangle.area <= 0.0:
+        return None
+    corners = np.asarray(rectangle.exterior.coords[:4], dtype=float)
+    first = corners[1] - corners[0]
+    axis_a = first / max(float(np.linalg.norm(first)), 1e-12)
+    axis_b = np.asarray((-axis_a[1], axis_a[0]))
+    points = np.asarray([point for part in getattr(shape, "geoms", [shape]) for point in part.exterior.coords], dtype=float)
+    if not len(points):
+        return None
+    a, b = points @ axis_a, points @ axis_b
+    centre_a, centre_b = (a.min() + a.max()) / 2.0, (b.min() + b.max()) / 2.0
+    half_a = min(max(a.max() - a.min(), low), high) / 2.0
+    half_b = min(max(b.max() - b.min(), low), high) / 2.0
+    box_points = [axis_a * (centre_a + sa * half_a) + axis_b * (centre_b + sb * half_b) for sa, sb in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    return Polygon([(float(x), float(y)) for x, y in box_points])
+
+
+def _split_dining_groups(instances: list[ObjectInstance], hm: np.ndarray, grid: RasterGrid, theta: float, units_per_metre: float, stats: dict[str, Any]) -> list[ObjectInstance]:
+    """A dining group (table pieces, chairs and unlabelled furniture touching them) gets one table top.
+
+    The table top is the largest table piece shaped like a table top (short side >= 0.5 m, area >= 0.35 m2,
+    filling at least 45 % of its wall-axis rectangle).  Without one, an unlabelled piece of that shape at table
+    height (0.60 - 0.90 m) is the top: a white or glass top returns few points of its own, so the instance
+    labels land on the chairs around it.  Other table pieces of at most 0.6 m2 with at least 0.06 m2 (and 30 %)
+    outside the top are chairs; their part over the top is clipped off with the table rectangle later.
+    """
+    upm = units_per_metre
+    stats.setdefault("dining_tops_from_unlabelled", 0)
+    stats.setdefault("dining_table_pieces_to_chairs", 0)
+    labels = [str(item.label or "").strip().lower() for item in instances]
+    tables = [index for index, label in enumerate(labels) if label in _TABLE_LABELS]
+    chairs = [index for index, label in enumerate(labels) if label == "chair"]
+    if not tables or not chairs:
+        return instances
+    loose = [index for index, item in enumerate(instances) if item.label is None and item.code == 117]
+    members = tables + chairs + loose
+    radius = max(1, int(round(0.10 * upm / grid.pixel_size)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    grown = {index: cv2.dilate(instances[index].mask.astype(np.uint8), kernel).astype(bool) for index in members}
+    parent = {index: index for index in members}
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for position, first in enumerate(members):
+        for second in members[position + 1:]:
+            if find(first) != find(second) and np.any(grown[first] & instances[second].mask):
+                parent[find(second)] = find(first)
+    groups: dict[int, list[int]] = {}
+    for index in members:
+        groups.setdefault(find(index), []).append(index)
+    pixel_area = grid.pixel_size**2
+
+    def top_shape(index: int) -> Polygon | None:
+        item = instances[index]
+        area = float(np.count_nonzero(item.mask)) * pixel_area
+        outlines = mask_to_polygons(item.mask, grid)
+        if area < 0.35 * upm**2 or not outlines:
+            return None
+        rectangle = _single_polygon(_wall_rectangle(unary_union(outlines).convex_hull, theta))
+        if rectangle is None or rectangle.area <= 0.0:
+            return None
+        corners = np.asarray(rectangle.exterior.coords[:4], dtype=float)
+        short = min(float(np.linalg.norm(corners[1] - corners[0])), float(np.linalg.norm(corners[3] - corners[0])))
+        if short < 0.5 * upm or area < 0.45 * rectangle.area:
+            return None
+        return rectangle
+
+    for group in groups.values():
+        group_tables = [index for index in group if index in tables]
+        if not group_tables or not any(index in chairs for index in group):
+            continue
+        tops = [(index, shape) for index in group_tables if (shape := top_shape(index)) is not None]
+        from_loose = False
+        if not tops:
+            tops = [(index, shape) for index in group if index in loose and 0.60 * upm <= instances[index].height <= 0.90 * upm and (shape := top_shape(index)) is not None]
+            from_loose = True
+        if not tops:
+            continue
+        top, rectangle = max(tops, key=lambda item: int(np.count_nonzero(instances[item[0]].mask)))
+        if from_loose:
+            # the labels of the pieces around it belong to the chairs: the top is just a table
+            instances[top].label = "table"
+            instances[top].has_fine_label = True
+            stats["dining_tops_from_unlabelled"] += 1
+        top_mask = _polygon_mask(rectangle.buffer(0.05 * upm, join_style=2), grid)
+        for index in group_tables:
+            if index == top:
+                continue
+            item = instances[index]
+            size = float(np.count_nonzero(item.mask))
+            outside = item.mask & ~top_mask
+            if size <= 0.0 or size * pixel_area > 0.60 * upm**2:
+                continue
+            if float(np.count_nonzero(outside)) >= max(0.30 * size, 0.06 * upm**2 / pixel_area):
+                # its part outside the top is a chair (the part over the top is clipped off with the table later)
+                item.label = "chair"
+                item.has_fine_label = True
+                stats["dining_table_pieces_to_chairs"] += 1
+            else:
+                # a sliver of a chair hangs on to this table piece: the piece only adds what lies over the top
+                item.mask = item.mask & top_mask
+    return [item for item in instances if np.any(item.mask)]
 
 
 def refit_clipped(

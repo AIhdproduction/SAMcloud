@@ -21,7 +21,7 @@ and the furniture outlines inside it are absorbed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Iterable
 
@@ -64,6 +64,7 @@ class BuiltinFrontSettings:
     room_free_fraction: float = 0.5
     room_reach_m: float = 0.5
     run_end_fraction: float = 0.5
+    bridge_reach_m: float = 3.0  # how far beyond a resolved unit its continuation (across a gap <= bridge_gap_m) is looked for
 
 
 @dataclass(slots=True)
@@ -150,6 +151,7 @@ def resolve_builtin_fronts(
     free = np.asarray(free_floor, dtype=bool)
     tall_mask = np.asarray(tall, dtype=bool)
     expand = cv2.dilate(tall_mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    resolved: list[tuple[_Chain, _Chain, float, tuple[float, float], float]] = []
     for front in sorted(chains, key=lambda chain: -chain.length):
         if front.length < settings.min_length_m * upm or not any(member.source == "wall" or member.source == "room" for member in front.members):
             continue
@@ -170,6 +172,9 @@ def resolve_builtin_fronts(
                     if run[0] - measured_start > settings.overshoot_m * upm or measured_end - run[1] > settings.overshoot_m * upm:
                         continue
                     run = _extend_run_to_side_walls(layers.get("A-WALL", []), front, side, run, depth, upm, settings)
+                    run = _cut_at_cross_walls(layers.get("A-WALL", []), front, side, run, depth, upm)
+                    if run[1] - run[0] < settings.min_length_m * upm:
+                        continue
                     strip = _strip_polygon(front, side, run, depth)
                     if any(strip.intersection(other).area > 0.30 * strip.area for other in accepted):
                         continue
@@ -185,12 +190,45 @@ def resolve_builtin_fronts(
                     accepted.append(strip)
                     stats["builtin_fronts"] += 1
                     stats["builtin_strips"].append({"depth_m": depth / upm, "length_m": (run[1] - run[0]) / upm, **fill, "bounds": [float(value) for value in strip.bounds]})
+                    resolved.append((front, back, side, run, depth))
                     done = True
                     break
                 if done:
                     break
             if done:
                 break
+    # A unit whose tall evidence is interrupted (a short gap, e.g. an open door or a reflection seen through it)
+    # carries on along the same front: a separate tall run that starts within bridge_gap_m of a resolved unit
+    # shares its depth and back line.  Sparse columns trimmed off the unit's own run are not a continuation.
+    for front, back, side, run, depth in resolved:
+        # The front may have been measured only along the resolved part: look beyond its ends as well.
+        reach = settings.bridge_reach_m * upm
+        sampled = replace(front, start=min(front.start, run[0] - reach), end=max(front.end, run[1] + reach))
+        gap_low, gap_high = settings.run_gap_m * upm, settings.bridge_gap_m * upm
+        for other in _tall_runs(sampled, side, expand, grid, upm, settings):
+            if gap_low < other[0] - run[1] <= gap_high:
+                part = (run[1], other[1])
+            elif gap_low < run[0] - other[1] <= gap_high:
+                part = (other[0], run[0])
+            else:
+                continue
+            extended = _extend_run_to_side_walls(layers.get("A-WALL", []), front, side, part, depth, upm, settings)
+            part = (extended[0], run[0]) if part[1] <= run[0] + 1e-9 else (run[1], extended[1])
+            part = _stop_at_cross_walls(layers.get("A-WALL", []), front, side, part, run, depth, upm, settings)
+            if part[1] - part[0] < settings.min_length_m * upm:
+                continue
+            strip = _strip_polygon(front, side, part, depth)
+            if any(strip.intersection(item).area > 0.30 * strip.area for item in accepted):
+                continue
+            fill = _fill_fractions(strip, tall_mask, free, grid)
+            band = _fill_fractions(_strip_polygon(front, side, part, settings.front_reach_m * upm), expand, free, grid)
+            room = _fill_fractions(_strip_polygon(front, -side, part, settings.room_reach_m * upm), tall_mask, free, grid)
+            if fill["fill"] < settings.fill_fraction or band["tall"] < 0.5 * settings.fill_fraction or room["free"] < settings.room_free_fraction:
+                continue
+            _apply_strip(layers, stats, front, back, side, part, depth, strip, fine_classes, fine_names, grid, upm, settings)
+            accepted.append(strip)
+            stats["builtin_fronts"] += 1
+            stats["builtin_strips"].append({"depth_m": depth / upm, "length_m": (part[1] - part[0]) / upm, **fill, "bridged": True, "bounds": [float(value) for value in strip.bounds]})
     return stats
 
 
@@ -379,6 +417,45 @@ def _extend_run_to_side_walls(walls: list[dict[str, Any]], front: _Chain, side: 
             if best_stop < along <= stop + reach:
                 best_stop = along
     return best_start, best_stop
+
+
+def _cross_wall_positions(walls: list[dict[str, Any]], front: _Chain, side: float, depth: float) -> list[float]:
+    """Positions along the front of perpendicular walls that cross a strip of ``depth`` behind it."""
+    positions: list[float] = []
+    for entity in walls:
+        points = entity.get("points", [])
+        if entity.get("type") != "polyline" or len(points) != 2 or entity.get("closed"):
+            continue
+        if _angle_gap(_angle_of(LineString(points)), front.angle) < math.radians(90.0 - 8.0):
+            continue
+        frames = [(float(front.unit @ np.asarray(point, dtype=float)), side * (float(front.normal @ np.asarray(point, dtype=float)) - front.offset)) for point in points]
+        low, high = sorted((frames[0][1], frames[1][1]))
+        if low <= 0.25 * depth and high >= 0.75 * depth:
+            positions.append((frames[0][0] + frames[1][0]) / 2.0)
+    return positions
+
+
+def _cut_at_cross_walls(walls: list[dict[str, Any]], front: _Chain, side: float, run: tuple[float, float], depth: float, upm: float) -> tuple[float, float]:
+    """The longest piece of ``run`` that no perpendicular wall crosses (a unit never runs through a wall)."""
+    tolerance = 0.05 * upm
+    cuts = sorted(position for position in _cross_wall_positions(walls, front, side, depth) if run[0] + tolerance < position < run[1] - tolerance)
+    if not cuts:
+        return run
+    bounds = [run[0], *cuts, run[1]]
+    pieces = list(zip(bounds[:-1], bounds[1:]))
+    return max(pieces, key=lambda piece: piece[1] - piece[0])
+
+
+def _stop_at_cross_walls(walls: list[dict[str, Any]], front: _Chain, side: float, part: tuple[float, float], run: tuple[float, float], depth: float, upm: float, settings: BuiltinFrontSettings) -> tuple[float, float]:
+    """Cut a continuation of ``run`` at the first perpendicular wall that crosses the strip, from the run outwards."""
+    tolerance = 0.05 * upm
+    start, stop = part
+    for along in _cross_wall_positions(walls, front, side, depth):
+        if stop <= run[0] + 1e-9 and start - tolerance < along < stop + tolerance:  # continuation before the run
+            start = max(start, along)
+        elif start >= run[1] - 1e-9 and start - tolerance < along < stop + tolerance:  # continuation after the run
+            stop = min(stop, along)
+    return start, stop
 
 
 def _strip_polygon(front: _Chain, side: float, run: tuple[float, float], depth: float) -> Polygon:

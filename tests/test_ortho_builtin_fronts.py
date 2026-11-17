@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import pytest
 from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 
 import ezdxf
 
@@ -335,3 +336,46 @@ def test_tall_mask_rules() -> None:
     by_class = tall_furniture_mask(scene.fine, FINE_NAMES, scene.classes, scene.height, (100,), scene.grid, 1.0)
     assert by_class.sum() > 0.8 * np.count_nonzero(scene.classes == 117)
     assert not tall_furniture_mask(scene.fine, FINE_NAMES, scene.classes, scene.height * 0.6, (100,), scene.grid, 1.0).any()
+
+
+def _carve_gap(scene: Scene, x0: float, x1: float, y0: float, y1: float) -> None:
+    """Free floor seen through a gap in the unit (an open door or a reflection): no tall evidence there."""
+    mask = _fill(scene.classes, scene.grid, _rect(x0, x1, y0, y1), scene.transform, 102)
+    scene.fine[mask] = 0
+    scene.height[mask] = 0.0
+    scene.free = scene.classes == 102
+
+
+@pytest.mark.parametrize("upm,angle", CASES)
+def test_wardrobe_with_interrupted_evidence_is_one_unit(upm: float, angle: float) -> None:
+    # A 3 m wardrobe whose tall evidence has a 0.6 m gap (floor seen through it) and whose front was measured only
+    # along its first part: the resolved part carries on across the gap, the wall moves behind the whole unit.
+    depth = 0.45
+    scene = _scene(upm, angle, unit=(0.6, 3.6, ROOM_DEPTH - depth, ROOM_DEPTH, "wardrobe", 1.95), front_wall=False)
+    scene.layers["A-WALL"].append(_wall(scene.transform, np.random.default_rng(5), upm, (0.6, ROOM_DEPTH - depth), (1.8, ROOM_DEPTH - depth)))
+    _carve_gap(scene, 1.8, 2.4, ROOM_DEPTH - depth, ROOM_DEPTH)
+    stats = _resolve(scene)
+    assert stats["builtin_fronts"] == 2 and sum(1 for strip in stats["builtin_strips"] if strip.get("bridged")) == 1
+    rectangles = [Polygon(entity["points"]) for entity in scene.layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed")]
+    covered = unary_union(rectangles)
+    assert covered.intersection(scene.strip).area >= 0.92 * scene.strip.area
+    walls = _wall_lines(scene)
+    back_pieces = [line for line in walls if max(scene.back_line.distance(Point(point)) for point in line.coords) <= 0.05 * upm]
+    unit_back = LineString([scene.transform(0.6, ROOM_DEPTH), scene.transform(3.6, ROOM_DEPTH)])
+    assert _covered_length(back_pieces, unit_back, 0.03 * upm) >= 0.95 * unit_back.length
+
+
+@pytest.mark.parametrize("upm,angle", CASES)
+def test_bridged_wardrobe_stops_at_cross_wall(upm: float, angle: float) -> None:
+    # Beyond a perpendicular wall at x = 3.0 the tall evidence belongs to another space: the unit ends at the wall.
+    depth = 0.45
+    scene = _scene(upm, angle, unit=(0.6, 3.6, ROOM_DEPTH - depth, ROOM_DEPTH, "wardrobe", 1.95), front_wall=False)
+    scene.layers["A-WALL"].append(_wall(scene.transform, np.random.default_rng(5), upm, (0.6, ROOM_DEPTH - depth), (1.8, ROOM_DEPTH - depth)))
+    _carve_gap(scene, 1.8, 2.4, ROOM_DEPTH - depth, ROOM_DEPTH)
+    rng = np.random.default_rng(3)
+    scene.layers["A-WALL"].append(_wall(scene.transform, rng, upm, (3.0, ROOM_DEPTH - depth - 0.05), (3.0, ROOM_DEPTH)))
+    _resolve(scene)
+    cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    ends = [max(((x / upm - 1.0) * cosine + (y / upm - 1.0) * sine) for x, y in Polygon(entity["points"]).exterior.coords)
+            for entity in scene.layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed")]
+    assert ends and max(ends) <= 3.0 + 0.06

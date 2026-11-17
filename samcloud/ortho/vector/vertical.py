@@ -36,6 +36,7 @@ class VerticalEvidence:
     ceiling_count: np.ndarray | None = None
     ceiling_z: np.ndarray | None = None
     soffit: np.ndarray | None = None
+    wall_bits: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)

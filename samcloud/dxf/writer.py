@@ -69,9 +69,12 @@ def build_dxf_document(result: DxfPlanResult, *, coordinates: str = "local") -> 
         add_symbol_blocks(document, result.blocks)
     scale_div, yaw = frame_scale_and_yaw(result.frame, coordinates)
     modelspace = document.modelspace()
-    for layer, entities in result.layers.items():
-        for entity in entities:
-            _add_entity(modelspace, entity, layer, result, coordinates, scale_div, yaw)
+    # Draw order = entity order: area fills (wall poché) first, texts last, so no fill ever covers a label.
+    for stage in (0, 1, 2):
+        for layer, entities in result.layers.items():
+            for entity in entities:
+                if _draw_stage(entity) == stage:
+                    _add_entity(modelspace, entity, layer, result, coordinates, scale_div, yaw)
     lower_left = _note_point(result, coordinates)
     note_text = f"{result.project_name} | {result.level_name} | {result.profile_name or 'unknown profile'} | scale {result.scale_factor:.6g} | {datetime.now().date().isoformat()}"
     if result.variant != "pointcloud":
@@ -109,6 +112,16 @@ def export_plan(result: DxfPlanResult, out_dir: Path, coordinates: str = "local"
             temporary.unlink()
         raise RuntimeError(f"DXF export audit failed: {error}") from error
     return destination
+
+
+def _draw_stage(entity: dict) -> int:
+    """0 for hatch fills, 2 for texts, 1 for all other geometry."""
+    kind = entity.get("type")
+    if kind == "hatch":
+        return 0
+    if kind == "text":
+        return 2
+    return 1
 
 
 def _ensure_furniture_block(document: ezdxf.document.Drawing) -> None:
@@ -162,6 +175,19 @@ def _add_entity(
             hatch.paths.add_polyline_path(points, is_closed=True)
             for hole in entity.get("holes", []):
                 hatch.paths.add_polyline_path([_point(point, result, coordinates) for point in hole], is_closed=True)
+    elif entity_type == "hatch":
+        # Area fill only (for example wall poché); the outline is a separate polyline entity.
+        points = [_point(point, result, coordinates) for point in entity.get("points", [])]
+        if len(points) >= 3:
+            style = result.layer_styles.get(layer, {})
+            hatch = modelspace.add_hatch(color=256, dxfattribs=attributes)
+            hatch_pattern = style.get("hatch_pattern")
+            if hatch_pattern and str(hatch_pattern).upper() != "SOLID":
+                hatch.set_pattern_fill(str(hatch_pattern), color=256, scale=float(style.get("hatch_scale") or 1.0))
+            hatch.paths.add_polyline_path([point[:2] for point in points], is_closed=True)
+            for hole in entity.get("holes", []):
+                if len(hole) >= 3:
+                    hatch.paths.add_polyline_path([_point(point, result, coordinates)[:2] for point in hole], is_closed=True)
     elif entity_type == "polyline3d":
         points = [_point(point, result, coordinates) for point in entity["points"]]
         modelspace.add_polyline3d(points, close=bool(entity.get("closed", False)), dxfattribs=attributes)

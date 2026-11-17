@@ -56,9 +56,10 @@ from samcloud.ortho.vector.spots import SpotSettings, ground_grid_points, points
 from samcloud.ortho.vector.terrain import DtmSampler, drape_coordinates, drape_outline_heights
 from samcloud.ortho.vector.vegetation import HedgeSettings, hedge_entities
 from samcloud.ortho.vector.kitchen_run import KitchenRunSettings, appliance_insert, build_kitchen_run
+from samcloud.ortho.vector.kitchen_layout import counter_lines, kitchen_cad_layout, tall_unit_entities
 from samcloud.ortho.vector.upper_cabinets import UpperCabinetSettings, detect_upper_cabinets, upper_band_mask
-from samcloud.ortho.vector.room_names import RoomNameSettings, name_rooms, room_label_text, tag_for_name
-from samcloud.ortho.vector.builtin_fronts import resolve_builtin_fronts, tall_furniture_mask
+from samcloud.ortho.vector.room_names import RoomNameSettings, name_halls, name_rooms, room_label_text, tag_for_name
+from samcloud.ortho.vector.builtin_fronts import _absorb_einb, _absorb_furniture, resolve_builtin_fronts, tall_furniture_mask
 from samcloud.ortho.vector.niche import NicheSettings, content_mask, resolve_recessed_niches
 from samcloud.ortho.vector.footprints import _NON_FOOTPRINT_INSTANCE_LABELS, ISLAND_LABELS, FootprintFit, IslandSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
 from samcloud.ortho.vector.wall_lines import (
@@ -70,7 +71,10 @@ from samcloud.ortho.vector.wall_lines import (
     face_buffer_polygons,
     face_entities,
 )
-from samcloud.ortho.vector.labels import class_display_name, label_entities, load_label_settings
+from samcloud.ortho.vector.wall_tidy import tidy_wall_entities
+from samcloud.ortho.vector.double_walls import DoubleWallSettings, TallUnitEvidence, WallEvidence, bound_rooms_by_walls, build_double_walls, update_opening_symbols
+from samcloud.ortho.vector.labels import class_display_name, label_entities, load_label_settings, resolve_label_overlaps
+from samcloud.ortho.vector.plan_polish import PlanPolishSettings, fit_kitchen_to_walls, place_object_labels, regularize_furniture, rooms_from_wall_cells
 from samcloud.ortho.vector.lines import boundary_lines, trace_lines
 from samcloud.ortho.vector.raster_grid import RasterGrid, mask_to_polygons
 from samcloud.ortho.vector.regularize import regularize_polygons
@@ -114,6 +118,8 @@ class CleanPlanSettings:
     indoor_upper_cabinets: UpperCabinetSettings = UpperCabinetSettings()
     indoor_room_names: RoomNameSettings = RoomNameSettings()
     indoor_kitchen_run: KitchenRunSettings = KitchenRunSettings()
+    walls: DoubleWallSettings = DoubleWallSettings()
+    plan_polish: PlanPolishSettings = PlanPolishSettings()
     outdoor_trunk: TrunkSettings = TrunkSettings()
     outdoor_hedges: HedgeSettings = HedgeSettings()
     outdoor_spots: SpotSettings = SpotSettings()
@@ -190,6 +196,8 @@ def load_clean_plan_settings(path: Path | str | None = None) -> CleanPlanSetting
         indoor_upper_cabinets=section_of("indoor_upper_cabinets", UpperCabinetSettings),
         indoor_room_names=section_of("indoor_room_names", RoomNameSettings),
         indoor_kitchen_run=section_of("indoor_kitchen_run", KitchenRunSettings),
+        walls=section_of("walls", DoubleWallSettings),
+        plan_polish=section_of("plan_polish", PlanPolishSettings),
         outdoor_trunk=section_of("outdoor_trunk", TrunkSettings),
         outdoor_hedges=section_of("outdoor_hedges", HedgeSettings),
         outdoor_spots=section_of("outdoor_spots", SpotSettings),
@@ -961,6 +969,9 @@ def _generate_indoor_clean_plan(
     alignment_names = {"bed", "wardrobe", "washing machine", "refrigerator", "fridge", "desk", "shelf"}
     fine_kitchen_labels = {"kitchen counter", "kitchen cabinet"}
     pending_kitchen: list[tuple[Any, str, str]] = []
+    furniture_id = 0  # links a furniture outline / insert with its "Name h=.." text (plan polish moves or drops both)
+    furniture_evidence: dict[int, Polygon] = {}  # traced footprint per outline: the plan polish picks its shape against it
+    traced_chairs = [item.polygon for item in instances if str(item.label or "").strip().lower() == "chair" and item.polygon is not None]
     kitchen_zone = _kitchen_zone(rooms_data.polygons, fine_classes, fine_names, grid, catalogue_inserts, units_per_metre, plan_settings.indoor_island.zone_radius_m)
     for instance in instances:
         if float(np.mean(fixture_coverage[instance.mask])) >= 0.50:
@@ -1057,36 +1068,45 @@ def _generate_indoor_clean_plan(
                     continue
                 fit = FootprintFit("rect" if was_rectangle else fit.kind, refit, fit.dev90, fit.iou, fit.radius)
         metric_height = instance.height / max(units_per_metre, 1e-9)
-        furniture_insert = _furniture_catalogue_insert(str(instance.label or "").strip().lower(), fit, wall_lines, units_per_metre) if fit.kind in {"rect", "rect_free"} and not clutter else None
+        # A table with traced chairs keeps its own rectangle: the dining block would draw stock chairs instead.
+        own_chairs = any(chair.distance(fit.polygon) <= 0.30 * units_per_metre for chair in traced_chairs)
+        furniture_insert = _furniture_catalogue_insert(str(instance.label or "").strip().lower(), fit, wall_lines, units_per_metre) if fit.kind in {"rect", "rect_free"} and not clutter and not own_chairs else None
         if furniture_insert is not None and not _insert_duplicates_existing(furniture_insert, output_layers):
             furniture_insert["attributes"] = {"LABEL": display}
             if instance.instance_id > 0:
                 furniture_insert["attributes"]["INSTANCE"] = str(instance.instance_id)
+            furniture_id += 1
+            furniture_insert["_furn_id"] = furniture_id
             output_layers["A-FURN"].append(furniture_insert)
             catalogue_inserts.append(furniture_insert)
             output_layers["A-ANNO"].append({
-                "type": "text", "text": f"{display} h={metric_height:.2f}", "point": list(fit.polygon.representative_point().coords[0]),
-                "height": (0.08 if fit.polygon.area < units_per_metre**2 else 0.12) * units_per_metre, "rotation": 0.0,
+                "type": "text", "text": _furniture_label_text(display, label_key, metric_height), "point": list(fit.polygon.representative_point().coords[0]),
+                "height": (0.08 if fit.polygon.area < units_per_metre**2 else 0.12) * units_per_metre, "rotation": 0.0, "_furn_id": furniture_id,
             })
             continue
         footprint_kinds[fit.kind] = footprint_kinds.get(fit.kind, 0) + 1
         if fit.kind == "free":
             free_footprint_labels.append(display)
         footprint_dev90_max = max(footprint_dev90_max, fit.dev90)
+        furniture_id += 1
         output_layers["A-FURN"].append({
-            "type": "polyline", "points": _polygon_points(fit.polygon), "closed": True, "holes": [],
+            "type": "polyline", "points": _polygon_points(fit.polygon), "closed": True, "holes": [], "_furn_id": furniture_id,
             "_hausdorff": fit.dev90, "_label": display, "_footprint_kind": fit.kind,
-            "_footprint_dev90": fit.dev90, "_wall_aligned": aligned,
+            "_footprint_dev90": fit.dev90, "_wall_aligned": aligned, "_semantic_label": str(instance.label or display),
             **({"_instance_id": int(instance.instance_id)} if instance.instance_id > 0 else {}),
         })
+        if not clutter:
+            measured = _footprint_evidence(component, local_grid, units_per_metre)
+            if measured is not None:
+                furniture_evidence[furniture_id] = measured
         detail_labels = {"sofa", "armchair", "bed", "table", "desk", "kitchen counter", "wardrobe", "shelf", "bathtub"}
         if str(instance.label or "").strip().lower() in detail_labels:
             for line in height_step_details(instance, height_map, grid, theta, units_per_metre, fit.polygon):
                 output_layers["A-FURN-DETL"].append({"type": "polyline", "points": [[float(x), float(y)] for x, y in line.coords], "closed": False})
         metric_height = instance.height / max(units_per_metre, 1e-9)
         output_layers["A-ANNO"].append({
-            "type": "text", "text": f"{display} h={metric_height:.2f}", "point": list(fit.polygon.representative_point().coords[0]),
-            "height": (0.08 if fit.polygon.area < units_per_metre**2 else 0.12) * units_per_metre, "rotation": 0.0,
+            "type": "text", "text": _furniture_label_text(display, label_key, metric_height), "point": list(fit.polygon.representative_point().coords[0]),
+            "height": (0.08 if fit.polygon.area < units_per_metre**2 else 0.12) * units_per_metre, "rotation": 0.0, "_furn_id": furniture_id,
         })
 
     kitchen_einb_from_fine += _emit_kitchen_run(
@@ -1150,16 +1170,66 @@ def _generate_indoor_clean_plan(
     footprint_metrics["upper_cabinets"] = len(upper_polygons)
     footprint_metrics["builtin_furniture_absorbed"] = builtin_front_stats["builtin_furniture_absorbed"]
 
+    double_walls_done = False
+    tall_units: list[tuple[Polygon, str]] = []
+    if plan_settings.walls.double_line:
+        # Double-line walls: every wall gets both faces with a measured or learned
+        # thickness; the room outlines then follow the inner faces.
+        report_progress(progress, 0.70, "Building double-line walls")
+        output_layers["A-WALL"], wall_tidy_stats = tidy_wall_entities(output_layers["A-WALL"], openings, units_per_metre)
+        footprint_metrics.update(wall_tidy_stats)
+        wall_evidence_rasters = WallEvidence(
+            wall_bits=vertical.wall_bits, all_bits=vertical.bitmask, bins=plan_settings.indoor_vertical.bins, storey_height=ceiling_height,
+            section=section, low=low, floor=free_space, door=door_mask, cameras=_level_camera_centres(project, ortho.stats, frame, level, ceiling_height),
+        )
+        double = build_double_walls(
+            output_layers["A-WALL"], openings, rooms_data.polygons, free_space | closed_floor, classes != 0, grid, units_per_metre, plan_settings.walls,
+            furniture=ceiling_furniture_mask | tall_mask, evidence=wall_evidence_rasters,
+            builtins=[Polygon(entity["points"]) for entity in output_layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed") and entity.get("_einb_kind") == "builtin_front" and len(entity.get("points", [])) >= 3],
+            tall_units=tall_unit_evidence(fine_classes, fine_names, classes, height_map, units_per_metre),
+        )
+        tall_units = list(double.tall_units)
+        output_layers["A-WALL"] = double.entities
+        output_layers["A-WALL-PATT"] = double.hatches
+        footprint_metrics.update(double.stats)
+        footprint_metrics["double_wall_openings_changed"] = _apply_opening_changes(output_layers, double.openings_changed, free_space, grid)
+        openings = list(double.openings)
+        footprint_metrics["double_wall_symbols_updated"] = update_opening_symbols(output_layers, openings, double.opening_slabs, units_per_metre)
+        if plan_settings.walls.bound_rooms:
+            bounded_rooms, bound_stats = bound_rooms_by_walls(list(sorted_rooms), double.closed_polygons, units_per_metre, plan_settings.walls, barriers=double.opening_cuts)
+            sorted_rooms = sorted(bounded_rooms, key=lambda item: (-item.representative_point().y, item.representative_point().x))
+            footprint_metrics.update(bound_stats)
+        double_walls_done = True
+        polish = plan_settings.plan_polish
+        if polish.enabled:
+            # Clean architectural plan: rooms = wall cells (an open-plan space is one room), regular furniture
+            # outlines that never reach into a wall.
+            polish_walls = unary_union(list(double.closed_polygons)) if double.closed_polygons else None
+            if polish.cell_rooms:
+                cell_rooms, cell_stats = rooms_from_wall_cells(
+                    list(sorted_rooms), double.closed_polygons, double.opening_cuts, free_space | closed_floor, grid, units_per_metre, theta, polish,
+                )
+                if cell_rooms:
+                    sorted_rooms = sorted(cell_rooms, key=lambda item: (-item.representative_point().y, item.representative_point().x))
+                footprint_metrics.update(cell_stats)
+            if polish.furniture:
+                footprint_metrics.update(regularize_furniture(
+                    output_layers, list(sorted_rooms), polish_walls, theta, units_per_metre, polish, _insert_footprint,
+                    evidence_of=lambda entity: furniture_evidence.get(entity.get("_furn_id")),
+                    height_of=_height_sampler(height_map, grid),
+                ))
+
     report_progress(progress, 0.72, "Labelling enclosed room areas")
     tagged_points = _collect_room_tags(output_layers, units_per_metre)
     room_names = name_rooms(sorted_rooms, tagged_points, units_per_metre, plan_settings.indoor_room_names)
+    room_names = name_halls(sorted_rooms, room_names, [(opening.center, opening.axis_angle) for opening in openings if opening.kind in {"DOOR", "passage"}], units_per_metre, plan_settings.indoor_room_names)
     generic_number = 0
     room_name_texts: list[str] = []
     for polygon, decision in zip(sorted_rooms, room_names, strict=True):
         if not decision.keep:
             continue
         generic_number += 1
-        title = decision.name or f"Raum {generic_number}"
+        title = decision.name or "Zimmer"
         room_name_texts.append(title)
         output_layers["A-AREA"].append({"type": "polyline", "points": _polygon_points(polygon), "closed": True, "holes": []})
         output_layers["A-ANNO"].append({"type": "text", "text": room_label_text(title, decision.area_m2), "point": list(polygon.representative_point().coords[0]), "height": 0.12 * units_per_metre, "rotation": 0.0, "_room_name": title})
@@ -1172,6 +1242,40 @@ def _generate_indoor_clean_plan(
     output_layers["A-EINB"], einb_tidy = tidy_builtins(output_layers["A-EINB"], output_layers["A-ANNO"], units_per_metre)
     footprint_metrics["einb_before_tidy"] = einb_tidy["before"]
     footprint_metrics["einb_after_tidy"] = einb_tidy["after"]
+    # Tall built-in kitchen units resolved by the wall stage: outline + cross + KS/HS (after the A-EINB tidy,
+    # which would merge two neighbouring units); traced furniture and built-ins inside them are absorbed.
+    footprint_metrics["tall_units_absorbed"] = _emit_tall_units(output_layers, tall_units, units_per_metre)
+    if double_walls_done and plan_settings.plan_polish.enabled:
+        kept_rooms = [polygon for polygon, decision in zip(sorted_rooms, room_names, strict=True) if decision.keep]
+        # The kitchen run ends at a tall unit like at a wall.
+        kitchen_walls = unary_union([polish_walls, *(shape for shape, _ in tall_units)]) if tall_units and polish_walls is not None else polish_walls
+        if plan_settings.plan_polish.kitchen:
+            footprint_metrics.update(fit_kitchen_to_walls(output_layers, kept_rooms, kitchen_walls, theta, units_per_metre, plan_settings.plan_polish))
+        if plan_settings.plan_polish.kitchen and plan_settings.plan_polish.kitchen_layout:
+            footprint_metrics.update(kitchen_cad_layout(
+                output_layers, kept_rooms, kitchen_walls, theta, units_per_metre, _height_sampler(height_map, grid),
+                _kitchen_appliance_points(fine_classes, fine_names, instance_raster, instance_labels, height_map, grid, units_per_metre),
+            ))
+        footprint_metrics.update(place_object_labels(output_layers, kept_rooms, units_per_metre, theta, _insert_footprint, plan_settings.plan_polish))
+    if not double_walls_done:
+        output_layers["A-WALL"], wall_tidy_stats = tidy_wall_entities(output_layers["A-WALL"], openings, units_per_metre)
+        footprint_metrics.update(wall_tidy_stats)
+    label_obstacles = [footprint for entities in output_layers.values() for entity in entities if entity.get("type") == "insert" and (footprint := _insert_footprint(entity)) is not None]
+    if double_walls_done and plan_settings.plan_polish.enabled:
+        # Room names also keep clear of traced furniture and built-in outlines.
+        label_obstacles += [
+            Polygon(entity["points"]).buffer(0) for name in ("A-FURN", "A-EINB") for entity in output_layers.get(name, [])
+            if entity.get("type") == "polyline" and entity.get("closed") and len(entity.get("points", [])) >= 3
+        ]
+    footprint_metrics.update(resolve_label_overlaps(
+        output_layers,
+        label_obstacles,
+        [polygon for polygon, decision in zip(sorted_rooms, room_names, strict=True) if decision.keep],
+        units_per_metre, load_label_settings(),
+    ))
+    if double_walls_done and plan_settings.plan_polish.enabled and plan_settings.plan_polish.kitchen and plan_settings.plan_polish.kitchen_layout:
+        # CAD kitchen: the counter is drawn by its front and end lines (its back is the wall face).
+        footprint_metrics["kitchen_counter_lines"] = counter_lines(output_layers, kitchen_walls, units_per_metre)
     styles, colors, linetypes, hatches = _layer_presentation(indoor_layers)
     _add_ortho_plan_layer_presentation(styles, colors, linetypes, hatches)
     statuses = {
@@ -1237,6 +1341,9 @@ def _section_occupancy(project: Path, stats: dict[str, Any], point_source: Path 
     high = np.zeros_like(section)
     measured_points: list[np.ndarray] = []
     vertical_bits = np.zeros((grid.height, grid.width), dtype=np.uint32)
+    # Height bins of wall-class (structural) points only: a wall face must be backed by wall points
+    # over most of the storey height, a furniture front or upper cabinet is not.
+    wall_bits = np.zeros((grid.height, grid.width), dtype=np.uint32)
     ceiling_count = np.zeros((grid.height, grid.width), dtype=np.uint16)
     ceiling_z = np.full((grid.height, grid.width), -np.inf, dtype=np.float32)
     soffit = np.zeros((grid.height, grid.width), dtype=bool)
@@ -1258,6 +1365,10 @@ def _section_occupancy(project: Path, stats: dict[str, Any], point_source: Path 
         if vertical_range.any():
             bins = np.clip((z_all[vertical_range] / max(height, 1e-9) * vertical_settings.bins).astype(np.int32), 0, vertical_settings.bins - 1)
             np.bitwise_or.at(vertical_bits, (rows_all[vertical_range], cols_all[vertical_range]), (np.uint32(1) << bins.astype(np.uint32)))
+            structural_range = vertical_range & keep
+            if structural_range.any():
+                wall_bin = np.clip((z_all[structural_range] / max(height, 1e-9) * vertical_settings.bins).astype(np.int32), 0, vertical_settings.bins - 1)
+                np.bitwise_or.at(wall_bits, (rows_all[structural_range], cols_all[structural_range]), (np.uint32(1) << wall_bin.astype(np.uint32)))
         ceiling_points = inside_all & (classes == 101) & (z_all >= 0.95 * height) & (z_all <= 1.08 * height)
         if ceiling_points.any():
             np.add.at(ceiling_count, (rows_all[ceiling_points], cols_all[ceiling_points]), 1)
@@ -1290,13 +1401,53 @@ def _section_occupancy(project: Path, stats: dict[str, Any], point_source: Path 
     bin_counts = np.unpackbits(wall_height_bins.view(np.uint8).reshape(grid.height, grid.width, 2), axis=2).sum(axis=2)
     wall_cells = (wall_counts > 0) & ((spans >= 0.25 * height) | (bin_counts >= 3))
     points = np.vstack(measured_points) if measured_points else np.empty((0, 3), dtype=float)
-    return wall_cells, section, low, high, points, _with_ceiling_evidence(vertical_bits, height, vertical_settings, ceiling_count, ceiling_z, soffit)
+    return wall_cells, section, low, high, points, _with_ceiling_evidence(vertical_bits, height, vertical_settings, ceiling_count, ceiling_z, soffit, wall_bits)
 
 
-def _with_ceiling_evidence(bits: np.ndarray, height: float, settings: VerticalSettings, ceiling_count: np.ndarray, ceiling_z: np.ndarray, soffit: np.ndarray) -> VerticalEvidence:
-    """Attach ceiling rasters to the existing vertical-evidence return value."""
+def _with_ceiling_evidence(bits: np.ndarray, height: float, settings: VerticalSettings, ceiling_count: np.ndarray, ceiling_z: np.ndarray, soffit: np.ndarray, wall_bits: np.ndarray | None = None) -> VerticalEvidence:
+    """Attach ceiling rasters (and the wall-class height bins) to the vertical-evidence return value."""
     evidence = vertical_evidence(bits, height, settings)
-    return VerticalEvidence(evidence.full, evidence.counter, evidence.top_height, evidence.bitmask, ceiling_count, ceiling_z, soffit)
+    return VerticalEvidence(evidence.full, evidence.counter, evidence.top_height, evidence.bitmask, ceiling_count, ceiling_z, soffit, wall_bits)
+
+
+def _level_camera_centres(project: Path, stats: dict[str, Any], frame: Frame, level: Level, storey_height: float) -> np.ndarray | None:
+    """Plan positions of the cameras registered on this level (for the wall visibility test)."""
+    model = stats.get("sparse_model_used") or (stats.get("source_paths") or {}).get("sparse_model")
+    if not model or not Path(model).exists():
+        return None
+    try:
+        from samcloud.ortho.cameras import load_cameras
+
+        cameras = load_cameras(Path(model), project)
+    except Exception:  # noqa: BLE001 - the visibility test is optional evidence
+        return None
+    if not cameras:
+        return None
+    centres = frame.to_local(np.asarray([camera.centre for camera in cameras], dtype=np.float64))
+    height = centres[:, 2] - float(level.floor_z)
+    keep = (height >= -0.2 * storey_height) & (height <= 1.2 * storey_height)
+    if not keep.any():
+        return None
+    return np.unique(np.round(centres[keep, :2], 3), axis=0)
+
+
+def _apply_opening_changes(layers: dict[str, list[dict[str, Any]]], changes: list[tuple[Any, Any]], free_space: np.ndarray, grid: RasterGrid) -> int:
+    """Redraw the symbols of openings the wall builder corrected, removed or added."""
+    count = 0
+    for old, new in changes:
+        if old is not None:
+            centre = np.asarray(old.center, dtype=float)
+            for layer in ("A-DOOR", "A-WIND"):
+                layers[layer] = [
+                    entity for entity in layers.get(layer, [])
+                    if entity.get("_opening_center") is None or float(np.linalg.norm(np.asarray(entity["_opening_center"][:2], dtype=float) - centre)) > 1e-6
+                ]
+        if new is not None:
+            for entity in opening_entities([new], free_space, grid=grid):
+                entity["_on_face"] = True
+                layers["A-WIND" if entity.get("type") == "insert" and entity.get("name") == "WINDOW" else "A-DOOR"].append(entity)
+        count += 1
+    return count
 
 
 def _indoor_structural_codes(layers: tuple[LayerDefinition, ...]) -> tuple[int, ...]:
@@ -1861,6 +2012,14 @@ def indoor_wall_metrics(result: DxfPlanResult) -> dict[str, Any]:
     max_values: list[float] = []
     snapped_length = 0.0
     for entity in wall_entities:
+        if entity.get("type") == "polyline" and entity.get("closed") and entity.get("_double_wall") and len(entity.get("points", [])) >= 3:
+            for ring in [entity["points"], *entity.get("holes", [])]:
+                ring_line = LineString([*ring, ring[0]])
+                lines.append(ring_line)
+                rms_values.append(0.0)
+                max_values.append(0.0)
+                snapped_length += ring_line.length
+            continue
         if entity.get("type") == "polyline" and not entity.get("closed") and len(entity.get("points", [])) >= 2:
             line = LineString(entity["points"])
         elif entity.get("type") == "arc":
@@ -2330,6 +2489,65 @@ def _furniture_catalogue_insert(label: str, fit: Any, wall_lines: list[LineStrin
     return snap_insert_to_wall(measured, kinds, wall_lines, units_per_metre, max_gap_m=0.15, tolerance=_FURNITURE_TOLERANCE)
 
 
+_APPLIANCE_LABELS: dict[str, tuple[str, ...]] = {
+    "COOKTOP": ("stove", "cooktop", "hob", "oven"),
+    "KITCHEN_SINK": ("kitchen sink", "sink"),
+    "REFRIGERATOR": ("refrigerator", "fridge"),
+}
+
+
+def _kitchen_appliance_points(
+    fine_classes: np.ndarray, fine_names: list[str], instance_raster: np.ndarray | None, instance_labels: dict[int, str],
+    height_map: np.ndarray, grid: RasterGrid, units_per_metre: float,
+) -> dict[str, np.ndarray]:
+    """Local points of appliance labels (fine label or instance label); cooktop / sink only at counter height."""
+    heights = np.nan_to_num(np.asarray(height_map, dtype=np.float32), nan=-1.0)
+    counter = (heights >= 0.75 * units_per_metre) & (heights <= 1.05 * units_per_metre)
+    output: dict[str, np.ndarray] = {}
+    for kind, names in _APPLIANCE_LABELS.items():
+        ids = [index + 1 for index, name in enumerate(fine_names) if str(name).strip().lower() in names]
+        mask = np.isin(fine_classes, ids) if ids else np.zeros(fine_classes.shape, dtype=bool)
+        if instance_raster is not None and instance_labels and not mask.any():
+            owners = [identifier for identifier, label in instance_labels.items() if str(label).strip().lower() in names]
+            if owners:
+                mask |= np.isin(instance_raster, owners)
+        if kind != "REFRIGERATOR":
+            mask &= counter
+        rows, cols = np.nonzero(mask)
+        if len(rows):
+            output[kind] = np.column_stack((grid.min_x + (cols + 0.5) * grid.pixel_size, grid.max_y - (rows + 0.5) * grid.pixel_size))
+    return output
+
+
+def _footprint_evidence(component: np.ndarray, local_grid: RasterGrid, units_per_metre: float) -> Polygon | None:
+    """Traced footprint of one object mask (largest part, 2 cm closing, holes filled)."""
+    polygons = mask_to_polygons(np.asarray(component, dtype=bool), local_grid)
+    if not polygons:
+        return None
+    measured = max(polygons, key=lambda item: item.area).buffer(0.02 * units_per_metre).buffer(-0.02 * units_per_metre)
+    parts = [measured] if isinstance(measured, Polygon) else [part for part in getattr(measured, "geoms", ()) if isinstance(part, Polygon)]
+    parts = [part for part in parts if part.area > 0.0]
+    if not parts:
+        return None
+    return Polygon(max(parts, key=lambda item: item.area).exterior).simplify(0.005 * units_per_metre, preserve_topology=True)
+
+
+def _height_sampler(height_map: np.ndarray, grid: RasterGrid) -> Callable[[np.ndarray], np.ndarray]:
+    """Height above the floor (units) at local points; NaN outside the raster or where nothing was measured."""
+    heights = np.asarray(height_map, dtype=np.float64)
+
+    def sample(points: np.ndarray) -> np.ndarray:
+        values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        cols = np.floor((values[:, 0] - grid.min_x) / grid.pixel_size).astype(np.int64)
+        rows = np.floor((grid.max_y - values[:, 1]) / grid.pixel_size).astype(np.int64)
+        inside = (rows >= 0) & (rows < heights.shape[0]) & (cols >= 0) & (cols < heights.shape[1])
+        output = np.full(len(values), np.nan)
+        output[inside] = heights[rows[inside], cols[inside]]
+        return output
+
+    return sample
+
+
 def _insert_footprint(insert: dict[str, object]) -> Polygon | None:
     """Plan footprint of a catalogue insert (body outline, no chairs)."""
     entry = catalogue_entry_for_block(str(insert["name"]))
@@ -2495,6 +2713,43 @@ def _island_appliances(island: Any, fine_classes: np.ndarray, fine_names: list[s
     return output
 
 
+def _furniture_label_text(display: str, label_key: str, height: float) -> str:
+    """Furniture label "Name h=0.76"; a chair is a seat-sized box and gets its name only ("Stuhl")."""
+    return display if label_key == "chair" else f"{display} h={height:.2f}"
+
+
+TALL_UNIT_FINE_LABELS = frozenset({"refrigerator", "fridge", "oven"})
+TALL_UNIT_IF_HIGH_FINE_LABELS = frozenset({"kitchen cabinet"})
+
+
+def tall_unit_evidence(
+    fine_classes: np.ndarray, fine_names: list[str], classes: np.ndarray, height_map: np.ndarray, units_per_metre: float,
+    tall_m: float = 1.6, low_m: float = 1.5,
+) -> TallUnitEvidence:
+    """Rasters for the tall built-in unit test of the wall stage: kitchen cabinets standing at full height
+    (>= ``tall_m``) and fridges / ovens are unit evidence; observed surfaces between 0.05 m and ``low_m`` are
+    low surfaces (counter tops, furniture) that never lie inside a floor-to-ceiling unit."""
+    names = [str(name).strip().lower() for name in fine_names]
+    heights = np.nan_to_num(np.asarray(height_map, dtype=float), nan=0.0)
+    fridge_ids = [index + 1 for index, name in enumerate(names) if name in TALL_UNIT_FINE_LABELS]
+    high_ids = [index + 1 for index, name in enumerate(names) if name in TALL_UNIT_IF_HIGH_FINE_LABELS]
+    fridge = np.isin(fine_classes, fridge_ids) & (heights >= 0.5 * units_per_metre)
+    front = fridge | (np.isin(fine_classes, high_ids) & (heights >= tall_m * units_per_metre))
+    low = (np.asarray(classes) != 0) & (heights > 0.05 * units_per_metre) & (heights < low_m * units_per_metre)
+    return TallUnitEvidence(front=front, fridge=fridge, low=low)
+
+
+def _emit_tall_units(layers: dict[str, list[dict[str, Any]]], units: list[tuple[Polygon, str]], units_per_metre: float) -> int:
+    """Write the tall units of the wall stage to A-EINB (outline, cross, KS/HS); returns absorbed objects."""
+    absorbed = 0
+    for shape, _label in units:
+        layers["A-EINB"], count = _absorb_einb(layers.get("A-EINB", []), shape)
+        absorbed += count + _absorb_furniture(layers, shape, shape)
+    for shape, label in units:
+        layers["A-EINB"].extend(tall_unit_entities(shape, label, units_per_metre, _wall_stage=True))
+    return absorbed
+
+
 def _absorb_chairs_at_dining_tables(layers: dict[str, list[dict[str, Any]]], units_per_metre: float) -> None:
     """Drop traced chairs that the TABLE_DINING block already draws around its table."""
     zones = []
@@ -2622,6 +2877,10 @@ def _add_ortho_plan_layer_presentation(styles: dict[str, dict[str, Any]], colors
             style["true_color"] = tuple(int(value) for value in values["true_color"])
         if "lineweight" in values:
             style["lineweight"] = int(values["lineweight"])
+        if "hatch_pattern" in values:
+            style["hatch_pattern"] = str(values["hatch_pattern"])
+        if "hatch_scale" in values:
+            style["hatch_scale"] = float(values["hatch_scale"])
 
 
 def _clip_neighbours_to_regularized_buildings(

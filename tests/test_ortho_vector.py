@@ -1567,3 +1567,56 @@ def test_clipped_chair_refit_to_rectangle() -> None:
     refit = refit_clipped(clipped, original, [], 1.0, force_rectangle=True)
     assert refit is not None and len(refit.exterior.coords) == 5 and clipped.buffer(0.01).contains(refit)
     assert refit.area >= 0.5 * clipped.area
+
+
+def test_white_table_top_with_chairs_mislabelled_as_table_pieces() -> None:
+    """A white top returns few points: the instance labels land on the chairs ("table" pieces straddling the top
+    edge, a "dining table" piece at its end) while the top itself is an unlabelled flat blob at table height.
+    The top becomes the table, every chair its own seat-sized box beside it - also two chairs side by side."""
+    from samcloud.ortho.plan import _furniture_label_text
+
+    grid = _footprint_grid()
+    rng = np.random.default_rng(20261117)
+    top = box(1.0, 0.0, 1.9, 1.8)
+    seats = {  # centre of each real chair -> (label of its piece, piece polygon)
+        (0.83, 0.42): ("table", box(0.62, 0.17, 1.12, 0.67)),
+        (0.83, 1.00): ("chair", box(0.63, 0.74, 1.08, 1.24)),  # 7 cm from its neighbour: must not merge
+        (2.07, 0.42): ("table", box(1.80, 0.18, 2.30, 0.66)),
+        (2.07, 1.20): ("table", box(1.82, 0.96, 2.31, 1.45)),
+        (1.45, 2.03): ("chair", box(1.21, 1.72, 1.69, 2.26)),
+        (1.45, -0.23): ("dining table", box(1.20, -0.47, 1.70, 0.08)),
+    }
+    hm = rng.normal(0.0, 0.003, (grid.height, grid.width)).astype(np.float32)
+    top_mask = _rasterise_polygon(top, grid)
+    hm[top_mask & (rng.random(top_mask.shape) < 0.6)] += 0.75  # sparse points on the white top
+    instances = []
+    for _centre, (label, piece) in seats.items():
+        mask = _rasterise_polygon(piece, grid)
+        hm[mask & ~top_mask] = 0.47
+        back = mask & ~top_mask & (rng.random(mask.shape) < 0.25)
+        hm[back] = 0.86
+        instances.append(ObjectInstance(mask, label, 117, True, 0.86, 0.9))
+    instances.append(ObjectInstance(top_mask, None, 117, False, 0.75, 0.95))
+    classes = np.where(np.logical_or.reduce([item.mask for item in instances]), 117, 0).astype(np.uint8)
+    stats: dict[str, int] = {}
+    refined = refine_dining_instances(instances, classes, grid, hm, 0.0, 1.0, stats)
+    tables = [item for item in refined if item.label in {"table", "dining table"}]
+    chairs = [item for item in refined if item.label == "chair"]
+    assert stats["dining_tops_from_unlabelled"] == 1 and stats["dining_table_pieces_to_chairs"] == 4
+    assert len(tables) == 1 and len(chairs) == 6
+    table_fit = tables[0].polygon or fit_footprint(tables[0].mask, grid, hm, 0.0, 1.0, fine_label=True, semantic_label="table").polygon
+    x0, y0, x1, y1 = table_fit.bounds
+    assert abs(x0 - 1.0) <= 0.05 and abs(x1 - 1.9) <= 0.05 and abs(y0 - 0.0) <= 0.05 and abs(y1 - 1.8) <= 0.05
+    centres = list(seats)
+    for chair in chairs:
+        corners = list(chair.polygon.exterior.coords)
+        sides = [math.dist(corners[index], corners[index + 1]) for index in range(4)]
+        assert all(0.40 - 1e-6 <= side <= 0.55 + 1e-6 for side in sides)
+        assert chair.polygon.intersection(table_fit).area <= 1e-3
+        nearest = min(centres, key=lambda centre: math.dist(centre, chair.polygon.centroid.coords[0]))
+        assert math.dist(nearest, chair.polygon.centroid.coords[0]) <= 0.15
+        centres.remove(nearest)  # one box per chair
+    for first in range(len(chairs)):
+        for second in range(first + 1, len(chairs)):
+            assert chairs[first].polygon.intersection(chairs[second].polygon).area <= 1e-3
+    assert _furniture_label_text("Stuhl", "chair", 0.86) == "Stuhl" and _furniture_label_text("Tisch", "table", 0.75) == "Tisch h=0.75"

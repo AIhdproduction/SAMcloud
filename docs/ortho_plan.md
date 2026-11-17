@@ -95,6 +95,153 @@ unscaled 360 scans still work, `units_per_metre` is derived automatically):
   (`builtin_fronts.py`, `vertical.py`);
 - instance labels name furniture and fixtures (Regal, Tisch, Stuhl, Schrank).
 
+### Double-line walls
+
+With `walls.double_line: true` in `config/ortho_plan.yaml` (the default) every
+indoor wall is drawn with both faces as a closed outline on `A-WALL`, filled on
+`A-WALL-PATT` (`samcloud/ortho/vector/double_walls.py`):
+
+1. **Solid side.** The side of a measured face with a room (ceiling room or free
+   floor) in front of it is the room side; the other side is the wall body. Faces
+   with no room on either side are oriented by a measured partner face, else the
+   unmeasured (void) side is the outside.
+2. **Measured thickness.** Two parallel faces whose bodies face each other at
+   `min_thickness_m`..`max_thickness_m` are one wall; the distance is its thickness.
+   A partner seen only beside a face (within `pair_gap_m`) lends its offset too.
+3. **Interior or exterior.** Behind the wall body the next room is searched: a
+   ceiling room within `probe_m` (or free floor right behind the wall) makes an
+   interior wall, whose thickness may also come from that room's edge; nothing
+   behind it makes an exterior wall. Door and window spans do not decide the kind.
+4. **Learned thickness.** Measured pairs and room-edge distances are clustered
+   into interior thickness classes; exterior walls use the measured exterior pairs
+   or `exterior_thickness_m`. Collinear faces of one wall line share the measured
+   thickness and are aligned on one line, so a face seen only in part still gets a
+   straight, consistent second face.
+5. **Wall bodies.** Every face run becomes a band on its solid side; ends are
+   extended into L corners, gaps up to `joint_reach_m` are closed, bands are united
+   (clean L/T/X joints) and each door and window is cut through the full thickness
+   of its host wall only (closed jambs). Steps and notches below `jog_m` are removed.
+6. **Outline completion.** Where a room edge borders unmeasured outside and no
+   wall was measured (for example behind kitchen units), an exterior wall is added
+   at the end of the measured data, continuing the neighbouring wall line.
+
+7. **Evidence checks.** A face whose measured data never forms a wall (wall-class
+   points over `face_min_height_m` reaching `face_reach_m`, or a floor-connected
+   surface such as a curtain) while furniture stands at it is a furniture front
+   (counter, upper cabinet) and is dropped. A face that no camera of the level sees
+   without looking through another face (a mirror phantom) is dropped.
+8. **Doors.** A door detected as its open leaf (perpendicular to a wall, one end at
+   it) becomes the opening in that wall next to the hinge, fitted to the stretch that
+   is open at sill and mid height; a measured face made of door points standing at a
+   wall is converted the same way. Doorways (no sill or mid-height points across the
+   wall, floor seen through it) are added, a door span that is solid wall is dropped,
+   a window overlapping a door keeps only its part beside the door, and wall stubs
+   shorter than `min_stub_m` next to an opening are not built.
+9. **Tall built-in units** (`tall_units: true`). A fridge, oven tower or tall kitchen
+   cabinet hides the wall behind it, and its front can be taken as a wall face (measured,
+   or completed from the room edge). A wall run with tall-unit evidence along at least
+   `tall_unit_min_m` within `tall_unit_band_m` of its face (fine label kitchen cabinet at
+   1.6 m or more, fridge, oven) is a unit front when the room in front of it is open floor,
+   a wall stands behind it at a unit depth (`tall_unit_min_depth_m`..`tall_unit_max_depth_m`)
+   and its footprint holds neither open floor nor observed low surfaces (counter tops,
+   furniture; `tall_unit_max_free`, `tall_unit_max_low`). The wall behind is a wall body
+   that rays from the front reach, or else a parallel wall on the same side ending next to
+   the unit (`tall_unit_neighbour_gap_m`): that hidden wall is continued behind the unit to
+   its far end. The unit reaches a perpendicular wall body within `tall_unit_side_gap_m`
+   (blind corner). Wall runs whose body lies in a unit are removed; the unit is drawn on
+   `A-EINB` as a rectangle with a cross and "KS" where fridge evidence lies at its front
+   (a long unit is split into a fridge module of `tall_unit_fridge_m` at the end holding it)
+   or "HS". The kitchen counter ends at such a unit like at a wall (a counter end within
+   0.30 m reaches its side). Same idea as the bedroom wardrobe rule (`builtin_fronts.py`),
+   which works on the single wall lines before this stage.
+
+Short faces with no other wall nearby (furniture sides) and the reveals of
+openings are not walls. Rooms (`A-AREA`) then follow the inner faces: a room grows
+up to `room_gap_m` towards the faces and fills a wall-enclosed cell it is alone in;
+two ceiling fragments with no wall between them are one room when either is below
+`room_merge_max_area_m2`. Window blocks span the wall thickness and door jamb lines
+run from face to face.
+
+### Plan polish
+
+After the double-line walls, `samcloud/ortho/vector/plan_polish.py` cleans the plan
+(`plan_polish:` in `config/ortho_plan.yaml`, all lengths in metres × units per metre):
+
+- **Rooms** (`A-AREA` and the room names) are the wall cells: the free cells of the wall
+  bodies with door and window spans closed. Their outlines are the inner wall faces, so
+  they are rectilinear and never cross a room interior. An open-plan space with no wall
+  between its parts is one room (kitchen run + sofa = "Wohnen / Küche"). A cell that holds
+  several measured ceiling rooms is split only at a passage: a straight or one-step cut
+  between two wall corners, at most `room_split_max_m` long, that leaves each ceiling room
+  on its own side (for example the hall that opens to the living room). Every cell with
+  floor gets a name and an area, also without fixtures ("Zimmer"; "Büro" with at least two
+  desks or monitors); a corridor between doors is a "Flur" from `min_hall_area_m2`.
+- **Furniture** (`A-FURN`): fragments of one instance are merged; each outline becomes a
+  rectangle along the wall axes when it covers the traced footprint (`furniture_rect_iou`),
+  stays a rotated rectangle when the object really stands at an angle, and is otherwise a
+  rectilinear outline (steps of at least `furniture_step_m`, at most
+  `furniture_max_vertices` corners). Outlines are cut out of the walls and their room;
+  traces inside a larger outline or a catalogue block are dropped, overlaps are cut back,
+  a sliver narrower than `furniture_sliver_m` glued to a much larger outline is dropped,
+  clutter below `furniture_min_area_m2` is dropped and ragged height-step lines are
+  removed. A label that cannot be right for the size (a 4 m² "Kissen", a 1.8 m high
+  "Bett") becomes "Möbel".
+- **Dining tables and chairs** (`footprints.py`, before the furniture loop): table pieces,
+  chairs and unlabelled furniture touching them form a dining group with one table top: the
+  largest table piece shaped like a top (short side ≥ 0.5 m, ≥ 0.35 m², filling 45 % of its
+  rectangle), else an unlabelled piece of that shape at table height (0.60–0.90 m) — a white
+  or glass top returns few points, so the instance labels land on the chairs around it.
+  Other table pieces with at least 0.06 m² outside the top are chairs. Chair pieces are
+  clipped by the top (thin slivers along its edge removed) and merge only while the merged
+  piece still fits one chair (0.70 m), so chairs side by side stay separate. A chair within
+  0.60 m of a table becomes a seat box on the table axes (0.40–0.55 m, from a piece of at
+  least 0.04 m²) pushed out from under the top; two boxes for one seat keep the larger.
+  Chairs are labelled "Stuhl" (no height), the table "Tisch h=…"; a table with traced
+  chairs keeps its own rectangle instead of the dining-table block with stock chairs.
+- **Shape recognition** (`furniture_shapes: true`, `furniture_shapes.py`): every outline is
+  checked against its traced footprint (the instance mask, holes filled — a person lying
+  on a sofa is not a hole in it). Candidates: the IoU-optimal wall-axis rectangle, a rotated
+  rectangle, an **L** (rectangle minus a corner notch: corner sofa, L desk), a **U**
+  (rectangle minus a side notch), circle / ellipse for classes that can be round (tables,
+  plants, lamps) and the rectilinear trace. The choice minimises `(1 − IoU) + penalty ×
+  extra rectangles`; the penalty depends on the class (sofa 0.035, desk 0.06, default
+  0.07, bed / table / chair 0.25), a notch must be at least 0.25 m on both sides and 6 %
+  of the box, and an L / U / round outline must reach IoU 0.85 on its own (noisy traces
+  stay rectangles). A notched or round outline replaces the fitted rectangle; a rectilinear
+  trace becomes the best rectangle when that explains the footprint with IoU ≥ 0.70.
+  The chosen kind, IoU and boundary distance per object are in the plan metrics
+  (`furniture_shapes`).
+- **Sofa detail**: the height profile across each edge of a sofa outline finds raised
+  bands (backrest / armrest at least 0.12 m above the seat, depth where the profile falls
+  half-way to the seat, 0.10–0.40 m). Their fronts are drawn as inner lines on
+  `A-FURN-DETL`; on an L / U sofa the inner corner is continued across the seat (corner
+  module). The label sits on the seat.
+- **Kitchen run** (`A-EINB`): each leg is moved flush onto the final inner wall face behind
+  it and all legs get one depth (0.60 m when the measurement is within the tolerance); a
+  peninsula keeps its measured position, a diagonal inner-corner unit (chamfer) is kept at
+  the moved corner. Loose front lines that retrace the run or double a wall face are
+  dropped; upper cabinets move onto the same wall.
+- **CAD kitchen** (`kitchen_layout: true`, `kitchen_layout.py`): a wall-backed leg grows
+  along its wall while counter heights (0.75–1.05 m) are measured in its front 0.30 m, up
+  to a wall face, never into it. A free-standing leg (peninsula) takes a raised band
+  beside it (≥ 0.08 m above the counter top, ≤ 1.30 m, at least half the leg length,
+  0.15–0.60 m deep) as a bar: it becomes part of the counter and the step is an inner
+  line; its free end continues to where counter-or-bar heights end. Cooktop and sink are
+  mounted on the counter at their labels measured at counter height (densest label
+  cluster), centred in the counter depth and fully inside it; a sink in a chamfered corner
+  sits on the diagonal. A full-depth tall unit (≥ 1.60 m) beyond a free leg end becomes a
+  rectangle with a cross and "KS" (fridge label) or "HS". Upper cabinets (`A-OBEN`,
+  dashed) get a cross. Traced furniture standing on the final counter or bar is absorbed.
+  Finally the counter is drawn by its front and end lines only (`_counter_front`); the side
+  on a wall face is the wall's line.
+- **Labels**: an object label sits inside its object (horizontal, or along a narrow
+  object), else beside it inside the room; labels of objects below
+  `label_min_object_area_m2` are omitted. Inside an object a label keeps `label_margin_m`
+  from the outline and from the object's own detail lines (sofa seat and backrest lines,
+  height steps). Room names and furniture labels never leave
+  their room (so they are never under a wall), and the DXF writes fills first and texts
+  last, so no wall hatch can cover a text.
+
 **Outdoor** (site plan):
 
 - DTM contours from all ground-level points at 0.20 m resolution: 1 m major
@@ -143,5 +290,7 @@ segmentation source, view options) are stored in `products/dxf/state.json`.
   were moved, the stage fails with a message.
 - Indoor plans work best on georeferenced or scaled projects; unscaled scans
   rely on the ceiling height as scale.
-- Wall thickness is estimated from points, not measured.
+- Wall thickness is measured only where both faces of a wall are seen; elsewhere
+  it comes from the neighbouring room edge, the learned thickness classes or the
+  configured exterior default (double-line walls).
 - Heavy stages use the GPU and can take minutes to hours on large projects.

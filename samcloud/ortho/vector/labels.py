@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 from shapely import affinity
 from shapely.errors import GEOSException
-from shapely.geometry import Polygon, box
-from shapely.ops import polylabel
+from shapely.geometry import Point, Polygon, box
+from shapely.ops import polylabel, unary_union
 import yaml
 
 
@@ -207,6 +207,196 @@ def label_entities(
         entities.append(entity)
 
     return entities
+
+
+_DIRECTIONS: tuple[tuple[float, float], ...] = tuple(
+    (math.cos(math.radians(angle)), math.sin(math.radians(angle))) for angle in range(0, 360, 45)
+)
+_FIXED_LABEL_LAYERS = frozenset({"A-DOOR"})
+_MOVABLE_LABEL_LAYERS = frozenset({"A-ANNO", "A-EINB"})
+
+
+def _text_box(entity: dict, height: float, point: tuple[float, float], settings: LabelSettings) -> Polygon:
+    """Unpadded rectangle of a text entity: len(text) * char_width_factor * height wide, height tall, rotated about its centre."""
+    width = len(str(entity.get("text", ""))) * settings.char_width_factor * height
+    cx, cy = point
+    raw = box(cx - width / 2.0, cy - height / 2.0, cx + width / 2.0, cy + height / 2.0)
+    rotation = float(entity.get("rotation", 0.0))
+    return affinity.rotate(raw, rotation, origin=(cx, cy)) if abs(rotation) > 1e-12 else raw
+
+
+def _overlaps(candidate: Polygon, others: Iterable[Polygon], minimum_area: float) -> bool:
+    c = candidate.bounds
+    for other in others:
+        o = other.bounds
+        if c[0] > o[2] or o[0] > c[2] or c[1] > o[3] or o[1] > c[3]:
+            continue
+        if candidate.intersection(other).area > minimum_area:
+            return True
+    return False
+
+
+def _room_containing(point: tuple[float, float], rooms: list[Polygon]) -> Polygon | None:
+    location = Point(point)
+    containing = [room for room in rooms if room.covers(location)]
+    return min(containing, key=lambda room: room.area) if containing else None
+
+
+def _free_room_point(
+    entity: dict, room: Polygon, obstacles: list[Polygon], blockers: list[Polygon], upm: float, minimum_area: float,
+    settings: LabelSettings,
+) -> tuple[float, float] | None:
+    """Best point inside the room where the label box touches neither an obstacle nor a blocking box."""
+    height = float(entity["height"])
+    free = room.difference(unary_union([obstacle.buffer(0.02 * upm) for obstacle in obstacles])) if obstacles else room
+    pieces = [piece for piece in getattr(free, "geoms", [free]) if isinstance(piece, Polygon) and not piece.is_empty]
+    original = (float(entity["point"][0]), float(entity["point"][1]))
+    best: tuple[float, float, tuple[float, float]] | None = None
+    for piece in pieces:
+        try:
+            pole = polylabel(piece, tolerance=0.01 * upm)
+        except GEOSException:
+            continue
+        point = (float(pole.x), float(pole.y))
+        candidate = _text_box(entity, height, point, settings)
+        if not room.buffer(1e-9).covers(candidate) or _overlaps(candidate, obstacles, minimum_area) or _overlaps(candidate, blockers, minimum_area):
+            continue
+        clearance = float(pole.distance(piece.exterior))
+        key = (-clearance, math.hypot(point[0] - original[0], point[1] - original[1]))
+        if best is None or key < best[:2]:
+            best = (key[0], key[1], point)
+    if best is None:
+        # The pole of a long free strip can sit where the label box does not fit: scan the room.
+        step = max(0.5 * height, 0.05 * upm)
+        min_x, min_y, max_x, max_y = room.bounds
+        free_union = unary_union(pieces) if pieces else None
+        for x in np.arange(min_x + step / 2.0, max_x, step):
+            for y in np.arange(min_y + step / 2.0, max_y, step):
+                point = (float(x), float(y))
+                candidate = _text_box(entity, height, point, settings)
+                if not room.buffer(1e-9).covers(candidate) or _overlaps(candidate, obstacles, minimum_area) or _overlaps(candidate, blockers, minimum_area):
+                    continue
+                clearance = float(free_union.exterior.distance(Point(point))) if isinstance(free_union, Polygon) else 0.0
+                key = (-clearance, math.hypot(point[0] - original[0], point[1] - original[1]))
+                if best is None or key < best[:2]:
+                    best = (key[0], key[1], point)
+    return best[2] if best is not None else None
+
+
+def resolve_label_overlaps(
+    layers: dict[str, list[dict]],
+    obstacles: list[Polygon],
+    rooms: list[Polygon],
+    units_per_metre: float,
+    settings: LabelSettings,
+) -> dict[str, int]:
+    """Resolve overlaps between plan text entities in place; never deletes a label.
+
+    A-DOOR texts and texts on other layers stay where they are. Room names (A-ANNO with ``_room_name``) stay unless they
+    cover an obstacle (insert footprint) or cross their room outline; then they move to the best free point inside their room. Other A-ANNO and A-EINB
+    labels are movable: on overlap (or when their box leaves their room) they take the nearest free offset (8 directions, steps of 1.2 text heights, at most
+    0.6 m), else shrink by ``settings.shrink_step`` and retry, else keep their position.
+    """
+    upm = max(float(units_per_metre), 1e-9)
+    minimum_area = 1e-6 * upm * upm
+    max_shift = 0.6 * upm
+    height_floor = max(0.06 * upm, settings.min_height * upm)
+    metrics = {"labels_moved": 0, "labels_shrunk": 0, "labels_unresolved": 0}
+
+    fixed: list[dict] = []
+    room_labels: list[dict] = []
+    movable: list[dict] = []
+    for name, entities in layers.items():
+        for entity in entities:
+            if entity.get("type") != "text" or not str(entity.get("text", "")).strip() or "point" not in entity:
+                continue
+            if float(entity.get("height", 0.0)) <= 0.0:
+                continue
+            if name in _FIXED_LABEL_LAYERS or name not in _MOVABLE_LABEL_LAYERS:
+                fixed.append(entity)
+            elif "_room_name" in entity:
+                room_labels.append(entity)
+            else:
+                movable.append(entity)
+
+    def current_box(entity: dict) -> Polygon:
+        return _text_box(entity, float(entity["height"]), (float(entity["point"][0]), float(entity["point"][1])), settings)
+
+    blockers = [current_box(entity) for entity in fixed]
+    placed: list[Polygon] = list(blockers)
+
+    for entity in sorted(room_labels, key=lambda item: (-float(item["height"]), str(item["text"]))):
+        label_box = current_box(entity)
+        origin = (float(entity["point"][0]), float(entity["point"][1]))
+        own_room = _room_containing(origin, rooms)
+        # A room name must lie inside its room: a box across the room outline sits under the wall.
+        outside = own_room is not None and not own_room.buffer(1e-9).covers(label_box)
+        if (obstacles and _overlaps(label_box, obstacles, minimum_area)) or outside:
+            room = own_room
+            target = _free_room_point(entity, room, obstacles, blockers, upm, minimum_area, settings) if room is not None else None
+            # A small room (WC, bath) may have no free spot for the full-size name: shrink it step by step.
+            original_height = float(entity["height"])
+            while target is None and room is not None and float(entity["height"]) * settings.shrink_step >= height_floor - 1e-9:
+                entity["height"] = float(entity["height"]) * settings.shrink_step
+                target = _free_room_point(entity, room, obstacles, blockers, upm, minimum_area, settings)
+            if target is not None:
+                entity["point"] = [float(target[0]), float(target[1])]
+                label_box = current_box(entity)
+                metrics["labels_moved"] += 1
+                if float(entity["height"]) != original_height:
+                    metrics["labels_shrunk"] += 1
+            else:
+                entity["height"] = original_height
+                metrics["labels_unresolved"] += 1
+        placed.append(label_box)
+
+    for entity in sorted(movable, key=lambda item: (-float(item["height"]), str(item["text"]), float(item["point"][0]), float(item["point"][1]))):
+        origin = (float(entity["point"][0]), float(entity["point"][1]))
+        original_height = float(entity["height"])
+        label_box = current_box(entity)
+        home = _room_containing(origin, rooms)
+        inside_home = home is None or home.buffer(1e-9).covers(label_box)
+        if inside_home and not _overlaps(label_box, placed, minimum_area):
+            placed.append(label_box)
+            continue
+        chosen: tuple[tuple[float, float], float] | None = None
+        height = original_height
+        first_pass = True
+        while chosen is None:
+            offsets: list[tuple[float, float]] = [] if first_pass else [(0.0, 0.0)]
+            step = 1.2 * height
+            for k in range(1, 5):
+                if k * step > max_shift + 1e-9:
+                    break
+                offsets.extend((dx * k * step, dy * k * step) for dx, dy in _DIRECTIONS)
+            for dx, dy in offsets:
+                point = (origin[0] + dx, origin[1] + dy)
+                candidate = _text_box(entity, height, point, settings)
+                if home is not None and not home.buffer(1e-9).covers(candidate):
+                    continue
+                if not _overlaps(candidate, placed, minimum_area):
+                    chosen = (point, height)
+                    break
+            if chosen is not None:
+                break
+            first_pass = False
+            smaller = height * settings.shrink_step
+            if smaller < height_floor - 1e-9:
+                break
+            height = smaller
+        if chosen is None:
+            metrics["labels_unresolved"] += 1
+            placed.append(label_box)
+            continue
+        point, height = chosen
+        if point != origin:
+            entity["point"] = [float(point[0]), float(point[1])]
+            metrics["labels_moved"] += 1
+        if height != original_height:
+            entity["height"] = float(height)
+            metrics["labels_shrunk"] += 1
+        placed.append(current_box(entity))
+    return metrics
 
 
 def _default_config_path() -> Path:

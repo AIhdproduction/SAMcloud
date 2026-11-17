@@ -312,13 +312,24 @@ def break_faces_at_openings(faces: list[WallFace], openings: list[object], toler
             output.append(face)
             continue
         cuts: list[tuple[float, float]] = []
+        origin = np.asarray(face.line.coords[0], dtype=float)
+        direction = _line_direction(face.line)
+        normal = np.asarray((-direction[1], direction[0]))
+        length = float(face.line.length)
         for opening in openings:
-            point = Point(getattr(opening, "center"))
-            if face.line.distance(point) > tolerance:
+            axis_angle = getattr(opening, "axis_angle", None)
+            if axis_angle is not None and not _parallel_axes(direction, np.asarray((math.cos(float(axis_angle)), math.sin(float(axis_angle)))), 10.0):
                 continue
-            centre = face.line.project(point)
-            width = float(getattr(opening, "width"))
-            cuts.append((max(0.0, centre - width / 2.0), min(face.line.length, centre + width / 2.0)))
+            offset = np.asarray(getattr(opening, "center"), dtype=float) - origin
+            if abs(float(np.dot(offset, normal))) > tolerance:
+                continue
+            # Project onto the supporting line: a face that merely starts inside
+            # the opening span is cut as well, even when it is far from the centre.
+            centre = float(np.dot(offset, direction))
+            half = float(getattr(opening, "width")) / 2.0
+            start, end = max(0.0, centre - half), min(length, centre + half)
+            if end - start > 1e-9:
+                cuts.append((start, end))
         if not cuts:
             output.append(face)
             continue

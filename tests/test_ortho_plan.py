@@ -498,9 +498,17 @@ def _build_indoor_wall_face_scene(project_dir: Path, *, units_per_metre: float) 
     return level, room
 
 
+def _single_line_settings() -> CleanPlanSettings:
+    from dataclasses import replace as dataclass_replace
+
+    settings = load_clean_plan_settings()
+    return dataclass_replace(settings, walls=dataclass_replace(settings.walls, double_line=False))
+
+
 def _assert_indoor_single_face_walls(units_per_metre: float, work_dir: Path) -> None:
     level, room = _build_indoor_wall_face_scene(work_dir / f"indoor_faces_{units_per_metre}", units_per_metre=units_per_metre)
-    result = generate_clean_plan(work_dir / f"indoor_faces_{units_per_metre}", level=level, mode="indoor")
+    # The single measured face lines (walls.double_line: false) stay available.
+    result = generate_clean_plan(work_dir / f"indoor_faces_{units_per_metre}", level=level, mode="indoor", settings=_single_line_settings())
     metrics = indoor_wall_metrics(result)
     assert len(result.layers["A-WALL"]) >= 4
     assert metrics["wall_face_rms_max"] <= 0.01 * units_per_metre
@@ -528,6 +536,29 @@ def test_indoor_single_face_walls_metric(work_dir: Path) -> None:
 
 def test_indoor_single_face_walls_scaled_0_8(work_dir: Path) -> None:
     _assert_indoor_single_face_walls(0.8, work_dir)
+
+
+@pytest.mark.parametrize("units_per_metre", [1.0, 0.8])
+def test_indoor_double_line_walls_default(units_per_metre: float, work_dir: Path) -> None:
+    project_dir = work_dir / f"indoor_double_{units_per_metre}"
+    level, _room = _build_indoor_wall_face_scene(project_dir, units_per_metre=units_per_metre)
+    result = generate_clean_plan(project_dir, level=level, mode="indoor")
+    walls = result.layers["A-WALL"]
+    assert walls and all(entity.get("type") == "polyline" and entity.get("closed") and entity.get("_double_wall") for entity in walls)
+    bodies = [Polygon(entity["points"], entity.get("holes", [])) for entity in walls]
+    assert all(body.is_valid and body.area > 0.0 for body in bodies)
+    # Every body is at least the minimum wall thickness wide and the hatch matches the outlines.
+    assert len(result.layers["A-WALL-PATT"]) == len(walls)
+    table = Polygon([(2.1 * units_per_metre, 2.5 * units_per_metre), (3.6 * units_per_metre, 2.5 * units_per_metre), (3.6 * units_per_metre, 3.5 * units_per_metre), (2.1 * units_per_metre, 3.5 * units_per_metre)])
+    assert not any(body.intersects(table.buffer(0.05 * units_per_metre)) for body in bodies)
+    assert result.layers["A-WIND"] and result.layers["A-DOOR"]
+    metrics = indoor_wall_metrics(result)
+    assert metrics["faces_inside_free_space"] <= 0.02
+    assert result.fingerprint_inputs["double_wall_bodies"] >= 1
+    exported = export_plan(result, project_dir / "dxf", coordinates="local")
+    document = ezdxf.readfile(exported)
+    assert not document.audit().has_errors
+    assert len(document.modelspace().query('HATCH[layer=="A-WALL-PATT"]')) == len(walls)
 
 
 def _set_table_fine_label(project_dir: Path, level: Level, label: str) -> None:

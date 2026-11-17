@@ -273,10 +273,11 @@ def opening_entities(
                 normal = np.asarray((-axis[1], axis[0]))
                 half = axis * (opening.width / 2.0)
                 thickness = max(opening.wall_thickness, 0.01)
+                centre_marker = [float(opening.center[0]), float(opening.center[1])]
                 entities.extend([
-                    {"type": "line", "start": (np.asarray(opening.center) - half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) - half + normal * thickness / 2.0).tolist()},
-                    {"type": "line", "start": (np.asarray(opening.center) + half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) + half + normal * thickness / 2.0).tolist()},
-                    {"type": "text", "text": f"{'Tür' if opening.kind == 'DOOR' else 'Durchgang'} {opening.width:.2f} m", "point": (np.asarray(opening.center) + normal * 0.15 * max(opening.wall_thickness / 0.25, 1.0)).tolist(), "height": 0.10, "rotation": math.degrees(opening.axis_angle)},
+                    {"type": "line", "start": (np.asarray(opening.center) - half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) - half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
+                    {"type": "line", "start": (np.asarray(opening.center) + half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) + half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
+                    {"type": "text", "text": f"{'Tür' if opening.kind == 'DOOR' else 'Durchgang'} {opening.width:.2f} m", "point": (np.asarray(opening.center) + normal * 0.15 * max(opening.wall_thickness / 0.25, 1.0)).tolist(), "height": 0.10, "rotation": math.degrees(opening.axis_angle), "_opening_label": True, "_opening_center": centre_marker},
                 ])
                 continue
             hinge_side = opening.hinge_side or "left"
