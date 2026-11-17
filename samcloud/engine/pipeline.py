@@ -54,7 +54,7 @@ from samcloud.control_points.repository import APRILTAG_CSV_NAME, load_detection
 from samcloud.control_points.apriltags import (
     MIN_GEOREF_TAGS, WARNING_GEOREF_UNAVAILABLE, TagGeorefUnavailable, apply_scale, build_tag_report, detect_apriltags,
     load_tag_detections, save_tag_detections, save_tag_report, tag_detection_entries, tag_edge_lengths, tag_scale,
-    tags_are_non_collinear, triangulate_tags,
+    tags_are_non_collinear, transform_tag_report, triangulate_tags,
 )
 from samcloud.control_points.auto_detect import _similarity, automatic_detection, populate_undistorted_coordinates, triangulate_observations
 from samcloud.control_points.adjustment import build_control_point_report, camera_intrinsics, leave_one_out_errors, populate_review_projections, pose_priors_in_model_frame, quality_gate, run_gcp_bundle_adjustment
@@ -92,6 +92,14 @@ class ProgressTracker:
             self.estimator.finish_stage()
             self.estimator.rates.save()
             self.write(force=True)
+
+    def report_prepare(self, done: int, total: int, detail: str = "") -> None:
+        """Progress callback of the image preparation (frame extraction and cubemap faces)."""
+        if self.estimator is None:
+            return
+        self.estimator.update(done, total)
+        self._detail = detail
+        self.write(force=total > 0 and done >= total)
 
     def feed_line(self, line: str) -> None:
         if self.estimator is not None and self.estimator.parse_line(line):
@@ -157,6 +165,7 @@ def run(
 
 def _build_estimator(
     args, num_images: int, colmap_config: dict, *, resume: bool, dense_max_image_size: int | None = None,
+    prepare_units: float | None = None,
 ) -> ProgressEstimator:
     dense = colmap_config.get("dense_reconstruction", {})
     camera = colmap_config.get("camera", {})
@@ -183,6 +192,8 @@ def _build_estimator(
     automatic = args.control_points_mode == "automatic"
     plan: list[tuple[str, float]] = []
     if not resume:
+        if prepare_units is not None:
+            plan.append(("prepare_images", prepare_units))
         plan += [("feature_extraction", num_images),
                  ("matching", stage_units("matching", images=num_images, matching=matching,
                                           spatial_neighbors=int(alignment.get("spatial_max_num_neighbors", 50)),
@@ -213,6 +224,124 @@ def _build_estimator(
             plan.append(("geometry_refinement", num_images))
     return ProgressEstimator(
         plan, RateStore(PROJECT_ROOT / "projects" / ".samcloud_stage_rates.json", profile=capture_type),
+    )
+
+
+def _plan_geometry_refinement(progress: "ProgressTracker | None", georeferenced: bool) -> None:
+    """Drop geometric refinement from the ETA as soon as it is known to be skipped (not georeferenced).
+
+    Only the estimate changes; whether refinement runs is still decided at the end of step 6.
+    """
+    if georeferenced or progress is None or progress.estimator is None:
+        return
+    progress.estimator.skip_stage("geometry_refinement")
+    progress.write(force=True)
+
+
+def _may_be_georeferenced(outdir: Path) -> bool:
+    """Georeference state a resume run starts from (GPS reference to fit, or an AprilTag survey frame)."""
+    return (outdir / "gps_ref.txt").is_file() or _local_tag_georeferenced(outdir)
+
+
+def _panorama_source_width(args) -> int | None:
+    """Width of the first equirectangular source (photo header or video stream), None when unknown."""
+    from samcloud.acquisition.panorama import find_panorama_images
+
+    if getattr(args, "panorama_images", None):
+        try:
+            photos = find_panorama_images(Path(args.panorama_images))
+            if photos:
+                from PIL import Image
+
+                with Image.open(photos[0]) as image:
+                    return int(image.size[0])
+        except Exception:  # noqa: BLE001 - only an estimate
+            pass
+    if getattr(args, "panorama_video", None):
+        try:
+            import cv2
+
+            capture = cv2.VideoCapture(str(args.panorama_video))
+            try:
+                width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) if capture.isOpened() else 0
+            finally:
+                capture.release()
+            if width > 0:
+                return width
+        except Exception:  # noqa: BLE001 - only an estimate
+            pass
+    return None
+
+
+def _expected_input_long_side(args) -> int | None:
+    """Long side of the images COLMAP will see, estimated before the inputs are prepared."""
+    if getattr(args, "capture_type", None) == "panorama_360":
+        from samcloud.acquisition.panorama import native_face_size
+
+        requested = int(getattr(args, "cubemap_face_size", 0) or 0)
+        width = _panorama_source_width(args)
+        if width:
+            native = native_face_size(width)
+            return native if requested <= 0 else min(requested, native)
+        return requested if requested > 0 else None
+    if not getattr(args, "images", None):
+        return None
+    try:
+        extensions = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
+        directory = Path(args.images)
+        first = next((path for path in sorted(directory.iterdir())
+                      if path.is_file() and path.suffix.lower() in extensions), None)
+        if first is None:
+            first = next((path for path in sorted(directory.rglob("*"))
+                          if path.is_file() and path.suffix.lower() in extensions), None)
+        if first is None:
+            return None
+        from PIL import Image
+
+        with Image.open(first) as image:
+            return int(max(image.size))
+    except Exception:  # noqa: BLE001 - only an estimate
+        return None
+
+
+def _planned_dense_size(
+    dense_config: dict, fallback: int, long_side: int | None, image_count: int, outdir: Path,
+) -> int:
+    """Dense max image size for the initial ETA plan, on the same basis as ``_dense_size_from_inputs``.
+
+    The real size is resolved from the prepared images; before that, ``auto`` uses the expected input
+    long side (cubemap face size for 360 inputs) so dense stereo is not planned at full camera resolution.
+    """
+    configured = dense_config.get("max_image_size", fallback)
+    if configured != "auto":
+        return int(configured)
+    options = dense_config.get("auto", {})
+    maximum = int(options.get("maximum", 3200))
+    if not long_side:
+        return min(int(fallback), maximum)
+    try:
+        free_bytes = shutil.disk_usage(outdir).free
+    except OSError:
+        free_bytes = 1 << 62
+    size, _reason = adaptive_dense_size(
+        int(long_side), max(int(image_count), 1), free_bytes,
+        ratio=float(options.get("ratio", 0.55)),
+        minimum=int(options.get("minimum", 2000)),
+        maximum=maximum,
+    )
+    return size
+
+
+def _initial_estimator(args, colmap_config: dict, outdir: Path, fallback_dense_size: int) -> ProgressEstimator:
+    """Estimator of a fresh run, built before the input images are prepared (estimated counts and sizes)."""
+    prepare_units, estimated_images = _estimate_prepare_work(args)
+    dense_size = _planned_dense_size(
+        colmap_config.get("dense_reconstruction", {}), fallback_dense_size,
+        _expected_input_long_side(args), estimated_images, outdir,
+    )
+    return _build_estimator(
+        args, estimated_images, colmap_config, resume=False,
+        dense_max_image_size=dense_size, prepare_units=prepare_units,
     )
 
 
@@ -585,6 +714,22 @@ def _align_panorama_gravity(sparse_dir: Path, model0: Path, report_dir: Path) ->
     return aligned_model, report
 
 
+def _transform_tag_report_to_gravity(report_path: Path, gravity_report: dict[str, object]) -> None:
+    """Bring a scale-only AprilTag report into the gravity-aligned frame of the final model."""
+    report_path = Path(report_path)
+    rotation = gravity_report.get("rotation") if isinstance(gravity_report, dict) else None
+    translation = gravity_report.get("translation") if isinstance(gravity_report, dict) else None
+    if not report_path.is_file() or rotation is None or translation is None:
+        return
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict) or report.get("mode") == "georef":
+            return
+        save_tag_report(report_path, transform_tag_report(report, rotation, translation))
+    except Exception as error:
+        print(f"WARNING: AprilTag report could not be moved to the gravity frame: {error}")
+
+
 def find_colmap_exe(colmap_bin):
     if colmap_bin:
         return colmap_bin
@@ -782,7 +927,37 @@ def _run_pose_prior_bundle_adjustment(
     reconstruction.write(output_model)
 
 
-def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) -> tuple[Path, bool, int | None]:
+def _estimate_prepare_work(args) -> tuple[int, int]:
+    """Expected (prepare-stage units, COLMAP image count) before the images are prepared."""
+    sources = 0
+    if args.capture_type == "panorama_360":
+        from samcloud.acquisition.panorama import expected_video_frame_count, find_panorama_images
+
+        if args.panorama_images:
+            try:
+                sources += len(find_panorama_images(Path(args.panorama_images)))
+            except (OSError, ValueError, TypeError):
+                pass
+        if args.panorama_video:
+            try:
+                sources += expected_video_frame_count(Path(args.panorama_video), args.frame_interval) or 0
+            except (OSError, ValueError, TypeError):
+                pass
+        sources = max(sources, 1)
+        return sources, 6 * sources
+    try:
+        if args.images:
+            extensions = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
+            sources = sum(1 for p in Path(args.images).rglob("*") if p.is_file() and p.suffix.lower() in extensions)
+    except (OSError, ValueError, TypeError):
+        pass
+    sources = max(sources, 1)
+    return sources, sources
+
+
+def resolve_input_images(
+    args, outdir: Path, parser: argparse.ArgumentParser, progress_callback=None,
+) -> tuple[Path, bool, int | None]:
     """Resolve normal images or prepare virtual perspective images for 360 media."""
     if args.capture_type != "panorama_360":
         if not args.images:
@@ -799,6 +974,7 @@ def resolve_input_images(args, outdir: Path, parser: argparse.ArgumentParser) ->
             Path(args.panorama_workdir).resolve() if args.panorama_workdir else outdir / "inputs",
             args.frame_interval,
             args.cubemap_face_size,
+            progress_callback=progress_callback,
         )
     except CaptureValidationError as error:
         parser.error(str(error))
@@ -904,6 +1080,7 @@ def _resume_dense_stereo(
         )
         global _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = progress
+    _plan_geometry_refinement(progress, _may_be_georeferenced(outdir))
 
     dense_config = colmap_config.get("dense_reconstruction", {})
     colmap = find_colmap_exe(args.colmap_bin)
@@ -925,6 +1102,50 @@ def _resume_dense_stereo(
     sparse_txt.mkdir(parents=True, exist_ok=True)
     run([colmap, "model_converter", "--input_path", str(dense_dir / "sparse"), "--output_path", str(sparse_txt),
          "--output_type", "TXT"], summary=summary, stage="Preparing classification")
+    georeferenced = (outdir / "gps_ref.txt").is_file()
+    if georeferenced:
+        try:
+            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt")
+            save_georeference(outdir / "georeference.json", georeference)
+            summary.settings["georeference_residual_m"] = georeference["residual_m"]
+        except Exception as error:
+            print(f"WARNING: Could not create GPS georeference: {error}")
+            georeferenced = False
+    elif _local_tag_georeferenced(outdir):
+        georeferenced = True
+    _classify_and_finish(
+        args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, georeferenced,
+    )
+
+
+def _resume_classification(
+    args, outdir: Path, report_dir: Path, summary: RunSummary, progress: ProgressTracker | None,
+    colmap_config: dict, dense_max_image_size: int, dense_num_iterations: int,
+    dense_gpu_index: int, classified_output: Path,
+) -> None:
+    """Continue directly at classification using an existing fused dense workspace."""
+    dense_dir = outdir / "dense"
+    sparse_txt = dense_dir / "sparse_txt"
+    required = (
+        (dense_dir / "images", (dense_dir / "images").is_dir()),
+        (dense_dir / "sparse", (dense_dir / "sparse").is_dir()),
+        (dense_dir / "fused.ply", (dense_dir / "fused.ply").is_file()),
+        (dense_dir / "fused.ply.vis", (dense_dir / "fused.ply.vis").is_file()),
+        (sparse_txt, sparse_txt.is_dir()),
+    )
+    missing = [str(path) for path, valid in required if not valid]
+    if missing:
+        raise ValueError("Cannot resume classification; workspace files are missing: " + ", ".join(missing))
+    if progress and progress.estimator is None:
+        image_list_path = outdir / "image_list.txt"
+        num_images = len([line for line in image_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]) if image_list_path.is_file() else 0
+        progress.estimator = _build_estimator(
+            args, num_images, colmap_config, resume=True, dense_max_image_size=dense_max_image_size,
+        )
+        global _ACTIVE_PROGRESS
+        _ACTIVE_PROGRESS = progress
+    _plan_geometry_refinement(progress, _may_be_georeferenced(outdir))
+    summary.settings["classification_resumed"] = True
     georeferenced = (outdir / "gps_ref.txt").is_file()
     if georeferenced:
         try:
@@ -1950,6 +2171,7 @@ def _refine_from_cache(
         )
         global _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = progress
+    _plan_geometry_refinement(progress, _is_georeferenced(outdir))
     summary.settings["refined_from_cache"] = manifest.get("created_at")
     print(f"Re-running step 6 from the processing cache of {manifest.get('created_at')}.")
     _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
@@ -2102,6 +2324,7 @@ def _classify_and_finish(
     *, cache_after_sam: bool = True,
 ) -> None:
     """Run the unchanged classification, refinement, and optional export tail."""
+    _plan_geometry_refinement(progress, georeferenced)
     classify_script = Path(__file__).resolve().parent / "classify.py"
     geometry_enabled = args.geometry_refinement == "1"
     classified_raw = classified_output.with_name("classified_raw.ply") if geometry_enabled else classified_output
@@ -2281,6 +2504,11 @@ def main():
         action="store_true",
         help="reuse the undistorted dense workspace and continue from dense stereo",
     )
+    ap.add_argument(
+        "--resume-classification",
+        action="store_true",
+        help="reuse the fused dense workspace and continue directly at SAM classification",
+    )
     ap.add_argument("--control-points-dir", default=None, help="project control_points directory")
     ap.add_argument("--control-points-crs", default="EPSG:2056+5728")
     ap.add_argument("--apriltags", action="store_true", help="search AprilTags and scale the sparse model from their size")
@@ -2299,6 +2527,12 @@ def main():
         ap.error("--resume-dense-stereo cannot be combined with --stop-after-alignment")
     if args.resume_dense_stereo and args.resume_after_control_points:
         ap.error("--resume-dense-stereo cannot be combined with --resume-after-control-points")
+    if args.resume_classification and args.stop_after_alignment:
+        ap.error("--resume-classification cannot be combined with --stop-after-alignment")
+    if args.resume_classification and args.resume_after_control_points:
+        ap.error("--resume-classification cannot be combined with --resume-after-control-points")
+    if args.resume_classification and args.resume_dense_stereo:
+        ap.error("--resume-classification cannot be combined with --resume-dense-stereo")
     if args.classification_engine == "flurseg" and args.class_set != "outdoor":
         print("FlurSeg is outdoor only; the indoor class set is classified with SAM3.")
 
@@ -2400,6 +2634,17 @@ def main():
             dense_num_iterations, dense_gpu_index, classified_output,
         )
         return
+    if args.resume_classification:
+        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images")
+        if dense_reason:
+            print(dense_reason)
+        summary.settings["dense_max_image_size"] = dense_max_image_size
+        summary.settings["dense_size_reason"] = dense_reason
+        _resume_classification(
+            args, outdir, report_dir, summary, progress, colmap_config, dense_max_image_size,
+            dense_num_iterations, dense_gpu_index, classified_output,
+        )
+        return
     if args.resume_dense_stereo:
         dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images")
         if dense_reason:
@@ -2411,7 +2656,14 @@ def main():
             dense_num_iterations, dense_gpu_index, classified_output,
         )
         return
-    images_dir, is_panorama, cubemap_face_size = resolve_input_images(args, outdir, ap)
+    if progress:
+        progress.estimator = _initial_estimator(args, colmap_config, outdir, dense_max_image_size)
+        progress.begin("prepare_images")
+    prepare_started_at = time.perf_counter()
+    images_dir, is_panorama, cubemap_face_size = resolve_input_images(
+        args, outdir, ap, progress.report_prepare if progress else None,
+    )
+    summary.record_stage("Preparing images", time.perf_counter() - prepare_started_at)
 
     db_path = outdir / "database.db"
     sparse_dir = outdir / "sparse"
@@ -2429,9 +2681,17 @@ def main():
     summary.settings["image_count"] = num_images
     print(f"Using {num_images} supported images from {images_dir}")
     if progress:
-        progress.estimator = _build_estimator(
-            args, num_images, colmap_config, resume=False, dense_max_image_size=dense_max_image_size,
-        )
+        if progress.estimator is not None and progress.estimator.current is not None:
+            # Learn the preparation rate from the real source count, then plan the rest with real image counts.
+            progress.estimator.set_units("prepare_images", num_images / 6 if is_panorama else num_images)
+            progress.finish()
+            progress.estimator.replan(_build_estimator(
+                args, num_images, colmap_config, resume=False, dense_max_image_size=dense_max_image_size,
+            ).plan)
+        else:
+            progress.estimator = _build_estimator(
+                args, num_images, colmap_config, resume=False, dense_max_image_size=dense_max_image_size,
+            )
         global _ACTIVE_PROGRESS
         _ACTIVE_PROGRESS = progress
     image_paths = [images_dir / name for name in image_list_path.read_text(encoding="utf-8").splitlines()]
@@ -2707,11 +2967,14 @@ def main():
                 print("AprilTag control-point quality gate did not pass. Waiting for control-point review.")
         except Exception as error:
             print(f"WARNING: AprilTag scaling failed, model stays unscaled: {error}")
+    # The georeference state is final here; a skipped geometric refinement leaves the ETA now.
+    _plan_geometry_refinement(progress, georeferenced)
 
     _release_sparse_intermediates(sparse_dir, model0)
     if args.capture_type == "panorama_360" and bool(alignment_config.get("gravity_align_panorama", True)) and not tag_georeferenced:
         model0, gravity_report = _align_panorama_gravity(sparse_dir, model0, report_dir)
         summary.settings["gravity_alignment"] = gravity_report
+        _transform_tag_report_to_gravity(report_dir / "apriltag_report.json", gravity_report)
     _write_final_model(sparse_dir, model0)
 
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model

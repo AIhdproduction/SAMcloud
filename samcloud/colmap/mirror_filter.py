@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -27,6 +27,10 @@ DEFAULTS = {
     "prior_trust_window_frac": 0.04, "prior_trust_min_valid": 0.05,
     "depth_edge_filter": {"enabled": True, "max_incidence_deg": 80.0, "edge_px": 1,
                           "edge_jump_rel": 0.05, "edge_jump_m": 0.03, "drop_lonely": False},
+    # free_space_views: a reflection seen through the mirror (>= 2 views at its depth) that no plain view confirms and at
+    # least this many plain views look straight through is removed (0 disables).  visibility_ignore_masks: SAM
+    # mirror-mask pixels give no visibility evidence (their depth is virtual).
+    "free_space_views": 2, "visibility_ignore_masks": True,
 }
 
 
@@ -55,13 +59,43 @@ class Mirror:
 
     @property
     def area(self) -> float:
-        try:
-            from shapely.geometry import Polygon
-            from shapely.ops import unary_union
+        def fallback() -> float:
+            total = 0.0
+            for points in self.polygons:
+                try:
+                    array = np.asarray(points, dtype=np.float64)
+                    if array.ndim == 2 and len(array) >= 3 and np.isfinite(array[:, :2]).all():
+                        total += abs(_polygon_area(array[:, :2]))
+                except (TypeError, ValueError):
+                    continue
+            return float(total)
 
-            return float(unary_union([Polygon(points) for points in self.polygons]).area)
+        try:
+            from shapely.geometry import MultiPolygon, Polygon
+            from shapely.ops import unary_union
         except ImportError:
-            return float(sum(abs(_polygon_area(points[:, :2])) for points in self.polygons))
+            return fallback()
+        try:
+            try:
+                from shapely import make_valid
+            except ImportError:
+                make_valid = None
+            parts = []
+            for points in self.polygons:
+                array = np.asarray(points, dtype=np.float64)
+                if array.ndim != 2 or len(array) < 3 or not np.isfinite(array[:, :2]).all():
+                    continue
+                polygon = Polygon(array[:, :2])
+                if not polygon.is_valid:
+                    polygon = make_valid(polygon) if make_valid is not None else polygon.buffer(0)
+                geometries = getattr(polygon, "geoms", [polygon])
+                parts.extend(g for g in geometries if isinstance(g, (Polygon, MultiPolygon)) and not g.is_empty)
+            if not parts:
+                return 0.0
+            area = float(unary_union(parts).area)
+            return area if np.isfinite(area) else fallback()
+        except Exception:  # GEOSException / TopologyException on odd geometry: the area is report-only
+            return fallback()
 
     @property
     def baseline_m(self) -> float:
@@ -388,6 +422,14 @@ def _dilated_mask(mask: np.ndarray | None, shape: tuple[int, int], radius: int) 
     return cv2.dilate(resized.astype(np.uint8), np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)) > 0
 
 
+def mirror_mask_reader(masks_dir: Path | str | None, dilate_px: int) -> Callable[[View, tuple[int, int]], np.ndarray | None]:
+    """name -> dilated SAM mirror mask at a depth-map shape, or None (no mask file / empty mask)."""
+    def read(view: View, shape: tuple[int, int]) -> np.ndarray | None:
+        mask = _dilated_mask(read_mirror_mask(masks_dir, view.name), shape, int(dilate_px))
+        return mask if mask is not None and mask.any() else None
+    return read
+
+
 def _prior_valid_mask_torch(depth, tolerance: float):
     """Return valid, non-edge pixels for an aligned Depth-Anything prior."""
     import torch
@@ -448,6 +490,8 @@ def phantom_mask(points: np.ndarray, mirrors: list[Mirror], views: list[View], s
     polygon_counts = torch.zeros_like(through_counts)
     direct_counts = torch.zeros_like(through_counts)
     blocked_counts = torch.zeros_like(through_counts)
+    confirm_counts = torch.zeros_like(through_counts)
+    free_counts = torch.zeros_like(through_counts)
     # Cull the point cloud by conservative spatial cells before projecting.  This keeps the
     # exact point test below, but avoids scanning every behind-plane point for every cubemap face.
     cell_size = max(0.10, 0.25 * float(settings.get("units_per_metre", 1.0)))
@@ -554,6 +598,7 @@ def phantom_mask(points: np.ndarray, mirrors: list[Mirror], views: list[View], s
             tolerance = margin_abs + margin_rel * visible_local[:, 2]
             prior_match = torch.zeros(len(positions), dtype=torch.bool, device=device)
             prior_open = torch.zeros(len(positions), dtype=torch.bool, device=device)
+            prior_confirm = torch.zeros(len(positions), dtype=torch.bool, device=device)
             if prior is not None and prior_ok is not None:
                 prior_depth = prior[v, u]
                 prior_match = ~valid_depth & prior_ok[v, u] & ((prior_depth - visible_local[:, 2]).abs()
@@ -565,6 +610,7 @@ def phantom_mask(points: np.ndarray, mirrors: list[Mirror], views: list[View], s
                 open_prior = ~valid_depth & prior_ok[v, u] & (prior_depth >= visible_local[:, 2] * (1.0 - float(settings["prior_tolerance"])))
                 trusted = prior_trust[v, u] if prior_trust is not None else torch.zeros_like(open_prior)
                 prior_open = open_prior & (trusted | ~through_wall)
+                prior_confirm = prior_match & (trusted | ~through_wall)
             for mirror_index, crossed in enumerate(crossings):
                 through_colmap = valid_depth & ((measured - visible_local[:, 2]).abs() <= tolerance)
                 through = visible_flags[:, mirror_index] & camera_front[mirror_index] & crossed & (through_colmap | prior_match)
@@ -583,7 +629,15 @@ def phantom_mask(points: np.ndarray, mirrors: list[Mirror], views: list[View], s
             plain_view = ~torch.stack(crossings).any(dim=0) & ~inside_mask
             direct = plain_view & open_view
             blocked = plain_view & closed_view
+            # A plain view that measures the point (COLMAP, or a believable prior) confirms it; one whose COLMAP depth lies
+            # clearly beyond the point looks straight through it (free space).  ``direct`` above also counts the latter.
+            confirmed = plain_view & ((valid_depth & ((measured - visible_local[:, 2]).abs() <= tolerance)) | prior_confirm)
+            free = plain_view & valid_depth & (measured > visible_local[:, 2] + tolerance)
             for mirror_index in range(len(mirrors)):
+                if bool(confirmed.any()):
+                    confirm_counts[target_rows[confirmed & visible_flags[:, mirror_index]], mirror_index] += 1
+                if bool(free.any()):
+                    free_counts[target_rows[free & visible_flags[:, mirror_index]], mirror_index] += 1
                 if bool(direct.any()):
                     kept = direct & visible_flags[:, mirror_index]
                     direct_counts[target_rows[kept], mirror_index] += 1
@@ -602,13 +656,20 @@ def phantom_mask(points: np.ndarray, mirrors: list[Mirror], views: list[View], s
         # A reflection is seen through the mirror polygon but never directly: every other view that
         # could see the point is blocked by the wall in front of it (at least two such views).
         occluded_rule = (polygon >= 2) & (direct == 0) & (blocked >= 2)
-        rejected = depth_rule | occluded_rule
+        confirm = confirm_counts[:, mirror_index][rows]
+        free = free_counts[:, mirror_index][rows]
+        free_views = int(settings["free_space_views"])
+        # A reflection inside a scanned room behind the mirror wall: seen in the mirror at its depth, never measured by a
+        # plain view, and plain views look straight through it.
+        free_rule = (enough_through & (confirm == 0) & (free >= free_views)) if free_views > 0 else torch.zeros_like(enough_through)
+        rejected = depth_rule | occluded_rule | free_rule
         removed[candidate_rows[rows]] |= rejected.cpu().numpy()
         mirror.filter_stats = {
             "through_points": int((through > 0).sum().item()),
             "prior_through": int((prior_through > 0).sum().item()),
             "removed": int(rejected.sum().item()),
             "direct_kept": int((enough_through & ~rejected & (direct > 0)).sum().item()),
+            "free_space_removed": int((free_rule & ~(depth_rule | occluded_rule)).sum().item()),
             "depth_maps_read": depth_maps_read,
             "prior_maps_read": prior_maps_read,
             "prior_disagree_share_out_mask": 1.0 - prior_pairs["out"][1] / max(1, prior_pairs["out"][0]),
@@ -625,7 +686,8 @@ def mirror_report(mirrors: list[Mirror], removed: np.ndarray) -> dict[str, Any]:
                      "through_points": int(mirror.filter_stats.get("through_points", 0)),
                      "prior_through": int(mirror.filter_stats.get("prior_through", 0)),
                      "removed": int(mirror.filter_stats.get("removed", 0)),
-                     "direct_kept": int(mirror.filter_stats.get("direct_kept", 0))} for mirror in mirrors],
+                     "direct_kept": int(mirror.filter_stats.get("direct_kept", 0)),
+                     "free_space_removed": int(mirror.filter_stats.get("free_space_removed", 0))} for mirror in mirrors],
         "mirror_points_removed": int(removed.sum()),
         "mirror_depth_maps_read": max((int(mirror.filter_stats.get("depth_maps_read", 0)) for mirror in mirrors), default=0),
         "mirror_prior_maps_read": max((int(mirror.filter_stats.get("prior_maps_read", 0)) for mirror in mirrors), default=0),

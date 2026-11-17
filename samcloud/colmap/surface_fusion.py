@@ -90,6 +90,7 @@ DEFAULTS: dict[str, Any] = {
                       "merge_angle_deg": 3, "merge_offset_m": 0.03, "min_views": 2, "min_baseline_m": 0.3,
                       "min_mask_share": 0.002, "mirror_dilate_px": 6, "through_share": 0.8, "fill_plane": False,
                       "prior_tolerance": 0.03, "prior_edge_tolerance": 0.02,
+                      "free_space_views": 2, "visibility_ignore_masks": True,
                       "ring_label_ids": [2, 5, 17]},
     "behind_wall_filter": {"enabled": False, "keep_depth_m": 1.0, "cell_m": 0.05, "floor_band_m": 0.15,
                            "extent_margin_m": 0.25, "blocked_share": 0.9, "min_support_views": 2,
@@ -688,8 +689,12 @@ def unconfirmed_mask(evidence: dict[str, np.ndarray], config: dict[str, Any]) ->
 def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, settings: dict[str, Any],
                     device: str = "cpu", progress: Callable[[int, int], None] | None = None,
                     prior_reader: Callable[[str], np.ndarray | None] | None = None, count_seen: bool = False,
-                    evidence: dict[str, np.ndarray] | None = None):
+                    evidence: dict[str, np.ndarray] | None = None,
+                    mirror_mask_reader: Callable[[View, tuple[int, int]], np.ndarray | None] | None = None):
     """True for points no camera disproves: COLMAP depth maps only (see module docstring).
+
+    ``mirror_mask_reader(view, shape)`` returns a boolean mask (or None): pixels inside it give no evidence,
+    because a mirror pixel's depth is the virtual depth of the reflected scene.
 
     Returns (keep, stats); with ``count_seen`` (keep, stats, seen) where ``seen`` is
     the number of views per point that see it (COLMAP depth, plus the
@@ -723,7 +728,9 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
         if not path.is_file():
             return None
         prior = prior_reader(view.name) if count_seen and prior_reader is not None else None
-        return read_colmap_array(path), prior
+        array = read_colmap_array(path)
+        mask = mirror_mask_reader(view, array.shape[:2]) if mirror_mask_reader is not None else None
+        return array, prior, mask
 
     def confirm(view: View, depth, weight, local) -> None:
         h, w = depth.shape
@@ -743,6 +750,7 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
         prior_open[index[(dd > 0) & from_prior & (dd >= zz - tolerance)]] += 1
 
     used = 0
+    masked_views = 0
     with ThreadPoolExecutor(max_workers=2) as pool:
         pending = pool.submit(load, views[0])
         for number, view in enumerate(views, start=1):
@@ -752,17 +760,20 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
             pending = pool.submit(load, views[number]) if number < len(views) else None
             if loaded is None:
                 continue
-            depth, prior = loaded
+            depth, prior, mask = loaded
             d = torch.as_tensor(np.asarray(depth, dtype=np.float32), device=device)
             from samcloud.colmap.depth_edges import geometric_valid_mask_torch
 
             d = torch.where(geometric_valid_mask_torch(d, view, settings) & (d <= max_depth), d, torch.zeros_like(d))
+            if mask is not None:
+                d = torch.where(torch.as_tensor(np.asarray(mask, dtype=bool), device=device), torch.zeros_like(d), d)
+                masked_views += 1
             h, w = d.shape
             rotation = torch.as_tensor(view.rotation, dtype=torch.float32, device=device)
             translation = torch.as_tensor(view.translation, dtype=torch.float32, device=device)
             local = p @ rotation.T + translation
             if count_seen:
-                combined = view_depth(view, depth, prior, None, (), settings, device=device)
+                combined = view_depth(view, depth, prior, None, (), settings, device=device, mirror_mask=mask)
                 if combined is not None:
                     confirm(view, combined[0], combined[1], local)
             z = local[:, 2]
@@ -788,7 +799,7 @@ def visibility_mask(points: np.ndarray, views: list[View], stereo_dir: Path, set
     disproved = (through >= int(settings["visibility_min_through"])) & \
         (through.float() > float(settings["visibility_through_ratio"]) * support.float())
     keep = ~disproved.cpu().numpy()
-    stats = {"removed_visibility": int((~keep).sum()), "visibility_views": used}
+    stats = {"removed_visibility": int((~keep).sum()), "visibility_views": used, "mirror_masked_views": masked_views}
     if count_seen:
         # never (or once) seen, but hidden behind a nearer surface in many views: behind a wall/ceiling
         unseen = (seen < int(settings["point_min_seen_views"])) & (hidden >= int(settings["point_hidden_views"]))
@@ -1524,6 +1535,16 @@ def _class_ids(class_names: list[str] | None) -> dict[str, int]:
     return {name: index + 1 for index, name in enumerate(short)}
 
 
+def _guarded_mirror_report(builder, mirrors, removed_by_mirror) -> dict[str, Any]:
+    """Mirror numbers are report-only: a failure here must never discard the fused cloud."""
+    try:
+        return builder(mirrors, removed_by_mirror)
+    except Exception as error:
+        print(f"WARNING: Mirror report failed: {error}")
+        return {"mirrors": [], "mirror_points_removed": int(np.asarray(removed_by_mirror).sum()),
+                "mirror_report_error": str(error)}
+
+
 def consolidate_classified_cloud(
     dense_dir: Path,
     classified_ply: Path,
@@ -1583,6 +1604,11 @@ def consolidate_classified_cloud(
                                              masks_dir=dense_dir / "sam_mirror")
             keep = ~removed_by_mirror
             vertex, points, source_indices = vertex[keep], points[keep], source_indices[keep]
+    mirror_reader = None
+    if mirrors and bool(mirror_settings.get("enabled", True)) and bool(mirror_settings.get("visibility_ignore_masks", True)):
+        from samcloud.colmap.mirror_filter import mirror_mask_reader
+
+        mirror_reader = mirror_mask_reader(dense_dir / "sam_mirror", int(mirror_settings.get("mirror_dilate_px", 6)))
     mode = str(settings.get("mode", "extract"))
     ids = _class_ids(class_names)
     excluded = tuple(ids[n.lower()] for n in settings.get("exclude_classes") or [] if n.lower() in ids)
@@ -1623,9 +1649,10 @@ def consolidate_classified_cloud(
                               "dropped_share": depth_filter_report.get("dropped", 0) / max(depth_filter_report.get("valid", 0), 1)},
     }
     if mirrors:
-        report.update(mirror_report(mirrors, removed_by_mirror))
+        report.update(_guarded_mirror_report(mirror_report, mirrors, removed_by_mirror))
     else:
         report.update({"mirrors": [], "mirror_points_removed": 0})
+    report["visibility_mirror_masks"] = mirror_reader is not None
     template = vertex[:0]
     if mode == "extract":
         xyz, rgb, lab = tsdf.extract(float(settings["min_weight"]))
@@ -1654,7 +1681,8 @@ def consolidate_classified_cloud(
         rgb = rgb[selected_local] if rgb is not None else np.full((len(selected), 3), 200, np.uint8)
     lap('snap')
     if settings.get("visibility_check", True):
-        visible, vis_stats = visibility_mask(xyz, views, stereo_dir, settings, device=device)
+        visible, vis_stats = visibility_mask(xyz, views, stereo_dir, settings, device=device,
+                                             mirror_mask_reader=mirror_reader)
         report.update(vis_stats)
         xyz, rgb, lab, selected = xyz[visible], rgb[visible], lab[visible], selected[visible]
         normals = normals[visible] if normals is not None else None
@@ -1674,7 +1702,8 @@ def consolidate_classified_cloud(
         # and a plane behind it is seen by (almost) no camera at all
         evidence: dict[str, np.ndarray] = {}
         visible, vis_stats, seen = visibility_mask(xyz, views, stereo_dir, settings, device=device,
-                                                   prior_reader=prior_reader, count_seen=True, evidence=evidence)
+                                                   prior_reader=prior_reader, count_seen=True, evidence=evidence,
+                                                   mirror_mask_reader=mirror_reader)
         report["removed_visibility_after_planes"] = vis_stats["removed_visibility"]
         report["removed_hidden"] = vis_stats["removed_hidden"]
         report["removed_unconfirmed"] = vis_stats["removed_unconfirmed"]

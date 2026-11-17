@@ -202,7 +202,11 @@ def test_automatic_control_point_mode_never_runs_the_tag_step(tmp_path: Path, mo
     assert tag_calls == []
 
 
-def _run_panorama_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag_result_factory) -> list[Path]:
+_GRAVITY_ROTATION = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]  # +90 degrees about x
+_GRAVITY_TRANSLATION = [1.0, 2.0, 3.0]
+
+
+def _run_panorama_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag_result_factory, gravity_extra: dict | None = None) -> list[Path]:
     cubemap = tmp_path / "inputs" / "cubemap"
     for face in ("front",):
         (cubemap / face).mkdir(parents=True, exist_ok=True)
@@ -213,7 +217,9 @@ def _run_panorama_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag_resu
     monkeypatch.setattr(pipeline, "_apriltag_step", lambda model0, *_a, **_k: tag_result_factory(model0))
     monkeypatch.setattr(
         pipeline, "_align_panorama_gravity",
-        lambda sparse_dir, model0, report_dir: gravity_calls.append(model0) or (model0, {"frame_count": 1, "up_spread_deg_rms": 0.0}),
+        lambda sparse_dir, model0, report_dir: gravity_calls.append(model0) or (
+            model0, {"frame_count": 1, "up_spread_deg_rms": 0.0, **(gravity_extra or {})},
+        ),
     )
     monkeypatch.setattr(sys, "argv", [
         "pipeline", "--capture-type", "panorama_360", "--panorama-workdir", str(tmp_path / "inputs"),
@@ -234,6 +240,48 @@ def test_scale_only_tag_result_keeps_panorama_gravity_alignment(tmp_path: Path, 
     scaled = lambda model0: pipeline.TagStepResult(model0, {"mode": "scale"}, False, False)  # noqa: E731
 
     assert len(_run_panorama_main(tmp_path, monkeypatch, scaled)) == 1
+
+
+def _scale_report(mode: str) -> dict:
+    return {"mode": mode, "tags": [{
+        "id": 7, "center_xyz": [1.0, 2.0, 3.0],
+        "corners_xyz": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+    }]}
+
+
+def _tag_step_writing_report(tmp_path: Path, mode: str, georeferenced: bool):
+    def factory(model0: Path):
+        pipeline.save_tag_report(tmp_path / "reports" / "apriltag_report.json", _scale_report(mode))
+        return pipeline.TagStepResult(model0, {"mode": mode}, georeferenced, False)
+    return factory
+
+
+def test_scale_only_panorama_run_saves_tag_report_in_gravity_frame(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gravity = {"rotation": _GRAVITY_ROTATION, "translation": _GRAVITY_TRANSLATION}
+
+    calls = _run_panorama_main(tmp_path, monkeypatch, _tag_step_writing_report(tmp_path, "scale", False), gravity)
+
+    assert len(calls) == 1
+    report = json.loads((tmp_path / "reports" / "apriltag_report.json").read_text(encoding="utf-8"))
+    assert report["frame"] == "gravity_aligned"
+    # p' = R p + t with R = 90 degrees about x: (1, 2, 3) -> (1, -3, 2) + (1, 2, 3)
+    assert report["tags"][0]["center_xyz"] == pytest.approx([2.0, -1.0, 5.0])
+    assert report["tags"][0]["corners_xyz"][2] == pytest.approx([2.0, 2.0, 4.0])
+
+
+def test_georeferenced_tag_report_is_not_transformed_by_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gravity = {"rotation": _GRAVITY_ROTATION, "translation": _GRAVITY_TRANSLATION}
+
+    calls = _run_panorama_main(tmp_path, monkeypatch, _tag_step_writing_report(tmp_path, "georef", True), gravity)
+
+    assert calls == []
+    report = json.loads((tmp_path / "reports" / "apriltag_report.json").read_text(encoding="utf-8"))
+    assert "frame" not in report
+    assert report["tags"][0]["center_xyz"] == [1.0, 2.0, 3.0]
+    # even if a georef-mode report were handed to the helper it stays untouched
+    path = tmp_path / "reports" / "apriltag_report.json"
+    pipeline._transform_tag_report_to_gravity(path, gravity)
+    assert json.loads(path.read_text(encoding="utf-8")) == report
 
 
 def test_optimize_control_points_on_tag_project_uses_tag_seeding_and_cubemap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

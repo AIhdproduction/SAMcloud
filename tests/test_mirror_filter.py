@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import pytest
 
-from samcloud.colmap.mirror_filter import Mirror, MirrorCandidate, detect_mirrors, mirror_candidate, phantom_mask
+from samcloud.colmap.mirror_filter import Mirror, MirrorCandidate, detect_mirrors, mirror_candidate, mirror_mask_reader, mirror_report, phantom_mask
 from samcloud.colmap.plane_fill import View, write_colmap_array
 from samcloud.engine import classify, pipeline
 
@@ -122,6 +122,51 @@ def test_mirror_union_area() -> None:
     ], [])
 
     assert mirror.area == pytest.approx(8.0, rel=0.05)
+
+
+def _bow_tie_mirror() -> Mirror:
+    return Mirror(np.array([0.0, 0.0, 1.0]), 0.0, np.zeros(3), [
+        np.array([[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]]),
+    ], [])
+
+
+def test_mirror_area_bow_tie_polygon_is_finite() -> None:
+    area = _bow_tie_mirror().area
+
+    assert np.isfinite(area) and area > 0.0
+
+
+def test_mirror_area_degenerate_polygons_do_not_raise() -> None:
+    mirror = Mirror(np.array([0.0, 0.0, 1.0]), 0.0, np.zeros(3), [
+        np.array([[0.0, 0.0], [1.0, 1.0]]),
+        np.array([[0.0, 0.0], [np.nan, 1.0], [1.0, 1.0]]),
+        np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]),
+    ], [])
+
+    assert mirror.area == pytest.approx(4.0)
+    assert Mirror(np.array([0.0, 0.0, 1.0]), 0.0, np.zeros(3), [np.zeros((2, 2))], []).area == 0.0
+
+
+def test_mirror_report_with_self_intersecting_mirror() -> None:
+    from samcloud.colmap.mirror_filter import mirror_report
+
+    report = mirror_report([_bow_tie_mirror()], np.zeros(5, dtype=bool))
+
+    assert np.isfinite(report["mirrors"][0]["area"]) and report["mirrors"][0]["area"] > 0.0
+    assert report["mirror_points_removed"] == 0
+
+
+def test_guarded_mirror_report_survives_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    from samcloud.colmap.surface_fusion import _guarded_mirror_report
+
+    def broken(mirrors, removed):
+        raise RuntimeError("TopologyException: side location conflict")
+
+    report = _guarded_mirror_report(broken, [_bow_tie_mirror()], np.array([True, True, False]))
+
+    assert report["mirror_points_removed"] == 2
+    assert "side location conflict" in report["mirror_report_error"]
+    assert "WARNING: Mirror report failed" in capsys.readouterr().out
 
 
 def test_adjacent_frames_do_not_confirm_mirror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -485,3 +530,86 @@ def test_phantom_occluded_in_all_direct_views_removed(tmp_path: Path) -> None:
 
     assert removed.tolist() == [True, True]
     assert mirror.filter_stats["direct_kept"] == 0
+
+
+def _write_room_depths(stereo: Path, room: list[View], scale: float, real: np.ndarray | None = None) -> None:
+    """Real back wall at z = 8 * scale in every room view; ``real`` points are measured at their own pixels."""
+    for view in room:
+        depth = np.full((100, 100), 8.0 * scale - float(view.center[2]), dtype=np.float32)
+        if real is not None:
+            local = real @ view.rotation.T + view.translation
+            for point in local:
+                x = int((view.fx * point[0] / point[2] + view.cx) * 100 / view.width)
+                y = int((view.fy * point[1] / point[2] + view.cy) * 100 / view.height)
+                # A small block so the depth-edge filter keeps the object pixel.
+                depth[y - 2:y + 3, x - 2:x + 3] = point[2]
+        write_colmap_array(stereo / "depth_maps" / f"{view.name}.geometric.bin", depth)
+
+
+def _free_space_scene(tmp_path: Path, scale: float, front_sees_points: bool):
+    stereo = tmp_path / "stereo"
+    (stereo / "depth_maps").mkdir(parents=True)
+    front = [_view(index, (x * scale, y * scale, 0.0)) for index, (x, y) in enumerate(((-0.31, 0.12), (0.17, -0.18), (0.42, 0.08)))]
+    room = [_view(10 + index, (x * scale, y * scale, z * scale))
+            for index, (x, y, z) in enumerate(((-0.27, 0.21, 3.7), (0.33, -0.12, 3.9), (0.08, 0.31, 3.6), (-0.19, -0.26, 4.1)))]
+    reflection = np.array([[0.11, 0.07, 5.0]]) * scale
+    real = np.array([[-0.9, 0.5, 6.4]]) * scale
+    for view in front:
+        if front_sees_points:
+            _write_support_depths(stereo, view, np.vstack((reflection, real)))
+        else:
+            write_colmap_array(stereo / "depth_maps" / f"{view.name}.geometric.bin", np.zeros((100, 100), np.float32))
+    _write_room_depths(stereo, room, scale, real)
+    _write_mirror_masks(tmp_path, front + room, np.zeros((100, 100), bool))
+    return stereo, front, room, reflection, real
+
+
+def test_reflection_inside_scanned_room_behind_mirror_removed(tmp_path: Path) -> None:
+    scale = 0.978
+    stereo, front, room, reflection, real = _free_space_scene(tmp_path, scale, front_sees_points=True)
+    points = np.vstack((reflection, real))
+    mirror = _wall_mirror(front, scale)
+
+    removed = phantom_mask(points, [mirror], front + room, stereo, {"units_per_metre": scale})
+
+    assert removed.tolist() == [True, False]
+    assert mirror.filter_stats["free_space_removed"] == 1
+    # The old rules count the plain views that look straight through the reflection as direct support.
+    old = _wall_mirror(front, scale)
+    assert phantom_mask(points, [old], front + room, stereo, {"units_per_metre": scale, "free_space_views": 0}).tolist() == [False, False]
+    assert old.filter_stats["free_space_removed"] == 0
+
+
+def test_free_space_rule_needs_mirror_evidence(tmp_path: Path) -> None:
+    scale = 0.978
+    stereo, front, room, reflection, _real = _free_space_scene(tmp_path, scale, front_sees_points=False)
+    mirror = _wall_mirror(front, scale)
+
+    removed = phantom_mask(reflection, [mirror], front + room, stereo, {"units_per_metre": scale})
+
+    # Looked through by the room views but never seen in the mirror: a matter for the visibility check.
+    assert removed.tolist() == [False]
+    assert mirror.filter_stats["free_space_removed"] == 0
+
+
+def test_mirror_mask_reader_dilates_and_skips_empty(tmp_path: Path) -> None:
+    masks = tmp_path / "sam_mirror"
+    masks.mkdir()
+    block = np.zeros((100, 100), np.uint8)
+    block[40:44, 40:44] = 255
+    assert cv2.imwrite(str(masks / f"{_view(0).name}.png"), block)
+    assert cv2.imwrite(str(masks / f"{_view(1).name}.png"), np.zeros((100, 100), np.uint8))
+    reader = mirror_mask_reader(masks, 2)
+
+    full = reader(_view(0), (100, 100))
+    assert full is not None and full.dtype == bool and full.shape == (100, 100)
+    assert full.sum() == 8 * 8 and full[38:46, 38:46].all()
+    small = reader(_view(0), (50, 50))
+    assert small is not None and small.dtype == bool and small.shape == (50, 50)
+    assert small.sum() == 6 * 6 and small[18:24, 18:24].all()
+    assert reader(_view(1), (50, 50)) is None  # empty mask
+    assert reader(_view(2), (50, 50)) is None  # no mask file
+    assert mirror_mask_reader(None, 2)(_view(0), (50, 50)) is None
+
+    report = mirror_report([_wall_mirror([_view(0)]), _wall_mirror([_view(1)])], np.zeros(3, bool))
+    assert [item["free_space_removed"] for item in report["mirrors"]] == [0, 0]

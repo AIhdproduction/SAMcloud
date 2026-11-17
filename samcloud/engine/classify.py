@@ -6,6 +6,11 @@ from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
+
+if not __package__:  # run as a plain script by pipeline.py
+    _repo_root = str(Path(__file__).resolve().parents[2])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
 from samcloud.classification.profiles import NEVER_CLASSIFIED_ID
 
 if __package__:

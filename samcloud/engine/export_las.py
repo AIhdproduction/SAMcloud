@@ -2,12 +2,17 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import laspy
 import numpy as np
 from pyproj import CRS, Transformer
 
+if not __package__:  # run as a plain script by pipeline.py
+    _repo_root = str(Path(__file__).resolve().parents[2])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
 from samcloud.pointcloud.georeference import (
     enu_to_target,
     export_height_system,

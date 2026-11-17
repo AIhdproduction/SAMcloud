@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import cv2
 import numpy as np
@@ -20,6 +20,42 @@ CUBEMAP_LAYOUT_VERSION = 2
 
 class CaptureValidationError(ValueError):
     """Raised when a capture source cannot be processed safely."""
+
+
+ProgressCallback = Callable[[int, int, str], None]
+
+
+def _notify(callback: ProgressCallback | None, done: int, total: int, detail: str) -> None:
+    """Call a progress callback; a failing callback must never break the preparation."""
+    if callback is None:
+        return
+    try:
+        callback(int(done), int(total), detail)
+    except Exception:
+        pass
+
+
+def expected_video_frame_count(video_path: Path, interval_seconds: float) -> int | None:
+    """Number of frames ``extract_video_frames`` will keep, or None when the video does not tell."""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            return None
+        frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        frames_per_second = capture.get(cv2.CAP_PROP_FPS)
+    finally:
+        capture.release()
+    try:
+        frame_count = float(frame_count)
+        frames_per_second = float(frames_per_second)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(frame_count) or not np.isfinite(frames_per_second):
+        return None
+    if frame_count <= 0 or frames_per_second <= 0:
+        return None
+    interval_frames = max(1, round(frames_per_second * interval_seconds))
+    return int((int(frame_count) - 1) // interval_frames) + 1
 
 
 @dataclass(frozen=True)
@@ -96,8 +132,15 @@ def validate_panorama_images(image_paths: Iterable[Path]) -> list[Path]:
     return valid_paths
 
 
-def extract_video_frames(video_path: Path, output_directory: Path, interval_seconds: float) -> list[Path]:
-    """Extract one equirectangular frame at each requested fixed time interval."""
+def extract_video_frames(
+    video_path: Path, output_directory: Path, interval_seconds: float,
+    progress_callback: ProgressCallback | None = None,
+) -> list[Path]:
+    """Extract one equirectangular frame at each requested fixed time interval.
+
+    ``progress_callback(kept, expected, detail)`` reports every kept frame;
+    ``expected`` is 0 when the video does not report its frame count.
+    """
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise CaptureValidationError("360 degree video cannot be opened")
@@ -109,6 +152,11 @@ def extract_video_frames(video_path: Path, output_directory: Path, interval_seco
     output_directory.mkdir(parents=True, exist_ok=True)
     next_frame_index = 0
     interval_frames = max(1, round(frames_per_second * interval_seconds))
+    expected_frames = 0
+    if progress_callback is not None:
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if np.isfinite(frame_count) and frame_count > 0:
+            expected_frames = int((int(frame_count) - 1) // interval_frames) + 1
     frame_index = 0
     extracted: list[Path] = []
     while True:
@@ -126,6 +174,12 @@ def extract_video_frames(video_path: Path, output_directory: Path, interval_seco
                 raise CaptureValidationError(f"Video frame could not be written: {frame_path.name}")
             extracted.append(frame_path)
             next_frame_index += interval_frames
+            if expected_frames:
+                shown = min(len(extracted), expected_frames)
+                _notify(progress_callback, shown, expected_frames,
+                        f"Frames extrahieren {shown}/{expected_frames}")
+            else:
+                _notify(progress_callback, len(extracted), 0, f"Frames extrahieren {len(extracted)}")
         frame_index += 1
     capture.release()
     if not extracted:
@@ -187,6 +241,7 @@ def prepare_panorama_inputs(
     project_inputs_directory: Path,
     frame_interval_seconds: float = 1.0,
     face_size: int = 0,
+    progress_callback: ProgressCallback | None = None,
 ) -> PreparedPanoramaInputs:
     """Create video frames, cubemap images, and an origin manifest for COLMAP.
 
@@ -195,6 +250,11 @@ def prepare_panorama_inputs(
     Larger values are capped at native. The default (1232 px) sits between
     1024 and native: about 25 % fewer pixels than native for dense matching
     and SAM, with nearly the same detail.
+
+    ``progress_callback(done, total, detail)`` reports one combined stage:
+    ``total`` is twice the number of panorama sources (frame extraction plus
+    cubemap faces; photos count as already extracted). ``total`` is 0 while a
+    video does not report its frame count. Callback errors are ignored.
     """
     validate_capture_configuration(
         "panorama_360",
@@ -214,11 +274,21 @@ def prepare_panorama_inputs(
         photo_paths = validate_panorama_images(find_panorama_images(Path(panorama_image_directory)))
         image_paths.extend(photo_paths)
         source_kind.update({path: "photo" for path in photo_paths})
+    photo_count = len(image_paths)
     extracted_frames: list[Path] = []
     if panorama_video_path:
-        extracted_frames = extract_video_frames(
-            Path(panorama_video_path), frame_directory, frame_interval_seconds
-        )
+        if progress_callback is None:
+            extracted_frames = extract_video_frames(
+                Path(panorama_video_path), frame_directory, frame_interval_seconds
+            )
+        else:
+            def _video_progress(kept: int, expected: int, detail: str) -> None:
+                total = 2 * (photo_count + expected) if expected > 0 else 0
+                _notify(progress_callback, photo_count + kept, total, detail)
+
+            extracted_frames = extract_video_frames(
+                Path(panorama_video_path), frame_directory, frame_interval_seconds, _video_progress
+            )
         image_paths.extend(extracted_frames)
         source_kind.update({path: "video_frame" for path in extracted_frames})
 
@@ -229,6 +299,7 @@ def prepare_panorama_inputs(
     for face_name in CUBEMAP_FACE_NAMES:
         (cubemap_directory / face_name).mkdir(parents=True, exist_ok=True)
     manifest_entries: list[dict[str, object]] = []
+    source_total = len(image_paths)
     for source_index, image_path in enumerate(image_paths):
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
@@ -255,6 +326,8 @@ def prepare_panorama_inputs(
                 "faces": face_records,
             }
         )
+        _notify(progress_callback, source_total + source_index + 1, 2 * source_total,
+                f"Würfelflächen {source_index + 1}/{source_total}")
     manifest_path.write_text(
         json.dumps(
             {

@@ -288,6 +288,33 @@ def save_tag_report(path: Path, report: dict) -> None:
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+GRAVITY_ALIGNED_FRAME = "gravity_aligned"
+
+
+def transform_tag_report(report: dict, rotation: Any, translation: Any) -> dict:
+    """Move every tag centre/corner of a report with p' = R p + t and mark it as gravity aligned.
+
+    Idempotent: a report that already carries frame "gravity_aligned" is returned unchanged.
+    """
+    if report.get("frame") == GRAVITY_ALIGNED_FRAME:
+        return report
+    matrix = np.asarray(rotation, dtype=float).reshape(3, 3)
+    shift = np.asarray(translation, dtype=float).reshape(3)
+    for tag in report.get("tags", []):
+        if not isinstance(tag, dict):
+            continue
+        center = tag.get("center_xyz")
+        if center is not None:
+            tag["center_xyz"] = [float(v) for v in matrix @ np.asarray(center, dtype=float).reshape(3) + shift]
+        corners = tag.get("corners_xyz")
+        if corners is not None:
+            moved = np.asarray(corners, dtype=float).reshape(-1, 3) @ matrix.T + shift
+            tag["corners_xyz"] = [[float(v) for v in row] for row in moved]
+    report["frame"] = GRAVITY_ALIGNED_FRAME
+    report["gravity_transform"] = {"rotation": matrix.tolist(), "translation": shift.tolist()}
+    return report
+
+
 def tags_are_non_collinear(xyz: np.ndarray, *, min_ratio: float = MIN_COLLINEARITY_RATIO) -> bool:
     """True when the second/first singular value of the centred coordinates reaches min_ratio."""
     points = np.asarray(xyz, dtype=float).reshape(-1, 3)

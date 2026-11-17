@@ -151,3 +151,26 @@ def test_resume_dense_stereo_rejects_missing_workspace(tmp_path: Path) -> None:
             pipeline.RunSummary(tmp_path / "products", {}), None, {}, 10, 1, 0,
             tmp_path / "products" / "classified.ply",
         )
+
+
+def test_resume_classification_rejects_missing_workspace(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Cannot resume classification") as error:
+        pipeline._resume_classification(
+            SimpleNamespace(), tmp_path / "products", tmp_path / "reports",
+            pipeline.RunSummary(tmp_path / "products", {}), None, {}, 10, 1, 0,
+            tmp_path / "products" / "classified.ply",
+        )
+    assert "fused.ply.vis" in str(error.value)
+    assert "sparse_txt" in str(error.value)
+
+
+@pytest.mark.parametrize("other", ["--stop-after-alignment", "--resume-after-control-points", "--resume-dense-stereo"])
+def test_resume_classification_flag_is_mutually_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, other: str,
+) -> None:
+    monkeypatch.setattr(sys, "argv", [
+        "pipeline", "--outdir", str(tmp_path / "products"), "--resume-classification", other,
+    ])
+    with pytest.raises(SystemExit) as exit_info:
+        pipeline.main()
+    assert exit_info.value.code == 2

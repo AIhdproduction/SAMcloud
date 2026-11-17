@@ -12,6 +12,7 @@ from typing import Callable
 # Seconds per unit measured on the Gruettistrasse test project
 # (291 images à 20 MP, RTX 4090, 2026-11-03). Learned rates override these.
 DEFAULT_RATES: dict[str, float] = {
+    "prepare_images": 0.002,       # per image (listing/loading; 360: see PANORAMA_RATES)
     "feature_extraction": 0.4,     # per image
     "matching": 0.0077,            # per image pair
     "mapping": 1.9,                # per image
@@ -26,6 +27,7 @@ DEFAULT_RATES: dict[str, float] = {
     "plane_fill": 0.2,             # per image (indoor only)
     "depth_fill": 0.6,             # per image (indoor only, Depth-Anything multi-view fill)
     "surface_fusion": 0.2,         # per image (indoor only, TSDF of all depth maps on the GPU)
+    "superpoint_vote": 0.05,       # per image (indoor only; test_home 2026-11: 37-70 s for 1350-2136 faces)
     "geometry_refinement": 0.47,   # per image
 }
 
@@ -35,6 +37,7 @@ DEFAULT_RATES: dict[str, float] = {
 # panorama_360 measured on test_home (1350 faces, RTX 4090, 2026-11-06/07).
 PANORAMA_RATES: dict[str, float] = {
     **DEFAULT_RATES,
+    "prepare_images": 1.0,         # per panorama source frame (video decode + 6 cubemap faces), first guess
     "feature_extraction": 0.018,
     "matching": 0.0019,            # per verified pair (exhaustive minus same-panorama pairs)
     "mapping": 0.2,
@@ -56,6 +59,7 @@ CAPTURE_DEFAULT_RATES: dict[str, dict[str, float]] = {
 }
 
 STAGE_LABELS: dict[str, str] = {
+    "prepare_images": "Bilder vorbereiten",
     "feature_extraction": "Merkmale extrahieren",
     "matching": "Bilder verknüpfen",
     "mapping": "Kameras ausrichten",
@@ -70,6 +74,7 @@ STAGE_LABELS: dict[str, str] = {
     "plane_fill": "Flächen auffüllen",
     "depth_fill": "Auffüllen mit Depth-Anything",
     "surface_fusion": "Oberflächen zusammenführen",
+    "superpoint_vote": "Superpoint-Abstimmung",
     "geometry_refinement": "Geometrische Verfeinerung",
 }
 
@@ -217,6 +222,23 @@ class ProgressEstimator:
         stage.status, stage.done_fraction, stage.finished_at = "done", 1.0, self.clock()
         if learn and stage.started_at is not None:
             self.rates.update(stage.name, stage.finished_at - stage.started_at, stage.units)
+
+    def set_units(self, name: str, units: float) -> None:
+        """Change the planned work of a stage that has not finished yet."""
+        stage = self._find(name)
+        if stage is not None and stage.status in {"pending", "running"}:
+            stage.units = float(units)
+
+    def replan(self, plan: list[tuple[str, float]]) -> None:
+        """Replace the pending stages by ``plan`` (e.g. with real image counts).
+
+        Stages that are running, done or skipped (such as a finished image
+        preparation) are kept, so elapsed time and their share stay intact.
+        """
+        kept = [stage for stage in self.stages if stage.status != "pending"]
+        names = {stage.name for stage in kept}
+        self.plan = list(plan)
+        self.stages = kept + [_Stage(name, float(units)) for name, units in plan if name not in names]
 
     def skip_stage(self, name: str) -> None:
         stage = self._find(name)

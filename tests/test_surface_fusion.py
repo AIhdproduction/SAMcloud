@@ -677,3 +677,110 @@ def test_buried_point_removed_and_surface_point_kept(tmp_path: Path) -> None:
     assert remove[:n].mean() < 0.02
     default, _ = raymarch_mask(points, labels, CLASS_IDS, views, dense / "stereo", {**settings, "raymarch_filter": {}}, evidence)
     assert default[n:n + 300].mean() < 0.1  # the rule is opt-in (bury_depth_m defaults to 0)
+
+
+def _block_depth(view, points: list[tuple[np.ndarray, float]]) -> np.ndarray:
+    """Depth map with a 3x3 block of equal depth at each point's pixel (survives the depth-edge filter)."""
+    depth = np.zeros((100, 100), np.float32)
+    for point, value in points:
+        local = view.rotation @ point + view.translation
+        x = int(view.fx * local[0] / local[2] + view.cx)
+        y = int(view.fy * local[1] / local[2] + view.cy)
+        depth[y - 1:y + 2, x - 1:x + 2] = value
+    return depth
+
+
+def _pixel_block(view, point: np.ndarray, radius: int) -> np.ndarray:
+    mask = np.zeros((100, 100), bool)
+    local = view.rotation @ point + view.translation
+    x = int(view.fx * local[0] / local[2] + view.cx)
+    y = int(view.fy * local[1] / local[2] + view.cy)
+    mask[y - radius:y + radius + 1, x - radius:x + radius + 1] = True
+    return mask
+
+
+def test_visibility_ignores_mirror_mask_pixels(tmp_path: Path) -> None:
+    from samcloud.colmap.plane_fill import View
+    from samcloud.colmap.surface_fusion import visibility_mask
+
+    def make(index: int, x: float) -> View:
+        return View(index, f"v{index}.png", np.eye(3), -np.array([x, 0.0, 0.0]), 50.0, 50.0, 50.0, 50.0, 100, 100)
+
+    reflection = np.array([0.013, 0.011, 5.0])
+    real = np.array([1.013, 0.011, 5.0])
+    mirror_views = [make(index, x) for index, x in enumerate((-0.21, 0.04, 0.19))]
+    plain_views = [make(3 + index, x) for index, x in enumerate((0.33, -0.37))]
+    views = mirror_views + plain_views
+    stereo = tmp_path / "stereo"
+    (stereo / "depth_maps").mkdir(parents=True)
+    masks: dict[str, np.ndarray] = {}
+    for view in mirror_views:
+        # Virtual depth of the reflected scene: the reflection's own depth at Q, far beyond P at P's pixel.
+        depth = _block_depth(view, [(reflection, 5.0), (real, 9.0)])
+        write_colmap_array(stereo / "depth_maps" / f"{view.name}.geometric.bin", depth)
+        masks[view.name] = _pixel_block(view, reflection, 3) | _pixel_block(view, real, 3)
+    for view in plain_views:
+        # Plain views look through Q (depth 9) and measure P at its true depth.
+        depth = _block_depth(view, [(reflection, 9.0), (real, 5.0)])
+        write_colmap_array(stereo / "depth_maps" / f"{view.name}.geometric.bin", depth)
+    points = np.vstack((reflection, real))
+
+    def reader(view, shape):
+        mask = masks.get(view.name)
+        if mask is not None and mask.shape != tuple(shape):
+            import cv2
+
+            mask = cv2.resize(mask.astype(np.uint8), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+        return mask
+
+    keep, stats = visibility_mask(points, views, stereo, DEFAULTS)
+    assert keep.tolist() == [True, False]  # the bug: virtual depth supports Q and "looks through" P
+    assert stats["mirror_masked_views"] == 0
+
+    keep, stats = visibility_mask(points, views, stereo, DEFAULTS, mirror_mask_reader=reader)
+    assert keep.tolist() == [False, True]
+    assert stats["mirror_masked_views"] == 3
+
+    _keep, _stats, seen = visibility_mask(points, views, stereo, DEFAULTS, count_seen=True)
+    assert int(seen[0]) == 3
+    keep, stats, seen = visibility_mask(points, views, stereo, DEFAULTS, count_seen=True, mirror_mask_reader=reader)
+    assert int(seen[0]) == 0
+    assert keep[0] == False and keep[1] == True  # noqa: E712
+    assert stats["mirror_masked_views"] == 3
+
+
+def test_consolidate_passes_mirror_mask_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import cv2
+
+    import samcloud.colmap.surface_fusion as fusion
+    from samcloud.colmap.mirror_filter import Mirror
+
+    original = fusion.visibility_mask
+
+    def run(name: str, settings: dict) -> tuple[dict, list]:
+        views = _views()
+        dense, ply, priors = _workspace(tmp_path / name, views, lambda depth, bias, view: depth * (1 + bias))
+        masks = dense / "sam_mirror"
+        masks.mkdir()
+        for view in views:
+            image = np.zeros((SIZE, SIZE), np.uint8)
+            image[10:20, 10:20] = 255
+            assert cv2.imwrite(str(masks / f"{view.name}.png"), image)
+        mirror = Mirror(np.array([0.0, 1.0, 0.0]), -9.0, np.array([0.0, 9.0, 1.0]),
+                        [np.array([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]])], views[:2])
+        calls: list = []
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("mirror_mask_reader"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(fusion, "visibility_mask", spy)
+        report = consolidate_classified_cloud(dense, ply, views, priors.get, settings, mirrors=[mirror])
+        return report, calls
+
+    report, calls = run("on", SETTINGS)
+    assert calls and all(callable(reader) for reader in calls)
+    assert report["visibility_mirror_masks"] is True
+    report, calls = run("off", {**SETTINGS, "mirror_filter": {"visibility_ignore_masks": False}})
+    assert calls and all(reader is None for reader in calls)
+    assert report["visibility_mirror_masks"] is False
