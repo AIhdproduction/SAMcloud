@@ -21,10 +21,7 @@ Worked examples per capture type, each on its own page:
 | Drone GPS/RTK | [Drone photos](docs/examples/drone.md) | capture guide; example results follow |
 | Standard camera | [Phone and handheld photos](docs/examples/phone.md) | capture guide; example results follow |
 
-<img src="assets/dense_cloud_clas.png" alt="Classified dense cloud of an apartment" width="800">
-
-Classified dense cloud of an apartment captured with a 360 degree video; the
-full walkthrough is in the [360 degree indoor example](docs/examples/indoor_360.md).
+Each page shows the full workflow for that capture type, from input to classified point cloud and DXF plan.
 
 ## Contents
 
