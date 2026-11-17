@@ -22,6 +22,7 @@ dialog change values afterwards.
 | Setting | Meaning |
 |---|---|
 | `application.projects_directory` | Local folder holding reopenable SAMcloud projects. |
+| `application.language` | Default UI language, `de` (shipped) or `en`. Read from the global `config/defaults.yml` only. A choice saved on the settings page (`.samcloud/user_preferences.json`) overrides it; an invalid value is ignored with a warning and German applies. See [docs/i18n.md](i18n.md). |
 | `project.image_storage` | `external_reference` keeps source photos in their original location. |
 | `coordinate_systems.input_crs` | CRS of image GPS data, normally `EPSG:4326` for drone EXIF. |
 | `coordinate_systems.working_crs` | Internal coordinate frame. `LOCAL` is valid before georeferencing. |
@@ -55,7 +56,8 @@ dialog change values afterwards.
 | `acquisition.panorama.supported_image_extensions`, `supported_video_extensions` | Accepted panorama file types (`.jpg`, `.jpeg`; `.mp4`). |
 | `viewer.sparse_cleaning.*` | Display-only clean-up of the sparse cloud (the COLMAP model is not changed): `min_track_length`, `max_reprojection_error`, `min_triangulation_angle_deg`, `max_camera_distance_factor`, `min_neighbors`, `min_points` (smaller clouds are shown unfiltered), `min_keep_ratio` (never hide more than 80 %). |
 
-The keys `application.language`, `project.keep_intermediate_files`,
+The copy of `application.language` in a project file is not used; the UI
+language is not a project setting. The keys `project.keep_intermediate_files`,
 `workflow.alignment_mode`, `workflow.georeferencing_mode`,
 `workflow.export_format`, `control_points.detection.secondary_target_type`, and
 `control_points.continue_automatically` are stored with each project, but no
@@ -333,10 +335,12 @@ Settings of the clean plan (job **Generate clean plan**,
 |---|---|
 | `contours` | Outdoor DTM contours: `resolution`, `major_interval` (1 m), `minor_interval` (0.25 m), smoothing, `ground_codes`. |
 | `labels` | Smart text labels: height factors, minimum area, shrink step. |
-| `layers` | Style (colour, lineweight, linetype) of plan layers such as `S-TOPO-MAJR`, `S-TOPO-MINR`, `S-ANNO`, `S-ELEV`, `A-ANNO`, `A-FURN-DETL`, `A-EINB`, `A-AREA`, `A-OBEN`. |
+| `layers` | Style (colour, lineweight, linetype) of plan layers such as `S-TOPO-MAJR`, `S-TOPO-MINR`, `S-ANNO`, `S-ELEV`, `A-ANNO`, `A-FURN-DETL`, `A-EINB`, `A-AREA`, `A-OBEN`, `A-WALL-PATT` (`hatch_pattern`, `hatch_scale` set the fill). |
 | `indoor_vertical`, `indoor_ceiling` | Vertical-surface evidence for wall faces and built-ins, and room boundaries from the ceiling. |
 | `clean_plan` | General limits: `segment_source`, label minimum areas, building angle tolerance, line gaps, tree height, `nominal_storey_height`, the indoor height bands (`wall`, `section`, `sill`, `lintel`) as fractions of floor-to-ceiling height, and footprint settings. |
-| `indoor_island`, `indoor_niche`, `indoor_upper_cabinets`, `indoor_room_names`, `indoor_kitchen_run` | Kitchen island, recessed niche, upper cabinets (layer `A-OBEN`), semantic room names, and the kitchen run along the walls (metres, scaled by the project's units per metre). |
+| `indoor_island`, `indoor_niche`, `indoor_upper_cabinets`, `indoor_room_names`, `indoor_kitchen_run` | Kitchen island, recessed niche, upper cabinets (layer `A-OBEN`), semantic room names (`hall_max_area_m2`, `hall_min_doors`: an unnamed room with the entrance door is a *Flur*), and the kitchen run along the walls (metres, scaled by the project's units per metre). |
+| `walls` | Double-line indoor walls: `double_line` (on by default; `false` gives the single measured face lines), thickness range `min_thickness_m`/`max_thickness_m`, `exterior_thickness_m` (used when no exterior wall pair is measured), `interior_thickness_m` (fallback without interior pairs), probe and run lengths, joint/jamb reach, `hatch` (solid poché on `A-WALL-PATT`), `bound_rooms` (rooms follow the inner wall faces), `room_edge_walls` (close the outline where a room edge borders unmeasured outside), `keep_isolated_faces`. See [ortho_plan.md](ortho_plan.md#double-line-walls). |
+| `plan_polish` | Final indoor plan polish: rooms from wall cells (`cell_rooms`, `room_split_max_m` widest passage that separates two spaces of one cell, `room_min_area_m2`), regular furniture outlines (`furniture_rect_iou`, `furniture_step_m`, `furniture_max_vertices`, `furniture_min_area_m2`), object labels (`label_min_object_area_m2`, `label_min_height_m`) and the wall-hugging kitchen run (`kitchen_depth_m`, `kitchen_wall_reach_m`). See [ortho_plan.md](ortho_plan.md#plan-polish). |
 | `outdoor_trunk`, `outdoor_hedges`, `outdoor_spots`, `outdoor_contour_labels`, `outdoor_roof` | Surveyor-style outdoor details: trunk diameters, hedges, spot heights, contour labels, and roof ridge/eave heights. |
 
 ## Capture settings stored per project

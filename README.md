@@ -10,23 +10,40 @@ get instance IDs, and classified clouds can be turned into clean 2D CAD plans
 (DXF). The project was developed for the Digital Twin Programming module at
 HSLU.
 
+## Examples
+
+Worked examples per capture type, each on its own page:
+
+| Capture type | Example | Status |
+|---|---|---|
+| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v11_tag`, from input to DXF plan |
+| 360 degree camera, outdoor | [360 degree outdoor](docs/examples/outdoor_360.md) | capture guide; example results follow |
+| Drone GPS/RTK | [Drone photos](docs/examples/drone.md) | capture guide; example results follow |
+| Standard camera | [Phone and handheld photos](docs/examples/phone.md) | capture guide; example results follow |
+
+<img src="assets/dense_cloud_clas.png" alt="Classified dense cloud of an apartment" width="800">
+
+Classified dense cloud of an apartment captured with a 360 degree video; the
+full walkthrough is in the [360 degree indoor example](docs/examples/indoor_360.md).
+
 ## Contents
 
-1. [Overview](#overview)
-2. [Processing pipeline](#processing-pipeline)
-3. [Semantic classification](#semantic-classification)
-4. [Targets, scale, and control points](#targets-scale-and-control-points)
-5. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
-6. [DXF export](#dxf-export)
-7. [User interface](#user-interface)
-8. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
-9. [Architecture](#architecture)
-10. [Configuration](#configuration)
-11. [Project files](#project-files)
-12. [Installation and start on Windows](#installation-and-start-on-windows)
-13. [Tests](#tests)
-14. [Scope and independent work](#scope-and-independent-work)
-15. [Author and license](#author-and-license)
+1. [Examples](#examples)
+2. [Overview](#overview)
+3. [Processing pipeline](#processing-pipeline)
+4. [Semantic classification](#semantic-classification)
+5. [Targets, scale, and control points](#targets-scale-and-control-points)
+6. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
+7. [DXF export](#dxf-export)
+8. [User interface](#user-interface)
+9. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
+10. [Architecture](#architecture)
+11. [Configuration](#configuration)
+12. [Project files](#project-files)
+13. [Installation and start on Windows](#installation-and-start-on-windows)
+14. [Tests](#tests)
+15. [Scope and independent work](#scope-and-independent-work)
+16. [Author and license](#author-and-license)
 
 Further documentation in [`docs/`](docs/):
 
@@ -36,6 +53,7 @@ Further documentation in [`docs/`](docs/):
 - [Object instances](docs/instances.md): per-point `instance_id`
 - [Orthophoto clean plan](docs/ortho_plan.md): true orthophoto to clean DXF
 - [Cyclone 3DR classes](docs/cyclone_classes.md): LAS codes and DXF layers
+- [UI language](docs/i18n.md): German/English interface, translation files
 
 ## Overview
 
@@ -81,8 +99,13 @@ Main features:
   individual classes. The LAS export (Cyclone 3DR / ASPRS LAS 1.4 codes) is
   started manually.
 - **DXF plans:** a fast point-cloud plan and a clean plan from a true
-  orthophoto, per storey (indoor) or as a site plan (outdoor), see
+  orthophoto, per storey (indoor) or as a site plan (outdoor). Indoor clean
+  plans have double-line walls with measured or learned thickness, rooms
+  bounded by the walls with name and area, and regularised furniture, see
   [DXF export](#dxf-export) and [docs/ortho_plan.md](docs/ortho_plan.md).
+- **German and English UI:** the interface is German by default and can be
+  switched to English in the settings; project files, reports and exports do
+  not depend on the language ([docs/i18n.md](docs/i18n.md)).
 
 ## Processing pipeline
 
@@ -169,7 +192,7 @@ faster.
 
 ### Classes
 
-The classes follow the Nomivox preset (`presets/default.json`) and are stored
+The classes follow the Nomivox preset [Nomivox Github](https://github.com/AIhdproduction/Nomivox) (`presets/default.json`) and are stored
 in `config/classes.json`: per class set the class order, the prompt list of
 every class, its LAS code, colour and German label. ID 0 is always
 *Unknown/noise* (LAS code 1, unclassified). Indoor uses the Nomivox classes of
@@ -505,6 +528,20 @@ The DXF page offers two plan variants (selector **Plan variant**):
   Clean exports are named `<project>_<level>_clean.dxf`. **Compare plans**
   overlays both variants. See [docs/ortho_plan.md](docs/ortho_plan.md).
 
+Indoor clean plans draw every wall with **both faces** as a closed outline on
+`A-WALL`, filled with a solid hatch on `A-WALL-PATT`. Where both faces were
+seen, the distance between them is the wall thickness; a face that was not
+seen is inferred from the learned thickness classes (or the configured
+exterior thickness), so it still runs straight and parallel. Door and window
+openings are cut through both faces. Rooms (`A-AREA` with name and area) are
+the cells enclosed by the walls, so their outlines follow the inner wall
+faces; an open-plan space with no wall between its parts is one room (for
+example "Wohnen / Küche"). Furniture outlines are regularised to rectangles
+or rectilinear shapes along the wall axes, cut back at walls and overlaps,
+and labelled inside their room; texts are written after the fills, so no
+hatch covers them. Details:
+[docs/ortho_plan.md](docs/ortho_plan.md#double-line-walls).
+
 Instance labels from `instances.json` (for example *Sofa*, *Tisch*) are written
 as text and block attributes in both variants when the classified cloud has
 instance IDs.
@@ -565,7 +602,10 @@ lists as "Custom 82": rename that class to **Road marking** in Cyclone 3DR once.
 
 ### Known limits
 
-- Wall thickness is an estimate from the point cloud, not a measured value.
+- Wall thickness is measured only where both faces of a wall are seen;
+  elsewhere it comes from the neighbouring room edge, the learned thickness
+  classes or the configured exterior default (clean plan). The point-cloud
+  plan estimates it from the points.
 - Door swing arcs are off by default.
 - COLMAP reconstructions without GPS or control points have no metric scale;
   set the scale before generating plans.
@@ -584,10 +624,23 @@ The UI is built with NiceGUI and opens at `http://127.0.0.1:8080`.
 | Targets | printable PDFs: AprilTags (150 mm, `tag36h11`) and numbered 180 mm cross targets; works without an open project |
 | Dense cloud | 3D viewer of the classified cloud in RGB or class mode, with class filters and colours, a height filter, object click and highlight, and AprilTag markers |
 | DXF | optional CAD export: preview, scale, alignment, levels, side view, DXF review, orthophoto clean plan and export |
-| Settings | coordinate systems, GPU, capture options, control point mode, classification settings, Improve & filter switches |
+| Settings | UI language (German/English), coordinate systems, GPU, capture options, control point mode, classification settings, Improve & filter switches |
 
-The page texts are partly German (for example *Klassen anpassen*, *AprilTag
-drucken*); the documentation uses English names.
+**Language.** The interface is available in German (default) and English.
+The default comes from `application.language` in `config/defaults.yml`; the
+card *Sprache / Language* on the settings page overrides it for this
+installation. The choice is saved immediately in
+`.samcloud/user_preferences.json` (not under version control) and applies at
+once: the settings page reloads in the new language and keeps unsaved inputs.
+*Reset to configured default* removes the stored choice. Invalid values fall
+back from the user choice to the configuration and then to German. Only
+visible texts are translated: internal IDs, class codes, API fields, project
+files, `progress.json`, and the DXF/LAS output stay the same in both languages;
+class names are translated for display only. This documentation uses the
+English UI names. Details: [docs/i18n.md](docs/i18n.md).
+
+The sidebar footer lists the main components: COLMAP | SAM3 | FlurSeg |
+Depth Anything.
 
 The classification settings per project are:
 
@@ -661,6 +714,8 @@ projects can export to the configured WGS84 and LV95 targets just like GPS proje
 main.py                          entry point (NiceGUI, port 8080)
 samcloud/
 ├── app/                         UI pages, layout, processing jobs, viewers, REST endpoints
+│   ├── i18n.py                  UI translations: t(key, **params), translate_or, language choice
+│   ├── locales/                 de/ and en/ translation files, one JSON file per namespace
 │   └── pages/                   home, projects, sparse (+ GCP review), control points, targets,
 │                                dense, dxf, settings
 ├── acquisition/                 360 degree frame extraction and cubemap preparation
@@ -703,7 +758,7 @@ More details are in [the architecture documentation](docs/architecture.md).
 
 | File | Purpose |
 |---|---|
-| `config/defaults.yml` | project defaults: coordinate systems, workflow, control points, AprilTags, classification, instances, acquisition, sparse display cleaning |
+| `config/defaults.yml` | UI language default (`application.language: de`), project defaults: coordinate systems, workflow, control points, AprilTags, classification, instances, acquisition, sparse display cleaning |
 | `config/export_crs.yml` | LAS export CRS presets, output height systems, and required PROJ grids |
 | `config/colmap.yml` | camera, matching, GPS/RTK, control point, dense, and step 6 settings (per capture type) |
 | `config/sam.yml` | SAM3 model, thresholds, tiles, voting, and instance settings |
@@ -850,8 +905,14 @@ committed.
 - the DXF export: LAS source, alignment, levels, geometry, writer, and GUI
 - the orthophoto clean plan: orthophoto, segmentation, vector extraction,
   symbol catalogue, kitchen, niches, and outdoor contours
+- the UI translations: identical German/English key sets and placeholders,
+  language resolution and fallbacks, and the settings language card
 
 The tests use synthetic data and need neither model weights nor a GPU.
+They run with the English UI: an autouse fixture in `tests/conftest.py` sets
+English and keeps the real `.samcloud/user_preferences.json` untouched. Tests
+that check German wording use the `german_ui` fixture or the `use_language`
+helper.
 
 `tests/conftest.py` needs the environment variable `SAMCLOUD_TEST_WORKDIR`, a
 writable directory for the per-test work folders (for example outside the

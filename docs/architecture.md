@@ -18,7 +18,7 @@ NiceGUI pages  (samcloud/app)
 
 | Package | Responsibility |
 |---|---|
-| `samcloud/app/` | NiceGUI pages (`pages/`), layout and navigation, the process launcher (`processing.py`), the Potree and canvas viewers, DXF page controllers, and the REST endpoints in `application.py` |
+| `samcloud/app/` | NiceGUI pages (`pages/`), layout and navigation, the process launcher (`processing.py`), the Potree and canvas viewers, DXF page controllers, the REST endpoints in `application.py`, and the UI translations (`i18n.py`, `locales/`) |
 | `samcloud/core/` | paths, configuration loading, project creation and persistence (`project_manager.py`), workflow state, project deletion, storage compaction (`storage.py`) |
 | `samcloud/acquisition/` | validation of exported Insta360 media, fixed-interval frame extraction, six perspective cubemap views per panorama, `inputs/panorama_manifest.json` |
 | `samcloud/colmap/` | COLMAP command construction, alignment and camera groups, panorama gravity alignment, and the step 6 modules: `depth_prior`, `depth_fill`, `surface_fusion`, `mirror_filter`, `depth_edges`, `point_cleaning`, `plane_fill`, `superpoint_vote` |
@@ -108,3 +108,20 @@ downsampled preview (`/api/pointcloud/{kind}`). Endpoints in
 | `/api/control-points/*` | markers, image crops, observation edits, optimize, continue (GCP review workspace) |
 | `/api/apriltags/markers` | AprilTag squares for the viewers |
 | `/api/dxf/payload/...`, `/api/dxf/background/...`, `/api/dxf/ortho/...` | DXF review data, backgrounds, and orthophoto previews |
+
+## UI translations
+
+All visible UI texts go through `samcloud/app/i18n.py`. Page code calls
+`t("namespace.key", **params)`, or `translate_or(key, fallback)` for keys built
+from data (for example class names via `classes.<name>`). The texts live in
+`samcloud/app/locales/<language>/<namespace>.json` (`de` and `en`, identical
+key sets, enforced by `tests/test_i18n.py`). The active language comes from
+the user choice in `.samcloud/user_preferences.json`, then
+`application.language` in `config/defaults.yml`, then `de`.
+
+Translation is a display concern of the UI only: the engine, project files,
+reports, `progress.json`, REST field names, and the LAS/DXF output are
+language-neutral, and stored English engine texts (progress stages, AprilTag
+warnings, viewer server messages) are translated when they are shown. Adding a
+language means a new `locales/<code>/` folder and an entry in
+`SUPPORTED_LANGUAGES`. Details: [i18n.md](i18n.md).
