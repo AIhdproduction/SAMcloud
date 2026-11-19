@@ -8,11 +8,17 @@ from dataclasses import replace
 import ezdxf
 import numpy as np
 import pytest
+from shapely import affinity
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
 from samcloud.ortho.vector.double_walls import (
     DoubleWallSettings,
+    WallEvidence,
+    WallRun,
+    _Face,
+    _neighbour_slab,
+    _wall_bodies,
     bound_rooms_by_walls,
     build_double_walls,
     update_opening_symbols,
@@ -519,3 +525,330 @@ def test_corner_tall_unit_continues_the_hidden_wall_behind_it() -> None:
         assert body.contains(Point(x, 3.1))  # the north wall continues behind it
     assert body.contains(Point(4.1, 3.1)) and body.contains(Point(1.0, 3.1))  # closed corner, wall still there
     assert body.geom_type == "Polygon"  # one closed body around the kitchen corner
+
+
+# --- isolated / stub / free-standing face rules (wall diagnosis v10) -----------------------------------------------
+
+def _faces_of(entities: list[dict]):
+    from samcloud.ortho.vector.double_walls import _collect_faces
+
+    faces, _ = _collect_faces(entities, 1.0, SETTINGS.min_face_m)
+    return faces
+
+
+def _split(entities: list[dict], rooms=(), settings=SETTINGS):
+    from samcloud.ortho.vector.double_walls import _split_isolated
+
+    kept, isolated = _split_isolated(_faces_of(entities), 1.0, settings, list(rooms))
+    return {tuple(round(float(v), 2) for v in (*f.start, *f.end)) for f in kept}, {tuple(round(float(v), 2) for v in (*f.start, *f.end)) for f in isolated}
+
+
+def test_stub_with_a_free_end_is_dropped_but_a_jamb_between_two_walls_stays() -> None:
+    wall_a, wall_b = _face(0.0, 0.0, 3.0, 0.0), _face(0.0, 0.5, 3.0, 0.5)
+    attached_one_end = _face(1.0, 0.0, 1.0, -0.5)  # 0.5 m, touches wall A only; the free end is 0.5 m from anything
+    jamb = _face(2.0, 0.5, 2.0, 0.0)  # 0.5 m between the two walls: both ends near
+    kept, isolated = _split([wall_a, wall_b, attached_one_end, jamb])
+    assert (1.0, 0.0, 1.0, -0.5) in isolated and (2.0, 0.5, 2.0, 0.0) in kept
+    # rule off (stub_min_length_m = 0): the old behaviour (one near end is enough) keeps it
+    kept_old, isolated_old = _split([wall_a, wall_b, attached_one_end, jamb], settings=replace(SETTINGS, stub_min_length_m=0.0))
+    assert (1.0, 0.0, 1.0, -0.5) in kept_old and not isolated_old
+
+
+def test_stub_end_must_touch_a_wall_not_just_lie_within_the_joint_reach() -> None:
+    # A 0.48 m face beside a wall (0.2 m from it at its lower end) is a free object edge, not a return: it touches a wall only
+    # at the top. Within joint_reach (0.35 m) the old rule kept it; a jamb touches within 0.10 m at both ends.
+    wall = _face(0.0, 0.0, 4.0, 0.0)
+    long_wall = _face(-0.2, -0.5, -0.2, 3.0)  # parallel wall 0.2 m left of the stub's lower end
+    stub = _face(0.0, 0.0, 0.0, -0.48)
+    # lower end (0,-0.48) is 0.2 m from long_wall: near by joint reach, not touching
+    kept, isolated = _split([wall, long_wall, stub])
+    assert (0.0, 0.0, 0.0, -0.48) in isolated
+    kept_old, isolated_old = _split([wall, long_wall, stub], settings=replace(SETTINGS, stub_end_reach_m=0.0))
+    assert (0.0, 0.0, 0.0, -0.48) in kept_old and not isolated_old
+    wall_below = _face(0.0, -0.48, 4.0, -0.48)
+    jamb = _face(2.0, 0.0, 2.0, -0.48)  # touches a wall at both ends
+    kept_touch, isolated_touch = _split([wall, wall_below, jamb])
+    assert (2.0, 0.0, 2.0, -0.48) in kept_touch and not isolated_touch
+
+
+def test_face_of_stub_length_or_more_keeps_the_single_end_rule() -> None:
+    wall = _face(0.0, 0.0, 3.0, 0.0)
+    return_wall = _face(1.0, 0.0, 1.0, -0.8)  # 0.8 m (>= 0.6), attached at one end
+    kept, isolated = _split([wall, return_wall])
+    assert (1.0, 0.0, 1.0, -0.8) in kept and not isolated
+
+
+def test_free_standing_face_under_2_5_m_is_dropped_unless_a_room_is_near() -> None:
+    wall = _face(0.0, 0.0, 6.0, 0.0)
+    free = _face(0.0, 3.0, 2.0, 3.0)  # 2.0 m, far from every wall end
+    kept, isolated = _split([wall, free])
+    assert (0.0, 3.0, 2.0, 3.0) in isolated
+    room_near = box(0.0, 2.0, 4.0, 2.6)  # ceiling room 0.4 m from the face: it borders a room
+    kept_near, isolated_near = _split([wall, free], rooms=[room_near])
+    assert (0.0, 3.0, 2.0, 3.0) in kept_near and not isolated_near
+    room_far = box(0.0, 1.0, 4.0, 2.0)  # 1.0 m away: no longer protects it
+    assert (0.0, 3.0, 2.0, 3.0) in _split([wall, free], rooms=[room_far])[1]
+    long_free = _face(0.0, 3.0, 2.6, 3.0)  # >= 2.5 m: kept
+    assert (0.0, 3.0, 2.6, 3.0) in _split([wall, long_free])[0]
+    attached = _face(0.0, 3.0, 2.0, 3.0), _face(0.0, 3.0, 0.0, 0.2)  # touching a wall end: not free at both ends
+    assert (0.0, 3.0, 2.0, 3.0) in _split([wall, *attached])[0]
+    assert (0.0, 3.0, 2.0, 3.0) in _split([wall, free], settings=replace(SETTINGS, isolated_free_max_length_m=0.0))[0]  # rule off
+
+
+def test_stub_and_free_rules_spare_builtin_and_niche_faces() -> None:
+    wall = _face(0.0, 0.0, 6.0, 0.0)
+    front = {**_face(0.0, 3.0, 2.0, 3.0), "_source": "builtin_front"}
+    tiny = {**_face(5.0, 3.0, 5.0, 3.5), "_source": "niche_panel"}
+    kept, isolated = _split([wall, front, tiny])
+    assert (0.0, 3.0, 2.0, 3.0) in kept
+    assert (5.0, 3.0, 5.0, 3.5) in isolated  # < 1.2 m with no near end is still the old isolated rule
+
+
+def test_room_edge_body_thickness_is_capped_at_max_thickness() -> None:
+    room = box(0.0, 0.0, 4.0, 3.0)
+    grid = _grid((-1.0, -1.0, 5.0, 5.5))
+    free = _mask(grid, [box(0.0, 0.0, 4.0, 2.4)])
+    valid = _mask(grid, [box(-0.05, -0.05, 4.05, 3.30)])
+    base = [_face(0.0, 0.0, 4.0, 0.0), _face(4.0, 0.0, 4.0, 3.3), _face(0.0, 3.3, 0.0, 0.0), _face(0.0, 3.3, 1.0, 3.3)]
+    behind = [_face(0.5, 4.0, 3.5, 4.0), _face(0.5, 4.2, 3.5, 4.2)]  # a wall 0.7 m behind the hidden north wall: mass in between is ~0.71 m
+    result = build_double_walls(base + behind, [], [room], free, valid, grid, 1.0, SETTINGS)
+    edge = [piece for piece in result.pieces if piece.get("source") == "room_edge"]
+    assert len(edge) == 1
+    assert edge[0]["thickness"] == pytest.approx(SETTINGS.max_thickness_m)
+    narrower = build_double_walls(base + [_face(0.5, 3.6, 3.5, 3.6), _face(0.5, 3.8, 3.5, 3.8)], [], [room], free, valid, grid, 1.0, SETTINGS)
+    assert [piece["thickness"] for piece in narrower.pieces if piece.get("source") == "room_edge"] == [pytest.approx(0.3)]  # below the cap: unchanged
+
+
+def _hidden_north_wall_scene():
+    room = box(0.0, 0.0, 4.0, 3.0)
+    grid = _grid((-1.0, -1.0, 5.0, 4.5))
+    free = _mask(grid, [box(0.0, 0.0, 4.0, 2.4)])
+    valid = _mask(grid, [box(-0.05, -0.05, 4.05, 3.30)])
+    entities = [_face(0.0, 0.0, 4.0, 0.0), _face(4.0, 0.0, 4.0, 3.3), _face(0.0, 3.3, 0.0, 0.0), _face(0.0, 3.3, 1.0, 3.3)]
+    return room, grid, free, valid, entities
+
+
+def test_room_edge_invents_no_wall_in_front_of_a_window_span() -> None:
+    # The measured window marks the wall line 0.5 m beyond the room edge's hidden wall: no outside block may be
+    # built in the window span (it stayed as a loose wall block beside the cut), the walls beside the window stay.
+    room, grid, free, valid, entities = _hidden_north_wall_scene()
+    window = Opening("WINDOW", (2.0, 3.8), 1.6, 0.0, 0.3)
+    plain = build_double_walls(entities, [], [room], free, valid, grid, 1.0, SETTINGS)
+    assert _body(plain).contains(Point(2.0, 3.45))  # without an opening the hidden wall is closed over the full side
+    result = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, SETTINGS)
+    body = _body(result)
+    assert not body.contains(Point(2.0, 3.45)) and not body.contains(Point(1.3, 3.45)) and not body.contains(Point(2.7, 3.45))
+    assert body.contains(Point(0.7, 3.45)) and body.contains(Point(3.3, 3.45))
+    off = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, replace(SETTINGS, room_edge_opening_reach_m=0.0))
+    assert _body(off).contains(Point(2.0, 3.45))  # rule off: the old behaviour
+
+
+def test_room_edge_drops_a_stub_left_beside_a_window_span() -> None:
+    # Window span x 1.13..3.87 leaves 0.13 m beside it at both ends, far below room_edge_min_length (0.3 m): no stub block.
+    room, grid, free, valid, entities = _hidden_north_wall_scene()
+    window = Opening("WINDOW", (2.5, 3.8), 2.7, 0.0, 0.3)
+    result = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, SETTINGS)
+    body = _body(result)
+    assert not body.contains(Point(1.08, 3.55)) and not body.contains(Point(3.93, 3.55)) and not body.contains(Point(2.5, 3.55))
+    off = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, replace(SETTINGS, room_edge_opening_reach_m=0.0))
+    assert _body(off).contains(Point(2.5, 3.55)) and _body(off).contains(Point(3.93, 3.55))
+
+
+def test_room_edge_ignores_openings_that_are_not_parallel_or_far() -> None:
+    room, grid, free, valid, entities = _hidden_north_wall_scene()
+    across = Opening("DOOR", (2.0, 3.8), 0.9, math.pi / 2.0, 0.3, leaf_detected=False)  # perpendicular to the room edge
+    far = Opening("WINDOW", (2.0, 6.0), 1.6, 0.0, 0.3)  # 2.7 m beyond the edge
+    for opening in (across, far):
+        result = build_double_walls(entities, [opening], [room], free, valid, grid, 1.0, SETTINGS)
+        assert _body(result).contains(Point(2.0, 3.45)), opening
+
+
+def _vertical_run(index: int, x: float, y0: float, y1: float, side: int, thickness: float = 0.25) -> tuple[_Face, WallRun]:
+    face = _Face(index, np.asarray((x, y0)), np.asarray((x, y1)), {"_source": "measured"}, side=side)
+    return face, WallRun(index, 0.0, abs(y1 - y0), thickness, "interior", "measured")
+
+
+def test_hostless_door_filling_a_short_wall_segment_takes_the_slab_of_the_collinear_run() -> None:
+    # The door fills the whole wall segment between y=2.0 and y=3.0: no run covers it, so it used to cut nothing and the room leaked.
+    face, run = _vertical_run(0, 0.0, 0.0, 2.0, side=1)  # solid on -x: slab x in [-0.25, 0]
+    door = Opening("DOOR", (0.0, 2.6), 0.8, math.pi / 2.0, 0.25, leaf_detected=False)
+    centre, axis = np.asarray(door.center), np.asarray((0.0, 1.0))
+    low, high = _neighbour_slab(centre, axis, 0.4, [run], {0: face}, 1.0, SETTINGS)
+    assert (low, high) == (pytest.approx(0.0), pytest.approx(0.25))  # offsets along the opening normal (-1, 0): x in [-0.25, 0]
+    _bands, slabs, cuts, _jambs = _wall_bodies([run], [face], [door], 1.0, SETTINGS)
+    assert slabs == [(pytest.approx(0.0), pytest.approx(0.25))]
+    assert cuts and unary_union(cuts).contains(Point(-0.12, 2.6))  # the gap is closed over the wall thickness
+
+
+def test_hostless_door_slab_comes_from_the_nearest_run_across_and_along() -> None:
+    near, near_run = _vertical_run(0, 0.0, 0.0, 2.0, side=1)  # on the opening line, ends 0.2 m before the span
+    other, other_run = _vertical_run(1, 0.46, 3.0, 5.0, side=-1)  # 0.46 m beside the line, starts right after the span
+    centre, axis = np.asarray((0.0, 2.6)), np.asarray((0.0, 1.0))
+    result = _neighbour_slab(centre, axis, 0.4, [other_run, near_run], {0: near, 1: other}, 1.0, SETTINGS)
+    assert result == (pytest.approx(0.0), pytest.approx(0.25))
+    assert _neighbour_slab(centre, axis, 0.4, [other_run], {1: other}, 1.0, SETTINGS) is not None  # alone it qualifies: order does not matter
+
+
+def test_hostless_door_without_a_collinear_run_still_cuts_nothing() -> None:
+    face, run = _vertical_run(0, 0.0, 0.0, 2.0, side=1)
+    centre, axis = np.asarray((0.0, 4.0)), np.asarray((0.0, 1.0))  # 1.6 m beyond the run end
+    assert _neighbour_slab(centre, axis, 0.4, [run], {0: face}, 1.0, SETTINGS) is None
+    across = np.asarray((1.0, 0.0))  # perpendicular door axis: the run is not a host
+    assert _neighbour_slab(np.asarray((0.0, 2.2)), across, 0.4, [run], {0: face}, 1.0, SETTINGS) is None
+    door = Opening("DOOR", (0.0, 4.0), 0.8, math.pi / 2.0, 0.25, leaf_detected=False)
+    _bands, slabs, cuts, _jambs = _wall_bodies([run], [face], [door], 1.0, SETTINGS)
+    assert slabs == [(0.0, 0.0)] and not cuts
+
+
+def test_hostless_window_next_to_a_run_still_cuts_nothing() -> None:
+    face, run = _vertical_run(0, 0.0, 0.0, 2.0, side=1)
+    window = Opening("WINDOW", (0.0, 2.6), 0.8, math.pi / 2.0, 0.25)
+    _bands, slabs, cuts, _jambs = _wall_bodies([run], [face], [window], 1.0, SETTINGS)
+    assert slabs == [(0.0, 0.0)] and not cuts
+
+
+# --------------------------------------------------------------------------
+# cabinet fronts taken as walls
+# --------------------------------------------------------------------------
+
+def _cabinet_front_scene(upm: float = 1.0, wall_points: bool = False, cabinet_labels: bool = True):
+    """Room A [0,4]x[0,3] with a run of kitchen cabinets along its north wall measured as a wall face at y = 2.3
+    (cabinet pixels y 2.3..3.0).  ``wall_points``: wall-class points of full height at the face (a real wall)."""
+    from samcloud.ortho.vector.double_walls import TallUnitEvidence
+
+    s = upm
+    entities, rooms, free, valid, grid = _two_rooms(upm)
+    free = free & ~_mask(grid, [box(0.9 * s, 2.3 * s, 3.1 * s, 3.0 * s)])
+    cabinet = _mask(grid, [box(1.0 * s, 2.3 * s, 3.0 * s, 3.0 * s)]) if cabinet_labels else np.zeros((grid.height, grid.width), dtype=bool)
+    zeros = np.zeros_like(cabinet)
+    units = TallUnitEvidence(front=zeros, fridge=zeros, low=zeros, cabinet=cabinet)
+    wall_solid = [box(-0.05 * s, -0.05 * s, 8.05 * s, 0.05 * s), box(3.95 * s, 0.0, 4.20 * s, 3.0 * s)]
+    if wall_points:
+        wall_solid.append(box(0.95 * s, 2.28 * s, 3.05 * s, 2.45 * s))
+    all_bits = np.zeros((grid.height, grid.width), dtype=np.uint32)
+    all_bits[_mask(grid, [box(1.0 * s, 2.3 * s, 3.0 * s, 2.7 * s)])] = np.uint32(0b111111)
+    evidence = WallEvidence(bins=16, storey_height=2.4 * s, wall_bits=_full_wall_bits(grid, wall_solid), all_bits=all_bits)
+    return entities + [_face(1.0 * s, 2.3 * s, 3.0 * s, 2.3 * s)], rooms, free, valid, grid, units, evidence
+
+
+@pytest.mark.parametrize("upm", (1.0, 0.8124))
+def test_wall_run_on_cabinet_labels_without_wall_points_is_dropped(upm: float) -> None:
+    entities, rooms, free, valid, grid, units, evidence = _cabinet_front_scene(upm)
+    settings = replace(SETTINGS, face_test=False, visibility_test=False)
+    probe = Point(2.0 * upm, 2.34 * upm)
+    off = build_double_walls(entities, [], rooms, free, valid, grid, upm, replace(settings, cabinet_walls=False), evidence=evidence, tall_units=units)
+    assert _body(off).contains(probe)  # old behaviour: the cabinet front is a wall
+    result = build_double_walls(entities, [], rooms, free, valid, grid, upm, settings, evidence=evidence, tall_units=units)
+    assert result.stats["cabinet_wall_runs"] == 1
+    assert not _body(result).contains(probe)
+    assert _body(result).contains(Point(-0.15 * upm, 1.5 * upm))  # the exterior walls stay
+    assert result.stats["cabinet_wall_m"] == pytest.approx(2.0, abs=0.25)
+
+
+@pytest.mark.parametrize("upm", (1.0, 0.8124))
+def test_real_wall_behind_cabinets_stays_a_wall(upm: float) -> None:
+    entities, rooms, free, valid, grid, units, evidence = _cabinet_front_scene(upm, wall_points=True)
+    settings = replace(SETTINGS, face_test=False, visibility_test=False)
+    result = build_double_walls(entities, [], rooms, free, valid, grid, upm, settings, evidence=evidence, tall_units=units)
+    assert result.stats.get("cabinet_wall_runs", 0) == 0
+    assert _body(result).contains(Point(2.0 * upm, 2.34 * upm))
+
+
+@pytest.mark.parametrize("upm", (1.0, 0.8124))
+def test_wall_run_without_cabinet_labels_stays_a_wall(upm: float) -> None:
+    entities, rooms, free, valid, grid, units, evidence = _cabinet_front_scene(upm, cabinet_labels=False)
+    settings = replace(SETTINGS, face_test=False, visibility_test=False)
+    result = build_double_walls(entities, [], rooms, free, valid, grid, upm, settings, evidence=evidence, tall_units=units)
+    assert result.stats.get("cabinet_wall_runs", 0) == 0
+    assert _body(result).contains(Point(2.0 * upm, 2.34 * upm))
+
+
+# --------------------------------------------------------------------------
+# cabinet columns whose side panels were taken as a wall
+# --------------------------------------------------------------------------
+
+def _column_scene(upm: float = 1.0, wall_points: bool | float = False, cabinet_labels: bool = True, length: float = 1.6, far_floor: bool = True):
+    """Room A [0,4]x[0,3] with a measured wall face at x = 2.0 running from the north wall down ``length`` metres.  Kitchen
+    cabinets stand east of it (x 2.3..2.9, flank only: the face body itself is not on a label); a built-in unit outline
+    covers x 2.0..2.9.  ``wall_points``: wall-class points of full height along the face (a real partition)."""
+    from samcloud.ortho.vector.double_walls import TallUnitEvidence
+
+    s = upm
+    entities, rooms, free, valid, grid = _two_rooms(upm)
+    y0 = 3.0 - length
+    free = free & ~_mask(grid, [box(1.95 * s, y0 * s, 2.95 * s, 3.0 * s)])
+    if not far_floor:  # nothing measured west of the face: it is the outer wall behind the cabinets
+        free = free & ~_mask(grid, [box(0.5 * s, y0 * s, 1.95 * s, 3.0 * s)])
+    cabinet = _mask(grid, [box(2.3 * s, y0 * s, 2.9 * s, 3.0 * s)]) if cabinet_labels else np.zeros((grid.height, grid.width), dtype=bool)
+    zeros = np.zeros_like(cabinet)
+    units = TallUnitEvidence(front=zeros, fridge=zeros, low=zeros, cabinet=cabinet)
+    solid = [box(-0.05 * s, -0.05 * s, 8.05 * s, 0.05 * s), box(3.95 * s, 0.0, 4.20 * s, 3.0 * s), box(-0.05 * s, 2.95 * s, 8.05 * s, 3.05 * s), box(-0.05 * s, 0.0, 0.05 * s, 3.0 * s), box(7.95 * s, 0.0, 8.05 * s, 3.0 * s)]
+    if wall_points is True:
+        solid.append(box(1.9 * s, y0 * s, 2.15 * s, 3.0 * s))
+    elif wall_points:  # a weakly measured real wall: wall points over only the given share of the run (at its far end)
+        solid.append(box(1.9 * s, (3.0 - float(wall_points) * length) * s, 2.15 * s, 3.0 * s))
+    evidence = WallEvidence(bins=16, storey_height=2.4 * s, wall_bits=_full_wall_bits(grid, solid), all_bits=np.zeros((grid.height, grid.width), dtype=np.uint32))
+    builtin = [box(2.0 * s, y0 * s, 2.9 * s, 3.0 * s)]
+    return entities + [_face(2.0 * s, 3.0 * s, 2.0 * s, y0 * s)], rooms, free, valid, grid, units, evidence, builtin
+
+
+@pytest.mark.parametrize("upm", (1.0, 0.8124))
+def test_unsupported_wall_stretch_beside_kitchen_cabinets_is_a_cabinet_column(upm: float) -> None:
+    entities, rooms, free, valid, grid, units, evidence, builtin = _column_scene(upm)
+    settings = replace(SETTINGS, face_test=False, visibility_test=False)
+    probe = box(1.7 * upm, 1.5 * upm, 2.3 * upm, 2.5 * upm)  # the face body, whichever side the solid side is taken
+    off = build_double_walls(entities, [], rooms, free, valid, grid, upm, replace(settings, cabinet_walls=False), evidence=evidence, tall_units=units, builtins=builtin)
+    assert _body(off).intersects(probe)  # old behaviour: the column's side panel is a wall
+    result = build_double_walls(entities, [], rooms, free, valid, grid, upm, settings, evidence=evidence, tall_units=units, builtins=builtin)
+    assert result.stats["cabinet_column_stretches"] == 1 and result.stats["cabinet_column_m"] == pytest.approx(1.6, abs=0.3)
+    assert not _body(result).intersects(probe)
+    assert _body(result).contains(Point(-0.15 * upm, 1.5 * upm))  # exterior walls stay
+    assert len(result.tall_units) == 1 and result.tall_units[0][1] == "HS"
+    x0, y0, x1, y1 = result.tall_units[0][0].bounds
+    assert x0 == pytest.approx(2.0 * upm, abs=0.1 * upm) and x1 == pytest.approx(2.9 * upm, abs=0.1 * upm)
+
+
+@pytest.mark.parametrize("upm", (1.0, 0.8124))
+def test_cabinet_column_rule_keeps_real_walls_and_short_or_unlabelled_stretches(upm: float) -> None:
+    settings = replace(SETTINGS, face_test=False, visibility_test=False)
+    probe = box(1.7 * upm, 1.5 * upm, 2.3 * upm, 2.5 * upm)
+    for kwargs in ({"wall_points": True}, {"wall_points": 0.3}, {"cabinet_labels": False}, {"length": 0.5}, {"far_floor": False}):
+        entities, rooms, free, valid, grid, units, evidence, builtin = _column_scene(upm, **kwargs)
+        result = build_double_walls(entities, [], rooms, free, valid, grid, upm, settings, evidence=evidence, tall_units=units, builtins=builtin)
+        assert result.stats.get("cabinet_column_stretches", 0) == 0, kwargs
+        if "length" not in kwargs:
+            assert _body(result).intersects(probe), kwargs
+
+
+@pytest.mark.parametrize("upm", (1.0, 0.8124))
+def test_short_remnant_beside_a_removed_cabinet_column_leaves_no_wall_stub(upm: float) -> None:
+    """The column stretch is removed; the 0.2 m of the run beyond it would be an island stub in the room: it goes too."""
+    entities, rooms, free, valid, grid, units, evidence, builtin = _column_scene(upm, length=1.8, wall_points=False)
+    # wall points over the last 0.2 m at the far end of the face keep that piece 'supported'
+    solid = _mask(grid, [box(1.9 * upm, 2.8 * upm, 2.15 * upm, 3.0 * upm)])
+    bits = evidence.wall_bits.copy()
+    bits[solid] = np.uint32(0xFFFF)
+    evidence = WallEvidence(bins=16, storey_height=2.4 * upm, wall_bits=bits, all_bits=evidence.all_bits)
+    settings = replace(SETTINGS, face_test=False, visibility_test=False)
+    result = build_double_walls(entities, [], rooms, free, valid, grid, upm, settings, evidence=evidence, tall_units=units, builtins=builtin)
+    assert result.stats["cabinet_column_stretches"] == 1
+    stub = box(1.7 * upm, 2.75 * upm, 2.3 * upm, 2.98 * upm)
+    assert not _body(result).intersects(stub)  # no 0.2 m stub left behind
+    keep = build_double_walls(entities, [], rooms, free, valid, grid, upm, replace(settings, cabinet_remnant_min_m=0.1), evidence=evidence, tall_units=units, builtins=builtin)
+    assert _body(keep).intersects(stub)  # with the old limit the stub stays (this is what the rule removes)
+
+
+@pytest.mark.parametrize("upm", [1.0, 0.8124])
+def test_a_small_floor_cell_between_two_doors_is_kept_as_a_hall_a_dead_end_cell_is_not(upm: float) -> None:
+    """A 1.4 m2 cell with two doors (a bit of corridor between doors) is floor of the flat: kept as "Flur"; with one door it is no hall."""
+    from samcloud.ortho.vector.room_names import RoomName, RoomNameSettings, name_halls
+
+    cell = affinity.scale(box(3.1, 12.6, 4.6, 13.55), upm, upm, origin=(0, 0))  # 1.5 x 0.95 m
+    area = cell.area / (upm * upm)
+    assert 1.2 < area < 1.5
+    decisions = [RoomName(None, area, False, frozenset())]  # below the 2 m2 room minimum: dropped without the hall rule
+    two = [((3.1 * upm, 13.0 * upm), math.pi / 2.0), ((4.6 * upm, 13.1 * upm), math.pi / 2.0)]
+    assert name_halls([cell], decisions, two, upm, RoomNameSettings())[0].keep is True
+    assert name_halls([cell], decisions, two[:1], upm, RoomNameSettings())[0].keep is False
+    tiny = affinity.scale(box(0.0, 0.0, 0.6, 0.6), upm, upm, origin=(0, 0))  # 0.36 m2 niche: never a room
+    assert name_halls([tiny], [RoomName(None, 0.36, False, frozenset())], [((0.0, 0.3 * upm), math.pi / 2.0), ((0.6 * upm, 0.3 * upm), math.pi / 2.0)], upm, RoomNameSettings())[0].keep is False

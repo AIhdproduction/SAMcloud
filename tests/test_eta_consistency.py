@@ -170,7 +170,7 @@ def test_step_six_run_summary_stages_are_grouped() -> None:
         assert name in refinement
     all_members = [member for _, members in home._TIME_GROUPS for member in members]
     assert len(all_members) == len(set(all_members))
-    assert set(dict(home._TIME_GROUPS)) | {"Übrige Schritte"} == set(home._TIME_GROUP_KEYS)
+    assert set(dict(home._TIME_GROUPS)) | {"Übrige Schritte", "DXF/IFC-Export"} == set(home._TIME_GROUP_KEYS)
 
 
 def test_processing_time_summary_puts_surface_fusion_into_step_six(tmp_path: Path) -> None:

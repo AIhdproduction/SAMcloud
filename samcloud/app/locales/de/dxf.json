@@ -1,6 +1,6 @@
 {
   "page": {
-    "title": "DXF-Export",
+    "title": "DXF/IFC-Export",
     "no_project": "Öffne ein Projekt, bevor du DXF-Pläne exportierst.",
     "not_ready": "Der DXF-Export braucht eine klassifizierte Punktwolke, dieses Projekt hat noch keine. Zuerst die Punktwolke klassifizieren, dann diese Seite erneut öffnen.",
     "advanced": "Erweitert"
@@ -15,7 +15,9 @@
     "segment": "Orthofoto wird segmentiert",
     "clean_plan": "Bereinigter Plan wird erzeugt",
     "prepare_levels": "Geschosse werden erkannt",
-    "run_all": "Alles berechnen"
+    "run_all": "Alles berechnen",
+    "export_ifc": "IFC exportieren",
+    "refine_openings": "Öffnungen verfeinern"
   },
   "job": {
     "fallback": "Job",
@@ -79,7 +81,9 @@
     "step_segmentation": "Segmentierung",
     "step_clean_plan": "Bereinigter Plan",
     "step_export": "DXF-Export",
-    "step_row": "{name}: {status}"
+    "step_row": "{name}: {status}",
+    "step_ifc": "IFC-Export",
+    "step_refine": "Öffnungen verfeinern"
   },
   "prep": {
     "title": "Vorbereitung",
@@ -201,5 +205,32 @@
     "ok": "ok",
     "empty": "leer",
     "failed": "fehlgeschlagen"
+  },
+  "stage": {
+    "step": "Schritt {index}/{total}: {name} – {stage}",
+    "step_names": {
+      "ortho": "Orthofoto erstellen",
+      "segment": "Orthofoto segmentieren",
+      "clean_plan": "Bereinigten Plan erzeugen",
+      "refine_openings": "Öffnungen verfeinern",
+      "export": "DXF exportieren",
+      "export_ifc": "IFC exportieren"
+    },
+    "states": {
+      "starting": "startet",
+      "complete": "fertig",
+      "skipped": "übersprungen (aktuell)"
+    },
+    "inner": {
+      "selecting_photos": "Fotos werden ausgewählt",
+      "detecting_openings": "Fenster und Türen werden erkannt",
+      "detecting_openings_points": "Öffnungen werden aus Punkten erkannt",
+      "refine_up_to_date": "Verfeinerte Öffnungen sind aktuell",
+      "refined": "{count} Öffnungen verfeinert ({mode})",
+      "reading_points": "Punkte werden gelesen: {amount} Mio.",
+      "scoring_photos": "Fotos werden bewertet {index}/{total}",
+      "voting_photos": "Fotos stimmen ab {index}/{total}",
+      "plan_has_openings": "Plan enthält die verfeinerten Öffnungen bereits"
+    }
   }
 }

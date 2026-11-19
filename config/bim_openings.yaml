@@ -1,0 +1,267 @@
+# Thresholds of the 3D opening refinement (samcloud/bim/openings3d). Metres unless the key says otherwise.
+# Values are the ones tuned on test_home_v10_tag and cross-checked on test_home_v11_tag (prototype C).
+schema_version: 1
+
+grid:
+  cell_m: 0.05                    # wall-plane grid cell
+  min_observed_weight: 0.15       # vote weight below which a cell counts as unobserved
+
+walls:                            # plan walls -> collinear wall lines (gaps = openings are bridged)
+  merge_angle_deg: 5.0
+  merge_offset_m: 0.25
+  max_gap_m: 3.0
+  min_line_length_m: 0.3
+  min_piece_length_m: 0.1
+  end_pad_m: 3.0                  # a line continues up to this far into the gap to the next collinear line (not bridged: gap > max_gap_m)
+
+selection:                        # which photographs look at which wall face
+  camera_prefixes: [front, back, left, right]   # cube-map side faces (no up/down)
+  grid_step_m: 0.25
+  min_front_offset_m: 0.25        # camera must stand at least this far in front of the face plane
+  max_angle_deg: 60.0
+  min_distance_m: 0.5
+  max_distance_m: 6.0
+  coverage_k: 5                   # a cell stops giving gain after this many views
+  min_images_per_face: 25
+  max_images_per_face: 45
+  images_per_metre: 4.0
+  min_gain: 0.3
+  min_valid_points: 6
+
+sam:
+  map_resolution: 616             # px of the cached score maps (square)
+  classes: [window, door, wall, furniture]
+  prompts:
+    - [window, glazing, window frame, glass pane, window sash, casement window]
+    - [door, door frame, door panel, interior door]
+    - [wall]
+    - [cabinet, sofa, table, chair, bed, curtain]
+
+vote:
+  zbuffer_tolerance_m: 0.15
+  max_angle_deg: 65.0
+  min_distance_m: 0.4
+  max_distance_m: 7.0
+  furniture_downweight: 0.8       # weight *= 1 - this * furniture probability
+  behind_margin_m: 0.3            # sample counts as "seen through" when the depth buffer is this far behind it
+  cloud_voxel_m: 0.02             # cloud thinning for the occlusion buffer
+  zbuffer_min_filter_px: 3
+
+points:
+  band_margin_m: 0.10             # points this far outside the wall thickness still count
+  solid_density: 6.0              # wall points per 3x3 cells for "solid"
+  wall_code: 100
+  ceiling_code: 101
+  floor_code: 102
+  door_code: 103
+  window_code: 104
+  leaf_z_m: [0.5, 1.8]            # door-class points in this height band are kept for the door-leaf search
+  leaf_voxel_m: 0.01              # voxel thinning of those points (one point per voxel)
+  leaf_reach_m: 2.3               # ... and only within this distance of a wall line (leaf length + hinge offset + margin)
+
+windows:
+  threshold: 0.45                 # smoothed window probability
+  smooth_sigma_cells: 1.0
+  morph_cells: 5
+  min_area_m2: 0.12
+  min_width_m: 0.25
+  min_height_m: 0.35
+  extent_fraction: 0.45
+  door_dominance: 0.15            # door prob > window prob + this -> door evidence, not a window
+  min_observed_fraction: 0.6
+  min_images: 2.0
+  max_occlusion: 0.65
+  band_merge_dv_m: 0.15
+  band_merge_gap_m: 0.20
+  pad_edge_margin_m: 0.30         # rectangles this close to a padded (artificial) line end are cut by it and dropped
+  photo_points_agree_m: 0.2
+  photo_weight: 0.4
+  points_weight: 0.6
+  points_search_m: 0.3
+  points_row_fill: 0.6
+  points_zone_max_fill: 0.4
+  floor_sill_m: 0.12
+  floor_glazing_min_width_m: 1.6
+  glazed_door_min_width_m: 0.7
+  interior_min_sill_m: 0.3
+  interior_min_prob: 0.7
+  interior_probe_m: 0.30          # a window span with a room this far beyond the wall face on BOTH sides is on an interior wall (also when its wall line is merged with an exterior wall)
+  confidence_points_bonus: 0.2
+  curtain_extended_confidence: 0.3
+
+mullions:
+  edge_margin_m: 0.125
+  max_bar_m: 0.15
+  merge_m: 0.2
+  photo_merge_m: 0.15
+  dip_fraction: 0.8
+  stripe_fill: 0.6
+  edge_spread_std: 1.0
+  edge_min_frac: 0.6
+  edge_median_factor: 1.5
+  min_rows: 4
+  min_cols: 8
+
+curtains:
+  furniture_threshold: 0.5
+  min_width_m: 0.5
+  min_height_m: 1.0
+  min_column_m: 0.5
+  tall_sill_max_m: 0.8
+  tall_head_min_m: 1.6
+  join_distance_m: 0.3
+  join_dv_m: 0.15
+  row_fraction: 0.5
+
+doors:
+  gap_row_range_m: [0.25, 1.5]
+  gap_solid_max: 0.35
+  min_width_m: 0.6
+  max_width_m: 2.4
+  snap_max_width_diff_m: 0.55
+  snap_centre_cells: 4
+  seed_search_cells: 6
+  line_distance_m: 0.5
+  evidence_rows_m: [0.2, 1.9]
+  door_fraction_min: 0.15
+  door_prob_min: 0.2
+  behind_min: 0.3
+  see_through_obs: 0.6
+  see_through_behind: 0.5
+  min_observed_fraction: 0.5
+  end_margin_cells: 2
+  head_range_m: [1.8, 2.35]
+  head_search_from_m: 1.7
+  head_agree_m: 0.2
+  photo_head_max_m: 2.3
+  photo_head_prob: 0.3
+  default_head_m: 2.0
+  glazed_window_prob: 0.4
+  glazed_rows_m: [0.3, 1.9]
+  glazed_split_min_overlap: 0.3
+  glazed_split_min_piece_m: 0.4
+  window_absorbs_door_overlap: 0.9   # share of a door gap on an exterior wall that a window rectangle (sill above the floor) must cover for the gap to be part of the window
+  photo_weight: 0.4               # head height = photo_weight * photo + points_weight * points when both agree
+  points_weight: 0.6
+  lintel_row_fill: 0.5            # wall points resume where this share of the gap columns is solid for three rows
+  min_evidence_cells: 10          # fewer observed cells in a gap: no photograph statistic
+  min_rays: 0.5                   # a cell counts as "ray observed" above this ray weight
+  floor_gap_window_overlap: 0.3   # an unseeded floor gap overlapping a floor-near window this much is that window
+  floor_gap_window_sill_m: 0.2
+  confidence_base: 0.45
+  confidence_door_fraction: 0.2
+  confidence_photo_door: 0.15
+  confidence_snapped: 0.1
+  confidence_measured_head: 0.1
+  window_split_margin_m: 0.1      # mullion kept on a window piece only this far from the piece edge
+  plan_gap_confidence: 0.35
+
+frames:                           # door casing measured from door-class points on the wall plane (frames.py)
+  inner_fraction: 0.8             # the inner part of the opening width that is searched for head / free cells
+  head_search_from_m: 1.6         # head = lowest height above this where enough columns hold points of any class
+  head_row_fraction: 0.5
+  head_min_points: 2
+  jamb_inside_m: 0.10             # jamb strip: this far inside the opening edge ...
+  jamb_outside_m: 0.18            # ... to this far outside it
+  jamb_rows_from_m: 0.1
+  jamb_rows_below_head_m: 0.05
+  jamb_min_points: 3              # door-class points per 5 cm row of the strip
+  jamb_coverage: 0.6              # share of the rows that must be covered for a frame strip
+  jamb_max_out_m: 0.30            # a wider door-class run outward of the jamb is a flat leaf, not a frame
+  out_rows_m: [0.5, 1.7]
+  out_max_m: 0.6
+  out_min_points: 2
+  out_run_cov: 0.4
+  out_run_cov_continue: 0.2
+  head_below_m: 0.18              # head strip: from this far below the measured head ...
+  head_above_m: 0.10              # ... to this far above it
+  head_margin_m: 0.10             # ... and this far beyond the opening edges
+  head_min_points: 3
+  head_coverage: 0.5              # share of the columns that must hold door-class points
+  head_peak_min_points: 10
+  head_peak_range_m: [1.85, 2.3]  # the door-class points of the head strip peak in this height range
+  side_rows_m: [0.3, 2.0]         # the wall next to each opening edge (side_from_m .. side_to_m outward) is checked in these rows
+  side_from_m: 0.05
+  side_to_m: 0.45
+  side_min_points: 3
+  cell_rows_m: [0.3, 1.9]         # opening cells that decide free / blocked / door fractions
+  free_max_points: 0
+  door_cell_points: 1
+  closed_leaf_fraction: 0.4       # door-class share of the opening cells at which a closed leaf fills the opening
+  wall_cell_points: 2
+  blocked_cell_points: 2
+
+leaf:                             # open door leaf found by the hinge-ray search (leaves.py)
+  search_radius_m: 2.0            # door-class points within this distance of the opening centre
+  max_points: 20000               # deterministic thinning (every k-th point) above this many points
+  min_points: 80                  # fewer points around a hinge / ray: no hypothesis
+  hinge_search_m: 0.12            # hinge point searched this far around each jamb ...
+  hinge_step_m: 0.06
+  angle_step_deg: 4.0
+  band_m: 0.04                    # a ray collects the points within this distance of it
+  bin_m: 0.05
+  bin_min_points: 6               # points per 5 cm bin of the ray for the bin to count as leaf
+  min_length_m: 0.5
+  max_length_m: 1.3
+  max_foot_m: 0.75                # the leaf reaches from below this height ...
+  min_top_m: 1.65                 # ... to above this height
+  min_leaf_points: 300
+  min_angle_deg: 25.0             # smaller opening angles are the closed leaf in the wall plane
+  same_hinge_m: 0.35              # two doors that find a leaf with hinges this close and ...
+  same_direction_deg: 15.0        # ... directions this similar found the same leaf: the hinge closer to its jamb keeps it
+  min_swing_m: 0.05               # the free end must be this far off the opening plane (else the side is unknown)
+
+classify:                         # door / passage / none from the frame measurements (classify.py)
+  min_side_wall_cov: 0.6          # wall-class row coverage beside at least one edge: the opening is on an observed wall
+  lintel_min_headroom_m: 0.30     # headroom (ceiling - measured head) at which a lintel exists ...
+  lintel_min_head_m: 1.85         # ... and the measured head is a door head
+  passage_max_headroom_m: 0.30    # an opening up to the ceiling (less headroom) without frame is a passage ...
+  passage_min_free_fraction: 0.6  # ... when this share of its cells is measured free of points
+  passage_unmeasured_head_open: true  # no point at all between the head search height and the ceiling (head not measured) counts as an opening up to the ceiling
+  closed_leaf_min_head_cov: 0.5   # a closed leaf (door-class cells fill the opening) also needs a head strip of this coverage; door-class points without a head are a leaf lying flat beside / in the gap
+  min_overlap_m: 0.05             # two openings of the same wall line overlapping more than this share the casing: the weaker one is trimmed at the stronger one
+  weak_door_fraction: 0.15        # door-class share of the opening cells that keeps a candidate a door
+  host_reach_m: 1.5               # wall stretches of the original host wall this far beside a door / passage are kept (closed where the measured faces leave them open)
+  host_min_stretch_m: 0.2         # shorter stretches of the host wall beside a door are jamb stubs and are not continued
+  min_head_m: 1.8                 # a measured head below this is not a door head (furniture, closed leaf): the detected head stays
+
+scan:                             # door frames on wall lines without opening (entrances, scan.py)
+  col_rows_m: [0.1, 1.9]
+  col_min_points: 1
+  col_coverage: 0.5               # share of the rows with door-class points for a jamb / leaf column
+  min_width_m: 0.6
+  max_width_m: 1.5
+  max_jamb_run_m: 0.35            # a jamb run is at most this wide (wider runs are closed leaves)
+  run_shrink_m: 0.10              # the casing of a closed-leaf run reaches this far into the run
+  end_margin_m: 0.1
+  overlap_margin_m: 0.1
+  plan_opening_reach_m: 0.25      # a plan opening this close to the wall line (plus half its thickness) blocks a scan candidate in its span
+  confidence: 0.6
+
+dedupe:
+  overlap_fraction: 0.4
+  centre_distance_m: 0.3
+  plan_door_merge_distance_m: 1.0
+  unconfirmed_distance_m: 0.8
+
+points_only:                      # fallback without photographs: hole rectangles in the point grid
+  closing_iterations: 2
+  min_rect_area_m2: 0.12
+  min_width_m: 0.25
+  min_height_m: 0.35
+  max_rects_per_component: 3
+  door_floor_v_m: 0.22
+  door_head_range_m: [1.6, 2.6]
+  door_max_width_m: 2.6
+  door_min_points: 40
+  window_sill_range_m: [0.25, 1.4]
+  window_min_height_m: 0.35
+  window_max_head_m: 2.6
+  window_evidence_density: 2.0
+  merge_dv_m: 0.15
+  merge_gap_m: 0.20
+  confidence: 0.4
+
+
+freshness:
+  wall_tolerance_m: 0.15          # wall-line end points may move this far between plan passes without re-refining

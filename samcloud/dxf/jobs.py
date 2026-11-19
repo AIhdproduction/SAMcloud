@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from samcloud.bim.jobs import ifc_export_status, run_ifc_export
 from samcloud.dxf.alignment import estimate_alignment
 from samcloud.dxf.cancel import CancelToken, Cancelled, ProgressCallback
 from samcloud.dxf.las_source import Frame, plausibility_warnings, read_las_info
@@ -422,6 +423,63 @@ def run_clean_plan(
     logger.info(f"Orthophoto clean plan cached at {result.project_name}")
 
 
+def refine_openings_status(project_dir: Path, level_id: str | None) -> str:
+    """'fresh' when openings_3d.json matches the plan walls AND the plan already contains it, else 'stale'/'missing'."""
+    from samcloud.bim.openings3d import plan_has_current_openings, refine_status
+
+    status = refine_status(project_dir, level_id or "")
+    if status == "fresh" and not plan_has_current_openings(project_dir, level_id or ""):
+        return "stale"
+    return status
+
+
+def run_refine_openings(
+    project_dir: Path,
+    las_path: Path,
+    level_id: str | None,
+    progress: ProgressCallback,
+    cancel: CancelToken,
+    logger: logging.Logger,
+    mode: str | None = None,
+    source: str | None = None,
+    force: bool = False,
+) -> None:
+    """Measure windows/doors on the wall planes (openings_3d.json); regenerate the clean plan once if the openings changed.
+
+    The refinement fingerprint only contains the wall set, so the plan pass that applies the refined openings
+    never triggers another refinement (no loop). Any refinement failure keeps the 2D openings.
+    """
+    from samcloud.bim.openings3d import plan_has_current_openings, refine_level_openings
+
+    state = load_state(project_dir)
+    info = read_las_info(las_path, cancel=cancel)
+    effective_mode = _effective_mode(mode, state.mode_override, info.mode)
+    if effective_mode != "indoor":
+        raise ValueError("Refine openings: indoor only")
+    level = _resolve_job_level(state, effective_mode, level_id, "opening refinement")
+    assert level is not None
+
+    def inner(start: float, end: float) -> ProgressCallback:
+        def callback(fraction: float, stage: str) -> None:
+            if cancel.is_cancelled():
+                raise Cancelled("Opening refinement cancelled")
+            progress(start + (end - start) * max(0.0, min(1.0, float(fraction))), stage)
+
+        return callback
+
+    logger.info(f"Refining openings for level '{level.name}'...")
+    outcome = refine_level_openings(project_dir, level.id, point_source=las_path, progress=inner(0.0, 0.6), cancel=cancel.is_cancelled, force=force)
+    logger.info(f"Opening refinement: {outcome.status} (mode {outcome.mode or '-'}, {outcome.openings} openings, changed={outcome.changed}, {outcome.seconds:.1f} s) {outcome.message}".rstrip())
+    if outcome.status == "failed":
+        logger.warning("Opening refinement failed; the plan keeps the 2D openings")
+        return
+    if plan_has_current_openings(project_dir, level.id):
+        progress(1.0, "Plan already contains the refined openings")
+        return
+    logger.info("Regenerating the clean plan with the refined openings...")
+    run_clean_plan(project_dir, las_path, level_id, inner(0.6, 1.0), cancel, logger, mode=effective_mode, source=source)
+
+
 def run_export(
     project_dir: Path,
     las_path: Path,
@@ -537,6 +595,28 @@ def run_export(
         progress(1.0, f"Exported {len(exported_files)} DXF file(s)")
 
 
+def run_export_ifc(
+    project_dir: Path,
+    las_path: Path,
+    level_id: str | None,
+    progress: ProgressCallback,
+    cancel: CancelToken,
+    logger: logging.Logger,
+    mode: str | None = None,
+) -> None:
+    """Export the level's IFC model and viewer assets into products/bim/<level>/."""
+    state = load_state(project_dir)
+    info = read_las_info(las_path, cancel=cancel)
+    effective_mode = _effective_mode(mode, state.mode_override, info.mode)
+    if effective_mode != "indoor":
+        raise ValueError("IFC export: indoor only for now")
+    level = _resolve_job_level(state, effective_mode, level_id, "IFC export")
+    assert level is not None
+    logger.info(f"Exporting IFC for level '{level.name}'...")
+    manifest = run_ifc_export(project_dir, level.id, progress, cancel.is_cancelled)
+    logger.info(f"IFC export finished: {manifest['ifc']} (IDS failures: {manifest['ids_failures']})")
+
+
 def run_ortho(
     project_dir: Path,
     las_path: Path,
@@ -624,8 +704,12 @@ def _run_workflow_steps(
     progress: ProgressCallback,
     cancel: CancelToken,
     logger: logging.Logger,
+    timings: dict[str, float] | None = None,
 ) -> None:
-    """Run or skip ordered workflow steps while keeping overall progress monotonic."""
+    """Run or skip ordered workflow steps while keeping overall progress monotonic.
+
+    When ``timings`` is given, each step's wall seconds are stored in it as soon as the step ends
+    (skipped steps count 0), so a caller still has them after a failure or cancel."""
     total = len(steps)
     for index, (name, operation, skip_when) in enumerate(steps, start=1):
         if cancel.is_cancelled():
@@ -634,9 +718,16 @@ def _run_workflow_steps(
         if bool(skip_when() if callable(skip_when) else skip_when):
             logger.info(f"{name}: skipped (up to date)")
             report(1.0, "skipped (up to date)")
+            if timings is not None:
+                timings[name] = 0.0
             continue
         report(0.0, "starting")
-        operation(report)
+        step_started = time.monotonic()
+        try:
+            operation(report)
+        finally:
+            if timings is not None:
+                timings[name] = round(time.monotonic() - step_started, 3)
         if cancel.is_cancelled():
             raise Cancelled("Combined job cancelled")
         report(1.0, "complete")
@@ -669,6 +760,21 @@ def run_prepare_levels(
     )
 
 
+def dxf_run_metrics_path(project_dir: Path) -> Path:
+    """Location of the durable timing record of the latest run_all job."""
+    return Path(project_dir) / "reports" / "dxf_run_metrics.json"
+
+
+def write_dxf_run_metrics(project_dir: Path, metrics: dict[str, Any]) -> Path:
+    """Write the run_all timing record atomically (temp file + replace)."""
+    target = dxf_run_metrics_path(project_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(".dxf_run_metrics.tmp.json")
+    temporary.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    os.replace(temporary, target)
+    return target
+
+
 def run_all(
     project_dir: Path,
     las_path: Path,
@@ -681,7 +787,47 @@ def run_all(
     source: str = "combined",
     force: bool = False,
 ) -> None:
-    """Build the selected target's orthophoto, clean plan, and DXF export."""
+    """Build the selected target's orthophoto, clean plan, and DXF export (+ IFC when indoor).
+
+    The wall time and per-step seconds are recorded in reports/dxf_run_metrics.json, also on failure."""
+    started_at = datetime.now(timezone.utc).isoformat()
+    started_clock = time.monotonic()
+    step_seconds: dict[str, float] = {}
+    status = "failed"
+    try:
+        _run_all_steps(project_dir, las_path, level_id, progress, cancel, logger, mode=mode, source=source, force=force, timings=step_seconds)
+        status = "completed"
+    except Cancelled:
+        status = "cancelled"
+        raise
+    finally:
+        try:
+            write_dxf_run_metrics(project_dir, {
+                "action": "run_all",
+                "level": level_id,
+                "status": status,
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "total_seconds": round(time.monotonic() - started_clock, 3),
+                "step_seconds": step_seconds,
+            })
+        except OSError as exc:
+            logger.warning(f"Could not write DXF/IFC run metrics: {exc}")
+
+
+def _run_all_steps(
+    project_dir: Path,
+    las_path: Path,
+    level_id: str | None,
+    progress: ProgressCallback,
+    cancel: CancelToken,
+    logger: logging.Logger,
+    *,
+    mode: str | None,
+    source: str,
+    force: bool,
+    timings: dict[str, float],
+) -> None:
     state = load_state(project_dir)
     info = read_las_info(las_path, cancel=cancel)
     effective_mode = _effective_mode(mode, state.mode_override, info.mode)
@@ -704,15 +850,30 @@ def run_all(
         clean_result = project_dir / "products" / "dxf" / ("site" if level is None else level.id) / "ortho" / "result.json"
         return exported.is_file() and clean_result.is_file() and exported.stat().st_mtime_ns >= clean_result.stat().st_mtime_ns
 
+    def refine_is_fresh() -> bool:
+        return not force and refine_openings_status(project_dir, level_id) == "fresh"
+
+    def ifc_is_fresh() -> bool:
+        return not force and ifc_export_status(project_dir, level_id or "") == "fresh"
+
     steps.extend(
         [
             ("Build orthophoto", lambda report: run_ortho(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode), lambda: is_fresh("ortho")),
             ("Segment orthophoto", lambda report: run_segment(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode, source=selected_source), lambda: is_fresh("segment")),
             ("Generate clean plan", lambda report: run_clean_plan(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode, source=selected_source), lambda: is_fresh("clean_plan")),
+            *(
+                [("Refine openings", lambda report: run_refine_openings(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode, source=selected_source, force=force), refine_is_fresh)]
+                if effective_mode == "indoor"
+                else []
+            ),
             ("Export DXF", lambda report: run_export(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode, variant="ortho"), export_is_fresh),
         ]
     )
-    _run_workflow_steps(steps, progress, cancel, logger)
+    if effective_mode == "indoor":
+        steps.append(("Export IFC", lambda report: run_export_ifc(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode), ifc_is_fresh))
+    else:
+        logger.info("IFC export: indoor only for now")
+    _run_workflow_steps(steps, progress, cancel, logger, timings)
 
 
 def _effective_mode(requested: str | None, override: str | None, detected: str) -> str:
@@ -747,7 +908,7 @@ def write_export_manifest(export_dir: Path, files: list[Path], coordinates: str)
 def main() -> None:
     """Entry point for CLI module."""
     parser = argparse.ArgumentParser(description="SAMcloud DXF background jobs CLI")
-    parser.add_argument("action", choices=["preview", "align", "levels", "generate", "export", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"], help="Job action to perform")
+    parser.add_argument("action", choices=["preview", "align", "levels", "generate", "export", "export_ifc", "refine_openings", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"], help="Job action to perform")
     parser.add_argument("--project", required=True, type=Path, help="Path to project directory")
     parser.add_argument("--las", required=True, type=Path, help="Path to LAS file")
     parser.add_argument("--level", required=False, default=None, type=str, help="Optional level ID")
@@ -812,6 +973,10 @@ def main() -> None:
             run_generate(project_dir, las_path, level_id, progress, token, logger, mode=mode)
         elif action == "export":
             run_export(project_dir, las_path, level_id, progress, token, logger, mode=mode, variant=variant)
+        elif action == "export_ifc":
+            run_export_ifc(project_dir, las_path, level_id, progress, token, logger, mode=mode)
+        elif action == "refine_openings":
+            run_refine_openings(project_dir, las_path, level_id, progress, token, logger, mode=mode, source=source, force=force)
         elif action == "ortho":
             run_ortho(project_dir, las_path, level_id, progress, token, logger, mode=mode)
         elif action == "segment":

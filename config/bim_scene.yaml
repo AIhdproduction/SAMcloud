@@ -1,0 +1,29 @@
+# Scene building defaults for the IFC export (samcloud/bim/scene_builder.py). Metres.
+storey:
+  fallback_height_m: 2.5
+slab:
+  thickness_m: 0.20
+  close_gap_m: 0.02
+  simplify_m: 0.01
+  min_hole_area_m2: 0.5
+  min_area_m2: 0.5
+ceiling:
+  thickness_m: 0.10
+walls:
+  dedup:
+    max_angle_deg: 3.0
+    offset_factor: 0.5      # centreline offset < factor * thickness
+    min_overlap_share: 0.5  # of the shorter piece
+    chain_gap_m: 0.05       # collinear pieces with a gap up to this are merged
+    chain_thickness_tol_m: 0.03
+  join:
+    reach_m: 0.40           # end of a wall within this distance of another wall's centreline joins it
+    min_angle_deg: 20.0
+openings:
+  host_angle_deg: 12.0
+  host_offset_m: 0.12       # opening centre beyond the wall half thickness plus this is not hosted
+  bridge_gap_m: 0.40
+  min_width_m: 0.20
+qa:
+  max_wall_overlap_share: 0.05
+  max_ceiling_wall_overlap_m2: 0.0001

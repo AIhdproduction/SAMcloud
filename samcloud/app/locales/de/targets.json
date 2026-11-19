@@ -1,5 +1,5 @@
 {
-  "intro": "Druckvorlagen für Passpunkte. Funktioniert auch ohne geöffnetes Projekt.",
+  "intro": "Druckvorlagen für Passpunkte.",
   "apriltag": {
     "title": "AprilTags (150 mm, tag36h11)",
     "hint": "Für Innenräume: Massstab und optional Georeferenzierung. Mit 100 % drucken.",

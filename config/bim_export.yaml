@@ -1,0 +1,74 @@
+# Defaults for the BIM (IFC) export. All heights are metres; the loader in
+# samcloud/bim/plan_model.py multiplies them by units_per_metre where local
+# plan units are needed.
+defaults:
+  door_head_m: 2.0
+  window_sill_m: 0.9
+  window_head_m: 2.1
+  passage_head_m: 2.0
+  upper_cabinet_z_m: [1.45, 2.15]
+  furniture_height_fallback_m: 0.8
+  # Kitchen run: base cabinets 0 .. base, worktop base .. top (so the run is 0.90 m high); a sink sits flush in the worktop, a hob lies on it.
+  kitchen_base_height_m: 0.86
+  kitchen_worktop_top_m: 0.90
+  kitchen_sink_bottom_m: 0.80
+  kitchen_hob_height_m: 0.03
+
+# Default furniture heights by catalogue kind (samcloud/ortho/vector/symbols.py CATALOGUE keys).
+furniture_height_by_kind_m:
+  BED_SINGLE: 0.5
+  BED_DOUBLE: 0.5
+  SOFA: 0.85
+  TABLE_DINING: 0.75
+  WARDROBE: 2.1
+  WC_WALL: 0.4
+  WASHBASIN: 0.85
+  BATHTUB: 0.55
+  SHOWER: 0.1
+  COOKTOP: 0.9
+  KITCHEN_SINK: 0.9
+  KITCHEN_ISLAND: 0.9
+
+# Default furniture heights by lower-case label (semantic label or display name).
+furniture_height_by_label_m:
+  bed: 0.5
+  sofa: 0.85
+  couch: 0.85
+  armchair: 0.85
+  table: 0.75
+  dining table: 0.75
+  desk: 0.75
+  chair: 0.9
+  wardrobe: 2.1
+  "chest of drawers": 0.9
+  cabinet: 1.0
+  shelf: 1.8
+  bookshelf: 1.8
+  "kitchen counter": 0.9
+  "kitchen cabinet": 0.9
+  kitchen: 0.9
+  "tall unit": 2.1
+  refrigerator: 1.8
+  fridge: 1.8
+  "washing machine": 0.85
+  stove: 0.9
+  sink: 0.9
+  toilet: 0.4
+  wc: 0.4
+  washbasin: 0.85
+  bathtub: 0.55
+  shower: 0.1
+  tv: 0.6
+  television: 0.6
+  plant: 0.8
+  objekt: 0.5
+  object: 0.5
+
+# Default heights by built-in kind (A-EINB polyline _einb_kind).
+furniture_height_by_einb_kind_m:
+  counter: 0.9
+  fine_kitchen: 0.9
+  segment: 0.9
+  island: 0.9
+  builtin_front: 2.1
+  tall_unit: 2.1

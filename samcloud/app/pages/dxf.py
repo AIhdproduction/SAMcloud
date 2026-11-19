@@ -7,18 +7,21 @@ is started by an explicit button through DxfPageController.start_job. Settings o
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
 from nicegui import run, ui
 
 from samcloud.app.dxf_controller import LAYER_MODES, MODEL_PROFILES, DxfPageController, dxf_unavailable_reason
-from samcloud.app.dxf_review_canvas import DxfReviewCanvas, background_url, ortho_preview_url, payload_url
+from samcloud.app.dxf_review_canvas import DxfReviewCanvas, background_url, level_key, ortho_preview_url, payload_url
 from samcloud.app.dxf_side_canvas import DxfSideCanvas
 from samcloud.app.dxf_side_view import encode_png_data_url, render_side_view
 from samcloud.app.i18n import t, translate_or
+from samcloud.app.ifc_viewer import IfcViewer, model_url
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
+from samcloud.bim import ui_data as bim_ui_data
 from samcloud.dxf.job_runner import DxfJobRunner
 
 ACTION_LABELS: dict[str, str] = {
@@ -32,6 +35,8 @@ ACTION_LABELS: dict[str, str] = {
     "clean_plan": "dxf.action.clean_plan",
     "prepare_levels": "dxf.action.prepare_levels",
     "run_all": "dxf.action.run_all",
+    "export_ifc": "dxf.action.export_ifc",
+    "refine_openings": "dxf.action.refine_openings",
 }
 """Job action -> translation key of its display label (resolved at render time by _action_label)."""
 
@@ -44,6 +49,63 @@ def _action_label(action: str, fallback: str | None = None) -> str:
     return t(key)
 
 
+_STEP_NAME_KEYS: dict[str, str] = {
+    "Build orthophoto": "dxf.stage.step_names.ortho",
+    "Segment orthophoto": "dxf.stage.step_names.segment",
+    "Generate clean plan": "dxf.stage.step_names.clean_plan",
+    "Refine openings": "dxf.stage.step_names.refine_openings",
+    "Export DXF": "dxf.stage.step_names.export",
+    "Export IFC": "dxf.stage.step_names.export_ifc",
+}
+_STEP_STATE_KEYS: dict[str, str] = {
+    "starting": "dxf.stage.states.starting",
+    "complete": "dxf.stage.states.complete",
+    "skipped (up to date)": "dxf.stage.states.skipped",
+}
+_STAGE_PATTERN = re.compile(r"^Step (\d+)/(\d+): (.+?) – (.*)$")
+
+
+_INNER_STAGE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern), key)
+    for pattern, key in (
+        (r"^Selecting photographs$", "dxf.stage.inner.selecting_photos"),
+        (r"^Detecting windows and doors$", "dxf.stage.inner.detecting_openings"),
+        (r"^Detecting openings from points$", "dxf.stage.inner.detecting_openings_points"),
+        (r"^Refined openings are up to date$", "dxf.stage.inner.refine_up_to_date"),
+        (r"^Refined (?P<count>\d+) openings \((?P<mode>[^)]*)\)$", "dxf.stage.inner.refined"),
+        (r"^Reading points (?P<amount>[\d.]+) M$", "dxf.stage.inner.reading_points"),
+        (r"^Scoring photographs (?P<index>\d+)/(?P<total>\d+)$", "dxf.stage.inner.scoring_photos"),
+        (r"^Voting photographs (?P<index>\d+)/(?P<total>\d+)$", "dxf.stage.inner.voting_photos"),
+        (r"^Plan already contains the refined openings$", "dxf.stage.inner.plan_has_openings"),
+    )
+)
+
+
+def _inner_stage_label(stage: str) -> str:
+    """Translate the inner stage texts of the opening refinement; unknown texts stay as they are."""
+    for pattern, key in _INNER_STAGE_PATTERNS:
+        match = pattern.match(stage)
+        if match is not None:
+            return t(key, **match.groupdict())
+    return stage
+
+
+def _stage_label(stage: str) -> str:
+    """Translate the combined workflow stage ("Step 4/7: Refine openings - starting"); other stages stay as they are."""
+    match = _STAGE_PATTERN.match(stage)
+    if match is None:
+        return _inner_stage_label(stage)
+    index, total, name, state = match.groups()
+    name_key = _STEP_NAME_KEYS.get(name)
+    state_key = _STEP_STATE_KEYS.get(state)
+    return t(
+        "dxf.stage.step",
+        index=index, total=total,
+        name=t(name_key) if name_key else name,
+        stage=t(state_key) if state_key else _inner_stage_label(state),
+    )
+
+
 def _job_state_label(job_state: str) -> str:
     """Translated job state (done, failed, cancelled, ...); unknown states are shown as-is."""
     return translate_or(f"dxf.job_state.{job_state}", job_state)
@@ -52,6 +114,23 @@ def _job_state_label(job_state: str) -> str:
 def _cache_status_label(status: str) -> str:
     """Translated cache freshness (missing / ok / stale)."""
     return translate_or(f"dxf.cache_status.{status}", status)
+
+
+def _ifc_cache_status(controller: DxfPageController, level_id: str | None) -> str:
+    """Freshness of the IFC export of a level in the cache-status vocabulary (missing / ok / stale)."""
+    status = bim_ui_data.ifc_status(controller.project_dir, level_key(level_id))
+    return "ok" if status == "fresh" else status
+
+
+def _refine_cache_status(controller: DxfPageController, level_id: str | None) -> str:
+    """Freshness of the opening refinement of a level in the cache-status vocabulary (missing / ok / stale)."""
+    from samcloud.dxf.jobs import refine_openings_status
+
+    try:
+        status = refine_openings_status(controller.project_dir, level_id)
+    except Exception:  # noqa: BLE001 - an unreadable cache counts as stale in the checklist
+        return "stale"
+    return "ok" if status == "fresh" else status
 
 
 def _mode_label(mode: str) -> str:
@@ -71,6 +150,7 @@ _STYLE = """
 .sam-result-fullscreen .sam-result-canvas-box { height:100%!important; }
 .sam-result-fullscreen .sam-result-side { overflow-y:auto; overflow-x:hidden; min-width:0; max-height:100%; flex:none; }
 .sam-result-side .q-checkbox__label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.q-slider.q-slider--disabled, .q-slider.disabled { opacity:.38!important; cursor:not-allowed!important; filter:grayscale(1); }
 .sam-dxf-log { max-height:220px; overflow:auto; white-space:pre-wrap; font-family:monospace; font-size:11px; color:#c9d8e4; background:#050b12; border:1px solid #20394b; border-radius:6px; padding:8px; }
 </style>
 """
@@ -150,6 +230,9 @@ class DxfPage:
         self.result_row = None
         self.result_opacity_slider = None
         self.result_fullscreen = False
+        self.ifc_viewer = None
+        self.ifc_row = None
+        self.ifc_fullscreen = False
         self.run_all_button = None
         self.job_stage = self.job_progress = self.cancel_button = self.job_log = None
         self.build_header()
@@ -162,6 +245,7 @@ class DxfPage:
             return
         self.build_compute_card()
         self.build_result_card()
+        self.build_ifc_card()
         with ui.expansion(t("dxf.page.advanced"), icon="tune", value=False).classes("w-full").mark("advanced"):
             self.stale_banner()
             self.build_preparation()
@@ -254,7 +338,7 @@ class DxfPage:
         action = _action_label(raw_action, raw_action or t("dxf.job.fallback"))
         job_state = str(status.get("state", "idle"))
         if running:
-            self.job_stage.set_text(t("dxf.job.running", action=action, stage=status.get("stage", ""),
+            self.job_stage.set_text(t("dxf.job.running", action=action, stage=_stage_label(str(status.get("stage", ""))),
                                       percent=f"{float(status.get('fraction', 0.0)) * 100:.0f}"))
         elif job_state == "idle":
             self.job_stage.set_text(t("dxf.job.idle"))
@@ -376,7 +460,9 @@ class DxfPage:
             (t("dxf.compute.step_ortho"), controller.ortho_status(level_id)),
             (t("dxf.compute.step_segmentation"), controller.segment_status(level_id)),
             (t("dxf.compute.step_clean_plan"), controller.plan_status(level_id, "ortho")),
+            *([(t("dxf.compute.step_refine"), _refine_cache_status(controller, level_id))] if controller.mode == "indoor" else []),
             (t("dxf.compute.step_export"), controller.plan_status(level_id, "ortho")),
+            (t("dxf.compute.step_ifc"), _ifc_cache_status(controller, level_id)),
         ]
         with ui.column().classes("gap-1"):
             for name, current in rows:
@@ -595,6 +681,12 @@ class DxfPage:
             with ui.row().classes("items-center gap-2"):
                 ui.button(t("dxf.result.open_dxf_folder"), icon="folder_open", on_click=self.open_dxf_folder).props("flat no-caps")
                 ui.button(t("dxf.result.download_dxf"), icon="download", on_click=lambda: self.download_dxf(level)).props("flat no-caps")
+                has_ifc = bim_ui_data.find_ifc(controller.project_dir, level_key(level)) is not None
+                ifc_button = ui.button(t("ifc.card.download"), icon="download", on_click=lambda: self.download_ifc(level)).props("flat no-caps").mark("download-ifc")
+                ifc_button.set_enabled(has_ifc)
+                if not has_ifc:
+                    with ifc_button:
+                        ui.tooltip(t("ifc.card.download_missing"))
                 ui.button(t("dxf.view.save_snapshot"), icon="photo_camera", on_click=lambda: self.save_snapshot("ortho", level)).props("flat no-caps")
 
     def build_result_canvas(self, result: Any, level: str | None) -> None:
@@ -721,6 +813,215 @@ class DxfPage:
             return
         target = matches[-1]
         ui.download(target.read_bytes(), filename=target.name, media_type="application/dxf")
+
+    def download_ifc(self, level: str | None) -> None:
+        target = bim_ui_data.find_ifc(self.controller.project_dir, level_key(level))
+        if target is None:
+            ui.notify(t("ifc.card.no_file"), type="warning")
+            return
+        ui.download(target.read_bytes(), filename=target.name, media_type="application/x-step")
+
+    # ------------------------------------------------------------------ IFC viewer
+
+    def build_ifc_card(self) -> None:
+        controller = self.controller
+        level = self.compute_level if controller.mode == "indoor" else None
+        with ui.card().classes("w-full gap-3").mark("ifc-card"):
+            ui.label(t("ifc.card.title")).classes("sam-section-title")
+            if controller.mode == "indoor" and level is None:
+                ui.label(t("ifc.card.empty")).classes("sam-muted").mark("ifc-empty")
+                return
+            key = level_key(level)
+            glb = bim_ui_data.glb_path(controller.project_dir, key)
+            data = bim_ui_data.props(controller.project_dir, key)
+            if glb is None or not data:
+                ui.label(t("ifc.card.empty")).classes("sam-muted").mark("ifc-empty")
+                return
+            by_node, counts = bim_ui_data.category_index(data)
+            self.ifc_hidden = {name for name in bim_ui_data.HIDDEN_BY_DEFAULT if name in counts}
+            self.ifc_checks: dict[str, ui.checkbox] = {}
+            if bim_ui_data.ifc_status(controller.project_dir, key) == "stale":
+                _banner(t("ifc.card.stale"), "warning").mark("ifc-stale")
+            qa = bim_ui_data.qa(controller.project_dir, key)
+            if isinstance(qa.get("ids_failures"), int):
+                ui.label(t("ifc.card.qa_failures", count=qa["ids_failures"])).classes("sam-muted text-sm").mark("ifc-qa")
+            self.ifc_fullscreen = False
+            with ui.row().classes("w-full gap-4 no-wrap items-stretch") as ifc_row:
+                self.ifc_row = ifc_row
+                with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:520px;min-width:0"):
+                    self.ifc_viewer = IfcViewer().classes("w-full h-full").mark("ifc-viewer")
+                    self.ifc_viewer.show(model_url(key, glb.stat().st_mtime_ns), by_node)
+                    self.ifc_viewer.set_hidden_classes(self.ifc_hidden)
+                    self.ifc_viewer.on("pick", lambda event: self.on_ifc_pick(event.args, key))
+                    self.ifc_viewer.on("ready", lambda event: self.on_ifc_ready(event.args))
+                    self.ifc_fullscreen_button = ui.button(icon="fullscreen", on_click=self.toggle_ifc_fullscreen).props(
+                        "flat round dense color=white").classes("absolute").style(
+                        "top:8px;left:8px;z-index:10;background:rgba(9,19,29,.65)").mark("ifc-fullscreen")
+                    with self.ifc_fullscreen_button:
+                        self.ifc_fullscreen_tooltip = ui.tooltip(t("dxf.result.fullscreen"))
+                with ui.column().classes("w-80 gap-2 sam-result-side"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.button(t("ifc.viewer.fit"), on_click=lambda: self.ifc_viewer.fit() if self.ifc_viewer else None).props("flat no-caps")
+                        ui.button(t("ifc.panel.all"), on_click=lambda: self.set_all_ifc_categories(True)).props("flat no-caps").mark("ifc-all")
+                        ui.button(t("ifc.panel.none"), on_click=lambda: self.set_all_ifc_categories(False)).props("flat no-caps").mark("ifc-none")
+                    ui.label(t("ifc.panel.types")).classes("text-sm")
+                    for name, count in counts.items():
+                        with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                            self.ifc_checks[name] = ui.checkbox(
+                                t(f"ifc.category.{name}"), value=name not in self.ifc_hidden,
+                                on_change=lambda event, category=name: self.toggle_ifc_category(category, bool(event.value)),
+                            ).mark(f"ifc-class-{name}")
+                            ui.label(str(count)).classes("sam-muted text-xs")
+                    ui.label(t("ifc.panel.section")).classes("text-sm q-mt-sm")
+                    self.ifc_section_label = ui.label(t("ifc.panel.section_off")).classes("sam-muted text-xs")
+                    self.ifc_section_slider = ui.slider(
+                        min=0.0, max=3.0, step=0.05, value=1.2, on_change=lambda event: self.set_ifc_section(event.value),
+                    ).props('label label-value="1.20 m"').mark("ifc-section")
+                    self.ifc_section_slider.set_enabled(False)  # greyed out until the section switch is on
+                    self.ifc_section_switch = ui.switch(
+                        t("ifc.panel.section"), value=False,
+                        on_change=lambda event: self.set_ifc_section(self.ifc_section_slider.value),
+                    ).mark("ifc-section-on")
+                    with ui.row().classes("w-full items-center justify-between no-wrap q-mt-sm"):
+                        ui.label(t("ifc.props.title")).classes("text-sm")
+                        ui.switch(t("ifc.props.show_all"), value=False,
+                                  on_change=lambda event: self.set_ifc_show_all(bool(event.value))).props("dense").classes("text-xs").mark("ifc-props-all")
+                    self.ifc_props_box = ui.column().classes("gap-1 w-full").style(
+                        "max-height:340px;overflow-y:auto;padding-right:6px").mark("ifc-props")
+                    self.ifc_show_all = False
+                    self.ifc_picked: str | None = None
+                    self.ifc_key = key
+                    self.show_ifc_properties(None, key)
+            ui.keyboard(on_key=self.on_ifc_key, ignore=["input", "select", "textarea"])
+
+    def toggle_ifc_category(self, category: str, visible: bool) -> None:
+        if visible:
+            self.ifc_hidden.discard(category)
+        else:
+            self.ifc_hidden.add(category)
+        if self.ifc_viewer is not None:
+            self.ifc_viewer.set_hidden_classes(self.ifc_hidden)
+
+    def set_all_ifc_categories(self, visible: bool) -> None:
+        self.ifc_hidden = set() if visible else set(self.ifc_checks)
+        for box in self.ifc_checks.values():
+            box.value = visible
+        if self.ifc_viewer is not None:
+            self.ifc_viewer.set_hidden_classes(self.ifc_hidden)
+
+    def set_ifc_section(self, height: float | None) -> None:
+        """Horizontal section: the slider height while the section switch is on, otherwise no clipping."""
+        self.ifc_section_slider.set_enabled(bool(self.ifc_section_switch.value))
+        if height is not None:
+            height = round(float(height), 2)
+            self.ifc_section_slider.props(f'label-value="{height:.2f} m"')
+        if not self.ifc_section_switch.value:
+            height = None
+        if height is None:
+            self.ifc_section_label.set_text(t("ifc.panel.section_off"))
+        else:
+            self.ifc_section_label.set_text(t("ifc.panel.section_height", height=f"{height:.2f}"))
+        if self.ifc_viewer is not None:
+            self.ifc_viewer.set_clip_height(height)
+
+    def on_ifc_ready(self, args: dict[str, Any]) -> None:
+        """Fit the section slider to the model's height range once the GLB is loaded."""
+        low = float(args.get("min_height", 0.0))
+        high = float(args.get("max_height", low + 3.0))
+        if high <= low:
+            return
+        # numeric props (a "min=0.0" string prop makes Quasar call toFixed on a string)
+        self.ifc_section_slider.props["min"] = round(low, 3)
+        self.ifc_section_slider.props["max"] = round(high, 3)
+        self.ifc_section_slider.update()
+        self.ifc_section_slider.value = round(min(high, low + 1.2), 2)
+
+    def on_ifc_pick(self, args: dict[str, Any], key: str) -> None:
+        global_id = args.get("global_id")
+        self.show_ifc_properties(str(global_id) if global_id else None, key)
+
+    def set_ifc_show_all(self, show_all: bool) -> None:
+        self.ifc_show_all = show_all
+        self.show_ifc_properties(self.ifc_picked, self.ifc_key)
+
+    def show_ifc_properties(self, global_id: str | None, key: str) -> None:
+        """Fill the property panel from props.json: name, class, type, opening details and property sets.
+
+        Only name, class, type, dimensions (Qto_*), SAMcloud_Scan and Pset_*Common are shown by default;
+        the "show all" switch adds the internal sets (Raumlot_*, Lining, Panel ...).
+        """
+        self.ifc_picked = global_id
+        box = self.ifc_props_box
+        box.clear()
+        with box:
+            if global_id is None:
+                ui.label(t("ifc.props.none")).classes("sam-muted text-xs")
+                return
+            info = (bim_ui_data.props(self.controller.project_dir, key).get("elements") or {}).get(global_id)
+            if not isinstance(info, dict):
+                ui.label(t("ifc.props.unknown")).classes("sam-muted text-xs")
+                return
+            self._property_rows([
+                (t("ifc.props.name"), info.get("name")), (t("ifc.props.class"), info.get("ifc_class")),
+                (t("ifc.props.type"), info.get("predefined_type")), (t("ifc.props.storey"), info.get("storey")),
+                (t("ifc.props.id"), global_id),
+            ])
+            details = bim_ui_data.opening_details(info)
+            if details:
+                self._opening_detail_rows(details)
+            for pset, values in bim_ui_data.visible_psets(info, self.ifc_show_all):
+                ui.label(str(pset)).classes("text-xs q-mt-xs").style("font-weight:600")
+                if isinstance(values, dict):
+                    self._property_rows(list(values.items()))
+
+    @staticmethod
+    def _opening_detail_rows(details: dict[str, Any]) -> None:
+        """Window / door summary: width, height, sill (BRH), head (STH), mullions, glazed."""
+        ui.label(t("ifc.props.opening")).classes("text-xs q-mt-xs").style("font-weight:600")
+        rows: list[tuple[Any, Any]] = []
+        for key, label in (("width", "ifc.props.width"), ("height", "ifc.props.height"),
+                           ("sill", "ifc.props.sill"), ("head", "ifc.props.head")):
+            if key in details:
+                rows.append((t(label), t("ifc.props.metres", value=f"{details[key]:.2f}")))
+        if "mullions" in details:
+            rows.append((t("ifc.props.mullions"), str(details["mullions"])))
+        if "glazed" in details:
+            rows.append((t("ifc.props.glazed"), t("ifc.props.yes") if details["glazed"] else t("ifc.props.no")))
+        if "hinge" in details:
+            rows.append((t("ifc.props.hinge"), t(f"ifc.props.hinge_{details['hinge']}")))
+        if "swing" in details:
+            rows.append((t("ifc.props.swing"), str(details["swing"])))
+        if "leaf_angle" in details:
+            rows.append((t("ifc.props.leaf_angle"), f"{details['leaf_angle']:.0f} deg"))
+        DxfPage._property_rows(rows)
+
+    @staticmethod
+    def _property_rows(rows: list[tuple[Any, Any]]) -> None:
+        for label, value in rows:
+            if value is None or value == "":
+                continue
+            with ui.row().classes("w-full no-wrap gap-2 items-baseline"):
+                ui.label(str(label)).classes("sam-muted text-xs").style("flex:0 0 42%;min-width:0;overflow-wrap:anywhere")
+                ui.label(str(value)).classes("text-xs").style("flex:1;min-width:0;overflow-wrap:anywhere")
+
+    def toggle_ifc_fullscreen(self) -> None:
+        self.set_ifc_fullscreen(not self.ifc_fullscreen)
+
+    def set_ifc_fullscreen(self, active: bool) -> None:
+        row = self.ifc_row
+        if row is None:
+            return
+        self.ifc_fullscreen = active
+        if active:
+            row.classes(add="sam-result-fullscreen")
+        else:
+            row.classes(remove="sam-result-fullscreen")
+        self.ifc_fullscreen_button.props(f"icon={'fullscreen_exit' if active else 'fullscreen'}")
+        self.ifc_fullscreen_tooltip.set_text(t("dxf.result.exit_fullscreen") if active else t("dxf.result.fullscreen"))
+
+    def on_ifc_key(self, event: Any) -> None:
+        if self.ifc_fullscreen and event.action.keydown and event.key.escape:
+            self.set_ifc_fullscreen(False)
 
     def build_review_section(self) -> None:
         self.review_section()

@@ -68,10 +68,15 @@ class DoubleWallSettings:
     jog_m: float = 0.04
     min_piece_area_m2: float = 0.003
     isolated_max_length_m: float = 1.2
+    stub_min_length_m: float = 0.6
+    stub_end_reach_m: float = 0.10
+    isolated_free_max_length_m: float = 2.5
+    isolated_free_room_distance_m: float = 0.6
     keep_isolated_faces: bool = False
     room_edge_walls: bool = True
     room_edge_min_area_m2: float = 2.0
     room_edge_min_length_m: float = 0.30
+    room_edge_opening_reach_m: float = 0.8  # room edges this close to a parallel door/window span invent no wall there (0 = off)
     hatch: bool = True
     bound_rooms: bool = True
     room_gap_m: float = 0.20
@@ -86,6 +91,10 @@ class DoubleWallSettings:
     visibility_min_share: float = 0.15
     door_leaf_reorient: bool = True
     door_detect: bool = True
+    # The openings come from the 3D refinement (measured frames, leaves, passages): the 2D door heuristics (leaf reorientation,
+    # solid-door rejection, doorway detection, doors made of leaf faces) must not move, drop or add openings; a leaf face is still
+    # removed from the wall faces.
+    refined_openings: bool = False
     door_min_width_m: float = 0.55
     door_max_width_m: float = 1.40
     door_floor_share: float = 0.15
@@ -105,6 +114,24 @@ class DoubleWallSettings:
     tall_unit_max_free: float = 0.15
     tall_unit_max_low: float = 0.25
     tall_unit_fridge_m: float = 0.60
+    # A wall run whose body lies on kitchen / cabinet labels and whose points show no wall (wall-class points of wall
+    # height) is a cabinet front taken as a wall: the run is dropped (the counter run / unit outlines draw the cabinets).
+    # A real wall behind cabinets keeps its wall-class points above and beside them and stays.
+    cabinet_walls: bool = True
+    cabinet_min_share: float = 0.50
+    cabinet_max_wall_share: float = 0.50
+    cabinet_dilate_m: float = 0.05
+    # A stretch of a measured wall run without any wall-class column (no wall points of wall height) that lies on or is flanked
+    # (within cabinet_flank_m, either side) by kitchen cabinet labels, at least cabinet_stretch_min_m long, is a cabinet column
+    # (its side panels were taken as a wall): the stretch is dropped and, where a built-in unit stands there, becomes a tall unit.
+    cabinet_flank_m: float = 0.50
+    cabinet_stretch_min_m: float = 0.60
+    cabinet_stretch_gap_m: float = 0.25
+    # ... and only when the run is mostly such a column: flagged samples >= cabinet_run_min_share of the run and wall-supported
+    # samples <= cabinet_run_max_support (a real wall that is merely weakly measured beside a kitchen unit keeps its run).
+    cabinet_remnant_min_m: float = 0.45  # what is left of the run beside a removed column is kept only when it is at least this long (no wall stubs)
+    cabinet_run_min_share: float = 0.40
+    cabinet_run_max_support: float = 0.15
 
 
 @dataclass(slots=True)
@@ -119,6 +146,7 @@ class TallUnitEvidence:
     front: np.ndarray
     fridge: np.ndarray
     low: np.ndarray
+    cabinet: np.ndarray | None = None  # kitchen / cabinet-labelled pixels (counter, cabinet, stove, fridge, sink ...)
 
 
 @dataclass(slots=True)
@@ -227,6 +255,7 @@ def build_double_walls(
     evidence: WallEvidence | None = None,
     builtins: Iterable[Polygon] = (),
     tall_units: TallUnitEvidence | None = None,
+    close_spans: Iterable[dict[str, Any]] = (),
 ) -> DoubleWallResult:
     """Turn single measured wall faces into closed double-line wall bodies.
 
@@ -238,6 +267,9 @@ def build_double_walls(
     outline wall is completed through them.  ``tall_units`` (optional) enables the tall built-in unit test:
     a wall face standing at the front of a tall kitchen unit (fridge, oven tower) is removed, the unit is
     returned in ``tall_units`` and the wall behind it is kept or continued (see ``_tall_unit_runs``).
+
+    ``close_spans`` ({"center", "axis_angle", "width"} each) are spans the 3D refinement classified as no opening: where the
+    measured walls on both sides leave a gap there, the host wall is continued across it (``door-fill`` run).
 
     The returned ``openings`` are the input openings after door-leaf correction,
     overlap resolution and door detection; ``openings_changed`` lists (old, new) pairs,
@@ -252,12 +284,14 @@ def build_double_walls(
         faces, face_stats = _filter_faces_by_evidence(faces, evidence, np.asarray(valid, dtype=bool), None if furniture is None else np.asarray(furniture, dtype=bool), grid, upm, settings)
         openings = _resolve_overlapping_openings(openings, upm)
         if settings.door_leaf_reorient:
-            openings = _reorient_door_leaves(openings, faces, evidence, grid, upm, settings)
+            if not settings.refined_openings:
+                openings = _reorient_door_leaves(openings, faces, evidence, grid, upm, settings)
             faces, leaf_doors = _leaf_faces_to_doors(faces, openings, evidence, grid, upm, settings)
             face_stats["double_wall_leaf_faces"] = len(leaf_doors)
-            openings = list(openings) + leaf_doors
+            if not settings.refined_openings:
+                openings = list(openings) + leaf_doors
     faces, reveals = _split_reveals(faces, openings, upm, settings)
-    faces, isolated = _split_isolated(faces, upm, settings)
+    faces, isolated = _split_isolated(faces, upm, settings, room_list)
     if settings.keep_isolated_faces:
         passthrough.extend((-1, {**face.entity, "points": [face.start.tolist(), face.end.tolist()], "_isolated_face": True}) for face in isolated)
     stats: dict[str, Any] = {"double_wall_faces": len(faces), "double_wall_passthrough": len(passthrough), "double_wall_isolated_faces": len(isolated), "double_wall_reveals_dropped": len(reveals), **face_stats}
@@ -297,7 +331,14 @@ def build_double_walls(
     if tall_units is not None and settings.tall_units:
         unit_shapes, unit_stats = _tall_unit_runs(runs, faces, free, tall_units, grid, upm, settings)
         stats.update(unit_stats)
-    if evidence is not None and settings.door_detect:
+    if tall_units is not None and tall_units.cabinet is not None and evidence is not None and settings.cabinet_walls:
+        cabinet_stats, cabinet_units = _cabinet_wall_runs(runs, faces, tall_units.cabinet, evidence, grid, upm, settings, [item for item in builtins if isinstance(item, Polygon) and not item.is_empty], free)
+        stats.update(cabinet_stats)
+        unit_shapes.extend(cabinet_units)
+    close_stats = _close_spans(list(close_spans), runs, faces, upm)
+    if close_stats:
+        stats["double_wall_spans_closed"] = close_stats
+    if evidence is not None and settings.door_detect and not settings.refined_openings:
         openings, rejected = _reject_solid_doors(openings, runs, faces, evidence, grid, upm)
         stats["double_wall_doors_rejected"] = rejected
         detected = _detect_wall_doors(runs, faces, openings, evidence, grid, upm, settings)
@@ -513,7 +554,7 @@ def update_opening_symbols(layers: dict[str, list[dict[str, Any]]], openings: li
                     face = high if float(np.dot(leaf, normal)) > 0.0 else low
                     entity["point"] = (centre + axis * along + normal * face).tolist()
                     updated += 1
-                elif entity.get("type") == "line" and entity.get("_jamb"):
+                elif entity.get("type") == "line" and (entity.get("_jamb") or entity.get("_mullion")):
                     start = np.asarray(entity["start"][:2], dtype=float)
                     along = float(np.dot(start - centre, axis))
                     entity["start"] = (centre + axis * along + normal * low).tolist()
@@ -589,6 +630,38 @@ def _opening_changes(before: list[Any], after: list[Any]) -> list[tuple[Any, Any
             continue
         changes.append((getattr(item, "_replaces", None), item))
     return changes
+
+
+def _neighbour_slab(centre: np.ndarray, axis: np.ndarray, half: float, runs: list[WallRun], face_of: dict[int, _Face], upm: float, settings: DoubleWallSettings) -> tuple[float, float] | None:
+    """Slab (offsets across the wall) of an opening that no wall run hosts: the wall continues the nearest parallel run.
+
+    Used for an opening that fills a whole short wall segment (no wall data inside the gap, so no run covers it): the
+    collinear run that ends beside the gap decides which slab the opening cuts.  The run must lie on the opening's line
+    (within the wall thickness) and end within ``jamb_reach_m`` + 0.15 m of the span.  None when no run qualifies.
+    """
+    normal = np.asarray((-axis[1], axis[0]))
+    limit = settings.max_thickness_m * upm
+    best: tuple[float, float, float] | None = None
+    for run in runs:
+        face = face_of[run.face]
+        if not _parallel(face.direction, axis, 10.0):
+            continue
+        offset = float(np.dot(centre - face.start, face.normal))
+        if abs(offset) > limit + run.thickness:
+            continue
+        along = float(np.dot(centre - face.start, face.direction))
+        gap = max(run.start - run.extend_start - (along + half), (along - half) - (run.end + run.extend_end), 0.0)
+        if gap > (settings.jamb_reach_m + 0.15) * upm:
+            continue
+        face_across = float(np.dot(face.start - centre, normal))
+        far_across = float(np.dot(face.point(0.0, run.thickness) - centre, normal))
+        low, high = min(face_across, far_across), max(face_across, far_across)
+        distance = abs(offset) + gap  # the run nearest to the opening (across and along) decides
+        if best is None or distance < best[0]:
+            best = (distance, low, high)
+    if best is None or best[2] - best[1] < 0.05 * upm:
+        return None
+    return best[1], best[2]
 
 
 def _bit_heights(bits: np.ndarray, bins: int, height: float) -> tuple[np.ndarray, np.ndarray]:
@@ -947,6 +1020,51 @@ def _reorient_door_leaves(openings: list[Any], faces: list[_Face], evidence: Wal
     return output
 
 
+def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_Face], upm: float, reach_m: float = 1.5) -> int:
+    """Continue the host wall across spans that are no opening (a gap between the measured faces); returns how many were closed.
+
+    The host is the nearest wall run parallel to the span and standing in its line.  A span the runs already cover (at least
+    80 %, e.g. by an invented room-edge wall) is left alone.
+    """
+    face_of = {face.index: face for face in faces}
+    reach = reach_m * upm
+    closed = 0
+    for span in spans:
+        centre = np.asarray(span["center"], dtype=float)[:2]
+        axis = np.asarray((math.cos(float(span["axis_angle"])), math.sin(float(span["axis_angle"]))))
+        half = float(span["width"]) / 2.0
+        candidates: list[tuple[float, WallRun, _Face, float, float]] = []
+        covered: list[LineString] = []
+        for run in runs:
+            face = face_of[run.face]
+            if run.thickness <= 0.0 or not _parallel(face.direction, axis, 10.0):
+                continue
+            across = float(np.dot(centre - face.start, face.solid_normal))
+            if not -0.10 * upm <= across <= run.thickness + 0.10 * upm:
+                continue
+            ends = sorted(float(np.dot(face.point(position) - centre, axis)) for position in (run.start, run.end))
+            overlap = (max(ends[0], -half), min(ends[1], half))
+            if overlap[1] > overlap[0]:
+                covered.append(LineString([(overlap[0], 0.0), (overlap[1], 0.0)]))
+            a = float(np.dot(centre - axis * half - face.start, face.direction))
+            b = float(np.dot(centre + axis * half - face.start, face.direction))
+            low, high = min(a, b), max(a, b)
+            candidates.append((max(run.start - high, low - run.end, 0.0), run, face, low, high))
+        if not candidates or (covered and unary_union(covered).length >= 0.8 * 2.0 * half):
+            continue
+        distance, run, face, low, high = min(candidates, key=lambda item: item[0])
+        if distance > reach:
+            continue
+        low, high = low - 0.02 * upm, high + 0.02 * upm
+        filler = _Face(len(faces), face.point(low), face.point(high), {"type": "polyline", "points": [], "closed": False, "_source": "door_fill"}, side=face.side)
+        filler.start, filler.end = face.start + face.direction * low, face.start + face.direction * high
+        faces.append(filler)
+        face_of[filler.index] = filler
+        runs.append(WallRun(filler.index, 0.0, filler.length, run.thickness, run.kind, "door-fill", group=run.group))
+        closed += 1
+    return closed
+
+
 def _reject_solid_doors(openings: list[Any], runs: list[WallRun], faces: list[_Face], evidence: WallEvidence, grid: RasterGrid, upm: float) -> tuple[list[Any], int]:
     """Drop a door whose span is solid wall at sill and mid height (a gap between face pieces, not a doorway).
 
@@ -1121,22 +1239,46 @@ def _split_reveals(faces: list[_Face], openings: list[Any], upm: float, settings
     return kept, reveals
 
 
-def _split_isolated(faces: list[_Face], upm: float, settings: DoubleWallSettings) -> tuple[list[_Face], list[_Face]]:
-    """A short face with no other wall near either end is a furniture side or stub, not a wall."""
+def _split_isolated(faces: list[_Face], upm: float, settings: DoubleWallSettings, rooms: Iterable[Polygon] = ()) -> tuple[list[_Face], list[_Face]]:
+    """Faces that are furniture sides or stubs, not walls.
+
+    * A face shorter than ``isolated_max_length_m`` with no other wall near either end.
+    * (stub rule) A face shorter than ``stub_min_length_m`` with a free end: a real jamb or return touches walls at both ends.
+    * (free-face rule) A face shorter than ``isolated_free_max_length_m`` that is free at both ends and farther than
+      ``isolated_free_room_distance_m`` from every ceiling room: a free-standing object side, not a wall.
+    Built-in fronts, niche panels and room-edge faces are exempt from the two extra rules.
+    """
     lines = [LineString([tuple(face.start), tuple(face.end)]) for face in faces]
     reach = settings.joint_reach_m * upm
+    room_union = unary_union([room for room in rooms if room.area > 0.5 * upm * upm]) if settings.isolated_free_max_length_m > 0 else None
     kept: list[_Face] = []
     isolated: list[_Face] = []
     for face, line in zip(faces, lines, strict=True):
-        if face.length >= settings.isolated_max_length_m * upm:
+        exempt = face.entity.get("_source") in ("niche_panel", "builtin_front", "room_edge")
+        short = face.length < settings.isolated_max_length_m * upm
+        stub = not exempt and face.length < settings.stub_min_length_m * upm
+        free_candidate = not exempt and face.length < settings.isolated_free_max_length_m * upm
+        if not (short or stub or free_candidate):
             kept.append(face)
             continue
         others = [other for other_line, other in zip(lines, faces, strict=True) if other is not face]
-        near = any(
-            min(LineString([tuple(other.start), tuple(other.end)]).distance(Point(tuple(point))) for other in others) <= reach
+        ends_near = [
+            bool(others) and min(LineString([tuple(other.start), tuple(other.end)]).distance(Point(tuple(point))) for other in others) <= reach
             for point in (face.start, face.end)
-        ) if others else False
-        (kept if near else isolated).append(face)
+        ]
+        drop = False
+        if stub:
+            # A real jamb / return touches a wall at both ends (stub_end_reach_m); a face 0.15-0.35 m beside one is a free object edge.
+            touching = [
+                bool(others) and min(LineString([tuple(other.start), tuple(other.end)]).distance(Point(tuple(point))) for other in others) <= settings.stub_end_reach_m * upm
+                for point in (face.start, face.end)
+            ] if settings.stub_end_reach_m > 0.0 else ends_near
+            drop = not all(touching)
+        elif short:
+            drop = not any(ends_near)
+        if not drop and free_candidate and not any(ends_near) and (room_union is None or room_union.is_empty or room_union.distance(line) > settings.isolated_free_room_distance_m * upm):
+            drop = True
+        (isolated if drop else kept).append(face)
     for number, face in enumerate(kept):
         face.index = number
     return kept, isolated
@@ -1479,6 +1621,10 @@ def _room_edge_runs(faces: list[_Face], runs: list[WallRun], rooms: list[Polygon
     step = 0.05 * upm
     units = unary_union([item.buffer(-0.01 * upm) for item in builtins]) if builtins else GeometryCollection()
     added: list[WallRun] = []
+    # An opening marks the wall line itself: a room edge beside it (parallel, within ``room_edge_opening_reach_m``) is that wall,
+    # not a hidden one, so no wall is invented in front of the opening (it would stay as an outside block beside the cut).
+    spans = [(_axis_of(opening), np.asarray(getattr(opening, "center"), dtype=float)[:2], float(getattr(opening, "width")) / 2.0 + 0.02 * upm) for opening in openings]
+    opening_reach = settings.room_edge_opening_reach_m * upm
     for room in rooms:
         if room.area < settings.room_edge_min_area_m2 * upm * upm:
             continue
@@ -1498,6 +1644,12 @@ def _room_edge_runs(faces: list[_Face], runs: list[WallRun], rooms: list[Polygon
             distances = np.arange(0.03, settings.max_thickness_m + 0.35, 0.01) * upm
             for t in along:
                 point = a + direction * t
+                if opening_reach > 0.0 and any(
+                    _parallel(direction, axis, 10.0) and abs(float(np.dot(point - centre, axis))) <= half and abs(float(np.dot(point - centre, np.asarray((-axis[1], axis[0]))))) <= opening_reach
+                    for axis, centre, half in spans
+                ):
+                    flags.append(False)
+                    continue
                 probe = point[None, :] + outward[None, :] * distances[:, None]
                 if bool(np.any(_lookup(roomish, grid, probe))):
                     flags.append(False)
@@ -1582,7 +1734,7 @@ def _room_edge_runs(faces: list[_Face], runs: list[WallRun], rooms: list[Polygon
                         if not hit.is_empty:
                             behind.append(min(Point(tuple(face.point(t * face.length))).distance(part) for part in _parts(hit)))
                     if behind and len(behind) >= 3:
-                        thickness = float(max(thickness, max(behind) + 0.01 * upm))
+                        thickness = float(min(max(thickness, max(behind) + 0.01 * upm), settings.max_thickness_m * upm))
                     faces.append(face)
                     face_of[face.index] = face
                     run = WallRun(face.index, 0.0, face.length, thickness, "exterior", "room-edge")
@@ -1843,6 +1995,110 @@ def _tall_unit_runs(
         output.extend(_label_unit(unit, fridge, grid, upm, settings))
     stats["tall_unit_rects"] = [[round(float(value), 3) for value in shape.bounds] + [label] for shape, label in output]
     return output, stats
+
+
+def _cabinet_wall_runs(
+    runs: list[WallRun], faces: list[_Face], cabinet: np.ndarray, evidence: WallEvidence, grid: RasterGrid, upm: float, settings: DoubleWallSettings, builtins: list[Polygon] = (), free: np.ndarray | None = None,
+) -> tuple[dict[str, Any], list[tuple[Polygon, str]]]:
+    """Drop wall runs that are cabinet fronts: the body lies on cabinet labels and no wall stands there.
+
+    ``cabinet_share`` = share of the run body (samples across its thickness) on cabinet-labelled pixels (dilated by
+    ``cabinet_dilate_m``); ``wall_share`` = share of the samples along the run where wall-class points of wall height
+    (``face_min_height_m`` covered, ``face_reach_m`` reached, any lateral position inside the body) exist.  A run is a
+    cabinet front when ``cabinet_share >= cabinet_min_share`` and ``wall_share <= cabinet_max_wall_share``.  A real wall
+    behind a cabinet carries wall-class points up its height and stays.
+    """
+    stats: dict[str, Any] = {"cabinet_wall_runs": 0, "cabinet_wall_m": 0.0, "cabinet_column_stretches": 0, "cabinet_column_m": 0.0}
+    units: list[tuple[Polygon, str]] = []
+    if evidence.wall_bits is None or evidence.storey_height <= 0.0 or not np.asarray(cabinet).any():
+        return stats, units
+    pixels = max(1, int(round(settings.cabinet_dilate_m * upm / grid.pixel_size)))
+    mask = cv2.dilate(np.asarray(cabinet, dtype=np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pixels + 1, 2 * pixels + 1))).astype(bool)
+    face_of = {face.index: face for face in faces}
+    kept: list[WallRun] = []
+    for run in runs:
+        face = face_of.get(run.face)
+        if face is None or run.thickness <= 0.0 or run.end - run.start < 0.3 * upm:
+            kept.append(run)
+            continue
+        along = np.arange(run.start, run.end + 1e-9, 0.04 * upm)
+        offsets = np.linspace(0.1 * run.thickness, 0.9 * run.thickness, 5)
+        wall = np.zeros(len(along), dtype=np.uint32)
+        hits = []
+        for offset in offsets:
+            points = face.start[None, :] + along[:, None] * face.direction[None, :] + face.solid_normal[None, :] * offset
+            wall |= _lookup(evidence.wall_bits, grid, points, 0).astype(np.uint32)
+            hits.append(_lookup(mask, grid, points))
+        cabinet_share = float(np.mean(np.asarray(hits)))
+        covered, top = _bit_heights(wall, evidence.bins, evidence.storey_height)
+        wall_share = float(np.mean((covered >= settings.face_min_height_m * upm) & (top >= settings.face_reach_m * upm)))
+        if cabinet_share >= settings.cabinet_min_share and wall_share <= settings.cabinet_max_wall_share:
+            stats["cabinet_wall_runs"] += 1
+            stats["cabinet_wall_m"] += (run.end - run.start) / upm
+            stats.setdefault("cabinet_wall_list", []).append([np.round(face.point(run.start), 2).tolist(), np.round(face.point(run.end), 2).tolist(), round(cabinet_share, 2), round(wall_share, 2)])
+            continue
+        kept.append(run)
+    # Second rule: stretches without a wall column that lie on / beside kitchen cabinets (a cabinet column whose panels read as wall).
+    step = 0.04 * upm
+    final: list[WallRun] = []
+    for run in kept:
+        face = face_of.get(run.face)
+        if face is None or run.thickness <= 0.0 or run.evidence == "room-edge" or run.end - run.start < settings.cabinet_stretch_min_m * upm:
+            final.append(run)
+            continue
+        along = np.arange(run.start, run.end + 1e-9, step)
+        wall = np.zeros(len(along), dtype=np.uint32)
+        on_cabinet = np.zeros(len(along), dtype=bool)
+        for offset in np.linspace(0.1 * run.thickness, 0.9 * run.thickness, 5):
+            points = face.start[None, :] + along[:, None] * face.direction[None, :] + face.solid_normal[None, :] * offset
+            wall |= _lookup(evidence.wall_bits, grid, points, 0).astype(np.uint32)
+            on_cabinet |= _lookup(mask, grid, points)
+        # cabinets beside the run on one side and measured room floor on the other: a column standing in the room, not the outer
+        # wall behind a counter (that one has no floor on its far side)
+        beside = [np.zeros(len(along), dtype=bool), np.zeros(len(along), dtype=bool)]
+        floor_beside = [np.zeros(len(along), dtype=bool), np.zeros(len(along), dtype=bool)]
+        for side, sign in enumerate((-1.0, 1.0)):
+            for distance in (0.1, 0.25, 0.4, settings.cabinet_flank_m):
+                lateral = -distance * upm if sign < 0 else run.thickness + distance * upm
+                points = face.start[None, :] + along[:, None] * face.direction[None, :] + face.solid_normal[None, :] * lateral
+                beside[side] |= _lookup(mask, grid, points)
+            if free is not None:
+                for distance in (0.3, 0.45, 0.6):
+                    lateral = -distance * upm if sign < 0 else run.thickness + distance * upm
+                    points = face.start[None, :] + along[:, None] * face.direction[None, :] + face.solid_normal[None, :] * lateral
+                    floor_beside[side] |= _lookup(free, grid, points)
+        covered, top = _bit_heights(wall, evidence.bins, evidence.storey_height)
+        supported = (covered >= settings.face_min_height_m * upm) & (top >= settings.face_reach_m * upm)
+        column = (beside[0] & floor_beside[1]) | (beside[1] & floor_beside[0])
+        flagged = (on_cabinet | column) & ~supported
+        if float(np.mean(flagged)) < settings.cabinet_run_min_share or float(np.mean(supported)) > settings.cabinet_run_max_support:
+            final.append(run)
+            continue
+        stretches = [(float(along[first]), float(along[last])) for first, last in _flag_runs(flagged, max(1, int(round(settings.cabinet_stretch_gap_m * upm / step))))]
+        stretches = [(a, b) for a, b in stretches if b - a >= settings.cabinet_stretch_min_m * upm]
+        if not stretches:
+            final.append(run)
+            continue
+        cursor = run.start
+        for a, b in stretches:
+            stats["cabinet_column_stretches"] += 1
+            stats["cabinet_column_m"] += (b - a) / upm
+            stats.setdefault("cabinet_column_list", []).append([np.round(face.point(a), 2).tolist(), np.round(face.point(b), 2).tolist()])
+            band = _band(face, a, b, run.thickness)
+            touching = [item for item in builtins if item.intersects(band) and item.intersection(band).area > 0.2 * band.area]
+            if touching:
+                hull = unary_union([band, *touching]).convex_hull
+                if isinstance(hull, Polygon) and not hull.is_empty:
+                    rect = hull.minimum_rotated_rectangle
+                    if isinstance(rect, Polygon) and not rect.is_empty:
+                        units.append((rect, "HS"))
+            if a - cursor >= settings.cabinet_remnant_min_m * upm:
+                final.append(WallRun(run.face, cursor, a, run.thickness, run.kind, run.evidence, run.group, run.extend_start if cursor == run.start else 0.0, 0.0))
+            cursor = b
+        if run.end - cursor >= settings.cabinet_remnant_min_m * upm:
+            final.append(WallRun(run.face, cursor, run.end, run.thickness, run.kind, run.evidence, run.group, 0.0, run.extend_end))
+    runs[:] = final
+    return stats, units
 
 
 def _axis_extent(geometry: Any, direction: np.ndarray) -> float:
@@ -2168,12 +2424,18 @@ def _wall_bodies(runs: list[WallRun], faces: list[_Face], openings: list[Any], u
             highs.append(max(face_across, far_across))
             hosts.append(run)
         if not hosts:
-            # An opening that lies in no wall (e.g. a door symbol in a wall gap) cuts nothing.
-            slabs.append((0.0, 0.0))
-            continue
-        # The thickest consistent host decides the slab (a thin face run beside a thick wall is part of it).
-        low, high = float(min(lows)), float(max(highs))
-        if high - low > settings.max_thickness_m * upm + 0.05 * upm:
+            # No wall run carries the opening, e.g. a door that fills a whole short wall segment (no wall data inside the gap).
+            # The collinear wall run beside the gap gives the slab of a door, so the gap is closed like any other cut; without one
+            # (and for a window) the opening cuts nothing (a symbol in a wall gap).
+            fallback = _neighbour_slab(centre, axis, half, solid_runs, face_of, upm, settings) if str(getattr(opening, "kind", "")) in {"DOOR", "passage"} else None
+            if fallback is None:
+                slabs.append((0.0, 0.0))
+                continue
+            low, high = fallback
+        else:
+            # The thickest consistent host decides the slab (a thin face run beside a thick wall is part of it).
+            low, high = float(min(lows)), float(max(highs))
+        if hosts and high - low > settings.max_thickness_m * upm + 0.05 * upm:
             best = max(range(len(hosts)), key=lambda item: hosts[item].end - hosts[item].start)
             low, high = lows[best], highs[best]
         slabs.append((low, high))

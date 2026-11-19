@@ -50,6 +50,7 @@
     "tag_crs": "Tag coordinate system",
     "tag_hint": "Optional: coordinates of the tag centre per ID. The ID on the printout must match the ID in the file.",
     "control_points": "Ground control points",
+    "auto_dxf": "Create DXF/IFC automatically after processing",
     "storage": "Storage",
     "image_directory": "Image directory",
     "rtk": "Images use RTK GPS",

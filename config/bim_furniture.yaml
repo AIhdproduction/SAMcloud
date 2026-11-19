@@ -1,0 +1,164 @@
+# Furniture / equipment mapping for the IFC4 export (samcloud/bim/furniture.py).
+#
+# Resolution order for one PlanFurniture item (first hit wins, keys compared case-insensitively):
+#   1. by_catalogue_kind[catalogue_kind]
+#   2. by_label[semantic_label]
+#   3. by_label[label]
+#   4. by_layer[layer]
+#   5. default
+# Every value is a key of `classes`.
+#
+# IFC4 notes (checked against the schema in tests/test_bim_furniture.py):
+# * IfcAudioVisualApplianceTypeEnum has no TELEVISION in IFC4 -> DISPLAY.
+# * Kitchen built-ins and tall units are IfcFurniture USERDEFINED (KitchenUnit / TallUnit) rather than
+#   IfcSystemFurnitureElement WORKSURFACE: that class describes modular office furniture systems,
+#   whereas ArchiCAD / Revit import IfcFurniture as a generic library object that can be re-typed.
+# * `colour` is the RGB surface style (0..1) applied to the body.
+
+classes:
+  chair:            {ifc_class: IfcFurniture, predefined_type: CHAIR, colour: [0.60, 0.45, 0.30]}
+  sofa:             {ifc_class: IfcFurniture, predefined_type: SOFA, colour: [0.45, 0.50, 0.60]}
+  table:            {ifc_class: IfcFurniture, predefined_type: TABLE, colour: [0.65, 0.50, 0.35]}
+  desk:             {ifc_class: IfcFurniture, predefined_type: DESK, colour: [0.60, 0.48, 0.35]}
+  bed:              {ifc_class: IfcFurniture, predefined_type: BED, colour: [0.80, 0.78, 0.72]}
+  shelf:            {ifc_class: IfcFurniture, predefined_type: SHELF, colour: [0.55, 0.42, 0.30]}
+  wardrobe:         {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: Wardrobe, colour: [0.70, 0.62, 0.50]}
+  cabinet:          {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: Cabinet, colour: [0.68, 0.60, 0.48]}
+  kitchen_unit:     {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: KitchenUnit, colour: [0.85, 0.85, 0.82]}
+  tall_unit:        {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: TallUnit, colour: [0.78, 0.76, 0.70]}
+  wall_cabinet:     {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: WallCabinet, colour: [0.85, 0.85, 0.82]}
+  worktop:          {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: Worktop, colour: [0.35, 0.35, 0.37]}
+  refrigerator:     {ifc_class: IfcElectricAppliance, predefined_type: REFRIGERATOR, colour: [0.82, 0.84, 0.86]}
+  cooker:           {ifc_class: IfcElectricAppliance, predefined_type: ELECTRICCOOKER, colour: [0.25, 0.25, 0.27]}
+  dishwasher:       {ifc_class: IfcElectricAppliance, predefined_type: DISHWASHER, colour: [0.78, 0.80, 0.82]}
+  washing_machine:  {ifc_class: IfcElectricAppliance, predefined_type: WASHINGMACHINE, colour: [0.90, 0.90, 0.92]}
+  dryer:            {ifc_class: IfcElectricAppliance, predefined_type: TUMBLEDRYER, colour: [0.90, 0.90, 0.92]}
+  microwave:        {ifc_class: IfcElectricAppliance, predefined_type: MICROWAVE, colour: [0.30, 0.30, 0.32]}
+  sink:             {ifc_class: IfcSanitaryTerminal, predefined_type: SINK, colour: [0.75, 0.80, 0.85]}
+  washbasin:        {ifc_class: IfcSanitaryTerminal, predefined_type: WASHHANDBASIN, colour: [0.92, 0.94, 0.96]}
+  toilet:           {ifc_class: IfcSanitaryTerminal, predefined_type: TOILETPAN, colour: [0.95, 0.95, 0.97]}
+  bathtub:          {ifc_class: IfcSanitaryTerminal, predefined_type: BATH, colour: [0.93, 0.95, 0.97]}
+  shower:           {ifc_class: IfcSanitaryTerminal, predefined_type: SHOWER, colour: [0.70, 0.85, 0.92]}
+  tv:               {ifc_class: IfcAudioVisualAppliance, predefined_type: DISPLAY, colour: [0.10, 0.10, 0.12]}
+  lamp:             {ifc_class: IfcLightFixture, predefined_type: NOTDEFINED, colour: [0.95, 0.90, 0.60]}
+  radiator:         {ifc_class: IfcSpaceHeater, predefined_type: RADIATOR, colour: [0.92, 0.92, 0.92]}
+  proxy:            {ifc_class: IfcBuildingElementProxy, predefined_type: NOTDEFINED, colour: [0.65, 0.65, 0.65]}
+
+by_catalogue_kind:
+  BED_SINGLE: bed
+  BED_DOUBLE: bed
+  SOFA: sofa
+  TABLE_DINING: table
+  WARDROBE: wardrobe
+  WC_WALL: toilet
+  WASHBASIN: washbasin
+  BATHTUB: bathtub
+  SHOWER: shower
+  COOKTOP: cooker
+  KITCHEN_SINK: sink
+  KITCHEN_ISLAND: kitchen_unit
+  builtin_front: tall_unit
+  tall_unit: tall_unit
+  upper_cabinet: wall_cabinet
+  counter: kitchen_unit
+  kitchen_base: kitchen_unit
+  worktop: worktop
+  fine_kitchen: kitchen_unit
+  segment: kitchen_unit
+  island: kitchen_unit
+  niche: proxy
+
+by_label:
+  # chairs
+  chair: chair
+  stuhl: chair
+  armchair: sofa
+  sessel: sofa
+  stool: chair
+  hocker: chair
+  # sofas
+  sofa: sofa
+  couch: sofa
+  # tables
+  table: table
+  tisch: table
+  "dining table": table
+  "coffee table": table
+  couchtisch: table
+  desk: desk
+  schreibtisch: desk
+  # beds
+  bed: bed
+  bett: bed
+  # shelves
+  shelf: shelf
+  bookshelf: shelf
+  bookcase: shelf
+  regal: shelf
+  # storage
+  wardrobe: wardrobe
+  kleiderschrank: wardrobe
+  cabinet: cabinet
+  schrank: cabinet
+  "chest of drawers": cabinet
+  kommode: cabinet
+  sideboard: cabinet
+  "tv stand": cabinet
+  nightstand: cabinet
+  nachttisch: cabinet
+  "kitchen counter": kitchen_unit
+  "kitchen cabinet": kitchen_unit
+  kitchen: kitchen_unit
+  "tall unit": tall_unit
+  tall_unit: tall_unit
+  builtin_front: tall_unit
+  upper_cabinet: wall_cabinet
+  worktop: worktop
+  "wall cabinet": wall_cabinet
+  # appliances
+  refrigerator: refrigerator
+  fridge: refrigerator
+  kühlschrank: refrigerator
+  oven: cooker
+  stove: cooker
+  cooktop: cooker
+  herd: cooker
+  dishwasher: dishwasher
+  geschirrspüler: dishwasher
+  "washing machine": washing_machine
+  waschmaschine: washing_machine
+  dryer: dryer
+  trockner: dryer
+  microwave: microwave
+  mikrowelle: microwave
+  # sanitary
+  sink: sink
+  "kitchen sink": sink
+  spüle: sink
+  washbasin: washbasin
+  lavabo: washbasin
+  waschbecken: washbasin
+  toilet: toilet
+  wc: toilet
+  bathtub: bathtub
+  badewanne: bathtub
+  shower: shower
+  "shower enclosure": shower
+  dusche: shower
+  # other
+  tv: tv
+  television: tv
+  fernseher: tv
+  lamp: lamp
+  lampe: lamp
+  radiator: radiator
+  heizkörper: radiator
+
+by_layer:
+  A-OBEN: wall_cabinet
+  A-EINB: kitchen_unit
+
+default: proxy
+
+# Fallback body height (m) when neither the instance bbox nor plan defaults give one.
+fallback_height_m: 0.8

@@ -227,5 +227,5 @@ async def test_home_dxf_button_absent_without_project(monkeypatch: pytest.Monkey
     async with user_simulation(root=lambda: None) as user:
         ui.page("/workflow")(_workflow_route)
         await user.open("/workflow")
-        await user.should_see("DXF export")
+        await user.should_see("DXF/IFC export")
         await user.should_not_see(marker="home-open-dxf")

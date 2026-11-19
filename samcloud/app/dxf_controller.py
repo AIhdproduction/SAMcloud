@@ -17,6 +17,7 @@ from samcloud.classification.profiles import ProfileInfo
 from samcloud.core.configuration import load_yaml
 from samcloud.dxf.config import load_dxf_config
 from samcloud.dxf.job_runner import DxfJobRunner
+from samcloud.bim.jobs import ifc_export_status as _ifc_export_status
 from samcloud.dxf.jobs import export_manifest_path
 from samcloud.dxf.las_source import Frame, is_ply_source, read_las_header_origin, read_las_header_profile
 from samcloud.dxf.layers import load_layer_config
@@ -796,7 +797,14 @@ class DxfPageController:
             if load_segment_result(self.project_dir, self._resolve_level(level_id), self.state.segment_source) is None:
                 settings = None
             current = clean_plan_fingerprint(self.project_dir, self._resolve_level(level_id), settings)
-            return "ok" if result.settings_fingerprint == current else "stale"
+            if result.settings_fingerprint != current:
+                return "stale"
+            if result.mode == "indoor":
+                from samcloud.bim.plan_model import plan_model_is_current
+
+                # The BIM sidecar belongs to the clean plan: projects generated before it existed regenerate it.
+                return "ok" if plan_model_is_current(self.plan_cache_dir(level_id, variant)) else "stale"
+            return "ok"
         except Exception as error:
             if "segmentation" in str(error).lower():
                 return "missing"
@@ -815,7 +823,7 @@ class DxfPageController:
         las = self.las_path
         if las is None or not Path(las).is_file():
             raise ValueError(t("dxf_ui.errors.no_las", action=action))
-        if action not in {"preview", "align", "levels", "generate", "export", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"}:
+        if action not in {"preview", "align", "levels", "generate", "export", "export_ifc", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"}:
             raise ValueError(t("dxf_ui.errors.unsupported_action", action=action))
         options: dict[str, str] = {}
         if action in {"segment", "clean_plan", "run_all"}:
@@ -825,6 +833,12 @@ class DxfPageController:
         elif action == "export":
             options["variant"] = self.state.plan_variant
         return self.runner.start(action, las=las, level=level_id, mode=self.mode, force=force, **options)
+
+    def ifc_export_status(self, level_key: str | None) -> Literal["missing", "fresh", "stale"]:
+        """Freshness of the level's IFC export (products/bim/<level>/export.json vs plan_model.json)."""
+        if level_key is None:
+            return "missing"
+        return _ifc_export_status(self.project_dir, level_key)
 
     def cancel_job(self) -> None:
         """Signal background job to cancel and terminate process if needed."""

@@ -267,3 +267,28 @@ def test_counter_set_back_from_the_walls_is_flushed_onto_them_by_the_wall_anchor
     assert [round(leg.depth / upm, 2) for leg in run.legs] == pytest.approx([0.90, 0.90], abs=0.03)  # measured from the wall, snapped to a standard depth
     lengths = sorted(round((leg.end - leg.start) / upm, 1) for leg in run.legs)
     assert lengths == pytest.approx([2.65, 3.65], abs=0.1)  # the measured ends of the counter, not the wall ends
+
+
+@pytest.mark.parametrize("upm", [1.0, UPM_V8])
+def test_run_is_built_from_sink_hob_and_cabinet_instances_without_a_counter_class(upm: float) -> None:
+    """No 'kitchen counter' label anywhere (SAM3 only found sink, stove and cabinets): the run still follows the wall."""
+    grid = _grid(upm)
+    walls = [LineString([(0.0, 0.0), (5.0 * upm, 0.0)])]
+    sink, hob, cabinet = _scaled(upm, 0.4, 0.0, 1.26, 0.55), _scaled(upm, 1.3, 0.0, 1.88, 0.55), _scaled(upm, 1.9, 0.0, 3.0, 0.6)
+    masks = {"kitchen sink": _mask_of(grid, sink), "stove": _mask_of(grid, hob), "kitchen cabinet": _mask_of(grid, cabinet)}
+    heights = _heights(grid, _mask_of(grid, sink, hob, cabinet), upm)
+    pending = [(_instance(mask, label, upm), label, label) for label, mask in masks.items()]
+    layers: dict[str, list[dict]] = {"A-EINB": [], "A-FURN": [], "P-SANI": [], "A-ANNO": [], "A-FURN-DETL": []}
+    metrics: dict = {}
+    inserts: list = []
+    assert _emit_kitchen_run(pending, layers, inserts, grid, heights, 0.0, walls, upm, metrics, KitchenRunSettings()) >= 1
+    assert metrics["kitchen_run_shape"] == "straight"
+    run = next(entity for entity in layers["A-EINB"] if entity.get("_einb_kind") == "fine_kitchen")
+    polygon = Polygon(run["points"])
+    assert polygon.area == pytest.approx(2.6 * 0.6 * upm**2, rel=0.10)
+    assert polygon.bounds[1] == pytest.approx(0.0, abs=0.03 * upm)  # back edge flush on the wall
+    assert (polygon.bounds[3] - polygon.bounds[1]) / upm == pytest.approx(0.6, abs=0.03)
+    kinds = sorted(item["_catalogue"]["kind"] for item in inserts)
+    assert kinds == ["COOKTOP", "KITCHEN_SINK"]
+    for item in inserts:
+        assert item["_catalogue"].get("on_kitchen_run") is True

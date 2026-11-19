@@ -39,6 +39,9 @@ class PlanPolishSettings:
     room_split_max_m: float = 2.4
     room_split_min_area_m2: float = 2.0
     room_jog_m: float = 0.04
+    wall_crack_cell_max_m2: float = 12.0  # a cell that exists only after the crack closing is accepted as a room up to this area (bath / WC, not a whole flat)
+    wall_crack_m: float = 0.02  # hairline gaps (up to 2x this = 4 cm) beside a door/window span are closed before small cells are found
+    barrier_bridge_m: float = 0.30  # two door/window spans closer than this are one opening with a wall stub between them (narrower than any passage)
     room_step_m: float = 0.30
     # Furniture: rectangle when it covers the footprint well, else a rectilinear outline along the wall axes.
     furniture: bool = True
@@ -95,6 +98,48 @@ def enclosed_cells(walls: Any, upm: float, minimum_m2: float = 0.5) -> list[Poly
     return cells
 
 
+def bridge_barriers(barriers: list[Polygon], reach: float, max_area: float) -> list[Polygon]:
+    """Wall stubs between two close door / window spans (the wall bodies there were cut away, e.g. a 25 cm jamb between a door and a window).
+
+    The stub is the part of the convex hull of the two spans that lies outside them and within ``reach`` of both; it is returned when the spans are at most ``reach`` apart
+    and the stub is small (``max_area``), so two spans in different walls are not bridged across a room.
+    """
+    bridges: list[Polygon] = []
+    for index, first in enumerate(barriers):
+        for second in barriers[index + 1:]:
+            if first.intersects(second) or first.distance(second) > reach:
+                continue
+            stub = unary_union([first, second]).convex_hull.difference(first).difference(second).intersection(first.buffer(reach, join_style=2)).intersection(second.buffer(reach, join_style=2))
+            for piece in _parts(stub):
+                if 0.0 < piece.area <= max_area:
+                    bridges.append(piece)
+    return bridges
+
+
+def close_wall_cracks(walls: Any, tolerance: float, barriers: Any = None) -> Any:
+    """Close narrow gaps (hairline cracks up to a short wall stretch) at door / window spans in the wall union.
+
+    Adjacent door spans (or a span and the wall beside it) can leave a crack of a few mm, or a numerically
+    zero-width seam, through the full wall thickness.  The cell behind it then leaks into the neighbouring room
+    (a bath behind two touching door spans merged with the living room).  A morphological closing with
+    ``tolerance`` fills gaps up to twice that width; only the filled pieces that touch a barrier (``barriers`` =
+    the door / window span polygons) are kept, every other seam and every wider opening is left unchanged.
+    Without ``barriers`` every crack is closed.
+    """
+    if walls is None or walls.is_empty or tolerance <= 0.0:
+        return walls
+    closed = walls.buffer(tolerance, join_style=2).buffer(-tolerance, join_style=2)
+    if closed.is_empty:
+        return walls
+    filled = closed.difference(walls)
+    if barriers is not None:
+        if barriers.is_empty:
+            return walls
+        pieces = [piece for piece in _parts(filled) if isinstance(piece, Polygon) and piece.distance(barriers) <= tolerance]
+        filled = unary_union(pieces) if pieces else GeometryCollection()
+    return unary_union([walls, filled]) if not filled.is_empty else walls
+
+
 def rooms_from_wall_cells(
     rooms: list[Polygon],
     wall_bodies: Iterable[Polygon],
@@ -122,7 +167,17 @@ def rooms_from_wall_cells(
     walls = unary_union(body_list + barrier_list)
     output: list[Polygon] = []
     used: set[int] = set()
-    for cell in enclosed_cells(walls, upm, settings.room_min_area_m2):
+    cell_candidates = enclosed_cells(walls, upm, settings.room_min_area_m2)
+    if settings.wall_crack_m > 0.0 and barrier_list:
+        # Door / window spans leave hairline cracks at their ends; a small space (bath, WC) that is closed only once those
+        # cracks are filled is still a room.  Cells formed by the closing that are larger than ``wall_crack_cell_max_m2``
+        # are not trusted (their leak may be a real passage): they stay with the measured ceiling rooms.
+        bridges = bridge_barriers(barrier_list, settings.barrier_bridge_m * upm, 0.20 * upm * upm) if settings.barrier_bridge_m > 0.0 else []
+        sealed = close_wall_cracks(unary_union([walls, *bridges]) if bridges else walls, settings.wall_crack_m * upm, unary_union(barrier_list))
+        for extra in enclosed_cells(sealed, upm, settings.room_min_area_m2):
+            if extra.area <= settings.wall_crack_cell_max_m2 * upm * upm and not any(extra.intersection(cell).area >= 0.5 * extra.area for cell in cell_candidates):
+                cell_candidates.append(extra)
+    for cell in cell_candidates:
         cell = _clean_outline(cell, settings.room_jog_m * upm) or cell
         if cell.area < settings.room_min_area_m2 * upm * upm:
             continue

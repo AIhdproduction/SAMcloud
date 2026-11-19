@@ -56,6 +56,7 @@ class ProjectManager:
         apriltags_enabled: bool | None = None,
         apriltag_coordinates_csv: str | Path | None = None,
         apriltag_crs: str | None = None,
+        auto_dxf: bool = True,
     ) -> Path:
         """Create a self-contained project folder without copying source images."""
         normalized_name = self._normalize_name(name)
@@ -85,6 +86,7 @@ class ProjectManager:
             control_points_mode=control_points_mode,
             storage=storage,
             apriltags_enabled=apriltags_enabled,
+            auto_dxf=auto_dxf,
         )
 
         ensure_workspace_directories()
@@ -158,6 +160,7 @@ class ProjectManager:
         control_points_mode: str,
         storage: dict | None = None,
         apriltags_enabled: bool | None = None,
+        auto_dxf: bool = True,
     ) -> dict[str, Any]:
         defaults = deepcopy(load_global_config("defaults.yml"))
         panorama_defaults = defaults.get("acquisition", {}).get("panorama", {})
@@ -182,6 +185,7 @@ class ProjectManager:
         # Only SAM3 classifies with text prompts; FlurSeg's 11 classes are fixed by its training.
         if defaults["classification"]["engine"] == "sam3" and is_customized(custom_classes):
             defaults["classification"]["custom_classes"] = normalize_customization(custom_classes, class_set)
+        defaults["workflow"]["auto_dxf"] = bool(auto_dxf)
         defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic"}
         tag_settings = defaults.setdefault("apriltags", {})
         tag_settings.setdefault("outlier_pct", 3.0)

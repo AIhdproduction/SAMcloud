@@ -723,7 +723,7 @@ async def test_dxf_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     else:
         _generate(project, las, [None], "outdoor")
     async with _dxf_user(project, monkeypatch) as user:
-        await user.should_see("DXF export")
+        await user.should_see("DXF/IFC export")
         await user.should_see("Preparation")
         await user.should_see(marker="review-canvas")
         if kind == "indoor":
@@ -792,3 +792,292 @@ def test_two_point_scale_uses_unscaled_distance_and_rescales_levels(tmp_path: Pa
     assert factor == pytest.approx(1.5)
     assert controller.available_levels()[0]["floor_z"] == pytest.approx(3.0)
     assert controller.available_levels()[0]["ceiling_z"] == pytest.approx(6.0)
+
+
+# --------------------------------------------------------------------------- IFC viewer card (WP4)
+
+
+def _tiny_glb(guid: str = "guid-1", ifc_class: str = "IfcWall") -> bytes:
+    """A valid glTF 2.0 binary with one triangle mesh node named after its GlobalId, with ifc_class extras."""
+    import struct
+
+    positions = struct.pack("<9f", 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    document = {
+        "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+        "nodes": [{"name": guid, "mesh": 0, "extras": {"ifc_class": ifc_class, "name": "Wall A"}}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}],
+        "bufferViews": [{"buffer": 0, "byteLength": len(positions)}],
+        "buffers": [{"byteLength": len(positions)}],
+    }
+    raw = json.dumps(document).encode("utf-8")
+    raw += b" " * (-len(raw) % 4)
+    total = 12 + 8 + len(raw) + 8 + len(positions)
+    return (struct.pack("<4sII", b"glTF", 2, total) + struct.pack("<I4s", len(raw), b"JSON") + raw
+            + struct.pack("<I4s", len(positions), b"BIN\x00") + positions)
+
+
+def _write_bim(project: Path, key: str = "site") -> Path:
+    folder = project / "products" / "bim" / key
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "model.glb").write_bytes(_tiny_glb())
+    (folder / f"{project.name}_{key}.ifc").write_text("ISO-10303-21;\nEND-ISO-10303-21;\n", encoding="utf-8")
+    (folder / "props.json").write_text(json.dumps({
+        "schema_version": 1, "ifc_file": f"{project.name}_{key}.ifc", "classes": {"IfcWall": 2, "IfcSpace": 1},
+        "elements": {
+            "guid-1": {"ifc_class": "IfcWall", "name": "Wall A", "predefined_type": "SOLIDWALL", "storey": "1",
+                       "psets": {"Pset_WallCommon": {"IsExternal": True}}},
+            "guid-2": {"ifc_class": "IfcWall", "name": "Wall B", "predefined_type": "SOLIDWALL", "storey": "1", "psets": {}},
+            "guid-3": {"ifc_class": "IfcSpace", "name": "Room", "predefined_type": "INTERNAL", "storey": "1", "psets": {}},
+        },
+    }), encoding="utf-8")
+    (folder / "qa.json").write_text(json.dumps({"ids_failures": 2, "elements": 3, "summary": {}}), encoding="utf-8")
+    import hashlib
+
+    plan_model = project / "products" / "dxf" / key / "ortho" / "plan_model.json"
+    plan_model.parent.mkdir(parents=True, exist_ok=True)
+    plan_model.write_text("{}", encoding="utf-8")
+    (folder / "export.json").write_text(json.dumps({
+        "ifc": f"{project.name}_{key}.ifc", "glb": "model.glb", "props": "props.json",
+        "plan_model_sha256": hashlib.sha256(b"{}").hexdigest(),
+    }), encoding="utf-8")
+    return folder
+
+
+def _emit(element: Any, event_type: str, args: Any) -> None:
+    """Deliver a browser event (as the Vue component would) to the Python listeners of an element."""
+    listeners = [listener for listener in element._event_listeners.values() if listener.type == event_type]
+    assert listeners, f"no {event_type} listener registered"
+    for listener in listeners:
+        element._handle_event({"listener_id": listener.id, "args": args})
+
+
+def test_tiny_glb_fixture_is_valid_glb() -> None:
+    import struct
+
+    data = _tiny_glb()
+    magic, version, length = struct.unpack_from("<4sII", data)
+    assert (magic, version, length) == (b"glTF", 2, len(data))
+    json_length = struct.unpack_from("<I", data, 12)[0]
+    document = json.loads(data[20:20 + json_length])
+    assert document["nodes"][0]["name"] == "guid-1" and document["nodes"][0]["extras"]["ifc_class"] == "IfcWall"
+
+
+@pytest.mark.anyio
+async def test_nav_label_is_dxf_ifc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    project = _result_project(tmp_path, "IfcNav")
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see("DXF/IFC", marker="nav-dxf")
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_ifc_card_shows_empty_state_and_disabled_download_without_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _result_project(tmp_path, "IfcEmpty")
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see("IFC model")
+        await user.should_see("No IFC yet", marker="ifc-empty")
+        await user.should_not_see(marker="ifc-viewer")
+        assert not _element(user, "download-ifc").enabled
+        await user.should_see("IFC export: missing")
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_ifc_card_with_files_lists_classes_and_toggles_hidden_classes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _result_project(tmp_path, "IfcFiles")
+    _write_bim(project)
+    async with _dxf_user(project, monkeypatch) as user:
+        viewer = _element(user, "ifc-viewer")
+        assert viewer.props["src"].startswith("/api/bim/site/model.glb?v=")
+        assert viewer.props["class-by-node"] == {"guid-1": "walls", "guid-2": "walls", "guid-3": "spaces"}
+        assert viewer.props["hidden-classes"] == ["spaces"]  # spaces are hidden by default
+        assert _element(user, "ifc-class-walls").value is True
+        assert _element(user, "ifc-class-spaces").value is False
+        await user.should_not_see(marker="ifc-class-doors")  # only categories present in props.json
+        await user.should_see("IDS: 2 failures", marker="ifc-qa")
+        assert _element(user, "download-ifc").enabled
+        await user.should_see("IFC export: up to date")
+        _set(user, "ifc-class-walls", False)
+        assert viewer.props["hidden-classes"] == ["spaces", "walls"]
+        _set(user, "ifc-class-spaces", True)
+        assert viewer.props["hidden-classes"] == ["walls"]
+        user.find(marker="ifc-all").click()
+        assert viewer.props["hidden-classes"] == []
+        assert _element(user, "ifc-class-walls").value is True
+        user.find(marker="ifc-none").click()
+        assert viewer.props["hidden-classes"] == ["spaces", "walls"]
+        assert _element(user, "ifc-class-walls").value is False
+    _no_error_logs(caplog)
+
+
+@pytest.mark.anyio
+async def test_ifc_section_slider_and_pick_shows_properties(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _result_project(tmp_path, "IfcSection")
+    _write_bim(project)
+    async with _dxf_user(project, monkeypatch) as user:
+        viewer = _element(user, "ifc-viewer")
+        assert viewer.props["clip-height"] is None
+        _set(user, "ifc-section", 2.0)
+        assert viewer.props["clip-height"] is None  # section switch is off
+        _set(user, "ifc-section-on", True)
+        assert viewer.props["clip-height"] == pytest.approx(2.0)
+        _set(user, "ifc-section", 1.5)
+        assert viewer.props["clip-height"] == pytest.approx(1.5)
+        _set(user, "ifc-section-on", False)
+        assert viewer.props["clip-height"] is None
+        await user.should_see("Click an element in the model.")
+        with user:
+            _emit(viewer, "pick", {"global_id": "guid-1", "ifc_class": "IfcWall"})
+        await user.should_see("Wall A")
+        await user.should_see("Pset_WallCommon")
+        await user.should_see("IsExternal")
+        await user.should_see("SOLIDWALL")
+        with user:
+            _emit(viewer, "pick", {"global_id": None, "ifc_class": ""})
+        await user.should_see("Click an element in the model.")
+        with user:
+            _emit(viewer, "ready", {"elements": 3, "min_height": 0.0, "max_height": 2.6, "up_converted": False})
+        slider = _element(user, "ifc-section")
+        assert float(slider.props["max"]) == pytest.approx(2.6) and float(slider.props["min"]) == pytest.approx(0.0)
+    _no_error_logs(caplog)
+
+
+def _bim_route_response(project: Path, monkeypatch: pytest.MonkeyPatch, route: Any, key: str) -> Any:
+    monkeypatch.setattr(app_state, "active_project_directory", project)
+    return route(key)
+
+
+def test_bim_api_routes_404_when_missing_and_200_with_media_types(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from samcloud.app import application
+
+    project = (tmp_path / "BimApi").resolve()
+    project.mkdir()
+    for route in (application.bim_model, application.bim_props, application.bim_ifc):
+        assert _bim_route_response(project, monkeypatch, route, "site").status_code == 404
+    _write_bim(project)
+    model = _bim_route_response(project, monkeypatch, application.bim_model, "site")
+    assert model.status_code == 200 and model.media_type == "model/gltf-binary"
+    assert model.headers["cache-control"] == "no-cache"
+    assert Path(model.path).read_bytes() == _tiny_glb()
+    props_response = _bim_route_response(project, monkeypatch, application.bim_props, "site")
+    assert props_response.status_code == 200 and props_response.media_type == "application/json"
+    ifc_response = _bim_route_response(project, monkeypatch, application.bim_ifc, "site")
+    assert ifc_response.status_code == 200 and Path(ifc_response.path).name == "BimApi_site.ifc"
+    assert "attachment" in ifc_response.headers["content-disposition"] and "BimApi_site.ifc" in ifc_response.headers["content-disposition"]
+    assert _bim_route_response(project, monkeypatch, application.bim_model, "7").status_code == 404
+    assert _bim_route_response(project, monkeypatch, application.bim_model, "..").status_code == 400
+    monkeypatch.setattr(app_state, "active_project_directory", None)
+    assert application.bim_model("site").status_code == 404
+
+
+def _write_opening_props(folder: Path) -> None:
+    """props.json with a window (sill/head via bbox, mullions, glazed), a ceiling and internal Raumlot psets."""
+    elements = {
+        "guid-w": {
+            "ifc_class": "IfcWindow", "name": "Window O002", "predefined_type": "WINDOW", "storey": "1",
+            "psets": {
+                "Lining": {"LiningDepth": 0.06},
+                "Panel 1": {"PanelPosition": "LEFT"}, "Panel 2": {"PanelPosition": "RIGHT"},
+                "Pset_WindowCommon": {"Reference": "O002", "IsExternal": True},
+                "Qto_WindowBaseQuantities": {"Width": 1.9, "Height": 1.52},
+                "Raumlot_User": {"PlanOpeningId": "O002", "MullionCount": 1.0, "Glazed": True},
+                "Raumlot_Location": {"StoreyElevation": 2.0, "BBoxMinZ": 2.9, "BBoxMaxZ": 4.42},
+            },
+        },
+        "guid-c": {"ifc_class": "IfcCovering", "name": "Ceiling Living", "predefined_type": "CEILING", "storey": "1", "psets": {}},
+        "guid-1": {"ifc_class": "IfcWall", "name": "Wall A", "predefined_type": "SOLIDWALL", "storey": "1", "psets": {}},
+    }
+    (folder / "props.json").write_text(json.dumps({"schema_version": 1, "ifc_file": "x.ifc", "elements": elements}), encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_ifc_panel_ceilings_hidden_slider_greyed_window_details_and_show_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _result_project(tmp_path, "IfcPolish")
+    _write_opening_props(_write_bim(project))
+    async with _dxf_user(project, monkeypatch) as user:
+        viewer = _element(user, "ifc-viewer")
+        assert viewer.props["hidden-classes"] == ["ceilings"]  # ceilings hidden by default
+        assert _element(user, "ifc-class-ceilings").value is False
+        # section slider is greyed out until the switch is on
+        slider = _element(user, "ifc-section")
+        assert slider.props.get("disable") is True
+        _set(user, "ifc-section-on", True)
+        assert not slider.props.get("disable")
+        _set(user, "ifc-section", 1.2000000000000002)
+        assert slider.props.get("label-value") == "1.20 m"
+        _set(user, "ifc-section-on", False)
+        assert slider.props.get("disable") is True
+        assert "max-height" in _element(user, "ifc-props")._style  # the property panel scrolls
+        with user:
+            _emit(viewer, "pick", {"global_id": "guid-w", "ifc_class": "IfcWindow"})
+        await user.should_see("Sill height (BRH)")
+        await user.should_see("0.90 m")  # 2.9 - 2.0
+        await user.should_see("Head height (STH)")
+        await user.should_see("2.42 m")  # 4.42 - 2.0
+        await user.should_see("Mullions")
+        await user.should_see("Glazed")
+        await user.should_see("Pset_WindowCommon")
+        await user.should_see("Qto_WindowBaseQuantities")
+        await user.should_not_see("Raumlot_Location")
+        await user.should_not_see("Lining")
+        _set(user, "ifc-props-all", True)
+        await user.should_see("Raumlot_Location")
+        await user.should_see("Lining")
+    _no_error_logs(caplog)
+
+
+def test_stage_text_english_matches_job_wording() -> None:
+    from samcloud.app.pages import dxf as dxf_page
+
+    stage = "Step 4/7: Refine openings – starting"
+    assert dxf_page._stage_label(stage) == stage
+    assert dxf_page._action_label("refine_openings") == "Refine openings"
+
+
+def test_stage_text_is_translated_for_workflow_steps(german_ui: None) -> None:
+    from samcloud.app.pages import dxf as dxf_page
+
+    stage = "Step 4/7: Refine openings – starting"
+    assert dxf_page._stage_label(stage) == "Schritt 4/7: Öffnungen verfeinern – startet"
+    assert dxf_page._stage_label("Step 7/7: Export IFC – skipped (up to date)") == "Schritt 7/7: IFC exportieren – übersprungen (aktuell)"
+    assert dxf_page._stage_label("Segmenting tiles 3/9") == "Segmenting tiles 3/9"  # unknown stages unchanged
+    assert dxf_page._action_label("refine_openings") == "Öffnungen verfeinern"
+
+
+def test_refine_openings_inner_stages_are_translated(german_ui: None) -> None:
+    from samcloud.app.pages import dxf as dxf_page
+
+    assert dxf_page._stage_label("Scoring photographs 3/10") == "Fotos werden bewertet 3/10"
+    assert dxf_page._stage_label("Step 4/7: Refine openings – Voting photographs 2/8") == "Schritt 4/7: Öffnungen verfeinern – Fotos stimmen ab 2/8"
+    assert dxf_page._stage_label("Refined 9 openings (photo)") == "9 Öffnungen verfeinert (photo)"
+    assert dxf_page._stage_label("Detecting windows and doors") == "Fenster und Türen werden erkannt"
+    assert dxf_page._stage_label("Reading points 12.5 M") == "Punkte werden gelesen: 12.5 Mio."
+
+
+def test_refine_openings_inner_stages_stay_english_in_english_ui() -> None:
+    from samcloud.app.pages import dxf as dxf_page
+
+    for stage in ("Selecting photographs", "Scoring photographs 3/10", "Refined 9 openings (photo)", "Plan already contains the refined openings"):
+        assert dxf_page._stage_label(stage) == stage
+
+
+@pytest.mark.anyio
+async def test_checklist_has_refine_openings_row_for_indoor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    project, las = _make_project(tmp_path, "IfcChecklist", "indoor")
+    level_ids = _prepare_indoor(project, las)
+    DxfPageController(project).delete_level(level_ids[1])
+    async with _dxf_user(project, monkeypatch) as user:
+        await user.should_see("Refine openings: missing")
+        await user.should_see("IFC export: missing")
+    _no_error_logs(caplog)

@@ -35,10 +35,13 @@ class RoomNameSettings:
 
     min_room_area_m2: float = 2.0
     guest_wc_max_area_m2: float = 4.0
+    bath_max_area_m2: float = 15.0  # a larger room with sanitary fixtures is named by its other contents (open plan next to a bath is no bath)
     hall_max_area_m2: float = 15.0
     hall_min_doors: int = 3
-    min_hall_area_m2: float = 1.0  # a smaller room than min_room_area_m2 is kept when it is a hall (corridor between doors)
+    small_hall_min_doors: int = 2  # a floor cell below min_room_area_m2 that two doors open into (a cell between doors) is a hall, never lost floor
+    min_hall_area_m2: float = 0.5  # a smaller room than min_room_area_m2 is kept when it is a hall (corridor between doors)
     office_min_items: int = 2  # desks / monitors needed before a room is named "Büro"
+    kitchen_min_items: int = 2  # kitchen items (sink, hob, counter ...) needed before a room is named "Küche" (one upper cabinet at a door of a room with a bed is no kitchen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +68,7 @@ def tag_for_name(name: str) -> str | None:
 def classify_room(tags: Iterable[str], area_m2: float, settings: RoomNameSettings = RoomNameSettings()) -> str | None:
     """Return the semantic room name for a set of fixture tags, or None without evidence."""
     found = set(tags)
-    if found & SANITARY_TAGS:
+    if found & SANITARY_TAGS and area_m2 <= settings.bath_max_area_m2:
         if found & {"bathtub", "shower"}:
             return "Bad"
         if "toilet" in found and area_m2 < settings.guest_wc_max_area_m2:
@@ -111,7 +114,7 @@ def name_rooms(
         area = polygon.area / (upm * upm)
         zone = polygon.buffer(0.05 * upm)
         inside = [tag for point, tag in points if zone.contains(point)]
-        tags = frozenset(tag for tag in inside if tag != "office" or inside.count("office") >= settings.office_min_items)
+        tags = frozenset(tag for tag in inside if (tag != "office" or inside.count("office") >= settings.office_min_items) and (tag != "kitchen" or "bed" not in inside or inside.count("kitchen") >= settings.kitchen_min_items))
         keep = area >= settings.min_room_area_m2 or bool(tags & SANITARY_TAGS)
         result.append(RoomName(classify_room(tags, area, settings), area, keep, tags))
     return result
@@ -155,7 +158,7 @@ def name_halls(
             continue
         touching = [index for index, ((x, y), _angle) in enumerate(door_list) if polygon.distance(Point(x, y)) <= reach]
         has_entrance = any(entrance[index] for index in touching)
-        if (has_entrance and len(touching) >= 2) or len(touching) >= settings.hall_min_doors:
+        if (has_entrance and len(touching) >= 2) or len(touching) >= settings.hall_min_doors or (small and len(touching) >= settings.small_hall_min_doors):
             output.append(RoomName("Flur", decision.area_m2, True, decision.tags))
         else:
             output.append(decision)

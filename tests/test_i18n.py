@@ -279,7 +279,7 @@ def test_real_catalogues_translate_shared_namespaces(monkeypatch: pytest.MonkeyP
     assert i18n.translate_or("workflow.status.completed", "completed") == "Abgeschlossen"
     _use_config(monkeypatch, "en")
     assert i18n.t("nav.overview") == "Overview"
-    assert i18n.translate_or("workflow.step.dxf", "dxf") == "DXF export"
+    assert i18n.translate_or("workflow.step.dxf", "dxf") == "DXF/IFC export"
 
 
 def test_class_keys_cover_configured_class_names() -> None:

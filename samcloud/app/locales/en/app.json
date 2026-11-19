@@ -13,6 +13,7 @@
     "invalid_ortho_kind": "Invalid ortho kind '{kind}'",
     "no_ortho_artifact": "No cached orthophoto artifact '{kind}' for level '{level}'",
     "invalid_body": "Request body must be an object",
-    "field_required": "{field} is required"
+    "field_required": "{field} is required",
+    "no_bim_file": "No IFC artefact available for level '{level}'"
   }
 }

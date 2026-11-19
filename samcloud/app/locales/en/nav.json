@@ -5,6 +5,6 @@
   "control_points": "Control points",
   "targets": "Targets",
   "dense": "Dense cloud",
-  "dxf": "DXF",
+  "dxf": "DXF/IFC",
   "settings": "Settings"
 }

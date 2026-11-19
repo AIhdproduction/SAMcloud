@@ -18,7 +18,7 @@ NiceGUI pages  (samcloud/app)
 
 | Package | Responsibility |
 |---|---|
-| `samcloud/app/` | NiceGUI pages (`pages/`), layout and navigation, the process launcher (`processing.py`), the Potree and canvas viewers, DXF page controllers, the REST endpoints in `application.py`, and the UI translations (`i18n.py`, `locales/`) |
+| `samcloud/app/` | NiceGUI pages (`pages/`), layout and navigation, the process launcher (`processing.py`), the Potree and canvas viewers, DXF page controllers, the IFC viewer (`ifc_viewer.py`, `ifc_viewer.js`; three.js is vendored in `assets/vendor/three/`), the REST endpoints in `application.py`, and the UI translations (`i18n.py`, `locales/`) |
 | `samcloud/core/` | paths, configuration loading, project creation and persistence (`project_manager.py`), workflow state, project deletion, storage compaction (`storage.py`) |
 | `samcloud/acquisition/` | validation of exported Insta360 media, fixed-interval frame extraction, six perspective cubemap views per panorama, `inputs/panorama_manifest.json` |
 | `samcloud/colmap/` | COLMAP command construction, alignment and camera groups, panorama gravity alignment, and the step 6 modules: `depth_prior`, `depth_fill`, `surface_fusion`, `mirror_filter`, `depth_edges`, `point_cleaning`, `plane_fill`, `superpoint_vote` |
@@ -28,6 +28,7 @@ NiceGUI pages  (samcloud/app)
 | `samcloud/viewer/` | point cloud previews, Potree conversion (`potree.py`), camera payloads, sparse display cleaning |
 | `samcloud/dxf/` | DXF page backend: LAS/PLY source, scale, alignment, levels, point-cloud plan generation, writer, cancellable background jobs (`jobs.py`, `job_runner.py`) |
 | `samcloud/ortho/` | true orthophoto, DSM, segmentation, clean plan generation and vector extraction (`vector/`) |
+| `samcloud/bim/` | IFC4 export of the clean plan (indoor): `plan_model.py` (reads `plan_model.json`), `scene_builder.py` (walls, openings, rooms, slabs, ceilings), `furniture.py` (class mapping), `export.py` (IFC, IDS validation, `qa.json`), `viewer_export.py` (`model.glb`, `props.json`), `jobs.py` (freshness, CLI `python -m samcloud.bim.jobs`), `ui_data.py` (viewer and download data for the page), `core/` (IFC writer, geometry, QA) and `openings3d/` (3D window/door refinement from photos and cloud, `openings_3d.json`); see [ifc_export.md](ifc_export.md) |
 | `samcloud/tools/` | command-line helpers (class import from a Nomivox preset, gravity alignment) |
 | `samcloud/engine/` | the processing implementation; see below |
 
@@ -108,6 +109,7 @@ downsampled preview (`/api/pointcloud/{kind}`). Endpoints in
 | `/api/control-points/*` | markers, image crops, observation edits, optimize, continue (GCP review workspace) |
 | `/api/apriltags/markers` | AprilTag squares for the viewers |
 | `/api/dxf/payload/...`, `/api/dxf/background/...`, `/api/dxf/ortho/...` | DXF review data, backgrounds, and orthophoto previews |
+| `/api/bim/{level}/model.glb`, `/api/bim/{level}/props.json`, `/api/bim/{level}/ifc` | IFC viewer model, element properties, and the IFC download |
 
 ## UI translations
 

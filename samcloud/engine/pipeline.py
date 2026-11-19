@@ -2517,7 +2517,12 @@ def main():
         default=None,
         help="path for the dashboard progress JSON file",
     )
+    ap.add_argument(
+        "--auto-dxf", choices=("0", "1"), default="0",
+        help="after a successful run, create the DXF/IFC export as a separate final stage",
+    )
     args = ap.parse_args()
+    _request_auto_dxf(args)
 
     if args.control_points_mode == "after_alignment":
         args.stop_after_alignment = True
@@ -3173,5 +3178,39 @@ def main():
     print(f"LAS with class IDs: {outdir / 'classified.las'}")
 
 
-if __name__ == "__main__":
+_AUTO_DXF_REQUEST: dict | None = None
+
+
+def _request_auto_dxf(args) -> None:
+    """Remember whether the final DXF/IFC stage was requested (``--auto-dxf 1``) for this process."""
+    global _AUTO_DXF_REQUEST
+    _AUTO_DXF_REQUEST = {
+        "enabled": getattr(args, "auto_dxf", "0") == "1",
+        "project_dir": Path(args.outdir).resolve().parent,
+        "progress_file": args.progress_file,
+        "started": time.time(),
+    }
+
+
+def run_auto_dxf_stage() -> None:
+    """Final stage after ``main()``: DXF/IFC export, only when requested and this run completed.
+
+    run_metrics*.json and run_summary.txt are final at this point, so the pipeline's total time never
+    contains the DXF/IFC time (the home page adds dxf_run_metrics.json separately). Never raises."""
+    request = _AUTO_DXF_REQUEST
+    if not request or not request["enabled"]:
+        return
+    try:
+        from samcloud.engine.auto_dxf import run_after_pipeline
+        run_after_pipeline(request["project_dir"], progress_file=request["progress_file"], not_before=request["started"])
+    except Exception as error:
+        print(f"DXF/IFC export (automatic) could not run: {error}", flush=True)
+
+
+def run_cli() -> None:
     main()
+    run_auto_dxf_stage()
+
+
+if __name__ == "__main__":
+    run_cli()

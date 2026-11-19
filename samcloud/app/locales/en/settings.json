@@ -28,7 +28,8 @@
   "processing": {
     "title": "Processing settings",
     "use_gpu": "Use GPU",
-    "control_points": "Ground control points"
+    "control_points": "Ground control points",
+    "auto_dxf": "Create DXF/IFC automatically after processing"
   },
   "control_points_mode": {
     "none": "No control points - continue automatically",

@@ -50,6 +50,7 @@
     "tag_crs": "Koordinatensystem der Tags",
     "tag_hint": "Optional: Koordinaten der Tag-Mitte je ID. Die ID auf dem Ausdruck muss mit der ID in der Datei übereinstimmen.",
     "control_points": "Passpunkte",
+    "auto_dxf": "DXF/IFC nach der Berechnung automatisch erstellen",
     "storage": "Speicher",
     "image_directory": "Bildordner",
     "rtk": "Bilder mit RTK-GPS",

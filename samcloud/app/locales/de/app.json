@@ -13,6 +13,7 @@
     "invalid_ortho_kind": "Ungültiger Orthofoto-Typ '{kind}'",
     "no_ortho_artifact": "Kein zwischengespeichertes Orthofoto '{kind}' für Ebene '{level}' vorhanden",
     "invalid_body": "Der Anfrageinhalt muss ein Objekt sein",
-    "field_required": "{field} ist erforderlich"
+    "field_required": "{field} ist erforderlich",
+    "no_bim_file": "Für Ebene '{level}' ist keine IFC-Datei vorhanden"
   }
 }

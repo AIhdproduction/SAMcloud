@@ -25,7 +25,7 @@
     "classification": "Klassifizieren",
     "refinement": "Verbessern & filtern",
     "export": "LAS / PLY exportieren",
-    "dxf": "DXF-Export"
+    "dxf": "DXF/IFC-Export"
   },
   "stage": {
     "prepare_images": "Bilder vorbereiten",
@@ -44,6 +44,7 @@
     "depth_fill": "Auffüllen mit Depth Anything",
     "surface_fusion": "Oberflächen zusammenführen",
     "superpoint_vote": "Superpoint-Abstimmung",
-    "geometry_refinement": "Geometrische Verfeinerung"
+    "geometry_refinement": "Geometrische Verfeinerung",
+    "dxf_ifc": "DXF/IFC-Export"
   }
 }

@@ -328,6 +328,12 @@ def symbol_extents(name: str) -> tuple[float, float, float, float]:
     return min(xs), min(ys), max(xs), max(ys)
 
 
+OPENING_ATTRIBUTE_TAGS: dict[str, tuple[str, ...]] = {
+    "WINDOW": ("BRH", "STH", "MULLIONS"),  # sill (Brüstungshöhe), head (Sturzhöhe), mullion count
+    "DOOR": ("H", "GLAZED"),  # head height, 1 for glazed doors
+}
+
+
 def add_symbol_blocks(doc: ezdxf.document.Drawing, names: Iterable[str] | None = None) -> None:
     """Create requested R2018 block definitions using ezdxf's current APIs.
 
@@ -352,6 +358,9 @@ def add_symbol_blocks(doc: ezdxf.document.Drawing, names: Iterable[str] | None =
         if name == "FURNITURE":
             block.add_attdef("class", (0.0, -0.78), "", height=0.08)
             block.add_attdef("height", (0.0, -0.9), "", height=0.08)
+        # Measured opening data (3D refinement): invisible attributes, heights in metres.
+        for tag in OPENING_ATTRIBUTE_TAGS.get(name, ()):
+            block.add_attdef(tag, (0.0, -0.78), "", height=0.08, dxfattribs={"flags": 1})
 
 
 def _add_entity(block: ezdxf.layouts.BlockLayout, entity: dict[str, object]) -> None:

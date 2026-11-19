@@ -45,3 +45,30 @@ def test_run_summary_includes_metrics_and_stage_durations(tmp_path):
     assert "Dense points: 12" in content
     assert "Classified coverage: 75.00%" in content
     assert "ground: 9 (75.00%)" in content
+
+
+def test_run_summary_lists_skipped_steps_as_warnings():
+    from samcloud.engine.run_summary import _step_warnings
+
+    lines = _step_warnings({
+        "surface_fusion": {"enabled": True, "error": "TopologyException: side location conflict at 0.5 0.5."},
+        "depth_fill": {"enabled": True, "added_points": 5},
+        "point_cleaning": "not a dict",
+    })
+    assert lines == ["WARNING: Surface fusion was skipped (walls stay thick): "
+                     "TopologyException: side location conflict at 0.5 0.5."]
+    fused = _step_warnings({"surface_fusion": {"final_points": 3, "mirror_report_error": "boom"}})
+    assert len(fused) == 1 and "Mirror report failed" in fused[0] and "boom" in fused[0]
+    assert _step_warnings({}) == []
+
+
+def test_run_summary_text_contains_warning_section(tmp_path):
+    products = tmp_path / "demo" / "products"
+    (products / "classified").mkdir(parents=True)
+    summary = RunSummary(products, {
+        "classified_output": str(products / "classified" / "classified.ply"),
+        "classification_summary": str(tmp_path / "missing.json"),
+        "surface_fusion": {"enabled": True, "error": "TopologyException: side location conflict"},
+    })
+    content = summary.write().read_text(encoding="utf-8")
+    assert "Warnings\n--------\nWARNING: Surface fusion was skipped" in content

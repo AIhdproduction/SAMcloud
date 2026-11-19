@@ -5,6 +5,6 @@
   "control_points": "Passpunkte",
   "targets": "Zielmarken",
   "dense": "Dichte Punktwolke",
-  "dxf": "DXF",
+  "dxf": "DXF/IFC",
   "settings": "Einstellungen"
 }

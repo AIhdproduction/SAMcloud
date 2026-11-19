@@ -15,6 +15,7 @@ from samcloud.classification.custom import project_classes_path
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_manager import apriltags_enabled
 from samcloud.core.storage import ensure_text_model, storage_settings
+from samcloud.engine.auto_dxf import auto_dxf_enabled
 from samcloud.pointcloud.georeference import ensure_project_georeference
 
 if TYPE_CHECKING:
@@ -420,6 +421,8 @@ class ProcessingManager:
             settings.get("coordinate_systems", {}).get("export_crs", "LOCAL"),
             "--progress-file",
             str(project_directory / "reports" / "progress.json"),
+            "--auto-dxf",
+            "1" if auto_dxf_enabled(settings) else "0",
         ]
         threshold_sweep = classification.get("threshold_sweep", [])
         if threshold_sweep:

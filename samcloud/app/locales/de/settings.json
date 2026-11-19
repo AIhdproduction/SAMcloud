@@ -28,7 +28,8 @@
   "processing": {
     "title": "Verarbeitung",
     "use_gpu": "GPU verwenden",
-    "control_points": "Passpunkte"
+    "control_points": "Passpunkte",
+    "auto_dxf": "DXF/IFC nach der Berechnung automatisch erstellen"
   },
   "control_points_mode": {
     "none": "Keine Passpunkte – automatisch fortfahren",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -14,10 +15,12 @@ import cv2
 import numpy as np
 from scipy import ndimage
 from skimage.segmentation import watershed
+import shapely
 from shapely import affinity, coverage_is_valid, line_merge, make_valid, unary_union
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
 
 from samcloud.classification.profiles import load_cyclone_codes
+from samcloud.bim.plan_model import build_plan_model, save_plan_model
 from samcloud.core.configuration import load_yaml
 from samcloud.core.paths import CONFIG_DIRECTORY
 from samcloud.dxf.cancel import CancelToken, Cancelled, ProgressCallback, check_cancel, report_progress
@@ -74,6 +77,7 @@ from samcloud.ortho.vector.wall_lines import (
 from samcloud.ortho.vector.wall_tidy import tidy_wall_entities
 from samcloud.ortho.vector.double_walls import DoubleWallSettings, TallUnitEvidence, WallEvidence, bound_rooms_by_walls, build_double_walls, update_opening_symbols
 from samcloud.ortho.vector.labels import class_display_name, label_entities, load_label_settings, resolve_label_overlaps
+from samcloud.ortho.vector.door_rooms import DoorRoomSettings, door_bounded_rooms
 from samcloud.ortho.vector.plan_polish import PlanPolishSettings, fit_kitchen_to_walls, place_object_labels, regularize_furniture, rooms_from_wall_cells
 from samcloud.ortho.vector.lines import boundary_lines, trace_lines
 from samcloud.ortho.vector.raster_grid import RasterGrid, mask_to_polygons
@@ -81,6 +85,8 @@ from samcloud.ortho.vector.regularize import regularize_polygons
 from samcloud.ortho.vector.trees import TrunkCollector, TrunkSettings, detect_crowns, tree_annotation_entities, tree_entities
 from samcloud.ortho.vector.vertical import VerticalEvidence, VerticalSettings, detect_door_leaf, extract_builtins, filter_builtins_to_rooms, tidy_builtins, vertical_evidence
 from samcloud.ortho.vector.ceiling import CeilingSettings, ceiling_rooms, ceiling_wall_pieces, snap_exterior_faces_to_flucht
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _MAX_WALL_THICKNESS_M: float = 0.30
@@ -120,6 +126,7 @@ class CleanPlanSettings:
     indoor_kitchen_run: KitchenRunSettings = KitchenRunSettings()
     walls: DoubleWallSettings = DoubleWallSettings()
     plan_polish: PlanPolishSettings = PlanPolishSettings()
+    indoor_door_rooms: DoorRoomSettings = DoorRoomSettings()
     outdoor_trunk: TrunkSettings = TrunkSettings()
     outdoor_hedges: HedgeSettings = HedgeSettings()
     outdoor_spots: SpotSettings = SpotSettings()
@@ -198,6 +205,7 @@ def load_clean_plan_settings(path: Path | str | None = None) -> CleanPlanSetting
         indoor_kitchen_run=section_of("indoor_kitchen_run", KitchenRunSettings),
         walls=section_of("walls", DoubleWallSettings),
         plan_polish=section_of("plan_polish", PlanPolishSettings),
+        indoor_door_rooms=section_of("indoor_door_rooms", DoorRoomSettings),
         outdoor_trunk=section_of("outdoor_trunk", TrunkSettings),
         outdoor_hedges=section_of("outdoor_hedges", HedgeSettings),
         outdoor_spots=section_of("outdoor_spots", SpotSettings),
@@ -847,12 +855,13 @@ def _generate_indoor_clean_plan(
     openings = _deduplicate_plan_openings(openings, 0.15 * units_per_metre)
     doors_deduplicated = opening_candidate_count - len(openings)
     openings = [opening for opening in openings if not _opening_into_void(opening, classes != 0, grid, units_per_metre)]
+    openings, openings_3d_info = _apply_refined_openings(openings, faces, project, level, units_per_metre, clean_plan_fingerprint(project, level, plan_settings))
     windows = [opening for opening in openings if opening.kind == "WINDOW"]
     faces, wall_extended_pieces, wall_extended_length = extend_faces_for_window_gaps(faces, windows, wall_evidence | vertical.full, grid, units_per_metre, passable=free_space | closed_floor)
     enriched: list[Opening] = []
     for opening in openings:
-        if opening.kind != "DOOR":
-            enriched.append(opening)
+        if opening.kind != "DOOR" or (opening.confidence is not None and opening.leaf_detected and opening.hinge_side is not None):
+            enriched.append(opening)  # windows, passages and doors whose open leaf the 3D refinement measured
             continue
         leaf = detect_door_leaf(opening, vertical, grid, ceiling_height, units_per_metre)
         enriched.append(replace(opening, leaf_detected=leaf is not None) if leaf is None else replace(opening, leaf_detected=True, leaf_angle_deg=leaf.angle_deg, leaf_direction_deg=leaf.direction_angle_deg, leaf_mode=leaf.mode, hinge_side=leaf.hinge_side, swing_side=leaf.swing_side))
@@ -867,7 +876,7 @@ def _generate_indoor_clean_plan(
     wall_evidence_coverage = float(np.mean([face_geometry_for_metrics.distance(Point(point[:2])) <= 0.05 * units_per_metre for point in wall_points])) if len(wall_points) else 0.0
     opening_symbols = opening_entities(openings, free_space, grid=grid)
     for entity in opening_symbols:
-        if entity.get("type") == "insert" and entity.get("name") == "WINDOW":
+        if (entity.get("type") == "insert" and entity.get("name") == "WINDOW") or entity.get("_opening_kind") == "WINDOW":
             entity["_on_face"] = True
             output_layers["A-WIND"].append(entity)
         else:
@@ -1171,24 +1180,32 @@ def _generate_indoor_clean_plan(
     footprint_metrics["builtin_furniture_absorbed"] = builtin_front_stats["builtin_furniture_absorbed"]
 
     double_walls_done = False
+    plan_wall_pieces: list[dict[str, Any]] | None = None
+    plan_wall_bodies: list[Polygon] = []
     tall_units: list[tuple[Polygon, str]] = []
     if plan_settings.walls.double_line:
         # Double-line walls: every wall gets both faces with a measured or learned
         # thickness; the room outlines then follow the inner faces.
         report_progress(progress, 0.70, "Building double-line walls")
-        output_layers["A-WALL"], wall_tidy_stats = tidy_wall_entities(output_layers["A-WALL"], openings, units_per_metre)
+        # A candidate the refinement classified as no opening still shapes the wall faces like the opening of the first pass did
+        # (measured faces are trimmed around it); the wall stage then closes its span (``close_spans``).
+        ghosts = [Opening("DOOR", tuple(span["center"]), float(span["width"]), float(span["axis_angle"]), float(span.get("thickness", 0.25 * units_per_metre))) for span in openings_3d_info.get("closed") or ()]
+        output_layers["A-WALL"], wall_tidy_stats = tidy_wall_entities(output_layers["A-WALL"], [*openings, *ghosts], units_per_metre)
         footprint_metrics.update(wall_tidy_stats)
         wall_evidence_rasters = WallEvidence(
             wall_bits=vertical.wall_bits, all_bits=vertical.bitmask, bins=plan_settings.indoor_vertical.bins, storey_height=ceiling_height,
             section=section, low=low, floor=free_space, door=door_mask, cameras=_level_camera_centres(project, ortho.stats, frame, level, ceiling_height),
         )
         double = build_double_walls(
-            output_layers["A-WALL"], openings, rooms_data.polygons, free_space | closed_floor, classes != 0, grid, units_per_metre, plan_settings.walls,
+            output_layers["A-WALL"], openings, rooms_data.polygons, free_space | closed_floor, classes != 0, grid, units_per_metre,
+            replace(plan_settings.walls, refined_openings=True) if openings_3d_info.get("applied") else plan_settings.walls,
             furniture=ceiling_furniture_mask | tall_mask, evidence=wall_evidence_rasters,
             builtins=[Polygon(entity["points"]) for entity in output_layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed") and entity.get("_einb_kind") == "builtin_front" and len(entity.get("points", [])) >= 3],
             tall_units=tall_unit_evidence(fine_classes, fine_names, classes, height_map, units_per_metre),
+            close_spans=[*(openings_3d_info.get("closed") or ()), *(openings_3d_info.get("fills") or ())],
         )
         tall_units = list(double.tall_units)
+        plan_wall_pieces, plan_wall_bodies = list(double.pieces), list(double.closed_polygons)
         output_layers["A-WALL"] = double.entities
         output_layers["A-WALL-PATT"] = double.hatches
         footprint_metrics.update(double.stats)
@@ -1212,6 +1229,15 @@ def _generate_indoor_clean_plan(
                 if cell_rooms:
                     sorted_rooms = sorted(cell_rooms, key=lambda item: (-item.representative_point().y, item.representative_point().x))
                 footprint_metrics.update(cell_stats)
+                # Rooms go from door to door: the floor no wall cell encloses (hall, strips, pockets behind furniture) is
+                # handed to the room it is open to; only walls and door lines split the interior.
+                door_rooms, door_stats = door_bounded_rooms(
+                    list(sorted_rooms), double.closed_polygons, openings, free_space | closed_floor, grid, units_per_metre, plan_settings.indoor_door_rooms,
+                    furniture=ceiling_furniture_mask | tall_mask, support=classes != 0, wall_pieces=double.pieces, theta=theta,
+                )
+                if door_rooms:
+                    sorted_rooms = sorted(door_rooms, key=lambda item: (-item.representative_point().y, item.representative_point().x))
+                footprint_metrics.update(door_stats)
             if polish.furniture:
                 footprint_metrics.update(regularize_furniture(
                     output_layers, list(sorted_rooms), polish_walls, theta, units_per_metre, polish, _insert_footprint,
@@ -1244,7 +1270,7 @@ def _generate_indoor_clean_plan(
     footprint_metrics["einb_after_tidy"] = einb_tidy["after"]
     # Tall built-in kitchen units resolved by the wall stage: outline + cross + KS/HS (after the A-EINB tidy,
     # which would merge two neighbouring units); traced furniture and built-ins inside them are absorbed.
-    footprint_metrics["tall_units_absorbed"] = _emit_tall_units(output_layers, tall_units, units_per_metre)
+    footprint_metrics["tall_units_absorbed"] = _emit_tall_units(output_layers, tall_units, units_per_metre, _height_sampler(height_map, grid))
     if double_walls_done and plan_settings.plan_polish.enabled:
         kept_rooms = [polygon for polygon, decision in zip(sorted_rooms, room_names, strict=True) if decision.keep]
         # The kitchen run ends at a tall unit like at a wall.
@@ -1305,9 +1331,69 @@ def _generate_indoor_clean_plan(
         dxf_entity_count(output_layers["A-WALL"]),
     )
     result = replace(result, statuses=statuses)
-    save_cached_result(result, clean_plan_cache_dir(project, level))
+    cache_dir = clean_plan_cache_dir(project, level)
+    save_cached_result(result, cache_dir)
+    try:
+        save_plan_model(build_plan_model(
+            project_name=project.name, level=level, frame=frame, units_per_metre=units_per_metre, layers=output_layers, openings=openings,
+            rooms=[(polygon, decision.name or "Zimmer") for polygon, decision in zip(sorted_rooms, room_names, strict=True) if decision.keep],
+            wall_pieces=plan_wall_pieces, wall_bodies=plan_wall_bodies, result_fingerprint=result.settings_fingerprint,
+            instances_path=project / "products" / "classified" / "instances.json", source_extra={"openings_3d": openings_3d_info} if openings_3d_info else None,
+        ), cache_dir)
+        _store_pass1_snapshot(cache_dir, openings_3d_info, result.settings_fingerprint)
+    except Exception:
+        _LOGGER.warning("plan_model.json sidecar could not be written; DXF unaffected; IFC export will be stale", exc_info=True)
     report_progress(progress, 1.0, "Indoor clean DXF plan generation complete")
     return result
+
+
+def pass1_snapshot_is_current(cache_dir: Path, fingerprint: str) -> bool:
+    """True when ``plan_model_pass1.json`` is a PURE pass-1 plan (no refined openings applied) of this clean-plan fingerprint."""
+    from samcloud.bim.plan_model import pass1_plan_path
+
+    snapshot = pass1_plan_path(cache_dir)
+    if not snapshot.is_file():
+        return False
+    try:
+        source = json.loads(snapshot.read_text(encoding="utf-8")).get("source") or {}
+    except (OSError, ValueError):
+        return False
+    return source.get("result_fingerprint") == fingerprint and not (source.get("openings_3d") or {}).get("applied")
+
+
+def _store_pass1_snapshot(cache_dir: Path, openings_3d_info: dict[str, Any], fingerprint: str) -> None:
+    """Keep the plan of the pass computed WITHOUT refined openings as the stable seed of the opening refinement.
+
+    A pass that applied refined openings never replaces the snapshot (refining again never starts from refined
+    openings). Every other pass is a pure pass 1 and becomes the snapshot; the hook only applies refined openings
+    while a pure snapshot of the same fingerprint exists, so a snapshot can never contain refined openings.
+    """
+    from samcloud.bim.plan_model import save_pass1_snapshot
+
+    if openings_3d_info.get("applied") and pass1_snapshot_is_current(cache_dir, fingerprint):
+        return
+    save_pass1_snapshot(cache_dir)
+
+
+def _apply_refined_openings(openings: list[Opening], faces: list[WallFace], project: Path, level: Level, units_per_metre: float, fingerprint: str) -> tuple[list[Opening], dict[str, Any]]:
+    """Hook: swap the 2D openings for the 3D-refined ones when a matching openings_3d.json exists (never fatal).
+
+    Refined openings are applied only when a pure pass-1 snapshot of the current fingerprint exists; otherwise this pass
+    is the unrefined pass 1 (it becomes the snapshot) and the empty sha makes run_all regenerate the plan once the
+    refinement has run on that snapshot.
+    """
+    try:
+        from samcloud.bim.openings3d.apply import apply_refined_openings
+        from samcloud.bim.openings3d.model import openings_3d_sha256
+
+        cache_directory = clean_plan_cache_dir(project, level)
+        if openings_3d_sha256(cache_directory) is not None and not pass1_snapshot_is_current(cache_directory, fingerprint):
+            return openings, {"sha256": "", "applied": False, "reason": "no current pass-1 snapshot yet"}
+        face_lines = [face.line for face in faces if face.kind == "line" and face.line is not None]
+        return apply_refined_openings(openings, cache_directory, face_lines, units_per_metre)
+    except Exception:  # noqa: BLE001 - refinement is an optional improvement
+        _LOGGER.warning("refined openings could not be applied; using the 2D openings", exc_info=True)
+        return openings, {}
 
 
 def _indoor_scale_and_bands(level: Level, settings: CleanPlanSettings) -> tuple[float, dict[str, tuple[float, float]]]:
@@ -1445,7 +1531,7 @@ def _apply_opening_changes(layers: dict[str, list[dict[str, Any]]], changes: lis
         if new is not None:
             for entity in opening_entities([new], free_space, grid=grid):
                 entity["_on_face"] = True
-                layers["A-WIND" if entity.get("type") == "insert" and entity.get("name") == "WINDOW" else "A-DOOR"].append(entity)
+                layers["A-WIND" if (entity.get("type") == "insert" and entity.get("name") == "WINDOW") or entity.get("_opening_kind") == "WINDOW" else "A-DOOR"].append(entity)
         count += 1
     return count
 
@@ -2722,6 +2808,10 @@ TALL_UNIT_FINE_LABELS = frozenset({"refrigerator", "fridge", "oven"})
 TALL_UNIT_IF_HIGH_FINE_LABELS = frozenset({"kitchen cabinet"})
 
 
+# Fine labels of kitchen units: a wall run lying on them without wall-class points is a cabinet front (double_walls._cabinet_wall_runs).
+CABINET_FINE_LABELS = frozenset({"kitchen cabinet", "kitchen counter", "stove", "refrigerator", "kitchen sink", "oven", "dishwasher", "microwave oven"})
+
+
 def tall_unit_evidence(
     fine_classes: np.ndarray, fine_names: list[str], classes: np.ndarray, height_map: np.ndarray, units_per_metre: float,
     tall_m: float = 1.6, low_m: float = 1.5,
@@ -2736,17 +2826,41 @@ def tall_unit_evidence(
     fridge = np.isin(fine_classes, fridge_ids) & (heights >= 0.5 * units_per_metre)
     front = fridge | (np.isin(fine_classes, high_ids) & (heights >= tall_m * units_per_metre))
     low = (np.asarray(classes) != 0) & (heights > 0.05 * units_per_metre) & (heights < low_m * units_per_metre)
-    return TallUnitEvidence(front=front, fridge=fridge, low=low)
+    cabinet_ids = [index + 1 for index, name in enumerate(names) if name in CABINET_FINE_LABELS]
+    cabinet = np.isin(fine_classes, cabinet_ids) if cabinet_ids else np.zeros(np.shape(fine_classes), dtype=bool)
+    return TallUnitEvidence(front=front, fridge=fridge, low=low, cabinet=cabinet)
 
 
-def _emit_tall_units(layers: dict[str, list[dict[str, Any]]], units: list[tuple[Polygon, str]], units_per_metre: float) -> int:
+def _measured_unit_height_m(shape: Polygon, height_of: Callable[[np.ndarray], np.ndarray] | None, units_per_metre: float) -> float | None:
+    """Height of a tall unit in metres: the 90th percentile of the measured surface heights over its footprint (None below 1.6 m or unmeasured)."""
+    if height_of is None or shape.is_empty:
+        return None
+    step = 0.04 * units_per_metre
+    x0, y0, x1, y1 = shape.bounds
+    xs, ys = np.meshgrid(np.arange(x0 + step / 2, x1, step), np.arange(y0 + step / 2, y1, step))
+    inside = shapely.contains_xy(shape, xs, ys)
+    if not inside.any():
+        return None
+    values = np.asarray(height_of(np.column_stack((xs[inside], ys[inside]))), dtype=float)
+    values = values[np.isfinite(values) & (values > 0.0)]
+    if values.size < 10:
+        return None
+    height = float(np.percentile(values, 90)) / max(units_per_metre, 1e-9)
+    return round(height, 2) if height >= 1.6 else None
+
+
+def _emit_tall_units(layers: dict[str, list[dict[str, Any]]], units: list[tuple[Polygon, str]], units_per_metre: float, height_of: Callable[[np.ndarray], np.ndarray] | None = None) -> int:
     """Write the tall units of the wall stage to A-EINB (outline, cross, KS/HS); returns absorbed objects."""
     absorbed = 0
     for shape, _label in units:
         layers["A-EINB"], count = _absorb_einb(layers.get("A-EINB", []), shape)
         absorbed += count + _absorb_furniture(layers, shape, shape)
     for shape, label in units:
-        layers["A-EINB"].extend(tall_unit_entities(shape, label, units_per_metre, _wall_stage=True))
+        meta: dict[str, Any] = {"_wall_stage": True}
+        measured = _measured_unit_height_m(shape, height_of, units_per_metre)
+        if measured is not None:
+            meta["_height_m"] = measured
+        layers["A-EINB"].extend(tall_unit_entities(shape, label, units_per_metre, **meta))
     return absorbed
 
 

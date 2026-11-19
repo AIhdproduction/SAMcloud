@@ -1,0 +1,97 @@
+# Tolerance profiles per data source (docs/MASTERPROMPT.md section 7, docs/TOLERANCES.md).
+# All lengths in meters. Nothing is hardcoded in code; samcloud.bim.core.qa.tolerances loads this file.
+#
+# deviation_tol: per element type tolerance for the signed point-to-surface deviation.
+#   Walls, floors and ceilings start from planar_snap_tol, openings, windows and doors from
+#   opening_dimension_target. They are separate keys so they can be tuned independently.
+# colors: tolerance view (12.4) as RGB 0..255: within = green, front = red (in front of the model
+#   surface beyond the tolerance), behind = blue (behind the model surface beyond it).
+# wall_default_thickness: one-sided walls (only one face seen). Always origin "assumed".
+# ceiling_sag_reference: "fitted" (default, Q2) or "horizontal".
+
+profiles:
+  tls:
+    provisional: false
+    note: "Defaults from MASTERPROMPT section 7."
+    planar_snap_tol: 0.02
+    ceiling_sag_tol: 0.04
+    opening_dimension_target: 0.02
+    coverage_radius: 0.05
+    coverage_min: 0.3
+    snap_quantile: 0.99
+    noise_warning_factor: 2.0
+    ceiling_sag_reference: fitted
+    wall_default_thickness:
+      interior: 0.12
+      exterior: 0.30
+    deviation_tol:
+      wall: 0.02
+      floor: 0.02
+      ceiling: 0.02
+      opening: 0.02
+      window: 0.02
+      door: 0.02
+    colors:
+      within: [46, 160, 67]
+      front: [214, 39, 40]
+      behind: [31, 119, 180]
+
+  slam:
+    provisional: true
+    note: >-
+      To be confirmed from the measured noise (M4 WP1). Relaxed because hand-held SLAM scanners
+      typically show a range noise of 1 to 3 cm on flat surfaces, so the TLS values (2 cm) would
+      only describe noise (tolerance below 2 sigma, see noise floor). Starting values are about
+      twice the TLS values, to be replaced by 2 times the measured sigma or more.
+    planar_snap_tol: 0.04
+    ceiling_sag_tol: 0.06
+    opening_dimension_target: 0.04
+    coverage_radius: 0.08
+    coverage_min: 0.25
+    snap_quantile: 0.99
+    noise_warning_factor: 2.0
+    ceiling_sag_reference: fitted
+    wall_default_thickness:
+      interior: 0.12
+      exterior: 0.30
+    deviation_tol:
+      wall: 0.04
+      floor: 0.04
+      ceiling: 0.04
+      opening: 0.04
+      window: 0.04
+      door: 0.04
+    colors:
+      within: [46, 160, 67]
+      front: [214, 39, 40]
+      behind: [31, 119, 180]
+
+  photogrammetry:
+    provisional: true
+    note: >-
+      To be confirmed from the measured noise (M4 WP1). Relaxed further than SLAM because
+      photogrammetric point clouds show larger noise (often 2 to 5 cm), outliers, and holes on
+      glass, mirrors and textureless surfaces. Coverage radius and minimum coverage allow for
+      the holes; outlier filtering is stricter in the pipeline, not here.
+    planar_snap_tol: 0.06
+    ceiling_sag_tol: 0.08
+    opening_dimension_target: 0.06
+    coverage_radius: 0.10
+    coverage_min: 0.2
+    snap_quantile: 0.99
+    noise_warning_factor: 2.0
+    ceiling_sag_reference: fitted
+    wall_default_thickness:
+      interior: 0.12
+      exterior: 0.30
+    deviation_tol:
+      wall: 0.06
+      floor: 0.06
+      ceiling: 0.06
+      opening: 0.06
+      window: 0.06
+      door: 0.06
+    colors:
+      within: [46, 160, 67]
+      front: [214, 39, 40]
+      behind: [31, 119, 180]

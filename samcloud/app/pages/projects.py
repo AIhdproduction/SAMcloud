@@ -211,6 +211,7 @@ def render() -> None:
                 label=t("projects.create.control_points"),
                 value="none",
             )
+            auto_dxf = ui.switch(t("projects.create.auto_dxf"), value=True).mark("auto-dxf-switch")
             with ui.card().classes("w-full"):
                 ui.label(t("projects.create.storage")).classes("text-base font-medium")
                 storage_switches = {
@@ -301,6 +302,7 @@ def render() -> None:
                         rtk_enabled=rtk_enabled.value,
                         control_points_mode=control_points_mode.value,
                         storage={key: bool(control.value) for key, control in storage_switches.items()},
+                        auto_dxf=bool(auto_dxf.value),
                         apriltags_enabled=bool(apriltag_switch.value),
                         apriltag_coordinates_csv=tag_upload["path"] if apriltag_switch.value else None,
                         apriltag_crs=tag_crs.value if tag_upload["path"] else None,

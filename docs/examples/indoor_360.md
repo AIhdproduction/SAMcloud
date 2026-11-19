@@ -9,7 +9,7 @@ equirectangular `.mp4`. The project uses the capture type **360 degree
 camera / Insta360** with the **Indoor** class set and AprilTags for the
 metric scale. The example shows every workflow step: alignment and tag scale,
 dense cloud, "Improve & filter", semantic classification, the clean DXF plan,
-and the project overview with the computing times.
+the IFC model, and the project overview with the computing times.
 
 All viewer images use the same camera, the same display settings and the same
 crop; the ceiling is hidden with the viewer's height filter (upper limit
@@ -63,34 +63,75 @@ found. Classification took 1 h 14 min. See
 
 ## 6. Clean DXF plan
 
-<img src="../../assets/workflow_dxf_plan.png" alt="Clean DXF plan of the apartment" width="800">
+The DXF and IFC export is created automatically after processing (the project
+setting **Create DXF/IFC automatically after processing**, default on); the
+DXF/IFC page shows the result and lets you recompute it.
 
-The clean plan (orthophoto variant) of the same apartment, shown in the same
-orientation as the viewer images (entrance door at the top). Walls are drawn
-as double lines with a grey fill: 70.9 m of wall, exterior walls 0.31 m thick
-(measured), interior walls in three learned thickness classes of 0.09, 0.21
-and 0.25 m. Seven rooms are bounded by the walls and carry name and area:
-Wohnen / Küche 39.9 m² (one open-plan room), Schlafen 18.7 m², Zimmer
-13.9 m², Flur 9.2 m², Bad 5.3 m², Gäste-WC 3.3 m² and Flur 1.4 m². The plan
-also holds 7 doors with their widths (0.71 to 1.12 m), 2 windows, sanitary
-and kitchen symbols (bathtub, 2 washbasins, 2 WCs, cooktop, corner sink), the
-U-shaped kitchen (counter drawn by its front lines, peninsula with a raised
-bar, sink on the diagonal corner unit, dashed upper cabinet), the tall
-built-in units (fridges "KS" and tall cabinets "HS" with a cross) with the
-wall behind them, the dining table with its six chairs each in its own
-labelled box, and furniture outlines with their heights whose shape is chosen
-against the measured footprint (the corner sofa as an L with backrest and
-corner-module lines), all on Cyclone/CAD layers. Computing everything on the
-DXF page took 4 min 10 s.
+<img src="../../assets/workflow_dxf_ifc_page.png" alt="DXF/IFC page with the clean plan of the apartment" width="800">
+
+The clean plan (orthophoto variant) of the same apartment on the DXF/IFC page,
+shown in the same orientation as the viewer images (entrance door at the top).
+Walls are drawn as double lines with a grey fill. Five rooms go from door to
+door and carry name and area: Gäste-WC 3.1 m², Bad 5.4 m², Zimmer 13.7 m²,
+Schlafen 20.5 m² and Wohnen / Küche 48.6 m². Kitchen and living room are one
+space, and the entrance hall is part of it because there is no door between
+them. The small corridor joins the bedroom through the passage. The plan also
+holds 5 doors with their widths (0.80 to 1.60 m), one passage (0.90 m, an
+opening up to the ceiling without door leaf, drawn as jamb lines only) and 2
+windows (1.85 m with two mullions, and 1.77 m with one mullion). Doors with a
+measured open leaf (three here) are drawn with
+their swing symbol on the measured hinge and swing side, sanitary and kitchen symbols,
+the kitchen (counter drawn by its front lines, dashed upper cabinet), the tall
+built-in units with the wall behind them, the dining table with its chairs
+each in its own labelled box, and furniture outlines with their heights whose
+shape is chosen against the measured footprint, all on Cyclone/CAD layers.
+Door and window widths, sill and head heights come from the opening
+refinement described in the next section.
 See [DXF export](../../README.md#dxf-export) and
 [Orthophoto clean plan](../ortho_plan.md).
 
-## 7. Project overview in the UI
+## 7. IFC model
+
+The same **Compute everything** button also writes the IFC. On indoor
+projects the page is called **DXF/IFC**, and the run is: orthophoto, segment,
+clean plan, **Refine openings**, clean plan again, DXF export, IFC export.
+**Refine openings** measures every window and door on its wall plane from the
+SAM3 masks of the cube-face photos (projected with the COLMAP poses, with
+occlusion test) and from the point cloud: width, sill height (BRH), head
+height (STH) and mullions; areas nobody saw stay unknown. It also tells a door
+(door-class casing or lintel) from a passage (opening up to the ceiling, no
+door) and from a candidate that is no opening at all, measures the head and the
+headroom of every door and the hinge and swing of an open leaf, and finds
+entrance doors in wall lines without opening. The DXF and the IFC
+are both written from the same building model (`plan_model.json`), so walls,
+rooms, doors and windows match. The DXF plan above and the IFC below come from this one model.
+
+<img src="../../assets/workflow_ifc_viewer.png" alt="IFC viewer on the DXF/IFC page" width="800">
+
+The IFC viewer below the DXF preview shows the model in 3D: 27 walls with
+their openings, 5 doors, 1 passage (an opening without door), 2 windows, 5
+rooms (6 room volumes, because a wall splits the bedroom into two pieces),
+floor slab, 6 ceilings and 42 furniture items. The viewer splits the furniture by IFC class into the
+element types *Möbel* (30, `IfcFurniture`), *Sanitär* (6,
+`IfcSanitaryTerminal`), *Geräte* (1, `IfcElectricAppliance`) and *Sonstiges*
+(5, `IfcBuildingElementProxy`), which add up to the 42 items. Element types
+can be shown or hidden; ceilings, rooms and openings are hidden by default so
+the view looks into the apartment. The export is checked
+against an IDS file (0 failures) and `qa.json` confirms that the openings of
+the DXF and the IFC are identical.
+
+<img src="../../assets/workflow_ifc_window.png" alt="Picked window with its properties" width="800">
+
+A click on an element highlights it and opens its properties. The picked
+window is 1.85 m wide and 1.40 m high, with sill height (BRH) 0.65 m, head
+height (STH) 2.05 m and 2 mullions. See [IFC export](../ifc_export.md).
+
+## 8. Project overview in the UI
 
 <img src="../../assets/Overview.png" alt="Project overview in the user interface" width="800">
 
-The workflow panel tracks all steps and their computing times (5 h 23 min in
-total for this project on one GPU). The local source path is blanked out in
+The workflow panel tracks all steps and their computing times (5 h 28 min in
+total for this project on one GPU: 5 h 23 min for the pipeline plus 4 min 32 s for the DXF/IFC export). The local source path is blanked out in
 the screenshot. It shows the default German interface; English can be selected
 in the settings (see [User interface](../../README.md#user-interface)).
 

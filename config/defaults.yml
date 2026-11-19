@@ -14,6 +14,8 @@ coordinate_systems:
 
 workflow:
   use_gpu: true
+  # Create DXF/IFC automatically after a successful processing run (step 8).
+  auto_dxf: true
   alignment_mode: incremental
   georeferencing_mode: optional
   control_points_enabled: false

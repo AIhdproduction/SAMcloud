@@ -162,6 +162,35 @@ two ceiling fragments with no wall between them are one room when either is belo
 `room_merge_max_area_m2`. Window blocks span the wall thickness and door jamb lines
 run from face to face.
 
+### Door classification in the second pass
+
+On an indoor level the plan is generated twice (see [DXF and IFC](ifc_export.md#refine-openings)). The second pass
+applies the refined openings, and the 3D refinement decides for every door candidate whether it is a **door**, a
+**passage** or **no opening at all**:
+
+- **door**: a casing of door-class points (Cyclone 103) around the opening (a jamb strip and the head strip), or a
+  closed leaf that fills the opening, or a lintel (at least 0.30 m of wall above a measured head of at least 1.85 m)
+  on an observed wall. Weak door evidence (a single jamb strip, door-class points in the gap) keeps the safe
+  default, a door.
+- **passage**: no door evidence, the opening reaches the ceiling (headroom below 0.30 m, measured) and its cells are
+  measured free. A passage stays an opening without leaf or swing arc, rooms on both sides are one room, and its head
+  height is the measured one (about 2.4 m instead of the 2.0 m default).
+- **no opening**: neither door evidence nor a measured free gap, or no wall beside the opening that was actually
+  observed (furniture in the wall band, a gap in unobserved wall). The candidate is dropped and the wall closes: the
+  wall stage continues the host wall over the span when the measured faces leave a gap there (the candidate still trims the measured faces in the face
+  tidy step like the opening of the first pass, so both faces of the wall pair up into one wall of the host thickness), and the 2D door
+  heuristics (leaf reorientation, doorway detection, doors made of leaf faces) do not move, drop or add openings of
+  the refinement (`walls.refined_openings`, set by the hook).
+
+An **open leaf** never makes a door. It is assigned (hinge side, swing side, opening angle) to a door only when it
+hinges at that door's own jamb; a leaf that two doors both find belongs to the one whose jamb is closer. In the DXF a
+door with a measured leaf is drawn as the `DOOR` block on the measured hinge, swinging to the measured side, with its
+two jamb lines; a door without a leaf, and every passage, is drawn as jamb lines only. The original host wall (the wall pieces of the first pass) stays
+beside every refined door and passage up to `classify.host_reach_m`: where the measured faces leave a stretch of it open (an entrance door in a wall nobody
+measured), the wall stage continues it (`door-fill` run of the host thickness), so a door never takes its wall away and the room reaches the door line. Wall lines are also scanned
+for door frames where no opening exists yet (entrances, `scan:` in `config/bim_openings.yaml`); such a door is added
+and hosted on its wall.
+
 ### Plan polish
 
 After the double-line walls, `samcloud/ortho/vector/plan_polish.py` cleans the plan
@@ -175,7 +204,25 @@ After the double-line walls, `samcloud/ortho/vector/plan_polish.py` cleans the p
   between two wall corners, at most `room_split_max_m` long, that leaves each ceiling room
   on its own side (for example the hall that opens to the living room). Every cell with
   floor gets a name and an area, also without fixtures ("Zimmer"; "Büro" with at least two
-  desks or monitors); a corridor between doors is a "Flur" from `min_hall_area_m2`.
+  desks or monitors); a corridor between doors is a "Flur" from `min_hall_area_m2` (0.5 m2; a cell below the room minimum that two doors open into, `small_hall_min_doors`, is kept as hall).
+  Rooms go from door to door (`door_rooms.py`, `indoor_door_rooms:`): the wall cells are completed
+  to the whole interior floor and split only by wall bodies, window spans and door lines (through
+  the wall centre, across the full door width), so each side gets half of the door reveal. A
+  passage (an opening without door leaf or lintel) does not split, furniture never carves or
+  splits a room, and a hall or strip that no wall cell encloses belongs to the room it is open to
+  (a floor reached only through doors is a room of its own). The shipped config sets
+  `room_split_max_m: 0`: a ceiling-room step inside a wall cell no longer splits it. Rooms stay on
+  measured ground (`support_*`: the top-view points; unobserved ground outside the wall line never
+  becomes floor), wall gaps narrower than any door and missing stretches of an exterior wall (up to
+  `exterior_gap_max_m`, bridged along the wall line) are closed for room building, a measured room
+  that a door line runs through is cut at the line, and a floor piece closed in by doors is a room
+  of its own. A door always separates two rooms, whatever else is open between them (rooms open to
+  each other along at least `merge_contact_m` without a wall or door line are one room). A passage (no door)
+  never separates. Room edges that follow the contour of the measured ground are
+  closed straight along the wall axes (`support_step_m`). In the wall stage a stretch of a measured wall run that has no wall
+  points, lies beside kitchen cabinets with room floor on its other side and makes up most of its run
+  is a cabinet column (`cabinet_*` in `walls:`): the wall is dropped and a tall unit with its measured
+  height (about 2.3 m) is drawn and exported instead.
 - **Furniture** (`A-FURN`): fragments of one instance are merged; each outline becomes a
   rectangle along the wall axes when it covers the traced footprint (`furniture_rect_iou`),
   stays a rotated rectangle when the object really stands at an angle, and is otherwise a

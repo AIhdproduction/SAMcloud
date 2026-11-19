@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import math
 
 import cv2
@@ -36,6 +37,13 @@ class Opening:
     hinge_side: str | None = None
     swing_side: int | None = None
     leaf_detected: bool | None = None
+    # Measured by the 3D refinement (samcloud.bim.openings3d); None / empty for 2D-only openings.
+    sill_m: float | None = None
+    head_m: float | None = None
+    height_source: str | None = None
+    mullion_u: tuple[float, ...] = ()  # metres from the left edge along the axis
+    glazed: bool = False
+    confidence: float | None = None
 
 
 def wall_faces_from_section(
@@ -251,6 +259,37 @@ def cut_openings(walls: list[Polygon], openings: list[Opening]) -> list[Polygon]
     return output
 
 
+@lru_cache(maxsize=1)
+def _default_heights() -> tuple[float, float, float]:
+    """Metric defaults (window sill, window head, door head) shared with the BIM export."""
+    from samcloud.bim.plan_model import load_bim_export_config
+
+    defaults = load_bim_export_config()["defaults"]
+    return float(defaults["window_sill_m"]), float(defaults["window_head_m"]), float(defaults["door_head_m"])
+
+
+def _head_suffix(opening: Opening) -> str:
+    return f" H {opening.head_m:.2f}" if opening.head_m is not None else ""
+
+
+def _window_attributes(opening: Opening) -> dict[str, str]:
+    """LABEL plus BRH (sill) / STH (head) in metres and MULLIONS; unmeasured windows carry the BIM defaults."""
+    default_sill, default_head, _ = _default_heights()
+    sill = default_sill if opening.sill_m is None else float(opening.sill_m)
+    head = default_head if opening.head_m is None else float(opening.head_m)
+    return {"LABEL": f"Window {opening.width:.2f} m", "BRH": f"{sill:.2f}", "STH": f"{head:.2f}", "MULLIONS": str(len(opening.mullion_u))}
+
+
+def _door_attributes(opening: Opening) -> dict[str, str]:
+    """LABEL plus H (head height, m) and GLAZED=1 for doors with a glass leaf."""
+    _, _, default_head = _default_heights()
+    head = default_head if opening.head_m is None else float(opening.head_m)
+    attributes = {"LABEL": f"Door {opening.width:.2f} m", "H": f"{head:.2f}"}
+    if opening.glazed:
+        attributes["GLAZED"] = "1"
+    return attributes
+
+
 def opening_entities(
     openings: list[Opening], free_space_mask: np.ndarray | None = None, *, grid: RasterGrid | None = None
 ) -> list[dict[str, object]]:
@@ -258,7 +297,9 @@ def opening_entities(
 
     The DOOR block has its closed leaf along positive x and open leaf along
     positive y.  Its x scale therefore always points from the hinge to the
-    other jamb; the sign of y scale is the normal-side swing direction.
+    other jamb; a right hinge turns the block by 180 degrees, so the y scale
+    carries the swing sign times -1 there: the open leaf always stands on the
+    ``swing_side`` side of the opening normal.
     """
     if free_space_mask is not None:
         if grid is None:
@@ -277,7 +318,7 @@ def opening_entities(
                 entities.extend([
                     {"type": "line", "start": (np.asarray(opening.center) - half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) - half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
                     {"type": "line", "start": (np.asarray(opening.center) + half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) + half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
-                    {"type": "text", "text": f"{'Tür' if opening.kind == 'DOOR' else 'Durchgang'} {opening.width:.2f} m", "point": (np.asarray(opening.center) + normal * 0.15 * max(opening.wall_thickness / 0.25, 1.0)).tolist(), "height": 0.10, "rotation": math.degrees(opening.axis_angle), "_opening_label": True, "_opening_center": centre_marker},
+                    {"type": "text", "text": f"{'Tür' if opening.kind == 'DOOR' else 'Durchgang'} {opening.width:.2f} m" + _head_suffix(opening), "point": (np.asarray(opening.center) + normal * 0.15 * max(opening.wall_thickness / 0.25, 1.0)).tolist(), "height": 0.10, "rotation": math.degrees(opening.axis_angle), "_opening_label": True, "_opening_center": centre_marker},
                 ])
                 continue
             hinge_side = opening.hinge_side or "left"
@@ -288,14 +329,28 @@ def opening_entities(
             swing_side = 1 if swing_side is None else swing_side
             direction = axis if hinge_side == "left" else -axis
             hinge = np.asarray(opening.center) - axis * (opening.width / 2.0) if hinge_side == "left" else np.asarray(opening.center) + axis * (opening.width / 2.0)
-            entities.append({"type": "insert", "name": "DOOR", "point": hinge.tolist(), "rotation": math.degrees(math.atan2(direction[1], direction[0])), "xscale": opening.width, "yscale": float(swing_side) * opening.width, "attributes": {"LABEL": f"Door {opening.width:.2f} m"}, "_leaf_angle_deg": opening.leaf_angle_deg, "_leaf_mode": opening.leaf_mode, "_hinge_side": hinge_side, "_swing_side": swing_side, "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
+            normal = np.asarray((-axis[1], axis[0]))
+            half = axis * (opening.width / 2.0)
+            thickness = max(opening.wall_thickness, 0.01)
+            centre_marker = [float(opening.center[0]), float(opening.center[1])]
+            entities.append({"type": "insert", "name": "DOOR", "point": hinge.tolist(), "rotation": math.degrees(math.atan2(direction[1], direction[0])), "xscale": opening.width, "yscale": float(swing_side) * opening.width * (1.0 if hinge_side == "left" else -1.0), "attributes": _door_attributes(opening), "_leaf_angle_deg": opening.leaf_angle_deg, "_leaf_mode": opening.leaf_mode, "_hinge_side": hinge_side, "_swing_side": swing_side, "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
+            # The opening's jambs stay drawn beside the swing symbol (CAD convention: the wall ends at the opening are marked).
+            entities.extend([
+                {"type": "line", "start": (np.asarray(opening.center) - half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) - half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
+                {"type": "line", "start": (np.asarray(opening.center) + half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) + half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
+            ])
         elif opening.kind == "WINDOW":
             normal = np.asarray((-axis[1], axis[0]))
             exterior_sign = 1.0
             if free_space_mask is not None and grid is not None:
                 positive, negative = _free_space_by_normal(opening, np.asarray(free_space_mask, dtype=bool), grid)
                 exterior_sign = -1.0 if positive >= negative else 1.0
-            entities.append({"type": "insert", "name": "WINDOW", "point": [opening.center[0] - opening.width / 2.0 * axis[0], opening.center[1] - opening.width / 2.0 * axis[1]], "rotation": math.degrees(opening.axis_angle), "xscale": opening.width, "yscale": exterior_sign * opening.wall_thickness, "attributes": {"LABEL": f"Window {opening.width:.2f} m"}, "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
+            origin = np.asarray((opening.center[0] - opening.width / 2.0 * axis[0], opening.center[1] - opening.width / 2.0 * axis[1]))
+            entities.append({"type": "insert", "name": "WINDOW", "point": origin.tolist(), "rotation": math.degrees(opening.axis_angle), "xscale": opening.width, "yscale": exterior_sign * opening.wall_thickness, "attributes": _window_attributes(opening), "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
+            # Mullion bars (3D refinement): a line across the wall thickness at every measured position, drawn in the window layer.
+            for position in opening.mullion_u:
+                start = origin + axis * float(position)
+                entities.append({"type": "line", "start": start.tolist(), "end": (start + normal * exterior_sign * opening.wall_thickness).tolist(), "_mullion": True, "_opening_center": list(opening.center), "_opening_kind": opening.kind})
     return entities
 
 

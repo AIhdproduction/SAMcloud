@@ -128,3 +128,37 @@ def test_idle_phase_shows_no_remaining_time() -> None:
     }
     assert home._phase_text("refinement", {"refinement": "not_started"}, progress) == "0%"
     assert home._phase_text("refinement", {"refinement": "running"}, progress).startswith("0% · ")
+
+
+def _refinement_progress(depth_prior: str, geometry: str, percent: float = 0.0) -> dict:
+    return {
+        "stages": [
+            {"key": "depth_prior", "status": depth_prior, "percent": percent, "expected_seconds": 100},
+            {"key": "surface_fusion", "status": "pending" if depth_prior != "done" else "done",
+             "percent": 100 if depth_prior == "done" else 0, "expected_seconds": 100},
+            {"key": "geometry_refinement", "status": geometry, "percent": 100 if geometry == "skipped" else 0,
+             "expected_seconds": 100},
+        ],
+    }
+
+
+def test_queued_phase_with_skipped_stage_shows_zero_percent() -> None:
+    progress = _refinement_progress("pending", "skipped")
+    progress["stages"][1]["status"] = "pending"
+    statuses = {"refinement": "queued"}
+    assert home._phase_percent("refinement", statuses, progress) == 0.0
+    assert home._phase_text("refinement", statuses, progress).startswith("0% · ")
+
+
+def test_running_phase_with_skipped_stage_counts_done_and_skipped() -> None:
+    progress = _refinement_progress("running", "skipped", percent=50.0)
+    progress["stages"][1]["status"] = "pending"
+    value = home._phase_percent("refinement", {"refinement": "running"}, progress)
+    assert value == pytest.approx((50 + 0 + 100) / 3)
+
+
+def test_completed_phase_with_skipped_stage_shows_full_percent() -> None:
+    progress = _refinement_progress("done", "skipped")
+    progress["stages"][0]["percent"] = 100
+    assert home._phase_percent("refinement", {"refinement": "completed"}, progress) == 100.0
+    assert home._phase_percent("refinement", {"refinement": "running"}, progress) == pytest.approx(100.0)

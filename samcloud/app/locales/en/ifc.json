@@ -1,0 +1,67 @@
+{
+  "card": {
+    "title": "IFC model",
+    "empty": "No IFC yet – 'Compute everything' creates DXF and IFC.",
+    "download": "Download IFC",
+    "download_missing": "No IFC file yet",
+    "no_file": "There is no IFC file.",
+    "qa_failures": "IDS: {count} failures",
+    "qa_ok": "IDS: {count} failures",
+    "stale": "The IFC is older than the current plan. 'Compute everything' recreates it."
+  },
+  "viewer": {
+    "hint": "Drag: orbit · right-drag: pan · wheel: zoom · click: properties",
+    "loading": "Loading 3D model...",
+    "load_failed": "Could not load the 3D model ({error}).",
+    "no_model": "No 3D model available.",
+    "fit": "Fit"
+  },
+  "panel": {
+    "types": "Element types",
+    "all": "all",
+    "none": "none",
+    "section": "Horizontal section",
+    "section_height": "Section height: {height} m",
+    "section_off": "Off"
+  },
+  "category": {
+    "walls": "Walls",
+    "ceilings": "Ceilings",
+    "floors": "Floors",
+    "spaces": "Spaces",
+    "doors": "Doors",
+    "windows": "Windows",
+    "openings": "Openings",
+    "furniture": "Furniture",
+    "sanitary": "Sanitary",
+    "appliances": "Appliances",
+    "builtins": "Built-ins",
+    "other": "Other"
+  },
+  "props": {
+    "title": "Properties",
+    "none": "Click an element in the model.",
+    "name": "Name",
+    "class": "Class",
+    "type": "Type",
+    "storey": "Storey",
+    "id": "GlobalId",
+    "unknown": "No properties found.",
+    "show_all": "show all",
+    "opening": "Opening",
+    "width": "Width",
+    "height": "Height",
+    "sill": "Sill height (BRH)",
+    "head": "Head height (STH)",
+    "mullions": "Mullions",
+    "glazed": "Glazed",
+    "hinge": "Hinge",
+    "hinge_left": "left",
+    "hinge_right": "right",
+    "swing": "Leaf swings to side",
+    "leaf_angle": "Leaf opening angle",
+    "yes": "yes",
+    "no": "no",
+    "metres": "{value} m"
+  }
+}

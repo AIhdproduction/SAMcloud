@@ -1,5 +1,5 @@
 {
-  "intro": "Print templates for control points. Works without an open project as well.",
+  "intro": "Print templates for control points.",
   "apriltag": {
     "title": "AprilTags (150 mm, tag36h11)",
     "hint": "For indoor use: scale and optional georeferencing. Print at 100 %.",

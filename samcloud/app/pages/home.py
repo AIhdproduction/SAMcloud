@@ -20,7 +20,7 @@ _WORKFLOW = (
     ("Classify", "classification"),
     ("Improve & filter", "refinement"),
     ("Export LAS / PLY", "export"),
-    ("DXF export", "dxf"),
+    ("DXF/IFC export", "dxf"),
 )
 
 _PHASE_RANGES = {
@@ -66,6 +66,7 @@ _TIME_GROUP_KEYS = {
     "Klassifizierung": "home.time_group.classification",
     "Verbessern & filtern": "home.time_group.refinement",
     "Export": "home.time_group.export",
+    "DXF/IFC-Export": "home.time_group.dxf_ifc",
     "Übrige Schritte": "home.time_group.other",
 }
 
@@ -117,6 +118,7 @@ def _processing_time_summary(project_directory: Path | None) -> dict | None:
     """Total processing time of the latest completed run chain (alignment run + resume run)."""
     if project_directory is None:
         return None
+    dxf_seconds = _dxf_ifc_seconds(project_directory)
     runs = []
     for path in (project_directory / "reports").glob("run_metrics_*.json"):
         try:
@@ -135,7 +137,7 @@ def _processing_time_summary(project_directory: Path | None) -> dict | None:
             if "Sparse reconstruction" in item.get("stage_seconds", {}):
                 chain.insert(0, item)
                 break
-    total = float(sum(float(item["total_seconds"]) for item in chain))
+    photogrammetry_total = float(sum(float(item["total_seconds"]) for item in chain))
     groups: dict[str, float] = {name: 0.0 for name, _ in _TIME_GROUPS}
     for item in chain:
         for stage, seconds in item.get("stage_seconds", {}).items():
@@ -143,10 +145,58 @@ def _processing_time_summary(project_directory: Path | None) -> dict | None:
                 if stage in members or (name == "Ausrichtung" and (stage.startswith("Tie point filtering") or stage.startswith("Bundle adjustment"))):
                     groups[name] += float(seconds)
                     break
-    other = max(0.0, total - sum(groups.values()))
+    other = max(0.0, photogrammetry_total - sum(groups.values()))
     if other >= 1.0:
         groups["Übrige Schritte"] = other
-    return {"total_seconds": total, "groups": {name: value for name, value in groups.items() if value >= 1.0}, "runs": len(chain)}
+    if dxf_seconds is not None:
+        groups["DXF/IFC-Export"] = dxf_seconds
+    visible = {name: value for name, value in groups.items() if value >= 1.0}
+    # The header and the Total line are the sum of exactly the lines shown, DXF/IFC included.
+    total = photogrammetry_total + (dxf_seconds if dxf_seconds is not None and dxf_seconds >= 1.0 else 0.0)
+    return {"total_seconds": total, "groups": visible, "runs": len(chain)}
+
+
+def _dxf_ifc_metrics(project_directory: Path | None) -> dict | None:
+    """Timing record of the latest DXF/IFC run_all job (reports/dxf_run_metrics.json), if readable."""
+    if project_directory is None:
+        return None
+    try:
+        data = json.loads((project_directory / "reports" / "dxf_run_metrics.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _dxf_ifc_seconds(project_directory: Path | None) -> float | None:
+    """Wall time of the latest completed DXF/IFC run, or None without a usable record."""
+    data = _dxf_ifc_metrics(project_directory)
+    if data is None or data.get("status") != "completed":
+        return None
+    seconds = data.get("total_seconds")
+    return float(seconds) if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0 else None
+
+
+def _dxf_ifc_step(project_directory: Path | None) -> dict:
+    """Status of workflow step 8: {"status": ready|running|completed|failed, "percent": 0..100}."""
+    if project_directory is None:
+        return {"status": "ready", "percent": 0.0}
+    job_file = project_directory / "products" / "dxf" / "job_status.json"
+    try:
+        job = json.loads(job_file.read_text(encoding="utf-8"))
+        job_age = datetime.now().timestamp() - job_file.stat().st_mtime
+    except (OSError, ValueError):
+        job, job_age = {}, 0.0
+    # A crashed job would leave "running" behind forever, so only a recently updated status counts.
+    if isinstance(job, dict) and job.get("action") == "run_all" and job.get("state") == "running" and job_age < 1800:
+        return {"status": "running", "percent": max(0.0, min(100.0, float(job.get("fraction") or 0.0) * 100.0))}
+    metrics = _dxf_ifc_metrics(project_directory)
+    if metrics is not None and metrics.get("status") == "failed":
+        return {"status": "failed", "percent": 0.0}
+    has_dxf = any((project_directory / "products" / "dxf" / "export").glob("*_clean.dxf"))
+    has_ifc = any((project_directory / "products" / "bim").glob("*/*.ifc"))
+    if has_dxf and has_ifc:
+        return {"status": "completed", "percent": 100.0}
+    return {"status": "ready", "percent": 0.0}
 
 
 def _storage_summary(project_directory: Path | None) -> dict | None:
@@ -569,9 +619,12 @@ def _render_workflow(project: dict | None) -> None:
     phase_labels = {}
     status_labels = {}
     dxf_reason = _dxf_unavailable_reason(project)
+    dxf_step = _dxf_ifc_step(state.active_project_directory) if project is not None else {"status": "ready", "percent": 0.0}
+    dxf_bar = None
+    dxf_status_label = None
     for index, (label, key) in enumerate(_WORKFLOW, start=1):
         if key == "dxf" and project is not None:
-            status = "ready" if dxf_reason is None else dxf_reason
+            status = dxf_step["status"] if dxf_step["status"] != "ready" else ("ready" if dxf_reason is None else dxf_reason)
         else:
             status = (
                 statuses.get(key, "ready") if key == "acquisition" and project is not None
@@ -588,7 +641,7 @@ def _render_workflow(project: dict | None) -> None:
         with ui.element("div").classes(step_class):
             ui.label(str(index)).classes("sam-step-number")
             ui.label(translate_or(f"workflow.step.{key}", label)).classes("sam-step-label")
-            if key == "dxf" and project is not None and dxf_reason is not None:
+            if key == "dxf" and project is not None and dxf_step["status"] == "ready" and dxf_reason is not None:
                 status_label = ui.label(status.replace("_", " ")).classes("sam-step-status")
                 status_label.style("text-transform:none").mark("home-dxf-status")
             else:
@@ -597,6 +650,9 @@ def _render_workflow(project: dict | None) -> None:
                     # Translated statuses are already cased correctly; CSS capitalize would capitalize every word.
                     status_label.style("text-transform:none")
                 status_labels[key] = status_label
+                if key == "dxf":
+                    status_label.mark("home-dxf-step-status")
+                    dxf_status_label = status_label
             if key == "dxf" and project is not None:
                 if dxf_reason is None:
                     ui.button(t("home.workflow.open_dxf"), icon="architecture", on_click=lambda: ui.navigate.to("/dxf")).props("flat dense no-caps").classes("text-cyan-4 text-xs q-mt-xs").mark("home-open-dxf")
@@ -605,6 +661,9 @@ def _render_workflow(project: dict | None) -> None:
                     with ui.element("div").classes("inline-block q-mt-xs") as dxf_slot:
                         ui.button(t("home.workflow.open_dxf"), icon="architecture").props("flat dense no-caps disable").classes("text-xs").mark("home-open-dxf")
                     dxf_slot.tooltip(dxf_reason)
+                if dxf_step["status"] in {"completed", "running"}:
+                    with ui.row().classes("items-center gap-2 w-full q-mt-xs"):
+                        dxf_bar = ui.linear_progress(value=dxf_step["percent"] / 100.0, show_value=False).classes("flex-1").mark("home-dxf-bar")
             show_bar = key in _PHASE_RANGES and project is not None
             if key == "acquisition" and show_bar:
                 show_bar = _has_prepare_stage(progress)
@@ -629,10 +688,21 @@ def _render_workflow(project: dict | None) -> None:
                         group_key = _TIME_GROUP_KEYS.get(name)
                         ui.label(translate_or(group_key, name) if group_key else name).classes("text-xs sam-muted")
                         ui.label(_format_elapsed(seconds)).classes("text-xs sam-muted")
+                with ui.row().classes("items-center justify-between w-full no-wrap q-mt-xs"):
+                    ui.label(t("home.workflow.total")).classes("text-xs").style("font-weight:600")
+                    ui.label(_format_elapsed(timing["total_seconds"])).classes("text-xs").style("font-weight:600").mark("home-total-time")
         storage = _storage_summary(state.active_project_directory)
         if storage is not None:
             after = float(storage.get("after_bytes", 0)) / 1024 ** 3
             ui.label(t("home.workflow.storage", size=f"{after:.1f}")).classes("text-xs sam-muted")
+
+    if project is not None and dxf_step["status"] == "running" and dxf_bar is not None and dxf_status_label is not None:
+        def refresh_dxf_step() -> None:
+            current = _dxf_ifc_step(state.active_project_directory)
+            dxf_bar.set_value(current["percent"] / 100.0)
+            dxf_status_label.set_text(_status_text(current["status"]))
+
+        ui.timer(2.0, refresh_dxf_step)
 
     if project is not None and _workflow_is_active(project.get("workflow", {})):
         def refresh_workflow() -> None:
@@ -658,6 +728,16 @@ def _phase_percent(stage: str, statuses: dict, progress: dict) -> float:
         return 100.0
     estimator_stages = _phase_items(stage, progress)
     if estimator_stages:
+        # A step that has not started (only pending/skipped stages) stays at 0 %: skipped stages
+        # only count as complete once the step runs, so a queued step never shows progress.
+        started = any(
+            item.get("status") in {"running", "done"}
+            or (item.get("status") != "skipped" and float(item.get("percent") or 0.0) > 0.0)
+            for item in estimator_stages
+        )
+        has_pending = any(item.get("status") not in {"done", "skipped"} for item in estimator_stages)
+        if not started and has_pending:
+            return 0.0
         weights = [max(float(item.get("expected_seconds") or 0.0), 1.0) for item in estimator_stages]
         values = [100.0 if item.get("status") in {"done", "skipped"} else float(item.get("percent") or 0.0) for item in estimator_stages]
         return sum(value * weight for value, weight in zip(values, weights)) / sum(weights)

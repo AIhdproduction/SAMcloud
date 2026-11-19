@@ -20,7 +20,10 @@ from samcloud.dxf.writer import export_plan
 from samcloud.ortho.vector.labels import LabelSettings, resolve_label_overlaps
 from samcloud.ortho.vector.plan_polish import (
     PlanPolishSettings,
+    bridge_barriers,
+    close_wall_cracks,
     collapse_short_edges,
+    enclosed_cells,
     fit_kitchen_to_walls,
     place_object_labels,
     plausible_label,
@@ -457,3 +460,134 @@ def test_object_label_keeps_clear_of_outline_and_detail_lines(upm: float) -> Non
     for line in (seat_line, module_line):
         assert LineString(line).distance(label_box) >= margin - 1e-6
     assert label["height"] >= 0.06 * upm - 1e-9 and len(layers["A-FURN-DETL"]) == 2
+
+
+def test_room_name_sanitary_fixtures_do_not_name_a_large_open_plan_room() -> None:
+    # A bath next to the living room was merged into it: 47 m2 holding a kitchen and sanitary fixtures is no "Bad".
+    assert classify_room({"toilet", "washbasin", "shower", "kitchen", "living"}, 47.0) == "Wohnen / Küche"
+    assert classify_room({"toilet", "kitchen"}, 30.0) == "Küche"
+    assert classify_room({"toilet", "washbasin", "shower"}, 47.0) is None  # nothing but sanitary fixtures in a hall-sized room: no evidence
+    assert classify_room({"toilet", "washbasin", "shower", "kitchen", "living"}, 5.0) == "Bad"  # a bath-sized room stays a bath
+    assert classify_room({"toilet", "washbasin"}, 3.0) == "Gäste-WC"
+    assert classify_room({"toilet", "washbasin"}, 14.9) == "Bad"
+    assert classify_room({"toilet", "kitchen", "living"}, 20.0, RoomNameSettings(bath_max_area_m2=25.0)) == "Bad"
+    rooms = [box(0, 0, 8, 6)]  # 48 m2 with a WC and a kitchen block inside
+    names = name_rooms(rooms, [((1.0, 1.0), "toilet"), ((2.0, 1.0), "washbasin"), ((6.0, 4.0), "kitchen"), ((4.0, 3.0), "living")], 1.0)
+    assert names[0].name == "Wohnen / Küche" and names[0].keep
+
+
+def _bath_walls(wall: float, barriers_gap: tuple[float, float]) -> tuple[list[Polygon], list[Polygon]]:
+    """Bath ring [10.0, 13.8] x [-3.4, -1.7] whose north wall is open between x 11.7 and 13.4, closed by two door-span barriers."""
+    ring = box(10.0, -3.4, 13.8, -1.7).difference(box(10.0 + wall, -3.4 + wall, 13.8 - wall, -1.7 - wall))
+    north_gap = box(11.7, -1.7 - wall, 13.4, -1.7)
+    middle = barriers_gap
+    barriers = [box(11.7, -1.7 - wall, middle[0], -1.7), box(middle[1], -1.7 - wall, 13.4, -1.7)]
+    return [ring.difference(north_gap)], barriers
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_hairline_crack_between_door_spans_does_not_open_the_room(upm: float) -> None:
+    # Two adjacent door spans leave a 2 mm slit through the wall: the bath cell must stay closed (it merged with the hall).
+    wall = 0.27
+    walls, barriers = _bath_walls(wall, (12.5, 12.502))
+    walls_s, barriers_s = [_s(item, upm) for item in walls], [_s(item, upm) for item in barriers]
+    union = unary_union(walls_s + barriers_s)
+    bath_point = _s(Point(11.5, -2.5), upm)
+    assert not any(cell.contains(bath_point) for cell in enclosed_cells(union, upm))  # the crack really leaks without the closing
+    closed = close_wall_cracks(union, 0.01 * upm, unary_union([_s(item, upm) for item in barriers]))
+    cells = [cell for cell in enclosed_cells(closed, upm) if cell.contains(bath_point)]
+    assert len(cells) == 1
+    inner_area = (13.8 - wall - 10.0 - wall) * (-1.7 - wall + 3.4 - wall) * upm * upm
+    assert cells[0].area == pytest.approx(inner_area, rel=0.02)
+    bath_ceiling = box(10.5, -3.0, 13.2, -2.1)
+    rooms, _ = rooms_from_wall_cells([_s(bath_ceiling, upm)], walls_s, barriers_s, None, None, upm, 0.0)
+    bath = [room for room in rooms if room.contains(bath_point)]
+    assert len(bath) == 1 and bath[0].area == pytest.approx(inner_area, rel=0.02)
+    assert not bath[0].contains(_s(Point(12.0, -1.0), upm))
+    # Rule off: the same input produces no bath room of the inner size.
+    leaking, _ = rooms_from_wall_cells([_s(bath_ceiling, upm)], walls_s, barriers_s, None, None, upm, 0.0, PlanPolishSettings(wall_crack_m=0.0))
+    assert not any(room.contains(bath_point) and abs(room.area - inner_area) < 0.02 * inner_area for room in leaking)
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_crack_closing_keeps_real_openings_open(upm: float) -> None:
+    # A 0.5 m (or wider) gap is a real passage, not a crack: the closing must leave it open, so no cell appears.
+    wall = 0.27
+    for gap in (0.5, 0.9):
+        walls, barriers = _bath_walls(wall, (12.5, 12.5 + gap))
+        union = unary_union([_s(item, upm) for item in walls + barriers])
+        closed = close_wall_cracks(union, 0.01 * upm, unary_union([_s(item, upm) for item in barriers]))
+        assert not any(cell.contains(_s(Point(11.5, -2.5), upm)) for cell in enclosed_cells(closed, upm)), gap
+        assert closed.symmetric_difference(union).area <= 1e-6 * upm * upm * 100
+
+
+def test_crack_closing_only_fills_seams_at_door_and_window_spans() -> None:
+    left, right = box(0.0, 0.0, 2.0, 0.3), box(2.002, 0.0, 4.0, 0.3)  # 2 mm seam between two wall bodies
+    door = box(6.0, 0.0, 7.0, 0.3)
+    walls = unary_union([left, right, box(7.001, 0.0, 9.0, 0.3), door])  # 1 mm seam beside the door span
+    closed = close_wall_cracks(walls, 0.01, door)
+    seam_wall = box(2.0, 0.0, 2.002, 0.3)
+    seam_door = box(7.0, 0.0, 7.001, 0.3)
+    assert closed.intersection(seam_door).area == pytest.approx(seam_door.area, rel=1e-6)  # door seam filled
+    assert closed.intersection(seam_wall).area == pytest.approx(0.0, abs=1e-9)  # wall-to-wall seam untouched
+    assert close_wall_cracks(walls, 0.01).intersection(seam_wall).area == pytest.approx(seam_wall.area, rel=1e-6)  # no barriers: all closed
+    assert close_wall_cracks(walls, 0.0, door) is walls
+
+
+def test_cell_formed_only_by_crack_closing_must_be_small() -> None:
+    # A 6 x 4 m space whose door spans leave a hairline crack stays with its measured ceiling room (a leak may be a real
+    # passage); the same crack on a bath-sized cell is closed.
+    wall = 0.2
+    ring = box(0.0, 0.0, 6.0, 4.0).difference(box(wall, wall, 6.0 - wall, 4.0 - wall))
+    gap = box(2.0, 4.0 - wall, 4.0, 4.0)
+    barriers = [box(2.0, 4.0 - wall, 3.0, 4.0), box(3.002, 4.0 - wall, 4.0, 4.0)]
+    ceiling = box(0.5, 0.5, 5.5, 3.5)
+    rooms, stats = rooms_from_wall_cells([ceiling], [ring.difference(gap)], barriers, None, None, 1.0, 0.0)
+    assert stats["room_cells"] == 0 and stats["rooms_outside_cells"] == 1
+    assert len(rooms) == 1 and rooms[0].area == pytest.approx(ceiling.area, rel=0.02)  # the measured room (15 m2), not the 5.6 x 3.6 wall cell
+    rooms_big, stats_big = rooms_from_wall_cells([ceiling], [ring.difference(gap)], barriers, None, None, 1.0, 0.0, PlanPolishSettings(wall_crack_cell_max_m2=30.0))
+    assert stats_big["room_cells"] == 1 and rooms_big[0].area == pytest.approx(5.6 * 3.6, rel=0.01)
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_short_wall_stretch_between_a_door_and_a_window_span_does_not_open_the_room(upm: float) -> None:
+    # Door span 11.7-12.4 and window span 12.65-13.4 leave 0.25 m of north wall without any body (the measured faces
+    # there were cut away): not a passage, the bath must stay closed.
+    wall = 0.27
+    walls, barriers = _bath_walls(wall, (12.4, 12.65))
+    walls_s, barriers_s = [_s(item, upm) for item in walls], [_s(item, upm) for item in barriers]
+    bath_point = _s(Point(11.5, -2.5), upm)
+    assert not any(cell.contains(bath_point) for cell in enclosed_cells(unary_union(walls_s + barriers_s), upm))
+    rooms, _ = rooms_from_wall_cells([_s(box(10.5, -3.0, 13.2, -2.1), upm)], walls_s, barriers_s, None, None, upm, 0.0)
+    bath = [room for room in rooms if room.contains(bath_point)]
+    inner_area = (13.8 - wall - 10.0 - wall) * (-1.7 - wall + 3.4 - wall) * upm * upm
+    assert len(bath) == 1 and bath[0].area == pytest.approx(inner_area, rel=0.02)
+    # a 0.5 m stretch (a real passage next to the door) is not closed
+    walls_wide, barriers_wide = _bath_walls(wall, (12.4, 12.9))
+    wide, _ = rooms_from_wall_cells([_s(box(10.5, -3.0, 13.2, -2.1), upm)], [_s(item, upm) for item in walls_wide], [_s(item, upm) for item in barriers_wide], None, None, upm, 0.0)
+    assert not any(room.contains(bath_point) and abs(room.area - inner_area) < 0.02 * inner_area for room in wide)
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_staggered_spans_with_a_wall_stub_gap_are_bridged_and_far_spans_are_not(upm: float) -> None:
+    # Door span (y -1.97..-1.68) and window span (y -2.23..-1.94, offset wall) with 0.25 m of missing wall between them.
+    door, window = box(11.7, -1.97, 12.4, -1.68), box(12.65, -2.23, 13.4, -1.94)
+    bridges = bridge_barriers([_s(door, upm), _s(window, upm)], 0.30 * upm, 0.20 * upm * upm)
+    assert bridges
+    bridge = unary_union(bridges)
+    assert bridge.covers(_s(Point(12.5, -1.95), upm)) and not bridge.intersects(_s(door, upm).buffer(-1e-6)) and not bridge.intersects(_s(window, upm).buffer(-1e-6))
+    far = box(13.0, -2.23, 13.75, -1.94)  # 0.6 m from the door span: two separate openings
+    assert bridge_barriers([_s(door, upm), _s(far, upm)], 0.30 * upm, 0.20 * upm * upm) == []
+    assert bridge_barriers([_s(door, upm), _s(window, upm)], 0.20 * upm, 0.20 * upm * upm) == []  # reach below the 0.25 m gap
+    assert bridge_barriers([_s(door, upm), _s(box(11.9, -1.7, 12.6, -1.4), upm)], 0.30 * upm, 0.20 * upm * upm) == []  # overlapping spans need no bridge
+
+
+def test_a_single_kitchen_item_does_not_turn_a_bedroom_into_a_kitchen() -> None:
+    """One upper cabinet at a door (inside the room outline) plus a bed: Schlafen.  Sink + hob: Küche."""
+    room = box(0.0, 0.0, 4.0, 4.0)
+    bed = ((1.0, 1.0), "bed")
+    cabinet = ((3.9, 3.9), "kitchen")
+    assert name_rooms([room], [bed, cabinet], 1.0)[0].name == "Schlafen"
+    kitchen = name_rooms([room], [((1.0, 3.0), "kitchen"), ((2.0, 3.0), "kitchen")], 1.0)[0]
+    assert kitchen.name == "Küche"
+    assert name_rooms([room], [((1.0, 3.0), "kitchen")], 1.0)[0].name == "Küche"  # without a bed a single kitchen item still names the room

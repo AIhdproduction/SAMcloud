@@ -1,0 +1,67 @@
+{
+  "card": {
+    "title": "IFC-Modell",
+    "empty": "Noch kein IFC – 'Alles berechnen' erzeugt DXF und IFC.",
+    "download": "IFC herunterladen",
+    "download_missing": "Noch keine IFC-Datei vorhanden",
+    "no_file": "Es ist keine IFC-Datei vorhanden.",
+    "qa_failures": "IDS: {count} Fehler",
+    "qa_ok": "IDS: {count} Fehler",
+    "stale": "Das IFC ist älter als der aktuelle Plan. 'Alles berechnen' erzeugt es neu."
+  },
+  "viewer": {
+    "hint": "Ziehen: drehen · Rechtsklick-Ziehen: verschieben · Mausrad: Zoom · Klick: Eigenschaften",
+    "loading": "3D-Modell wird geladen...",
+    "load_failed": "Das 3D-Modell konnte nicht geladen werden ({error}).",
+    "no_model": "Kein 3D-Modell vorhanden.",
+    "fit": "Einpassen"
+  },
+  "panel": {
+    "types": "Elementtypen",
+    "all": "alle",
+    "none": "keine",
+    "section": "Horizontalschnitt",
+    "section_height": "Schnitthöhe: {height} m",
+    "section_off": "Aus"
+  },
+  "category": {
+    "walls": "Wände",
+    "ceilings": "Decken",
+    "floors": "Böden",
+    "spaces": "Räume",
+    "doors": "Türen",
+    "windows": "Fenster",
+    "openings": "Öffnungen",
+    "furniture": "Möbel",
+    "sanitary": "Sanitär",
+    "appliances": "Geräte",
+    "builtins": "Einbauten",
+    "other": "Sonstiges"
+  },
+  "props": {
+    "title": "Eigenschaften",
+    "none": "Element im Modell anklicken.",
+    "name": "Name",
+    "class": "Klasse",
+    "type": "Typ",
+    "storey": "Geschoss",
+    "id": "GlobalId",
+    "unknown": "Keine Eigenschaften gefunden.",
+    "show_all": "alle anzeigen",
+    "opening": "Öffnung",
+    "width": "Breite",
+    "height": "Höhe",
+    "sill": "Brüstungshöhe (BRH)",
+    "head": "Sturzhöhe (STH)",
+    "mullions": "Sprossen",
+    "glazed": "Verglast",
+    "hinge": "Angelseite",
+    "hinge_left": "links",
+    "hinge_right": "rechts",
+    "swing": "Türblatt schwingt zur Seite",
+    "leaf_angle": "Öffnungswinkel Türblatt",
+    "yes": "ja",
+    "no": "nein",
+    "metres": "{value} m"
+  }
+}

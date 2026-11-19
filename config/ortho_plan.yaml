@@ -203,10 +203,15 @@ walls:
   jog_m: 0.04
   min_piece_area_m2: 0.003
   isolated_max_length_m: 1.2
+  stub_end_reach_m: 0.10            # ... where "has a wall" means touching within this distance (0 = joint_reach_m)
+  stub_min_length_m: 0.6            # faces shorter than this need a wall at BOTH ends (0 = off)
+  isolated_free_max_length_m: 2.5   # free-standing face (no wall at either end) shorter than this is dropped (0 = off)
+  isolated_free_room_distance_m: 0.6  # ... unless a ceiling room lies this close
   keep_isolated_faces: false
   room_edge_walls: true
   room_edge_min_area_m2: 2.0
   room_edge_min_length_m: 0.30
+  room_edge_opening_reach_m: 0.8    # a room edge this close to a parallel door/window span invents no wall (0 = off)
   hatch: true
   bound_rooms: true
   room_gap_m: 0.20
@@ -248,6 +253,18 @@ walls:
   tall_unit_max_free: 0.15
   tall_unit_max_low: 0.25
   tall_unit_fridge_m: 0.60
+  # A wall run on kitchen / cabinet labels (share >= cabinet_min_share) whose wall-class points of wall height cover at most
+  # cabinet_max_wall_share of it is a cabinet front taken as a wall; a real wall behind cabinets keeps its wall points and stays.
+  cabinet_walls: true
+  cabinet_min_share: 0.50
+  cabinet_max_wall_share: 0.50
+  cabinet_dilate_m: 0.05
+  cabinet_flank_m: 0.50
+  cabinet_stretch_min_m: 0.60
+  cabinet_stretch_gap_m: 0.25
+  cabinet_remnant_min_m: 0.45
+  cabinet_run_min_share: 0.40
+  cabinet_run_max_support: 0.15
 
 # Plan polish (after the double-line walls): rooms = wall cells, regular furniture, wall-hugging kitchen, clean labels.
 plan_polish:
@@ -257,9 +274,12 @@ plan_polish:
   cell_rooms: true
   room_min_area_m2: 1.0
   room_min_floor_share: 0.10
-  room_split_max_m: 2.4
+  room_split_max_m: 0.0             # rooms go from door to door: a wall cell is never split by a ceiling-room step (the door lines split, see indoor_door_rooms)
   room_split_min_area_m2: 2.0
   room_jog_m: 0.04
+  wall_crack_cell_max_m2: 12.0      # a cell that exists only after that closing counts as a room up to this area (bath / WC, not a whole flat)
+  wall_crack_m: 0.02                # hairline gaps (<= 2x = 4 cm) beside a door/window span are closed before small cells are found (0 = off)
+  barrier_bridge_m: 0.30            # two door/window spans closer than this get the wall stub between them (0 = off)
   room_step_m: 0.30
   # Furniture: rectangle along the wall axes when it covers the footprint (IoU), else a rectilinear outline
   # with steps >= furniture_step_m and at most furniture_max_vertices corners; clipped out of the walls.
@@ -293,6 +313,35 @@ plan_polish:
   # counter drawn by its front and end lines.
   kitchen_layout: true
 
+# Rooms go from door to door (door_rooms.py): the interior floor is split only by wall bodies, window spans and
+# door lines (through the wall centre, full door width); each side gets half of the door reveal.  Passages do not
+# split, furniture never carves a room, floor no wall cell encloses (hall, strips, pockets) joins the room it is open to.
+indoor_door_rooms:
+  enabled: true
+  floor_close_m: 0.50
+  floor_grow_m: 0.30
+  wall_reach_m: 0.60
+  strip_open_m: 0.20
+  merge_contact_m: 1.00
+  door_overshoot_m: 0.30
+  line_buffer_m: 0.04
+  contact_m: 0.03
+  min_contact_m: 0.15
+  min_piece_m2: 0.02
+  min_room_m2: 0.50
+  furniture_reach_m: 0.40
+  support_window_m: 0.50
+  support_density: 0.50
+  support_step_m: 0.40
+  support_grow_m: 0.25
+  gap_close_m: 0.30
+  gap_close_max_m2: 0.60
+  exterior_gap_max_m: 3.2
+  pocket_close_m: 0.60
+  pocket_min_contact_m: 0.25
+  wall_pocket_max_m2: 1.0           # a corner pocket bounded by walls and ONE room is closed over the walls up to this area, so rooms reach the wall faces (0 = off)
+  wall_face_reach_m: 0.60           # a pocket between rooms reaches the wall faces within this distance even where the measured support ends (floor hidden behind furniture)
+
 # Semantic room names; rooms below min_room_area_m2 without sanitary fixtures are dropped.
 indoor_room_names:
   min_room_area_m2: 2.0
@@ -301,8 +350,10 @@ indoor_room_names:
   # (also a corridor of at least min_hall_area_m2); office_min_items desks/monitors name a room "Büro".
   hall_max_area_m2: 15.0
   hall_min_doors: 3
-  min_hall_area_m2: 1.0
+  small_hall_min_doors: 2           # a cell below min_room_area_m2 that two doors open into (between doors) is a hall: enclosed floor is never lost
+  min_hall_area_m2: 0.5
   office_min_items: 2
+  kitchen_min_items: 2
 
 # Kitchen run along the walls (straight / L / U) with cooktop and sink inserts from fine labels.
 indoor_kitchen_run:

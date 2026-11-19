@@ -156,6 +156,9 @@ class RunSummary:
         ]
         if metrics["note"]:
             lines.append(f"Note: {metrics['note']}")
+        warnings = _step_warnings(settings)
+        if warnings:
+            lines.extend(["", "Warnings", "-" * 8, *warnings])
         lines.extend([
             "",
             "Input and settings",
@@ -217,6 +220,28 @@ class RunSummary:
             "A higher point count is not automatically better; check the cloud visually for noise and missing surfaces.",
         ])
         return "\n".join(lines) + "\n"
+
+
+_STEP_WARNING_TEXT = {
+    "depth_fill": "Depth-Anything fill was skipped",
+    "point_cleaning": "Point cleaning was skipped",
+    "surface_fusion": "Surface fusion was skipped (walls stay thick)",
+    "plane_fill": "Plane filling was skipped",
+    "superpoint_vote": "Superpoint voting was skipped",
+}
+
+
+def _step_warnings(settings: dict[str, Any]) -> list[str]:
+    """WARNING lines for optional steps that failed and for report-only parts that errored."""
+    lines = []
+    for key, text in _STEP_WARNING_TEXT.items():
+        report = settings.get(key)
+        if isinstance(report, dict) and report.get("error"):
+            lines.append(f"WARNING: {text}: {report['error']}")
+    fusion = settings.get("surface_fusion")
+    if isinstance(fusion, dict) and fusion.get("mirror_report_error"):
+        lines.append(f"WARNING: Mirror report failed (cloud was still fused): {fusion['mirror_report_error']}")
+    return lines
 
 
 def _read_json(path: Path) -> dict[str, Any]:

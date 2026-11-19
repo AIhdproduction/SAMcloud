@@ -234,6 +234,7 @@ def render() -> None:
         with ui.card().classes("w-full"):
             ui.label(t("settings.processing.title")).classes("text-lg font-medium")
             use_gpu = ui.switch(t("settings.processing.use_gpu"), value=workflow["use_gpu"])
+            auto_dxf = ui.switch(t("settings.processing.auto_dxf"), value=bool(workflow.get("auto_dxf", True))).mark("auto-dxf-switch")
             control_points = ui.select(
                 dict(CONTROL_POINTS_MODE_OPTIONS),
                 label=t("settings.processing.control_points"),
@@ -331,6 +332,7 @@ def render() -> None:
             "working_crs": working_crs,
             "export_crs": export_crs,
             "use_gpu": use_gpu,
+            "auto_dxf": auto_dxf,
             "control_points": control_points,
             "class_set": class_set,
             "min_votes": min_votes,
@@ -379,6 +381,7 @@ def render() -> None:
                 coordinates["working_crs"] = working_crs.value
                 coordinates["export_crs"] = export_crs.value
                 workflow["use_gpu"] = use_gpu.value
+                workflow["auto_dxf"] = bool(auto_dxf.value)
                 workflow["control_points_enabled"] = control_points.value in {"after_alignment", "automatic"}
                 project.setdefault("workflow", {})["control_points_mode"] = control_points.value
                 classification["class_set"] = class_set.value

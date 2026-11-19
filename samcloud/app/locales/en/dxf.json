@@ -1,6 +1,6 @@
 {
   "page": {
-    "title": "DXF export",
+    "title": "DXF/IFC export",
     "no_project": "Open a project before exporting DXF plans.",
     "not_ready": "DXF export needs a classified point cloud, but this project has none yet. Classify the point cloud first, then open this page again.",
     "advanced": "Advanced"
@@ -15,7 +15,9 @@
     "segment": "Segmenting orthophoto",
     "clean_plan": "Generating clean plan",
     "prepare_levels": "Detecting storeys",
-    "run_all": "Compute everything"
+    "run_all": "Compute everything",
+    "export_ifc": "Export IFC",
+    "refine_openings": "Refine openings"
   },
   "job": {
     "fallback": "Job",
@@ -79,7 +81,9 @@
     "step_segmentation": "Segmentation",
     "step_clean_plan": "Clean plan",
     "step_export": "DXF export",
-    "step_row": "{name}: {status}"
+    "step_row": "{name}: {status}",
+    "step_ifc": "IFC export",
+    "step_refine": "Refine openings"
   },
   "prep": {
     "title": "Preparation",
@@ -201,5 +205,32 @@
     "ok": "ok",
     "empty": "empty",
     "failed": "failed"
+  },
+  "stage": {
+    "step": "Step {index}/{total}: {name} – {stage}",
+    "step_names": {
+      "ortho": "Build orthophoto",
+      "segment": "Segment orthophoto",
+      "clean_plan": "Generate clean plan",
+      "refine_openings": "Refine openings",
+      "export": "Export DXF",
+      "export_ifc": "Export IFC"
+    },
+    "states": {
+      "starting": "starting",
+      "complete": "complete",
+      "skipped": "skipped (up to date)"
+    },
+    "inner": {
+      "selecting_photos": "Selecting photographs",
+      "detecting_openings": "Detecting windows and doors",
+      "detecting_openings_points": "Detecting openings from points",
+      "refine_up_to_date": "Refined openings are up to date",
+      "refined": "Refined {count} openings ({mode})",
+      "reading_points": "Reading points {amount} M",
+      "scoring_photos": "Scoring photographs {index}/{total}",
+      "voting_photos": "Voting photographs {index}/{total}",
+      "plan_has_openings": "Plan already contains the refined openings"
+    }
   }
 }

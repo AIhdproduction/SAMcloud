@@ -14,6 +14,7 @@ from samcloud.app.i18n import t
 from samcloud.app.state import state
 from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.dxf_review_canvas import review_background, review_payload
+from samcloud.bim import ui_data as bim_ui_data
 from samcloud.app.gcp_review import apriltag_marker_payload, apriltag_warnings, image_crop, marker_payload, resolve_project_image
 from samcloud.core.paths import ASSETS_DIRECTORY
 from samcloud.control_points.repository import (
@@ -471,6 +472,47 @@ def dxf_ortho_file(level_key: str, kind: str, v: str | None = None):
     if path is None or not path.is_file():
         return JSONResponse({"error": t("app.errors.no_ortho_artifact", kind=kind, level=level_key)}, status_code=404)
     return FileResponse(path, media_type=ORTHO_MEDIA_TYPES[kind], headers={"Cache-Control": "private, max-age=3600"})
+
+
+def _bim_file(level_key: str, finder) -> tuple[Path | None, JSONResponse | None]:
+    """Resolve a BIM artefact of the active project; returns (path, None) or (None, error response)."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return None, JSONResponse({"error": t("app.errors.no_project")}, status_code=404)
+    try:
+        path = finder(project_directory, level_key)
+    except ValueError as error:
+        return None, JSONResponse({"error": str(error)}, status_code=400)
+    if path is None or not path.is_file():
+        return None, JSONResponse({"error": t("app.errors.no_bim_file", level=level_key)}, status_code=404)
+    return path, None
+
+
+@app.get("/api/bim/{level_key}/model.glb")
+def bim_model(level_key: str):
+    """Serve the IFC viewer GLB of a level; never generates."""
+    path, error = _bim_file(level_key, bim_ui_data.glb_path)
+    if path is None:
+        return error
+    return FileResponse(path, media_type="model/gltf-binary", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/bim/{level_key}/props.json")
+def bim_props(level_key: str):
+    """Serve the IFC element properties (props.json) of a level."""
+    path, error = _bim_file(level_key, bim_ui_data.props_path)
+    if path is None:
+        return error
+    return FileResponse(path, media_type="application/json", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/bim/{level_key}/ifc")
+def bim_ifc(level_key: str):
+    """Download the IFC file of a level as an attachment."""
+    path, error = _bim_file(level_key, bim_ui_data.find_ifc)
+    if path is None:
+        return error
+    return FileResponse(path, media_type="application/x-step", filename=path.name, headers={"Cache-Control": "no-cache"})
 
 
 def _review_action(payload: dict[str, object], action):

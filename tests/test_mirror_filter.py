@@ -613,3 +613,17 @@ def test_mirror_mask_reader_dilates_and_skips_empty(tmp_path: Path) -> None:
 
     report = mirror_report([_wall_mirror([_view(0)]), _wall_mirror([_view(1)])], np.zeros(3, bool))
     assert [item["free_space_removed"] for item in report["mirrors"]] == [0, 0]
+
+
+def test_bow_tie_union_raises_in_shapely_but_not_in_mirror_area() -> None:
+    """Regression for the v10 'Surface fusion was skipped: TopologyException' (unguarded unary_union)."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    bow = [(0, 0), (1, 1), (1, 0), (0, 1)]
+    square = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    with pytest.raises(Exception, match="side location conflict"):
+        unary_union([Polygon(bow), Polygon(square)])
+    mirror = Mirror(np.array([0.0, 0.0, 1.0]), 0.0, np.zeros(3),
+                    [np.array(bow, dtype=float), np.array(square, dtype=float)], [])
+    assert mirror.area == pytest.approx(1.0)

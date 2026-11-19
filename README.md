@@ -7,7 +7,7 @@ clouds from drone, standard-camera, and 360 degree Insta360 imagery with
 COLMAP. It then assigns semantic LAS classes with SAM3 and checks every class
 geometrically. Indoor scans get a metric scale from printed AprilTags, objects
 get instance IDs, and classified clouds can be turned into clean 2D CAD plans
-(DXF). The project was developed for the Digital Twin Programming module at
+(DXF) and, for indoor scans, an IFC4 building model. The project was developed for the Digital Twin Programming module at
 HSLU.
 
 ## Examples
@@ -31,7 +31,7 @@ Each page shows the full workflow for that capture type, from input to classifie
 4. [Semantic classification](#semantic-classification)
 5. [Targets, scale, and control points](#targets-scale-and-control-points)
 6. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
-7. [DXF export](#dxf-export)
+7. [DXF export](#dxf-export) (incl. [IFC export](#ifc-export))
 8. [User interface](#user-interface)
 9. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
 10. [Architecture](#architecture)
@@ -49,6 +49,7 @@ Further documentation in [`docs/`](docs/):
 - [AprilTag scale and georeferencing](docs/apriltag_scale.md)
 - [Object instances](docs/instances.md): per-point `instance_id`
 - [Orthophoto clean plan](docs/ortho_plan.md): true orthophoto to clean DXF
+- [IFC export](docs/ifc_export.md): IFC4 model, 3D opening refinement, IFC viewer
 - [Cyclone 3DR classes](docs/cyclone_classes.md): LAS codes and DXF layers
 - [UI language](docs/i18n.md): German/English interface, translation files
 
@@ -100,6 +101,12 @@ Main features:
   plans have double-line walls with measured or learned thickness, rooms
   bounded by the walls with name and area, and regularised furniture, see
   [DXF export](#dxf-export) and [docs/ortho_plan.md](docs/ortho_plan.md).
+- **IFC4 building model (indoor):** the same button that makes the DXF also
+  writes an IFC4 file from the same building model (`plan_model.json`), so
+  walls, rooms, doors and windows match the DXF. Windows and doors are
+  measured on the wall planes from the photos and the cloud (sill, head,
+  mullions), and an IFC viewer on the DXF page shows the result, see
+  [IFC export](#ifc-export) and [docs/ifc_export.md](docs/ifc_export.md).
 - **German and English UI:** the interface is German by default and can be
   switched to English in the settings; project files, reports and exports do
   not depend on the language ([docs/i18n.md](docs/i18n.md)).
@@ -510,6 +517,16 @@ button and runs as a background job (`python -m samcloud.dxf.jobs …`) with a
 progress bar and **Cancel**. A cancelled or failed job keeps the previous cache
 and shows the end of `products/dxf/job.log`. Only one DXF job runs per project.
 
+**Automatic DXF/IFC (workflow step 8).** After a successful processing run
+(steps 1 to 6) the DXF and, for indoor projects, IFC export is created
+automatically as a separate final stage: the same jobs as **Compute everything**,
+once per detected storey (once for the site outdoors). A failure of this stage
+never fails the processing run; it is shown as step 8 "failed" and as a warning
+in `reports/run_summary.txt` (details in `reports/auto_dxf.json`). Turn it off
+with **Create DXF/IFC automatically after processing** (project creation or
+Settings, key `workflow.auto_dxf`, default on). For a finished project run it by
+hand with `python -m samcloud.engine.auto_dxf --project <project directory>`.
+
 ### Plan variants
 
 The DXF page offers two plan variants (selector **Plan variant**):
@@ -521,7 +538,7 @@ The DXF page offers two plan variants (selector **Plan variant**):
   catalogue blocks for doors, windows and fixtures, room names and, outdoors,
   contours and spot heights. Each stage has its own button and cache (**Build
   orthophoto**, **Segment**, **Generate clean plan**, **Export DXF**), and
-  **Compute everything** runs all stages for the selected level or site.
+  **Compute everything** runs all stages for the selected level or site (indoor: including **Refine openings** and the IFC export, see [IFC export](#ifc-export)).
   Clean exports are named `<project>_<level>_clean.dxf`. **Compare plans**
   overlays both variants. See [docs/ortho_plan.md](docs/ortho_plan.md).
 
@@ -531,8 +548,10 @@ seen, the distance between them is the wall thickness; a face that was not
 seen is inferred from the learned thickness classes (or the configured
 exterior thickness), so it still runs straight and parallel. Door and window
 openings are cut through both faces. Rooms (`A-AREA` with name and area) are
-the cells enclosed by the walls, so their outlines follow the inner wall
-faces; an open-plan space with no wall between its parts is one room (for
+the floor between the walls, split only by walls and door lines (each room
+goes to the middle of its doors, a passage without a door does not split), so
+their outlines follow the inner wall faces and never stop at furniture; an
+open-plan space with no wall or door between its parts is one room (for
 example "Wohnen / Küche"). Furniture outlines are regularised to rectangles
 or rectilinear shapes along the wall axes, cut back at walls and overlaps,
 and labelled inside their room; texts are written after the fills, so no
@@ -607,6 +626,31 @@ lists as "Custom 82": rename that class to **Road marking** in Cyclone 3DR once.
 - COLMAP reconstructions without GPS or control points have no metric scale;
   set the scale before generating plans.
 - Only uncompressed LAS files are read; LAZ is not supported.
+
+## IFC export
+
+On indoor projects the DXF page is the **DXF/IFC** page. **Compute everything**
+runs: orthophoto, segmentation, clean plan, **Refine openings**, clean plan
+again (with the refined openings), DXF export and IFC export. One button
+therefore produces a DXF and an IFC4 file. Both are written from the same
+building model, `plan_model.json` in `products/dxf/<level id>/ortho/`, so
+walls, rooms, doors and windows are identical in both files.
+
+- **Refine openings** measures every window and door on its wall plane
+  (SAM3 window/door masks from the photos, projected with the COLMAP poses
+  with occlusion test, plus evidence from the point cloud). It finds mullions,
+  sill and head heights, and marks unobserved areas as unknown. The DXF window
+  blocks carry the attributes `BRH` (sill), `STH` (head) and `MULLIONS`, doors
+  `H` and `GLAZED`.
+- The **IFC** has storey, walls with openings, doors, windows, rooms
+  (`IfcSpace` with name and area), floor slab, ceilings and the furniture, and
+  is checked against an IDS file with a QA report. It is written to
+  `products/bim/<level id>/`.
+- An **IFC viewer** below the DXF preview shows the model in 3D (element
+  classes can be shown or hidden, click for properties, horizontal section) and
+  offers the IFC download.
+
+Details, outputs and the command line are in [docs/ifc_export.md](docs/ifc_export.md).
 
 ## User interface
 
@@ -728,6 +772,8 @@ samcloud/
 ├── dxf/                         DXF page backend: LAS source, alignment, levels, plan generation,
 │                                writer, background jobs (python -m samcloud.dxf.jobs)
 ├── ortho/                       true orthophoto, segmentation, DSM, clean DXF plan (vector/)
+├── bim/                         IFC4 export from plan_model.json, 3D opening refinement (openings3d/),
+│                                viewer assets, IDS/QA (python -m samcloud.bim.jobs)
 ├── tools/                       command-line helpers (class import, gravity alignment)
 └── engine/                      processing implementation (run as subprocesses)
     ├── pipeline.py              orchestrates all stages
@@ -766,6 +812,7 @@ More details are in [the architecture documentation](docs/architecture.md).
 | `config/dxf_export.yaml`, `config/dxf_layers.yaml` | DXF export defaults and the code-to-layer mapping |
 | `config/cyclone_codes.yaml`, `config/model_profiles/` | Cyclone 3DR classification codes and per-model profiles |
 | `config/ortho.yaml`, `config/ortho_segment.yaml`, `config/ortho_plan.yaml` | orthophoto, orthophoto segmentation, and clean plan settings |
+| `config/bim_export.yaml`, `config/bim_scene.yaml`, `config/bim_openings.yaml`, `config/bim_furniture.yaml`, `config/bim/` | IFC export defaults, scene building, 3D opening refinement, furniture mapping, IDS file and tolerances (see [docs/ifc_export.md](docs/ifc_export.md)) |
 
 Each new project receives a copy of the defaults in
 `projects/<project-name>/project.samcloud.yml`. Values saved there apply only
@@ -792,7 +839,8 @@ projects/<project-name>/
 │   │   └── fine_labels.json     vocabulary of the fine_term property
 │   ├── viewer/                  viewer previews, manifest, potree/ octrees
 │   ├── ortho/<level>|site/      orthophoto, height rasters, segmentation (DXF page)
-│   └── dxf/                     DXF page state and caches, export/, snapshots/
+│   ├── dxf/                     DXF page state and caches, export/, snapshots/
+│   └── bim/<level>/             IFC, qa.json, viewer model (DXF page, indoor)
 └── reports/                     pipeline log, run summary, classification, geometry and
                                  control point summaries, apriltag_report.json
 ```
