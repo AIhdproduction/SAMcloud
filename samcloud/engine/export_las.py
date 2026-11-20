@@ -131,8 +131,16 @@ def export_las(
     class_set: str,
     georeference_path: Path | None = None,
     engine: str = "sam3",
+    *,
+    extra_dims: dict[str, np.ndarray] | None = None,
 ) -> int:
+    """Write a classified PLY as LAS 1.4 (LAZ when ``output_path`` ends with ``.laz``).
+
+    ``extra_dims`` maps names to per-point arrays (PLY order) written as extra bytes
+    (float -> float32, ints -> uint16/uint32, bool -> uint8).
+    """
     payload_offset, vertex_count = read_ply_header(input_path)
+    extra_arrays = _prepare_extra_dims(extra_dims, vertex_count)
     output_crs = export_target_crs(target_crs)
     require_export_grids(target_crs)
     georeference = _load_georeference_for_export(source_crs, target_crs, georeference_path)
@@ -169,8 +177,15 @@ def export_las(
     if has_instance_id:
         header.add_extra_dim(laspy.ExtraBytesParams(name="instance_id", type=np.uint32, description="SAM object instance id"))
 
+    for name, array in extra_arrays.items():
+        header.add_extra_dim(laspy.ExtraBytesParams(name=name, type=array.dtype, description=name[:31]))
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with input_path.open("rb") as source, laspy.open(output_path, mode="w", header=header) as destination:
+    open_kwargs = {}
+    if str(output_path).lower().endswith(".laz"):
+        open_kwargs = {"do_compress": True, "laz_backend": laspy.LazBackend.Lazrs}
+    written = 0
+    with input_path.open("rb") as source, laspy.open(output_path, mode="w", header=header, **open_kwargs) as destination:
         for points in _ply_chunks(source, payload_offset, vertex_count, chunk_size):
             count = len(points)
             xyz = np.column_stack((points["x"], points["y"], points["z"]))
@@ -196,6 +211,9 @@ def export_las(
                 las_points.fine_term = points["fine_term"]
             if has_instance_id:
                 las_points.instance_id = points["instance_id"]
+            for name, array in extra_arrays.items():
+                setattr(las_points, name, array[written:written + count])
+            written += count
             destination.write_points(las_points)
 
     write_profile_sidecar(output_path, profile, class_set, class_set)
@@ -205,6 +223,25 @@ def export_las(
     print(f"Export height system: {export_height_system(target_crs)}")
 
     return vertex_count
+
+
+def _prepare_extra_dims(extra_dims: dict[str, np.ndarray] | None, count: int) -> dict[str, np.ndarray]:
+    """Validate extra-dimension arrays and cast them to LAS-friendly dtypes."""
+    prepared: dict[str, np.ndarray] = {}
+    for name, values in (extra_dims or {}).items():
+        array = np.asarray(values)
+        if array.shape != (count,):
+            raise ValueError(f"extra dim {name!r} needs shape ({count},), got {array.shape}")
+        if array.dtype == np.bool_:
+            array = array.astype(np.uint8)
+        elif array.dtype.kind == "f":
+            array = array.astype(np.float32)
+        elif array.dtype.kind in "iu":
+            array = array.astype(np.uint16 if array.dtype.itemsize <= 2 and array.dtype.kind == "u" else np.uint32)
+        else:
+            raise ValueError(f"extra dim {name!r}: unsupported dtype {array.dtype}")
+        prepared[name] = array
+    return prepared
 
 
 def _create_transformer(

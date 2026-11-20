@@ -20,6 +20,7 @@ from samcloud.bim.core.ifc.elements import (
     write_slabs,
     write_walls,
 )
+from samcloud.bim.core.ifc.outdoor import write_outdoor
 from samcloud.bim.core.ifc.georef import crs_label, write_georeferencing
 from samcloud.bim.core.ifc.ids import finalize_guids, normalize_relation_order
 from samcloud.bim.core.ifc.properties import write_properties
@@ -41,6 +42,17 @@ SUPPORTED_KINDS = frozenset(
         ElementKind.SPACE,
         ElementKind.STAIR,
         ElementKind.FURNITURE,
+        ElementKind.TERRAIN,
+        ElementKind.BUILDING,
+        ElementKind.TREE,
+        ElementKind.SHRUB,
+        ElementKind.SITE_WALL,
+        ElementKind.FENCE,
+        ElementKind.PAVEMENT,
+        ElementKind.CURB,
+        ElementKind.MARKING,
+        ElementKind.MANHOLE,
+        ElementKind.VEGETATION_AREA,
     }
 )
 """Kinds the M1 writer exports; reserved kinds are skipped with a warning."""
@@ -113,6 +125,10 @@ def write_ifc(
         ai_model=ai_model,
     )
     for problem in scene.check_references():
+        if " building_id: unknown id " in problem:
+            building_id = problem.rsplit("'", 2)[1]
+            if scene.elements.get(building_id, None) is not None and scene.elements[building_id].kind == ElementKind.BUILDING:
+                continue
         ctx.warn(f"scene reference: {problem}")
 
     create_project(ctx)
@@ -127,6 +143,7 @@ def write_ifc(
     write_stairs(ctx)
     write_openings(ctx)
     write_fillings(ctx)
+    write_outdoor(ctx)
     write_spaces(ctx)
     write_space_boundaries(ctx)
     write_properties(ctx)

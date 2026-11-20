@@ -4,8 +4,11 @@ from pathlib import Path
 
 from ifctester import ids
 
+from samcloud.bim.core.ifc import write_ifc
 from samcloud.bim.core.qa import IDS_PATH, build_ids, write_ids
+from samcloud.bim.core.qa import validate_ifc
 from samcloud.bim.core.qa.ids_spec import SPECS
+from samcloud.bim.core.synth.room import RoomSpec, build_room_scene
 
 EXPECTED_SPECIFICATIONS = [
     "IfcWall",
@@ -71,3 +74,25 @@ def test_description_and_object_type_are_required_everywhere_they_are_written() 
             continue
         required = {getattr(f, "name", None) for f in spec.requirements}
         assert {"Description", "ObjectType"} <= required, spec.name
+
+
+def test_indoor_fixture_ids_result_is_unchanged(tmp_path: Path) -> None:
+    result = write_ifc(build_room_scene(RoomSpec()), tmp_path / "indoor.ifc")
+    report = validate_ifc(result.path, reports_dir=tmp_path / "reports")
+
+    assert report.ids_failures == []
+    applicable = {
+        item["name"]: item["applicable"]
+        for item in report.ids_specifications
+        if item["applicable"]
+    }
+    assert applicable == {
+        "IfcWall": 4,
+        "IfcSlab floor": 1,
+        "IfcSlab ceiling": 1,
+        "IfcOpeningElement": 3,
+        "IfcWindow": 2,
+        "IfcDoor": 1,
+        "IfcSpace": 1,
+        "IfcBuildingStorey": 1,
+    }

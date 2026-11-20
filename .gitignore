@@ -54,3 +54,8 @@ graphify-out/
 /tools/
 /_codex_pytest*/
 /.samcloud/
+
+# SAMcloud share feature (secrets and generated packages)
+*credentials*.yaml
+*.local.yaml
+products/share/

@@ -131,7 +131,7 @@ def test_potree_dense_viewer_has_tag_colour_click_priority_and_label(german_ui: 
     assert ">Passpunkte</button>" in potree_viewer._html("sam-potree-sparse", show_markers=True)
 
 
-def test_render_potree_dense_toolbar_label_is_apriltags(monkeypatch, german_ui: None) -> None:
+def test_render_potree_dense_toolbar_label_is_passpunkte(monkeypatch, german_ui: None) -> None:
     from samcloud.app import potree_viewer
 
     html_calls: list[str] = []
@@ -145,7 +145,7 @@ def test_render_potree_dense_toolbar_label_is_apriltags(monkeypatch, german_ui: 
     monkeypatch.setattr(potree_viewer, "ui", fake)
     potree_viewer.render_potree_viewer("dense", title="t", class_colors=[[1, 2, 3]], marker_endpoint="/api/apriltags/markers")
     potree_viewer.render_potree_viewer("sparse", title="t", class_colors=[[1, 2, 3]], marker_endpoint="/api/control-points/markers")
-    assert ">AprilTags</button>" in html_calls[0] and "Passpunkte" not in html_calls[0]
+    assert ">Passpunkte</button>" in html_calls[0] and "AprilTags</button>" not in html_calls[0]
     assert ">Passpunkte</button>" in html_calls[1]
 
 

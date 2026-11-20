@@ -32,6 +32,7 @@
     "auto_dxf": "Create DXF/IFC automatically after processing"
   },
   "control_points_mode": {
+    "auto": "Automatic when control points with coordinates exist",
     "none": "No control points - continue automatically",
     "after_alignment": "Use control points after alignment",
     "automatic": "Automatic (detect targets)"

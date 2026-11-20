@@ -1,0 +1,83 @@
+{
+  "button": "Teilen (QR)",
+  "unavailable": "Verfügbar nach Schritt 6",
+  "title": "Punktwolke per QR-Code teilen",
+  "intro": "Die klassifizierte Punktwolke wird (höchstens {max_points} Punkte) als Webansicht exportiert und hochgeladen. Danach erhältst du einen QR-Code und einen Link.",
+  "start": "Erzeugen",
+  "retry": "Erneut versuchen",
+  "cancel": "Abbrechen",
+  "cancelling": "Wird abgebrochen …",
+  "cancelled": "Abgebrochen.",
+  "close": "Schliessen",
+  "copy": "Link kopieren",
+  "save_png": "PNG speichern",
+  "open": "Öffnen",
+  "extend": "Verlängern",
+  "extended": "Verlängert, gültig bis {date}.",
+  "recreate": "Neu erzeugen",
+  "delete": "Link löschen",
+  "deleted": "Link gelöscht.",
+  "copied": "Link kopiert.",
+  "expired": "Der Link ist abgelaufen (seit {date}). Bitte neu erzeugen.",
+  "valid_until": "gültig bis {date}",
+  "info": "{points} Punkte, {size} MB",
+  "error_unknown": "Unbekannter Fehler.",
+  "confirm": "Die Punktwolke wird öffentlich über diesen Link erreichbar. Fortfahren?",
+  "confirm_yes": "Fortfahren",
+  "confirm_no": "Abbrechen",
+  "setup": {
+    "title": "Cloudflare R2 einrichten",
+    "intro": "Geteilte Punktwolken liegen in deinem eigenen Cloudflare-R2-Bucket. Einmalig einrichten:",
+    "field_account_id": "Account-ID",
+    "field_access_key_id": "Access Key ID",
+    "field_secret_access_key": "Secret Access Key",
+    "field_bucket": "Bucket-Name",
+    "field_public_base_url": "Öffentliche URL (r2.dev)",
+    "incomplete": "Bitte alle Felder ausfüllen (öffentliche URL mit https://).",
+    "testing": "Verbindung wird getestet …",
+    "test": "Verbindung testen",
+    "save": "Speichern",
+    "saved": "Zugangsdaten gespeichert.",
+    "ok": "Verbindung erfolgreich, Links laufen nach {days} Tagen ab.",
+    "lifecycle_missing": "Löschregel nicht gefunden – bitte Schritt 5 der Anleitung ausführen",
+    "lifecycle_ok": "Löschregel (15 Tage) gefunden.",
+    "ok_short": "Verbindung erfolgreich.",
+    "lifecycle_unknown": "Verbindung erfolgreich. Die Löschregel kann mit diesem Token nicht geprüft werden – wenn du Schritt 5 erledigt hast, ist alles in Ordnung."
+  },
+  "settings": {
+    "title": "Teilen / Cloudflare",
+    "configured": "Verbunden: Bucket {bucket} (Account {account})",
+    "not_configured": "Noch kein Cloudflare-Konto eingerichtet.",
+    "edit": "Konto ändern",
+    "delete": "Konto löschen",
+    "deleted": "Zugangsdaten gelöscht."
+  },
+  "guide": {
+    "title": "Anleitung: Cloudflare R2 für SAMcloud einrichten",
+    "s1": {
+      "title": "Cloudflare-Konto erstellen",
+      "body": "Öffne https://dash.cloudflare.com/\nRegistriere dich oder melde dich an.\nÖffne R2 Object Storage."
+    },
+    "s2": {
+      "title": "Bucket erstellen",
+      "body": "Klicke auf Create bucket.\nGib einen Namen ein, z. B. `samcloud-shares`.\nWähle Standard als Storage Class.\nKlicke auf Create bucket."
+    },
+    "s3": {
+      "title": "Öffentlichen Zugriff aktivieren",
+      "body": "Öffne deinen Bucket.\nGehe zu Settings → Public Access.\nAktiviere die Public Development URL (r2.dev).\nKopiere die angezeigte öffentliche URL."
+    },
+    "s4": {
+      "title": "API-Schlüssel erstellen",
+      "body": "Öffne R2 Object Storage → Manage R2 API Tokens.\nKlicke auf Create Account API token.\nVerwende folgende Einstellungen: Token name: `SAMcloud`; Permissions: `Object Read & Write`; Specify bucket(s): `Apply to specific buckets only`; Bucket: Deinen erstellten Bucket auswählen; TTL: `Forever`; Client IP Address Filtering: Leer lassen.\nKlicke auf Create Account API Token.\nSpeichere die Access Key ID und den Secret Access Key sicher."
+    },
+    "s5": {
+      "title": "Automatische Löschung einrichten",
+      "body": "Öffne deinen Bucket und gehe zu Settings → Object Lifecycle Rules.\nErstelle eine Regel mit dem Namen `samcloud-auto-delete`.\nWähle Delete objects nach 15 Tagen.\nSpeichere und aktiviere die Regel."
+    },
+    "s6": {
+      "title": "Zugangsdaten in SAMcloud eintragen",
+      "body": "Öffne in SAMcloud die Einstellungen für die Cloudflare-Verbindung und trage diese fünf Angaben ein: Account ID: In R2 Object Storage (Übersicht, nicht im Bucket) rechts im Kasten „Account Details“ – 32 Zeichen, ohne https:// und ohne .r2.cloudflarestorage.com (es ist der Teil vor `.r2.cloudflarestorage.com` im S3-Endpoint, der nach dem Erstellen des Tokens angezeigt wird); Access Key ID: Aus dem erstellten API-Token; Secret Access Key: Aus dem erstellten API-Token; Bucket Name: Name deines Buckets; Public URL: Öffentliche r2.dev-Adresse aus Schritt 3.\nKlicke auf Verbindung testen und speichere die Einstellungen."
+    },
+    "note": "Wichtig: Gib deine API-Schlüssel niemals weiter. Bei der öffentlichen URL sind Dateien für alle Personen mit dem entsprechenden Link zugänglich."
+  }
+}

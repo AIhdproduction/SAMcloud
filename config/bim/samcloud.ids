@@ -17,6 +17,13 @@
                         <simpleValue>IFCWALL</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -375,6 +382,13 @@
                         <simpleValue>FLOOR</simpleValue>
                     </predefinedType>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -704,6 +718,13 @@
                         <simpleValue>USERDEFINED</simpleValue>
                     </predefinedType>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -1036,6 +1057,13 @@
                         <simpleValue>CEILING</simpleValue>
                     </predefinedType>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -1661,6 +1689,13 @@
                         <simpleValue>IFCWINDOW</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -1996,6 +2031,13 @@
                         <simpleValue>IFCDOOR</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -2665,6 +2707,13 @@
                         <simpleValue>IFCSTAIR</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3004,6 +3053,13 @@
                         <simpleValue>IFCFURNITURE</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3098,6 +3154,13 @@
                         <simpleValue>IFCELECTRICAPPLIANCE</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3192,6 +3255,13 @@
                         <simpleValue>IFCSANITARYTERMINAL</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3286,6 +3356,13 @@
                         <simpleValue>IFCAUDIOVISUALAPPLIANCE</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3380,6 +3457,13 @@
                         <simpleValue>IFCLIGHTFIXTURE</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3474,6 +3558,13 @@
                         <simpleValue>IFCSPACEHEATER</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
@@ -3568,6 +3659,13 @@
                         <simpleValue>IFCBUILDINGELEMENTPROXY</simpleValue>
                     </name>
                 </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
             </applicability>
             <requirements>
                 <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">

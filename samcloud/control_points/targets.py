@@ -199,6 +199,8 @@ def _bowtie_from_contour(contour: np.ndarray, shape: tuple[int, int]) -> dict[st
         if len(lobe) < 6:
             return None
         _, triangle = cv2.minEnclosingTriangle(lobe)
+        if triangle is None:
+            return None
         triangle_area = abs(cv2.contourArea(triangle.reshape(3, 2)))
         triangle_fits.append(len(lobe) / triangle_area if triangle_area > 0 else 0.0)
         vertices = triangle.reshape(3, 2).astype(float)

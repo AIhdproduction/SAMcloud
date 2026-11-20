@@ -54,6 +54,7 @@ class ExportContext:
     ai_backend: str | None
     ai_model: str | None
     referenced: bool = False
+    georef_crs: object | None = None
     model_context: ifcopenshell.entity_instance | None = None
     body_context: ifcopenshell.entity_instance | None = None
     axis_context: ifcopenshell.entity_instance | None = None

@@ -6,11 +6,12 @@ import ifcopenshell
 import ifcopenshell.api.georeference
 
 from samcloud.bim.core.ifc.context import ExportContext
+from samcloud.bim.core.model import CrsInfo, ElementKind
 
 
 def crs_label(ctx: ExportContext) -> str | None:
     """EPSG code or name of the CRS when the export is referenced, else None."""
-    crs = ctx.scene.settings.crs
+    crs = ctx.georef_crs or ctx.scene.settings.crs
     if crs is None:
         return None
     if crs.epsg is not None:
@@ -28,6 +29,16 @@ def write_georeferencing(ctx: ExportContext) -> None:
     before this runs (otherwise ``add_georeferencing`` creates nothing).
     """
     crs = ctx.scene.settings.crs
+    if crs is None and any(
+        element.kind in {
+            ElementKind.TERRAIN, ElementKind.BUILDING, ElementKind.TREE, ElementKind.SHRUB,
+            ElementKind.SITE_WALL, ElementKind.FENCE, ElementKind.PAVEMENT, ElementKind.CURB,
+            ElementKind.MARKING, ElementKind.MANHOLE, ElementKind.VEGETATION_AREA,
+        }
+        for element in ctx.scene.elements.values()
+    ):
+        crs = CrsInfo(epsg=2056, vertical_datum="LN02", name="CH1903+ / LV95", source="none")
+    ctx.georef_crs = crs
     label = crs_label(ctx)
     if crs is None or label is None:
         ctx.referenced = False

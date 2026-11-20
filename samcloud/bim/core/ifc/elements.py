@@ -149,9 +149,20 @@ def new_product(
         product.Tag = element.id
     ctx.entities[element.id] = product
     if contained:
-        if element.storey_id is None:
+        building_id = element.building_id
+        if building_id is None and isinstance(element, WindowElement | DoorElement):
+            opening = ctx.scene.elements.get(element.params.opening_id)
+            if isinstance(opening, OpeningElement):
+                host = ctx.scene.elements.get(opening.params.host_wall_id)
+                if isinstance(host, WallElement):
+                    building_id = host.building_id
+        if element.storey_id is None and not (
+            building_id is not None
+            and building_id in ctx.scene.elements
+            and ctx.scene.elements[building_id].kind == ElementKind.BUILDING
+        ):
             ctx.flag(element.id, "no storey assigned (contained in the building)")
-        container = container_of(ctx, element.storey_id, element.building_id)
+        container = container_of(ctx, element.storey_id, building_id)
         ifcopenshell.api.spatial.assign_container(
             ctx.file, products=[product], relating_structure=container
         )

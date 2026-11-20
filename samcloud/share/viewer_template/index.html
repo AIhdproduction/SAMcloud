@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<title>SAMcloud Punktwolke</title>
+<link rel="stylesheet" href="lib/potree/potree.css">
+<link rel="stylesheet" href="css/share.css">
+</head>
+<body>
+<div id="app" class="share-app">
+  <header class="share-header">
+    <div class="share-title"><strong id="project-name">Punktwolke</strong>
+      <span id="project-meta" class="share-meta"></span></div>
+    <div class="share-brand"><strong>SAM</strong>cloud</div>
+  </header>
+  <main class="share-stage">
+    <div id="potree-area" class="share-area"></div>
+    <div class="share-toolbar" id="toolbar">
+      <button type="button" data-action="rgb" class="is-selected">RGB</button>
+      <button type="button" data-action="classification">Klassen</button>
+      <button type="button" data-action="legend">Legende</button>
+      <button type="button" data-action="markers" class="is-selected" id="markers-button">Passpunkte</button>
+      <label class="share-size">Punktgr&ouml;sse
+        <input type="range" id="size-slider" min="0.5" max="6" step="0.25" value="1.5"></label>
+      <button type="button" data-action="reset">Ansicht zur&uuml;cksetzen</button>
+    </div>
+    <aside id="legend" class="share-legend" aria-label="Klassen"></aside>
+    <button type="button" id="error-button" class="share-error-button" hidden>Fehlerdetails</button>
+    <aside id="error-panel" class="share-error-panel" hidden>
+      <div class="share-error-actions">
+        <button type="button" id="error-copy">Kopieren</button>
+        <button type="button" id="error-close">Schliessen</button>
+      </div>
+      <pre id="error-text"></pre>
+    </aside>
+    <div id="status" class="share-status">Punktwolke wird geladen &hellip;</div>
+  </main>
+</div>
+<script src="lib/jquery/jquery-3.1.1.min.js"></script>
+<script src="lib/spectrum/spectrum.js"></script>
+<script src="lib/jquery-ui/jquery-ui.min.js"></script>
+<script src="lib/other/BinaryHeap.js"></script>
+<script src="lib/tween/tween.min.js"></script>
+<script src="lib/d3/d3.min.js"></script>
+<script src="lib/proj4/proj4.js"></script>
+<script src="lib/i18next/i18next.js"></script>
+<script src="lib/three/three.min.js"></script>
+<script src="lib/potree/potree.js"></script>
+<script src="js/share_viewer.js"></script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+html, body { margin: 0; height: 100%; overscroll-behavior: none; background: #050b12; color: #eaf2f8; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.share-app { display: flex; flex-direction: column; height: 100%; }
+.share-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 14px; background: #0b1722; border-bottom: 1px solid #28475b; }
+.share-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.share-meta { margin-left: 10px; color: #8fb3c9; font-size: 12px; }
+.share-brand { font-size: 16px; letter-spacing: .02em; color: #dcecf6; white-space: nowrap; }
+.share-brand strong { color: #26b7ef; }
+.share-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+/* own stacking context: Potree's marker labels (z-index 100..1000) stay below the toolbar, legend and status */
+.share-area { position: absolute; inset: 0; z-index: 0; isolation: isolate; touch-action: none; }
+.share-toolbar { position: absolute; z-index: 30; top: 10px; left: 10px; right: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; pointer-events: none; }
+.share-toolbar > * { pointer-events: auto; }
+.share-toolbar button { border: 1px solid #47718a; border-radius: 6px; padding: 8px 12px; background: #102131; color: #dcecf6; cursor: pointer; font-size: 13px; }
+.share-toolbar button.is-selected { border-color: #26b7ef; background: #16516c; }
+.share-size { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid #28475b; border-radius: 6px; background: rgba(9, 19, 29, .88); color: #b9ccda; font-size: 12px; }
+.share-legend { position: absolute; z-index: 40; top: 60px; right: 10px; max-height: calc(100% - 80px); overflow: auto; width: min(320px, 70vw); padding: 10px; border: 1px solid #365c74; border-radius: 8px; background: rgba(9, 19, 29, .95); font-size: 13px; display: none; }
+.share-legend.is-open { display: block; }
+.share-legend label { display: flex; align-items: center; gap: 8px; padding: 5px 0; cursor: pointer; }
+.share-legend i { width: 14px; height: 14px; border-radius: 3px; display: inline-block; flex: none; }
+.share-legend small { margin-left: auto; color: #8fb3c9; }
+.share-legend .share-legend-actions { display: flex; gap: 8px; margin-bottom: 6px; }
+.share-legend .share-legend-actions button { border: 1px solid #47718a; border-radius: 5px; padding: 5px 9px; background: #102131; color: #dcecf6; cursor: pointer; }
+.share-status { position: absolute; z-index: 30; left: 10px; bottom: 10px; padding: 6px 10px; border-radius: 6px; background: rgba(9, 19, 29, .88); color: #b9ccda; font-size: 12px; }
+.share-area .annotation-titlebar { font-size: 13px; font-weight: 700; padding: 3px 8px; border: 2px solid #fff; border-radius: 6px; color: #06202f !important; box-shadow: 0 0 0 2px rgba(0, 0, 0, .55); }
+.share-area .annotation { opacity: 1 !important; }
+.share-area .annotation.is-hidden { display: none !important; }
+@media (max-width: 600px) {
+  .share-toolbar button { padding: 9px 11px; }
+  .share-meta { display: block; margin-left: 0; }
+}
+
+/* touch: the render area (canvas and Potree's label layer) owns every gesture; labels never swallow touches */
+.share-area, .share-area * { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.share-area .annotation, .share-area .annotation * { pointer-events: none; }
+.share-toolbar, .share-legend { touch-action: manipulation; }
+.share-legend { overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+
+/* error details (appears only when an error was caught) */
+.share-error-button { position: absolute; z-index: 45; right: 10px; bottom: 10px; border: 1px solid #ef6b73; border-radius: 6px; padding: 8px 12px; background: #3a1519; color: #ffd9dc; font-size: 13px; cursor: pointer; touch-action: manipulation; }
+.share-error-panel { position: absolute; z-index: 50; inset: 50px 10px 50px 10px; display: flex; flex-direction: column; border: 1px solid #365c74; border-radius: 8px; background: rgba(9, 19, 29, .97); touch-action: manipulation; }
+.share-error-panel[hidden], .share-error-button[hidden] { display: none; }
+.share-error-actions { display: flex; gap: 8px; padding: 8px; }
+.share-error-actions button { border: 1px solid #47718a; border-radius: 5px; padding: 8px 12px; background: #102131; color: #dcecf6; cursor: pointer; }
+.share-error-panel pre { margin: 0; padding: 8px 10px; overflow: auto; flex: 1; font-size: 11px; white-space: pre-wrap; word-break: break-all; color: #dcecf6; -webkit-overflow-scrolling: touch; user-select: text; -webkit-user-select: text; }
+.share-status button { margin-left: 6px; border: 0; background: transparent; color: #dcecf6; font-size: 16px; cursor: pointer; }
+
+/* iOS Safari: the page itself must never scroll, bounce or zoom; dynamic viewport height for the address bar */
+html, body { position: fixed; inset: 0; width: 100%; overflow: hidden; overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
+.share-app { height: 100vh; height: 100dvh; }
+.share-area, .share-toolbar button { -webkit-tap-highlight-color: transparent; }

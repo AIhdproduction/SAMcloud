@@ -343,6 +343,7 @@ class ElementBase(_Strict):
     provenance: Provenance = Provenance.SCRIPT
     locked: bool = False
     source_instance_ids: list[str] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
     metrics: Metrics = Field(default_factory=Metrics)
     status: Status = Status.UNSURE
     notes: list[str] = Field(default_factory=list)
@@ -444,22 +445,240 @@ class FurnitureElement(ElementBase):
     params: OpaqueParams = Field(default_factory=OpaqueParams)
 
 
+class MeshParams(ParamsBase):
+    """Indexed triangular mesh in local scene coordinates."""
+
+    vertices: list[Point3] = Field(default_factory=list)
+    triangles: list[tuple[int, int, int]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate(self) -> MeshParams:
+        if not self.vertices and not self.triangles:
+            return self
+        if not self.vertices or not self.triangles:
+            raise ValueError("mesh needs vertices and triangles")
+        for triangle in self.triangles:
+            if len(set(triangle)) != 3 or any(index < 0 or index >= len(self.vertices) for index in triangle):
+                raise ValueError("mesh triangle has invalid vertex indices")
+        return self
+
+
+class TerrainParams(MeshParams):
+    """Terrain surface mesh."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class TreeParams(ParamsBase):
+    """Measured tree dimensions; omitted values are conservative stylised defaults."""
+
+    trunk_xy: Point2 | None = None
+    base_z: Real | None = None
+    height: Positive | None = None
+    crown_diameter: Positive | None = None
+    trunk_diameter: Positive | None = None
+
+
+class ShrubParams(ParamsBase):
+    outline: list[Point2]
+    base_z: Real | None = None
+    height: Positive
+
+    @model_validator(mode="after")
+    def _validate(self) -> ShrubParams:
+        _check_outline(self.outline, "shrub outline")
+        if self.base_z is None:
+            raise ValueError("shrub base_z is required")
+        return self
+
+
+class SiteWallParams(ParamsBase):
+    footprint: list[Point2] | None = None
+    axis: list[Point2] | None = None
+    thickness: Positive | None = None
+    base_z: Real | None = None
+    top_z: Real = 1.0
+
+    @model_validator(mode="after")
+    def _validate(self) -> SiteWallParams:
+        if self.footprint is None and (self.axis is None or self.thickness is None):
+            raise ValueError("site wall needs a footprint or axis and thickness")
+        if self.base_z is None:
+            raise ValueError("site wall base_z is required")
+        if self.footprint is not None:
+            _check_outline(self.footprint, "site wall footprint")
+        if self.axis is not None and len(self.axis) < 2:
+            raise ValueError("site wall axis needs at least two points")
+        if self.top_z <= self.base_z:
+            raise ValueError("site wall top_z must exceed base_z")
+        return self
+
+
+class FenceParams(ParamsBase):
+    axis: list[Point3]
+    height: Positive
+
+    @model_validator(mode="after")
+    def _validate(self) -> FenceParams:
+        if len(self.axis) < 2:
+            raise ValueError("fence axis needs at least two points")
+        return self
+
+
+class PavementParams(MeshParams):
+    kind: Literal["road", "sidewalk", "path"] = "road"
+    thickness: Positive = 0.10
+
+
+class CurbParams(ParamsBase):
+    axis: list[Point3]
+    width: Positive = 0.12
+    height: Positive = 0.25
+    curb_sweep: Literal["auto", "extrude_only"] = "auto"
+
+    @model_validator(mode="after")
+    def _validate(self) -> CurbParams:
+        if len(self.axis) < 2:
+            raise ValueError("curb axis needs at least two points")
+        return self
+
+
+class MarkingParams(ParamsBase):
+    points: list[Point2 | Point3]
+    closed: bool = False
+
+    @model_validator(mode="after")
+    def _validate(self) -> MarkingParams:
+        if len(self.points) < (3 if self.closed else 2):
+            raise ValueError("marking has too few points")
+        return self
+
+
+class ManholeParams(ParamsBase):
+    center: Point3
+    diameter: Positive
+    type: str = ""
+
+
+class VegetationAreaParams(ParamsBase):
+    outline: list[Point2]
+    base_z: Real | None = None
+    height: NonNegative = 0.0
+
+    @model_validator(mode="after")
+    def _validate(self) -> VegetationAreaParams:
+        _check_outline(self.outline, "vegetation outline")
+        if self.base_z is None:
+            raise ValueError("vegetation area base_z is required")
+        return self
+
+
+class BuildingParams(MeshParams):
+    """Closed LoD2 envelope; face roles are ground=0, wall=1 and roof=2."""
+
+    model_config = ConfigDict(extra="allow")
+
+    face_roles: list[Literal[0, 1, 2]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_roles(self) -> BuildingParams:
+        if self.face_roles and len(self.face_roles) != len(self.triangles):
+            raise ValueError("building face_roles must match triangles")
+        if not self.face_roles:
+            self.face_roles = [1] * len(self.triangles)
+        return self
+
+
 class TerrainElement(ElementBase):
-    """Reserved: terrain (non-parametric surface mesh, M7)."""
+    """Terrain surface mesh."""
 
     default_ifc_class: ClassVar[str] = "IfcGeographicElement"
     default_predefined_type: ClassVar[str | None] = "TERRAIN"
     kind: Literal[ElementKind.TERRAIN] = ElementKind.TERRAIN
-    params: OpaqueParams = Field(default_factory=OpaqueParams)
+    params: TerrainParams = Field(default_factory=TerrainParams)
     non_parametric: bool = True
 
 
 class BuildingElement(ElementBase):
-    """Reserved: outdoor building envelope (M7)."""
+    """Outdoor building LoD2 envelope."""
 
     default_ifc_class: ClassVar[str] = "IfcBuilding"
     kind: Literal[ElementKind.BUILDING] = ElementKind.BUILDING
-    params: OpaqueParams = Field(default_factory=OpaqueParams)
+    params: BuildingParams = Field(default_factory=BuildingParams)
+
+
+class TreeElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcGeographicElement"
+    kind: Literal[ElementKind.TREE] = ElementKind.TREE
+    params: TreeParams = Field(default_factory=TreeParams)
+
+    @model_validator(mode="after")
+    def _defaults(self) -> TreeElement:
+        defaults: dict[str, object] = {"trunk_xy": (0.0, 0.0), "base_z": 0.0, "height": 5.0, "crown_diameter": 3.0, "trunk_diameter": 0.25}
+        for name, value in defaults.items():
+            if getattr(self.params, name) is None:
+                setattr(self.params, name, value)
+                self.param_origin.setdefault(name, ParamOrigin.ASSUMED)
+        return self
+
+
+class ShrubElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcGeographicElement"
+    kind: Literal[ElementKind.SHRUB] = ElementKind.SHRUB
+    params: ShrubParams
+
+    @model_validator(mode="after")
+    def _set_base_z_origin(self) -> ShrubElement:
+        self.param_origin.setdefault("base_z", ParamOrigin.MEASURED)
+        return self
+
+
+class SiteWallElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcWall"
+    kind: Literal[ElementKind.SITE_WALL] = ElementKind.SITE_WALL
+    params: SiteWallParams
+
+
+class FenceElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcRailing"
+    kind: Literal[ElementKind.FENCE] = ElementKind.FENCE
+    params: FenceParams
+
+
+class PavementElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcCivilElement"
+    kind: Literal[ElementKind.PAVEMENT] = ElementKind.PAVEMENT
+    params: PavementParams
+
+
+class CurbElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcCivilElement"
+    kind: Literal[ElementKind.CURB] = ElementKind.CURB
+    params: CurbParams
+
+
+class MarkingElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcAnnotation"
+    kind: Literal[ElementKind.MARKING] = ElementKind.MARKING
+    params: MarkingParams
+
+
+class ManholeElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcDistributionChamberElement"
+    default_predefined_type: ClassVar[str | None] = "MANHOLE"
+    kind: Literal[ElementKind.MANHOLE] = ElementKind.MANHOLE
+    params: ManholeParams
+
+
+class VegetationAreaElement(ElementBase):
+    default_ifc_class: ClassVar[str] = "IfcGeographicElement"
+    kind: Literal[ElementKind.VEGETATION_AREA] = ElementKind.VEGETATION_AREA
+    params: VegetationAreaParams
+
+    @model_validator(mode="after")
+    def _set_base_z_origin(self) -> VegetationAreaElement:
+        self.param_origin.setdefault("base_z", ParamOrigin.MEASURED)
+        return self
 
 
 Element = Annotated[
@@ -474,7 +693,16 @@ Element = Annotated[
     | StairElement
     | FurnitureElement
     | TerrainElement
-    | BuildingElement,
+    | BuildingElement
+    | TreeElement
+    | ShrubElement
+    | SiteWallElement
+    | FenceElement
+    | PavementElement
+    | CurbElement
+    | MarkingElement
+    | ManholeElement
+    | VegetationAreaElement,
     Field(discriminator="kind"),
 ]
 """Discriminated union over all element kinds."""
@@ -497,4 +725,15 @@ PARAMS_MODELS: dict[ElementKind, type[ParamsBase]] = {
     ElementKind.DOOR: DoorParams,
     ElementKind.SPACE: SpaceParams,
     ElementKind.STAIR: StairParams,
+    ElementKind.TERRAIN: TerrainParams,
+    ElementKind.BUILDING: BuildingParams,
+    ElementKind.TREE: TreeParams,
+    ElementKind.SHRUB: ShrubParams,
+    ElementKind.SITE_WALL: SiteWallParams,
+    ElementKind.FENCE: FenceParams,
+    ElementKind.PAVEMENT: PavementParams,
+    ElementKind.CURB: CurbParams,
+    ElementKind.MARKING: MarkingParams,
+    ElementKind.MANHOLE: ManholeParams,
+    ElementKind.VEGETATION_AREA: VegetationAreaParams,
 }

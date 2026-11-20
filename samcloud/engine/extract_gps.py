@@ -123,13 +123,74 @@ def read_gps(image_path):
     return lat, lon, alt
 
 
+INPUT_HEIGHT_CHOICES = ("ellipsoidal", "ln02", "egm96")
+_VERTICAL_SOURCE_CRS = {"ln02": "EPSG:4326+5728", "egm96": "EPSG:4326+5773"}
+
+
+_TRANSFORMER_CACHE: dict = {}
+
+
+def input_height_description(input_height: str) -> str:
+    """Describe the datum of the EXIF altitudes and how gps_ref.txt heights relate to it."""
+    mode = _validate_input_height(input_height)
+    if mode == "ellipsoidal":
+        return "GPS altitude as recorded in the image EXIF (treated as ellipsoidal height)"
+    names = {"ln02": "LN02 orthometric height (EPSG:5728)", "egm96": "EGM96 geoid height (EPSG:5773)"}
+    return f"GPS altitude in image EXIF is {names[mode]}; converted once to ellipsoidal height (EPSG:4979)"
+
+
+def _validate_input_height(input_height: str) -> str:
+    mode = str(input_height).strip().lower()
+    if mode not in INPUT_HEIGHT_CHOICES:
+        raise ValueError(
+            f"Invalid input_height '{input_height}'. Use one of: {', '.join(INPUT_HEIGHT_CHOICES)}."
+        )
+    return mode
+
+
+def to_ellipsoidal_height(lat, lon, alt, input_height: str = "ellipsoidal"):
+    """Convert altitudes of the given datum to ellipsoidal height (EPSG:4979).
+
+    ``lat``/``lon``/``alt`` are scalars or arrays; the result has the shape of ``alt``.
+    ``ellipsoidal`` returns ``alt`` unchanged. ``ln02`` and ``egm96`` need the matching PROJ
+    geoid grid and raise ValueError with install instructions when it is missing.
+    """
+    import numpy as np
+
+    mode = _validate_input_height(input_height)
+    if mode == "ellipsoidal":
+        return alt
+    try:
+        from samcloud.pointcloud.georeference import strict_transformer
+    except ImportError:  # running as a plain script: make the repository root importable
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from samcloud.pointcloud.georeference import strict_transformer
+    if mode not in _TRANSFORMER_CACHE:
+        _TRANSFORMER_CACHE[mode] = strict_transformer(_VERTICAL_SOURCE_CRS[mode], "EPSG:4979")
+    transformer = _TRANSFORMER_CACHE[mode]
+    lon_a = np.atleast_1d(np.asarray(lon, dtype=float))
+    lat_a = np.atleast_1d(np.asarray(lat, dtype=float))
+    alt_a = np.atleast_1d(np.asarray(alt, dtype=float))
+    _, _, height = transformer.transform(lon_a, lat_a, alt_a, errcheck=True)
+    height = np.asarray(height, dtype=float)
+    if not np.all(np.isfinite(height)):
+        raise ValueError(
+            f"Height conversion from {mode} returned invalid values; a required PROJ grid may be unavailable."
+        )
+    return height.reshape(np.shape(alt)) if np.ndim(alt) else float(height[0])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--images-dir", required=True)
     ap.add_argument("--out", required=True, help="output ref_images.txt path")
     ap.add_argument("--require-all", action="store_true",
                     help="fail if any supported image has no readable GPS EXIF")
+    ap.add_argument("--input-height", default="ellipsoidal", choices=INPUT_HEIGHT_CHOICES,
+                    help="datum of the EXIF GPSAltitude; ln02/egm96 are converted to ellipsoidal height")
     args = ap.parse_args()
+    # Fail early (before reading images) when a required grid is missing.
+    to_ellipsoidal_height(47.0, 8.0, 0.0, args.input_height)
 
     images_dir = Path(args.images_dir)
     exts = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
@@ -150,6 +211,7 @@ def main():
             missing.append(p.relative_to(images_dir).as_posix())
             continue
         lat, lon, alt = gps
+        alt = to_ellipsoidal_height(lat, lon, alt, args.input_height)
         image_name = p.relative_to(images_dir).as_posix()
         lines.append(f"{image_name} {lat:.8f} {lon:.8f} {alt:.3f}")
 

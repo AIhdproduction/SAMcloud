@@ -34,12 +34,19 @@ def detect_crowns(
     min_crown_diameter: float = 1.5,
     max_crown_diameter: float = 25.0,
     smoothing_sigma_m: float = 0.3,
-) -> list[Crown]:
+    return_labels: bool = False,
+) -> list[Crown] | tuple[list[Crown], np.ndarray]:
     """Detect crowns by peak-seeded watershed; oversized regions are re-seeded once.
 
     A region larger than the maximum diameter is split using half the original
     peak separation before its candidates are measured. This handles fused canopies
     without accepting a single implausibly large crown.
+
+    With ``return_labels=True`` the result is ``(crowns, labels)``: ``labels`` is the
+    int32 watershed raster aligned with the CHM grid (0 = background). Labels are not
+    renumbered after oversized splits and may be non-contiguous; crowns rejected by
+    the diameter limits keep their label in the raster. Find a crown's label by
+    sampling ``labels`` at its ``trunk`` pixel (``grid.local_to_pixel``).
     """
     heights = np.asarray(chm, dtype=np.float32)
     trees = np.asarray(tree_mask, dtype=bool)
@@ -47,7 +54,7 @@ def detect_crowns(
         raise ValueError("CHM and tree_mask must match RasterGrid")
     active = trees & np.isfinite(heights) & (heights >= min_height)
     if not active.any():
-        return []
+        return ([], np.zeros(heights.shape, dtype=np.int32)) if return_labels else []
     smoothed = gaussian_filter(np.where(active, heights, 0.0), sigma=max(0.0, smoothing_sigma_m / grid.pixel_size))
     distance = max(1, int(round(min_crown_diameter / (2.0 * grid.pixel_size))))
     labels = _watershed_labels(smoothed, active, distance, min_height)
@@ -72,6 +79,8 @@ def detect_crowns(
         center = grid.pixel_to_local(float(rows.mean()), float(cols.mean()))
         trunk = grid.pixel_to_local(float(row), float(col))
         crowns.append(Crown(center, trunk, diameter, float(heights[row, col]), area))
+    if return_labels:
+        return crowns, labels.astype(np.int32, copy=False)
     return crowns
 
 

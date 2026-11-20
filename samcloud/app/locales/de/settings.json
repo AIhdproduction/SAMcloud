@@ -32,6 +32,7 @@
     "auto_dxf": "DXF/IFC nach der Berechnung automatisch erstellen"
   },
   "control_points_mode": {
+    "auto": "Automatisch, wenn Passpunkte mit Koordinaten vorhanden",
     "none": "Keine Passpunkte – automatisch fortfahren",
     "after_alignment": "Passpunkte nach der Ausrichtung verwenden",
     "automatic": "Automatisch (Targets erkennen)"

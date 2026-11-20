@@ -11,6 +11,7 @@ import ifcopenshell.api.unit
 from samcloud.bim.core.ifc.context import ExportContext
 from samcloud.bim.core.ifc.ids import set_guid, set_key_guid
 from samcloud.bim.core.ifc.shapes import place
+from samcloud.bim.core.model import BuildingElement
 
 Entity = ifcopenshell.entity_instance
 
@@ -88,6 +89,11 @@ def create_spatial_tree(ctx: ExportContext) -> None:
     building_items = [
         (b.id, b.name or DEFAULT_BUILDING, b.site_id) for b in scene.buildings.values()
     ]
+    building_items.extend(
+        (element.id, element.name or DEFAULT_BUILDING, element.site_id)
+        for element in scene.elements.values()
+        if isinstance(element, BuildingElement) and element.id not in scene.buildings
+    )
     if not building_items:
         building_items = [("default-building", DEFAULT_BUILDING, None)]
     for building_id, name, site_ref in building_items:

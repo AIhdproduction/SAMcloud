@@ -26,6 +26,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _WINDOWS_NO_CONSOLE = 0x08000000
 
 
+def _project_control_points_mode(project: dict[str, Any]) -> str:
+    """Return the configured mode, defaulting legacy project files to coordinate-aware auto."""
+    mode = project.get("workflow", {}).get("control_points_mode", "auto")
+    if mode not in {"none", "after_alignment", "automatic", "auto"}:
+        raise ValueError("invalid control-point mode")
+    return mode
+
+
 def optimize_control_points(project_directory: Path, project: dict[str, Any]) -> bool:
     """Re-run the automatic GCP adjustment from the preserved pristine model only."""
     from samcloud.engine.pipeline import _rerun_control_points
@@ -140,17 +148,13 @@ class ProcessingManager:
 
         project = self._state.projects.load(project_directory)
         workflow = project.setdefault("workflow", {})
-        mode = workflow.get(
-            "control_points_mode",
-            "after_alignment"
-            if project.get("settings", {}).get("workflow", {}).get("control_points_enabled", False)
-            else "none",
-        )
-        if mode not in {"none", "after_alignment", "automatic"}:
+        try:
+            mode = _project_control_points_mode(project)
+        except ValueError:
             raise ValueError(t("processing.error.invalid_control_point_mode"))
 
         workflow["alignment"] = "running"
-        workflow["control_points"] = "not_started" if mode in {"after_alignment", "automatic"} else "skipped"
+        workflow["control_points"] = "not_started" if mode in {"after_alignment", "automatic", "auto"} else "skipped"
         workflow["dense_cloud"] = "queued"
         workflow["classification"] = "queued"
         workflow["refinement"] = "queued"

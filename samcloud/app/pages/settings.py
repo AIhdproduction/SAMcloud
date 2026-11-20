@@ -22,6 +22,7 @@ from samcloud.app.i18n import (
 from samcloud.app.layout import render_page
 from samcloud.app.pages.projects import CAPTURE_TYPE_OPTIONS, CLASS_SET_OPTIONS, ENGINE_OPTIONS, TranslatedOptions
 from samcloud.app.state import state
+from samcloud.share.ui import render_settings_card as render_share_settings_card
 from samcloud.core.configuration import load_export_crs_presets
 from samcloud.core.storage import storage_settings
 from samcloud.app.pages.projects import STORAGE_OPTIONS
@@ -29,6 +30,7 @@ from samcloud.core.storage import DEFAULT_STORAGE
 
 
 CONTROL_POINTS_MODE_OPTIONS = TranslatedOptions({
+    "auto": "settings.control_points_mode.auto",
     "none": "settings.control_points_mode.none",
     "after_alignment": "settings.control_points_mode.after_alignment",
     "automatic": "settings.control_points_mode.automatic",
@@ -135,6 +137,7 @@ def render() -> None:
         project_directory = state.active_project_directory
         draft_owner = str(project_directory)
         _render_language_card(draft_controls, draft_owner)
+        render_share_settings_card()
         project = state.active_project()
         if project_directory is None or project is None:
             ui.label(t("settings.no_project"))
@@ -178,7 +181,7 @@ def render() -> None:
         )
         control_points_mode = project.get("workflow", {}).get(
             "control_points_mode",
-            "after_alignment" if workflow.get("control_points_enabled", False) else "none",
+            "auto",
         )
 
         with ui.card().classes("w-full"):
@@ -382,7 +385,7 @@ def render() -> None:
                 coordinates["export_crs"] = export_crs.value
                 workflow["use_gpu"] = use_gpu.value
                 workflow["auto_dxf"] = bool(auto_dxf.value)
-                workflow["control_points_enabled"] = control_points.value in {"after_alignment", "automatic"}
+                workflow["control_points_enabled"] = control_points.value in {"after_alignment", "automatic", "auto"}
                 project.setdefault("workflow", {})["control_points_mode"] = control_points.value
                 classification["class_set"] = class_set.value
                 classification["min_votes"] = int(min_votes.value or 0)

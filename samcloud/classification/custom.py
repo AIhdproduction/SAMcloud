@@ -19,8 +19,9 @@ from samcloud.core.paths import CONFIG_DIRECTORY
 from samcloud.classification.profiles import load_cyclone_codes
 
 PROJECT_CLASSES_RELATIVE = Path("config") / "classes.json"
-CUSTOM_LAS_CODE_START = 82
+CUSTOM_LAS_CODE_START = 200
 CUSTOM_CLASS_LIMIT = 255
+LEGACY_CUSTOM_CODES = frozenset({82, 83})  # were custom slots before becoming Road marking / Path
 _HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
@@ -37,6 +38,14 @@ def project_classes_path(project_directory: Path | str | None) -> Path:
     return global_classes_path()
 
 
+def _free_custom_codes() -> list[int]:
+    """LAS codes offered to new custom classes: custom slots at or above ``CUSTOM_LAS_CODE_START``."""
+    return sorted(
+        code for code, entry in load_cyclone_codes().items()
+        if entry.get("custom") and code >= CUSTOM_LAS_CODE_START
+    )
+
+
 def migrate_classes_config(config: dict) -> dict:
     """Return an in-memory Cyclone-safe migration of a legacy project class configuration."""
     config = deepcopy(config)
@@ -49,7 +58,9 @@ def migrate_classes_config(config: dict) -> dict:
         config["instance_labels_de"] = deepcopy(global_config.get("instance_labels_de", {}))
     if "instance_label_aliases" not in config:
         config["instance_label_aliases"] = deepcopy(global_config.get("instance_label_aliases", {}))
-    custom_codes = [code for code, entry in load_cyclone_codes().items() if entry.get("custom") and code != 82]
+    custom_codes = _free_custom_codes()
+    # Codes a legacy project may legitimately hold: every registry custom slot plus the former custom 82/83.
+    stored_custom_codes = {code for code, entry in load_cyclone_codes().items() if entry.get("custom")} | LEGACY_CUSTOM_CODES
     for class_set in ("outdoor", "indoor"):
         codes = config.get("las_codes", {}).get(class_set)
         entries = config.get(class_set)
@@ -60,6 +71,8 @@ def migrate_classes_config(config: dict) -> dict:
             class_name(entry): global_codes[index]
             for index, entry in enumerate(global_config[class_set], start=1)
         }
+        standard_values = set(standard_codes.values())
+        standard_values = set(standard_codes.values())
         migrated = [global_codes[0]]
         used = {global_codes[0]}
         for index, entry in enumerate(entries, start=1):
@@ -69,7 +82,8 @@ def migrate_classes_config(config: dict) -> dict:
                 used.add(standard_codes[name])
                 continue
             current = codes[index] if index < len(codes) else None
-            if current not in custom_codes or current in used:
+            # Codes already stored in a project file are never renumbered, even below 200.
+            if current not in stored_custom_codes or current in used or current in standard_values:
                 current = next((code for code in custom_codes if code not in used), None)
                 if current is None:
                     raise ValueError("Keine freien LAS-Klassencodes mehr")
@@ -183,7 +197,7 @@ def build_custom_classes(class_set: str, customization: dict | None, config: dic
     colors = list(base.get("colors", {}).get(class_set) or [])
     labels = list(base.get("labels_de", {}).get(class_set) or [])
     used_codes = set(las_codes)
-    custom_codes = [code for code, entry in load_cyclone_codes().items() if entry.get("custom") and code != 82]
+    custom_codes = _free_custom_codes()
     available_codes = [code for code in custom_codes if code not in used_codes]
     for item in custom["added"]:
         entries.append(", ".join([item["name"], *item["prompts"]]))

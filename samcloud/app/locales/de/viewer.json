@@ -31,7 +31,8 @@
     "other": "Andere"
   },
   "markers": {
-    "open_review": "Doppelklick: in der Passpunkt-Prüfung öffnen"
+    "open_review": "Doppelklick: in der Passpunkt-Prüfung öffnen",
+    "none": "Keine Passpunkte im Projekt"
   },
   "camera": {
     "fallback_title": "Kamera",

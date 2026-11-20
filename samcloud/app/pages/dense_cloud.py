@@ -1,6 +1,7 @@
 """Dense cloud inspection and semantic class controls."""
 
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from samcloud.app.layout import render_page
 from samcloud.app.pointcloud_viewer import default_class_colors, render_pointcloud_viewer
 from samcloud.app.state import state
 from samcloud.classification.custom import load_project_classes, project_classes_path
+from samcloud.share.ui import render_share_button
 from samcloud.classification.service import class_default_colors, class_las_codes
 
 
@@ -40,6 +42,12 @@ def render() -> None:
         fine_term_names_de = _fine_term_names_de(_fine_labels_path(project), _class_config())
         with ui.column().classes("w-full gap-4"):
             with ui.card().classes("w-full"):
+                with ui.row().classes("items-center gap-3"):
+                    ui.label(t("dense.viewer_title")).classes("text-lg font-medium")
+                    try:
+                        render_share_button(state.active_project_directory, project)
+                    except Exception:  # sharing is optional and must never break the viewer page
+                        logging.getLogger(__name__).exception("share button unavailable")
                 render_pointcloud_viewer(
                     "dense",
                     title=t("dense.viewer_title"),

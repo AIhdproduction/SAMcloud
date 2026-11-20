@@ -1,0 +1,97 @@
+# Defaults for the outdoor drone product chain (samcloud/drone).
+class_codes:                 # LAS class codes for outdoor classes
+  road_marking: 82           # road marking class code
+  path: 83                   # path class code
+  custom_slots_start: 200    # first free code for user-defined classes
+terrain:
+  dsm_resolution_m: 0.10     # DSM raster cell size
+  dtm_resolution_m: 0.25     # DTM raster cell size
+  ground_filter: auto        # auto|pmf|csf (auto = winner of the comparison)
+  csf:                       # cloth simulation filter parameters
+    cloth_resolution_m: 0.5  # cloth grid size
+    rigidness: 2             # cloth rigidness (1..3)
+    class_threshold_m: 0.15  # max distance cloth-to-point for ground
+    iterations: 500          # simulation iterations
+    time_step: 0.65          # simulation time step
+  tin:                       # constrained TIN meshing
+    constraint_buffer_m: 0.05    # buffer around breaklines
+    min_angle_deg: 20            # minimum triangle angle
+    max_steiner_per_edge: 50     # cap on Steiner points per edge
+buildings:
+  ransac_distance_m: 0.05    # RANSAC inlier distance for planes
+  region_growing:            # plane region growing
+    k: 16                    # neighbours for normal estimation
+    epsilon_m: 0.08          # max point-to-plane distance
+    min_points: 200          # min points per region
+    normal_angle_deg: 10     # max normal deviation
+  label_pruning_buffer_m: 2.5    # buffer when pruning stray building labels
+  complexity_factor: 0.7     # roof model complexity trade-off
+  max_seconds_per_building: 60   # time budget per building
+openings:
+  min_views: 3               # min camera views as evidence
+  min_area_m2: 0.3           # smallest accepted opening
+  max_area_m2: 12.0          # largest accepted opening
+  door_bottom_tolerance_m: 0.20  # door bottom vs. ground tolerance
+  window_min_sill_m: 0.40    # min sill height for windows
+  reference_strip_m: 0.5     # facade strip used as depth reference
+vegetation:
+  tree_min_height_m: 2.0     # min height to count as tree
+  tree_min_points: 200       # min points per tree
+  crown_triangles: {min: 60, max: 120}   # crown mesh triangle budget
+  default_trunk_diameter_m: 0.30     # used only with ParamOrigin.ASSUMED
+pavement:
+  min_thickness_m: 0.10      # min pavement layer thickness
+  snap_tolerance_m: 0.01     # vertex snapping tolerance
+  max_gap_overlap_cm2: 1.0   # max tolerated gap/overlap between polygons
+  snap_search_m: 0.15        # search radius for snapping to curbs (residual target stays max_gap_overlap_cm2)
+  gap_tolerance_m: 0.15      # gaps narrower than this between neighbouring pavements are closed
+  min_area_m2: 2.0           # smaller pavement polygons become QA entries instead of elements
+curb:
+  min_length_m: 0.3          # shorter curb axes are not emitted
+  dp_tolerance_m: 0.015      # Douglas-Peucker tolerance for axis thinning
+  section_width_m: 0.12      # curb cross-section width
+  section_height_m: 0.25     # curb cross-section height
+  arc_fit_max_residual_m: 0.01   # max residual for arc fitting
+  arc_max_radius_m: 50.0     # larger radii are treated as straight
+  arc_min_points: 4          # min points for an arc
+dxf:
+  local_origin: false        # false = real LV95 coordinates
+  hatch: false               # write hatches
+  contour_major_m: 1.0       # major contour interval
+  contour_minor_m: auto      # auto -> 0.2 or 0.5 chosen from noise/slope
+  spline_contours: true      # smooth contours as splines
+  tin_layer_frozen: true     # freeze TIN layer
+  spot_spacing_m: 10.0       # spacing of the thinned S-ELEV spot-height grid
+ifc:
+  curb_sweep: auto           # auto|extrude_only
+  epsg: 2056                 # CRS code
+  vertical_datum: LN02       # height datum
+cloud_filter:                # tiled cloud clean-up (samcloud/drone/cloud_filter.py)
+  tile_size_m: 10.0          # processing tile edge length
+  halo_m: 1.0                # overlap around each tile to avoid edge effects
+  outliers:                  # statistical/radius outlier removal
+    nb_neighbors: 20         # neighbours for the mean-distance statistic
+    std_ratio: 2.0           # reject points beyond mean + std_ratio * sigma
+    radius: null             # optional radius criterion (m); null = off
+    min_points: null         # min neighbours within radius; null = off
+  planar:                    # denoise planar surfaces (roofs, walls, ...)
+    class_codes: [6, 144, 145]   # LAS codes treated as planar
+    sigma_factor: 1.0        # noise sigma multiplier for plane inliers
+    curvature_keep: 0.05     # keep points with curvature above this (edges)
+    radius: 0.3              # neighbourhood radius (m)
+    min_inlier_fraction: 0.95    # plane accepted if this share fits
+    max_rms_m: 0.015         # plane accepted if RMS below this
+  ground:                    # denoise ground-like surfaces
+    class_codes: [2, 11, 71, 73, 83, 82]   # LAS codes treated as ground surface
+    radius: 0.5              # neighbourhood radius (m)
+    normal_jump_deg: 12.0    # normal change that marks an edge
+    curb_clearance_m: 0.15   # protected distance around curb points
+    curb_code: 74            # LAS code of curb points
+    sigma_factor: 1.0        # noise sigma multiplier for surface inliers
+    min_inlier_fraction: 0.95    # surface accepted if this share fits
+    max_rms_m: 0.015         # surface accepted if RMS below this
+boundary:                    # processing boundary (samcloud/drone/perimeter.py)
+  mode: camera_hull          # camera_hull | perimeter (KML) | intersection | none
+  buffer_m: 10.0             # outward buffer of the camera-position convex hull
+  perimeter_path: null       # KML path (relative to project or absolute); null = inputs/survey/*.kml
+  perimeter_buffer_m: 2.0    # margin around the KML polygon in mode "perimeter"

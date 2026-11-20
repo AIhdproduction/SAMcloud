@@ -349,6 +349,29 @@ def test_tree_crowns_watershed_and_block_scale() -> None:
     assert all(min(math.dist(crown.trunk, peak) for peak in peaks) < 0.2 for crown in crowns)
 
 
+def test_detect_crowns_return_labels_aligned_with_chm() -> None:
+    grid = RasterGrid(0.0, 12.0, 0.1, 120, 120)
+    rows, cols = np.indices((120, 120))
+    chm = (11.0 * np.exp(-((rows - 55) ** 2 + (cols - 40) ** 2) / (2 * 10**2))
+           + 15.0 * np.exp(-((rows - 60) ** 2 + (cols - 82) ** 2) / (2 * 18**2))).astype(np.float32)
+    mask = chm >= 2.0
+    plain = detect_crowns(chm, mask, grid, min_crown_diameter=1.5)
+    crowns, labels = detect_crowns(chm, mask, grid, min_crown_diameter=1.5, return_labels=True)
+    assert crowns == plain
+    assert labels.shape == chm.shape
+    assert labels[~mask].max() == 0
+    ids = []
+    for crown in crowns:
+        row, col = grid.local_to_pixel(*crown.trunk)
+        identifier = int(labels[int(round(row)), int(round(col))])
+        assert identifier > 0
+        assert abs(np.count_nonzero(labels == identifier) * grid.pixel_size**2 - crown.area) < 1e-6
+        ids.append(identifier)
+    assert len(set(ids)) == len(ids)
+    empty, empty_labels = detect_crowns(chm, np.zeros_like(mask), grid, return_labels=True)
+    assert empty == [] and empty_labels.shape == chm.shape and empty_labels.max() == 0
+
+
 def test_symbol_blocks_created_and_readable(work_dir: Path) -> None:
     document = ezdxf.new("R2018")
     add_symbol_blocks(document)

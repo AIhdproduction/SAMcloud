@@ -71,7 +71,7 @@ class Status(StrEnum):
 
 
 class ElementKind(StrEnum):
-    """Element kinds. The last four are reserved for later milestones."""
+    """Element kinds represented by the scene model."""
 
     WALL = "wall"
     WALL_JOIN = "wall_join"
@@ -85,6 +85,15 @@ class ElementKind(StrEnum):
     FURNITURE = "furniture"
     TERRAIN = "terrain"
     BUILDING = "building"
+    TREE = "tree"
+    SHRUB = "shrub"
+    SITE_WALL = "site_wall"
+    FENCE = "fence"
+    PAVEMENT = "pavement"
+    CURB = "curb"
+    MARKING = "marking"
+    MANHOLE = "manhole"
+    VEGETATION_AREA = "vegetation_area"
 
 
 class WallJustification(StrEnum):

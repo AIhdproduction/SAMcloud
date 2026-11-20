@@ -88,6 +88,13 @@ def test_texture_and_ambiguous_crosses_are_rejected() -> None:
     assert detect_target(image, (400.5, 300.5), 130, "cross") is None
 
 
+def test_degenerate_triangle_blob_is_skipped_without_crashing(monkeypatch) -> None:
+    image = _cross((412.37, 288.81))
+    monkeypatch.setattr(cv2, "minEnclosingTriangle", lambda _lobe: (0.0, None))
+
+    assert detect_target(image, (412.87, 289.31), 110, "cross") is None
+
+
 def test_stronger_cross_wins_and_input_variants_work() -> None:
     center = (412.37, 288.81)
     image = _cross(center)

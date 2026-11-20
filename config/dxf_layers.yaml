@@ -21,6 +21,8 @@ layers:
   - {mode: outdoor, codes: [6], name: S-BLDG, color: 7, linetype: CONTINUOUS, lineweight: 50, geometry: polygon, min_area: 0.25, simplify_tolerance: 0.05, hatch: false}
   - {mode: outdoor, codes: [3], name: S-VEG, color: 94, linetype: CONTINUOUS, lineweight: 25, geometry: polygon, min_area: 0.25, simplify_tolerance: 0.05, hatch: false}
   - {mode: outdoor, codes: [4, 5, 95], name: S-TREE, color: 94, linetype: CONTINUOUS, lineweight: 25, geometry: tree, min_area: 0.0, simplify_tolerance: 0.05, hatch: false}
+  - {mode: outdoor, codes: [94], name: S-SHRUB, color: 94, linetype: CONTINUOUS, lineweight: 18, geometry: tree, min_area: 0.0, simplify_tolerance: 0.05, hatch: false}
+  - {mode: outdoor, codes: [83], name: S-PATH, color: 32, linetype: CONTINUOUS, geometry: skeleton, min_area: 0.0, simplify_tolerance: 0.05, hatch: false}
   - {mode: outdoor, codes: [84], name: S-POLE, color: 6, linetype: CONTINUOUS, geometry: circle, min_area: 0.0, simplify_tolerance: 0.02, hatch: false}
   - {mode: outdoor, codes: [91], name: S-VEH, color: 1, linetype: CONTINUOUS, geometry: polygon, min_area: 0.1, simplify_tolerance: 0.05, hatch: false}
   - {mode: outdoor, codes: [151], name: S-WORK, color: 30, linetype: CONTINUOUS, geometry: polygon, min_area: 0.1, simplify_tolerance: 0.05, hatch: false}
@@ -31,3 +33,19 @@ layers:
   - {mode: outdoor, codes: [14], name: S-WIRE, color: 6, linetype: CONTINUOUS, geometry: line, min_area: 0.0, simplify_tolerance: 0.05, hatch: false}
   - {mode: outdoor, codes: [180], name: S-MATL, color: 253, linetype: CONTINUOUS, geometry: polygon, min_area: 0.1, simplify_tolerance: 0.05, hatch: false}
   - {mode: outdoor, codes: [64], name: IGNORE, color: 7, linetype: CONTINUOUS, geometry: ignore, min_area: 0.0, simplify_tolerance: 0.0, hatch: false}
+
+# Drone-pipeline outdoor layers written by samcloud/dxf/writer.py (ensure_outdoor_layers).
+# Not class-driven (the loader in samcloud/dxf/layers.py ignores this key); S-SHRUB and S-PATH
+# are repeated here so the writer has one complete style table. `frozen: true` = created frozen/off.
+outdoor_extra_layers:
+  - {name: S-BLDG-ROOF, color: 30, linetype: CONTINUOUS, lineweight: 35}
+  - {name: S-BLDG-WIND, color: 4, linetype: CONTINUOUS, lineweight: 18}
+  - {name: S-BLDG-DOOR, color: 1, linetype: CONTINUOUS, lineweight: 18}
+  - {name: S-SHRUB, color: 94, linetype: CONTINUOUS, lineweight: 18}
+  - {name: S-PATH, color: 32, linetype: CONTINUOUS}
+  - {name: S-TOPO-TIN, color: 8, linetype: CONTINUOUS, frozen: true}
+  # Styles mirror config/ortho_plan.yaml (layers:). true_color is documentation only unless the writer applies it; the ACI colour is what ensure_outdoor_layers uses.
+  - {name: S-TOPO-MAJR, color: 30, true_color: [150, 60, 40], linetype: CONTINUOUS, lineweight: 25}
+  - {name: S-TOPO-MINR, color: 74, true_color: [120, 170, 110], linetype: CONTINUOUS, lineweight: 13}
+  - {name: S-ELEV, color: 3, linetype: CONTINUOUS, lineweight: 18}
+  - {name: S-ANNO-GRENZE, color: 1, linetype: DASHED, lineweight: 25}

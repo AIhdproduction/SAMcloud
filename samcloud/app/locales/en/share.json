@@ -1,0 +1,83 @@
+{
+  "button": "Share (QR)",
+  "unavailable": "Available after step 6",
+  "title": "Share point cloud via QR code",
+  "intro": "The classified point cloud (at most {max_points} points) is exported as a web view and uploaded. You then get a QR code and a link.",
+  "start": "Create",
+  "retry": "Try again",
+  "cancel": "Cancel",
+  "cancelling": "Cancelling …",
+  "cancelled": "Cancelled.",
+  "close": "Close",
+  "copy": "Copy link",
+  "save_png": "Save PNG",
+  "open": "Open",
+  "extend": "Extend",
+  "extended": "Extended, valid until {date}.",
+  "recreate": "Recreate",
+  "delete": "Delete link",
+  "deleted": "Link deleted.",
+  "copied": "Link copied.",
+  "expired": "The link has expired (since {date}). Please recreate it.",
+  "valid_until": "valid until {date}",
+  "info": "{points} points, {size} MB",
+  "error_unknown": "Unknown error.",
+  "confirm": "The point cloud will be publicly reachable through this link. Continue?",
+  "confirm_yes": "Continue",
+  "confirm_no": "Cancel",
+  "setup": {
+    "title": "Set up Cloudflare R2",
+    "intro": "Shared point clouds are stored in your own Cloudflare R2 bucket. One-time setup:",
+    "field_account_id": "Account ID",
+    "field_access_key_id": "Access Key ID",
+    "field_secret_access_key": "Secret Access Key",
+    "field_bucket": "Bucket name",
+    "field_public_base_url": "Public URL (r2.dev)",
+    "incomplete": "Please fill in all fields (public URL starting with https://).",
+    "testing": "Testing connection …",
+    "test": "Test connection",
+    "save": "Save",
+    "saved": "Credentials saved.",
+    "ok": "Connection successful, links expire after {days} days.",
+    "lifecycle_missing": "Deletion rule not found – please follow step 5 of the guide",
+    "lifecycle_ok": "Deletion rule (15 days) found.",
+    "ok_short": "Connection successful.",
+    "lifecycle_unknown": "Connection successful. The deletion rule cannot be checked with this token – if you have done step 5, everything is fine."
+  },
+  "settings": {
+    "title": "Sharing / Cloudflare",
+    "configured": "Connected: bucket {bucket} (account {account})",
+    "not_configured": "No Cloudflare account set up yet.",
+    "edit": "Change account",
+    "delete": "Delete account",
+    "deleted": "Credentials deleted."
+  },
+  "guide": {
+    "title": "Guide: Set up Cloudflare R2 for SAMcloud",
+    "s1": {
+      "title": "Create a Cloudflare account",
+      "body": "Open https://dash.cloudflare.com/\nSign up or log in.\nOpen R2 Object Storage."
+    },
+    "s2": {
+      "title": "Create a bucket",
+      "body": "Click Create bucket.\nEnter a name, e.g. `samcloud-shares`.\nChoose Standard as the storage class.\nClick Create bucket."
+    },
+    "s3": {
+      "title": "Enable public access",
+      "body": "Open your bucket.\nGo to Settings → Public Access.\nEnable the Public Development URL (r2.dev).\nCopy the public URL that is shown."
+    },
+    "s4": {
+      "title": "Create an API key",
+      "body": "Open R2 Object Storage → Manage R2 API Tokens.\nClick Create Account API token.\nUse these settings: Token name: `SAMcloud`; Permissions: `Object Read & Write`; Specify bucket(s): `Apply to specific buckets only`; Bucket: select the bucket you created; TTL: `Forever`; Client IP Address Filtering: leave empty.\nClick Create Account API Token.\nStore the Access Key ID and the Secret Access Key safely."
+    },
+    "s5": {
+      "title": "Set up automatic deletion",
+      "body": "Open your bucket and go to Settings → Object Lifecycle Rules.\nCreate a rule named `samcloud-auto-delete`.\nChoose Delete objects after 15 days.\nSave and enable the rule."
+    },
+    "s6": {
+      "title": "Enter the credentials in SAMcloud",
+      "body": "In SAMcloud open the settings for the Cloudflare connection and enter these five values: Account ID: In R2 Object Storage (overview, not inside the bucket) on the right in the \"Account Details\" box – 32 characters, without https:// and without .r2.cloudflarestorage.com (it is the part before `.r2.cloudflarestorage.com` in the S3 endpoint shown after creating the token); Access Key ID: from the API token you created; Secret Access Key: from the API token you created; Bucket Name: the name of your bucket; Public URL: the public r2.dev address from step 3.\nClick Test connection and save the settings."
+    },
+    "note": "Important: Never share your API keys. With the public URL, files are accessible to everyone who has the link."
+  }
+}

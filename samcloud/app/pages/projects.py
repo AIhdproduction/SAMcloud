@@ -63,6 +63,7 @@ CLASS_SET_OPTIONS = TranslatedOptions({
     "indoor": "projects.class_set.indoor",
 })
 CONTROL_POINTS_MODE_OPTIONS = TranslatedOptions({
+    "auto": "projects.control_points_mode.auto",
     "none": "projects.control_points_mode.none",
     "after_alignment": "projects.control_points_mode.after_alignment",
 })
@@ -209,7 +210,7 @@ def render() -> None:
             control_points_mode = ui.select(
                 dict(CONTROL_POINTS_MODE_OPTIONS),
                 label=t("projects.create.control_points"),
-                value="none",
+                value="auto",
             )
             auto_dxf = ui.switch(t("projects.create.auto_dxf"), value=True).mark("auto-dxf-switch")
             with ui.card().classes("w-full"):

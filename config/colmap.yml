@@ -37,6 +37,13 @@ georeferencing:
   standard_gps_prior_std_z_m: 5.0
   control_point_minimum_observations: 2
   control_point_crs: EPSG:2056
+  # Height datum of the image EXIF GPSAltitude: ellipsoidal | ln02 | egm96.
+  # ellipsoidal: WGS84/ETRS89 ellipsoidal height (default, used as is).
+  # ln02: orthometric height above LN02 (EPSG:5728); converted once to ellipsoidal
+  #   height via the CHGeo2004 grid. Use for RTK flown with the swipos mount
+  #   MSM_GISGEO_LV95LN02 (LV95 + LN02 corrections).
+  # egm96: height above the EGM96 geoid (EPSG:5773), converted via the PROJ geoid grid.
+  input_height: ellipsoidal
 
 dense_reconstruction:
   use_geometric_consistency: true
@@ -200,6 +207,9 @@ dense_reconstruction:
   # Separate settings per capture type; never shared implicitly.
   capture_profiles:
     drone_gps:
+      # Optional dense image size override (inactive): replaces dense_reconstruction.max_image_size
+      # and/or the auto ratio/minimum/maximum for this capture type only, e.g.
+      # dense_size: {max_image_size: auto, maximum: 4000}   (or max_image_size: 4000 for a fixed size)
       patch_match: {}
       fusion: {}
       point_cleaning: {}

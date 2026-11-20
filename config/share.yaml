@@ -1,0 +1,11 @@
+# Settings for "Punktwolke per QR-Code teilen" (samcloud/share). No secrets belong in this file.
+provider: cloudflare_r2  # cloudflare_r2 | local (env SAMCLOUD_SHARE_PROVIDER overrides)
+expiry_days: 15          # lifetime of a shared link (bucket lifecycle rule; "Verlängern" restarts it)
+max_points: 20000000     # upper limit of the shared point cloud (voxel thinning, classes preserved)
+octree_encoding: BROTLI  # PotreeConverter encoding of the shared octree
+providers:
+  local:
+    directory: null      # null = <project>/products/share/site ; else an absolute directory
+    serve: false         # true = serve the site through a tiny local HTTP server (preview) and use http:// URLs
+    host: 127.0.0.1
+    port: 0              # 0 = free port

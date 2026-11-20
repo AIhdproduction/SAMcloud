@@ -79,8 +79,14 @@ def fit_similarity(
     return scale, rotation, translation, residual_m
 
 
-def fit_enu_to_ecef(model_dir: Path, gps_ref: Path) -> dict[str, Any]:
-    """Estimate the COLMAP ENU-to-ECEF similarity from matched camera positions."""
+def fit_enu_to_ecef(
+    model_dir: Path, gps_ref: Path, height_reference: str | None = None,
+) -> dict[str, Any]:
+    """Estimate the COLMAP ENU-to-ECEF similarity from matched camera positions.
+
+    ``height_reference`` describes the origin of the heights in ``gps_ref`` and is stored
+    in the result; it defaults to ``HEIGHT_REFERENCE``.
+    """
     centres = camera_centres(model_dir)
     gps_positions = read_gps_ref(gps_ref)
     names = sorted(set(centres).intersection(gps_positions))
@@ -104,7 +110,7 @@ def fit_enu_to_ecef(model_dir: Path, gps_ref: Path) -> dict[str, Any]:
         "translation": translation.tolist(),
         "pairs": len(names),
         "residual_m": residual_m,
-        "height_reference": HEIGHT_REFERENCE,
+        "height_reference": height_reference if height_reference else HEIGHT_REFERENCE,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -161,11 +167,17 @@ def load_georeference(path: Path) -> dict[str, Any]:
         or not np.all(np.isfinite(translation))
     ):
         raise ValueError("Georeference contains non-finite transformation values")
+    if "height_offset_m" in georeference and not np.isfinite(float(georeference["height_offset_m"])):
+        raise ValueError("Georeference height offset must be finite")
     return georeference
 
 
 def enu_to_target(points_enu: np.ndarray, georeference: dict[str, Any], target_crs: str) -> np.ndarray:
-    """Transform one point-cloud chunk from COLMAP ENU to the requested target CRS."""
+    """Transform one ENU chunk to a target CRS, applying its optional target-height offset.
+
+    ``height_offset_m`` is zero when absent.  A checkpoint-derived correction is stored
+    as ``-mean(dH)`` because checkpoint residuals use ``dH = measured - surveyed``.
+    """
     points = _points_array(points_enu, "ENU")
     scale = float(georeference["scale"])
     rotation = np.asarray(georeference["rotation"], dtype=float)
@@ -184,7 +196,8 @@ def enu_to_target(points_enu: np.ndarray, georeference: dict[str, Any], target_c
         return np.column_stack((longitude, latitude, height))
     transformer = strict_transformer("EPSG:4979", target_definition)
     x, y, transformed_height = _transform_strict(transformer, longitude, latitude, height)
-    return np.column_stack((x, y, transformed_height))
+    height_offset_m = float(georeference.get("height_offset_m", 0.0))
+    return np.column_stack((x, y, transformed_height + height_offset_m))
 
 
 def export_target_crs(target_crs: str) -> str:

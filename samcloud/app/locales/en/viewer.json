@@ -31,7 +31,8 @@
     "other": "Other"
   },
   "markers": {
-    "open_review": "Double-click: open in the control point review"
+    "open_review": "Double-click: open in the control point review",
+    "none": "No control points in the project"
   },
   "camera": {
     "fallback_title": "Camera",

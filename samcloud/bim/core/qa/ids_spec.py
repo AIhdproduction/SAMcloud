@@ -322,6 +322,11 @@ def _build_specification(spec: TypeSpec) -> ids.Specification:
     result.applicability.append(
         ids.Entity(name=spec.ifc_class, predefinedType=spec.predefined_type)
     )
+    # Indoor product rules must not match site-contained outdoor products that
+    # happen to share an IFC class, such as IfcWall site walls.
+    if any(rule in _IN_STOREY for rule in spec.part_of):
+        for rule in _IN_STOREY:
+            result.applicability.append(ids.PartOf(name=rule.name, relation=rule.relation))
     for attribute, value in spec.attributes:
         result.requirements.append(ids.Attribute(name=attribute, value=value))
     for rule in spec.part_of:

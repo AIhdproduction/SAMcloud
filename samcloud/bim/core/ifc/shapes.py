@@ -89,6 +89,95 @@ def swept_solid_representation(ctx: ExportContext, solids: Sequence[Entity]) -> 
     return ctx.file.createIfcShapeRepresentation(ctx.body, "Body", "SweptSolid", list(solids))
 
 
+def triangulated_face_set(
+    ifc: ifcopenshell.file,
+    vertices: Sequence[Vec3],
+    triangles: Sequence[tuple[int, int, int]],
+) -> Entity:
+    """Create a closed IFC triangular face set from zero-based mesh indices."""
+    points = ifc.createIfcCartesianPointList3D(
+        [tuple(float(value) for value in vertex) for vertex in vertices]
+    )
+    indices = [tuple(int(index) + 1 for index in triangle) for triangle in triangles]
+    return ifc.createIfcTriangulatedFaceSet(points, None, True, indices, None)
+
+
+def tessellation_representation(ctx: ExportContext, item: Entity) -> Entity:
+    """Body/Tessellation representation for a triangulated mesh item."""
+    return ctx.file.createIfcShapeRepresentation(ctx.body, "Body", "Tessellation", [item])
+
+
+def swept_curb(
+    ifc: ifcopenshell.file,
+    axis: Sequence[Vec3],
+    width: float = 0.12,
+    height: float = 0.25,
+) -> Entity:
+    """Create an IfcFixedReferenceSweptAreaSolid along a three-dimensional polyline."""
+    profile = rectangle_profile(ifc, (0.0, height / 2.0), width, height)
+    directrix = ifc.createIfcPolyline([_point3(ifc, point) for point in axis])
+    position = ifc.createIfcAxis2Placement3D(_point3(ifc, axis[0]), None, None)
+    return ifc.createIfcFixedReferenceSweptAreaSolid(
+        profile, position, directrix, None, None, _direction(ifc, (0.0, 0.0, 1.0))
+    )
+
+
+def stylised_tree(
+    ifc: ifcopenshell.file,
+    trunk_xy: Vec2,
+    base_z: float,
+    height: float,
+    crown_diameter: float,
+    trunk_diameter: float,
+) -> tuple[Entity, Entity]:
+    """Return a 12-sided trunk extrusion and a 72-triangle ellipsoid crown mesh."""
+    crown_height = max(height * 0.55, crown_diameter * 0.6)
+    crown_base = base_z + height - crown_height
+    radius = crown_diameter / 2.0
+    trunk = polygon_profile(
+        ifc,
+        [
+            (
+                trunk_diameter / 2.0 * np.cos(2.0 * np.pi * index / 12.0),
+                trunk_diameter / 2.0 * np.sin(2.0 * np.pi * index / 12.0),
+            )
+            for index in range(12)
+        ],
+    )
+    trunk_solid = extrusion(ifc, trunk, crown_base - base_z, origin=(trunk_xy[0], trunk_xy[1], base_z))
+    vertices: list[Vec3] = [(trunk_xy[0], trunk_xy[1], crown_base)]
+    # Five latitude rings plus two poles produce 72 triangles with 12 sectors.
+    for ring in range(1, 6):
+        angle = -np.pi / 2.0 + np.pi * ring / 6.0
+        for sector in range(12):
+            azimuth = 2.0 * np.pi * sector / 12.0
+            vertices.append(
+                (
+                    trunk_xy[0] + radius * np.cos(angle) * np.cos(azimuth),
+                    trunk_xy[1] + radius * np.cos(angle) * np.sin(azimuth),
+                    crown_base + crown_height / 2.0 * (1.0 + np.sin(angle)),
+                )
+            )
+    top_index = len(vertices)
+    vertices.append((trunk_xy[0], trunk_xy[1], crown_base + crown_height))
+    triangles: list[tuple[int, int, int]] = []
+    for sector in range(12):
+        next_sector = (sector + 1) % 12
+        triangles.append((0, 1 + next_sector, 1 + sector))
+    for ring in range(4):
+        start = 1 + ring * 12
+        following = start + 12
+        for sector in range(12):
+            next_sector = (sector + 1) % 12
+            triangles.extend(((start + sector, start + next_sector, following + next_sector), (start + sector, following + next_sector, following + sector)))
+    start = 1 + 4 * 12
+    for sector in range(12):
+        triangles.append((start + sector, start + (sector + 1) % 12, top_index))
+    crown = triangulated_face_set(ifc, vertices, triangles)
+    assert 60 <= len(triangles) <= 120
+    return trunk_solid, crown
+
+
 def axis_representation(ctx: ExportContext, length: float) -> Entity:
     """Axis / Curve2D representation from (0, 0) to (length, 0) in the local frame."""
     representation = ifcopenshell.api.geometry.add_axis_representation(

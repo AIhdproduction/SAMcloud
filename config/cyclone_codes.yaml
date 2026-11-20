@@ -81,8 +81,8 @@ codes:
   79: {name: "Traffic light"}
   80: {name: "Street lamp"}
   81: {name: "Rail/Road sign"}
-  82: {name: "Custom 82", custom: true}
-  83: {name: "Custom 83", custom: true}
+  82: {name: "Road marking"}
+  83: {name: "Path"}
   84: {name: Pole}
   85: {name: Tunnel}
   86: {name: Bridge}

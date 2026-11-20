@@ -110,12 +110,15 @@ def test_translated_option_keys_exist_in_both_languages() -> None:
 
 def test_translated_options_keep_values_and_follow_language(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_config(monkeypatch, "de")
-    assert list(settings_page.CONTROL_POINTS_MODE_OPTIONS) == ["none", "after_alignment", "automatic"]
+    assert list(settings_page.CONTROL_POINTS_MODE_OPTIONS) == ["auto", "none", "after_alignment", "automatic"]
+    assert settings_page.CONTROL_POINTS_MODE_OPTIONS["auto"] == "Automatisch, wenn Passpunkte mit Koordinaten vorhanden"
     assert settings_page.CONTROL_POINTS_MODE_OPTIONS["automatic"] == "Automatisch (Targets erkennen)"
     assert list(settings_page.TILE_SIZE_OPTIONS) == [768, 1008, 1280]
     assert settings_page.STORAGE_OPTIONS is projects_page.STORAGE_OPTIONS
     _use_config(monkeypatch, "en")
     assert settings_page.CONTROL_POINTS_MODE_OPTIONS["automatic"] == "Automatic (detect targets)"
+    assert settings_page.CONTROL_POINTS_MODE_OPTIONS["auto"] == "Automatic when control points with coordinates exist"
+    assert projects_page.CONTROL_POINTS_MODE_OPTIONS["auto"] == "Automatic when control points with coordinates exist"
     assert dict(projects_page.CLASS_SET_OPTIONS) == {"outdoor": "Outdoor", "indoor": "Indoor"}
 
 
@@ -228,5 +231,30 @@ async def test_save_settings_unchanged_by_language(tmp_path: Path, monkeypatch: 
         await user.should_see("Projekteinstellungen gespeichert")
     saved = _saved_project(project)
     assert saved["settings"]["classification"]["min_votes"] == 3
-    assert saved["workflow"]["control_points_mode"] == "none"
+    assert saved["workflow"]["control_points_mode"] == "auto"
     assert set(saved["settings"]["storage"]) == set(projects_page.STORAGE_OPTIONS)
+
+
+# --------------------------------------------------------------------------- auto control-point mode on the home page
+
+
+def test_home_auto_mode_without_control_points_shows_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from samcloud.app.pages import home as home_page
+
+    _use_config(monkeypatch, "de")
+    project_dir = tmp_path / "proj"
+    (project_dir / "control_points").mkdir(parents=True)
+    project = {"workflow": {"control_points_mode": "auto", "control_points": "not_started", "alignment": "ready"}}
+    monkeypatch.setattr(home_page.state, "active_project_directory", project_dir, raising=False)
+    assert home_page._live_workflow(project)["control_points"] == "skipped"
+    assert home_page._control_points_status_text(project, "not_started") == "übersprungen (keine Passpunkte)"
+    _use_config(monkeypatch, "en")
+    assert home_page._control_points_status_text(project, "skipped") == "skipped (no control points)"
+
+    (project_dir / "control_points" / "control_points.csv").write_text("name,x,y,z\n", encoding="utf-8")
+    assert home_page._live_workflow(project)["control_points"] == "not_started"
+    assert home_page._control_points_status_text(project, "not_started") != "skipped (no control points)"
+
+    project["workflow"]["control_points_mode"] = "after_alignment"
+    (project_dir / "control_points" / "control_points.csv").unlink()
+    assert home_page._live_workflow(project)["control_points"] == "not_started"

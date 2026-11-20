@@ -51,7 +51,7 @@ class ProjectManager:
         panorama_video_path: str = "",
         frame_interval_seconds: float | None = None,
         rtk_enabled: bool = False,
-        control_points_mode: str = "none",
+        control_points_mode: str = "auto",
         storage: dict | None = None,
         apriltags_enabled: bool | None = None,
         apriltag_coordinates_csv: str | Path | None = None,
@@ -168,7 +168,7 @@ class ProjectManager:
             frame_interval_seconds = float(panorama_defaults.get("frame_interval_seconds", 1.0))
         if class_set not in {"outdoor", "indoor"}:
             raise ValueError("Select the indoor or outdoor semantic class set")
-        if control_points_mode not in {"none", "after_alignment", "automatic"}:
+        if control_points_mode not in {"none", "after_alignment", "automatic", "auto"}:
             raise ValueError("Select whether control points should be used after alignment")
         validate_capture_configuration(
             capture_type,
@@ -186,7 +186,7 @@ class ProjectManager:
         if defaults["classification"]["engine"] == "sam3" and is_customized(custom_classes):
             defaults["classification"]["custom_classes"] = normalize_customization(custom_classes, class_set)
         defaults["workflow"]["auto_dxf"] = bool(auto_dxf)
-        defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic"}
+        defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic", "auto"}
         tag_settings = defaults.setdefault("apriltags", {})
         tag_settings.setdefault("outlier_pct", 3.0)
         tag_settings.setdefault("last_printed_id", -1)
@@ -238,7 +238,7 @@ class ProjectManager:
             "settings": defaults,
             "workflow": {
                 "alignment": "not_started",
-                "control_points": "not_started" if control_points_mode in {"after_alignment", "automatic"} else "skipped",
+                "control_points": "not_started" if control_points_mode in {"after_alignment", "automatic", "auto"} else "skipped",
                 "dense_cloud": "not_started",
                 "classification": "not_started",
                 "refinement": "not_started",

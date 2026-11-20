@@ -61,6 +61,7 @@
     "completed": "Abgeschlossen",
     "failed": "Fehlgeschlagen",
     "skipped": "Übersprungen",
+    "skipped_no_control_points": "übersprungen (keine Passpunkte)",
     "waiting": "Wartet",
     "ready": "Bereit"
   },

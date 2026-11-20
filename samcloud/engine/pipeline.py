@@ -306,16 +306,20 @@ def _expected_input_long_side(args) -> int | None:
 
 def _planned_dense_size(
     dense_config: dict, fallback: int, long_side: int | None, image_count: int, outdir: Path,
+    capture_type: str | None = None,
 ) -> int:
     """Dense max image size for the initial ETA plan, on the same basis as ``_dense_size_from_inputs``.
 
     The real size is resolved from the prepared images; before that, ``auto`` uses the expected input
     long side (cubemap face size for 360 inputs) so dense stereo is not planned at full camera resolution.
     """
-    configured = dense_config.get("max_image_size", fallback)
+    from samcloud.colmap.alignment import dense_size_settings
+
+    resolved = dense_size_settings({**dense_config, "max_image_size": dense_config.get("max_image_size", fallback)}, capture_type)
+    configured = resolved["max_image_size"]
     if configured != "auto":
         return int(configured)
-    options = dense_config.get("auto", {})
+    options = resolved["auto"]
     maximum = int(options.get("maximum", 3200))
     if not long_side:
         return min(int(fallback), maximum)
@@ -337,7 +341,7 @@ def _initial_estimator(args, colmap_config: dict, outdir: Path, fallback_dense_s
     prepare_units, estimated_images = _estimate_prepare_work(args)
     dense_size = _planned_dense_size(
         colmap_config.get("dense_reconstruction", {}), fallback_dense_size,
-        _expected_input_long_side(args), estimated_images, outdir,
+        _expected_input_long_side(args), estimated_images, outdir, getattr(args, "capture_type", None),
     )
     return _build_estimator(
         args, estimated_images, colmap_config, resume=False,
@@ -345,9 +349,18 @@ def _initial_estimator(args, colmap_config: dict, outdir: Path, fallback_dense_s
     )
 
 
-def _dense_size_from_inputs(dense_config: dict, outdir: Path, images_dir: Path) -> tuple[int, str | None]:
-    """Resolve numeric or automatic dense resolution from the first project image."""
-    configured = dense_config.get("max_image_size", 3200)
+def _dense_size_from_inputs(
+    dense_config: dict, outdir: Path, images_dir: Path, capture_type: str | None = None,
+) -> tuple[int, str | None]:
+    """Resolve numeric or automatic dense resolution from the first project image.
+
+    ``capture_type`` applies an optional ``capture_profiles.<type>.dense_size`` override.
+    """
+    from samcloud.colmap.alignment import dense_size_settings
+
+    resolved = dense_size_settings(dense_config, capture_type)
+    configured = resolved["max_image_size"]
+    dense_config = {**dense_config, "max_image_size": configured, "auto": resolved["auto"]}
     if configured != "auto":
         return int(configured), None
     image_list = outdir / "image_list.txt"
@@ -987,6 +1000,14 @@ def resolve_input_images(
     return prepared.cubemap_directory, True, prepared.face_size
 
 
+def _configured_height_reference() -> str:
+    """Describe the EXIF altitude datum configured in colmap.yml (georeferencing.input_height)."""
+    from samcloud.engine.extract_gps import input_height_description
+
+    mode = load_global_config("colmap.yml").get("georeferencing", {}).get("input_height", "ellipsoidal")
+    return input_height_description(str(mode))
+
+
 def _resume_automatic_control_points(
     args, outdir: Path, report_dir: Path, summary: RunSummary, progress: ProgressTracker | None,
     colmap_config: dict, dense_max_image_size: int, dense_num_iterations: int,
@@ -1105,7 +1126,7 @@ def _resume_dense_stereo(
     georeferenced = (outdir / "gps_ref.txt").is_file()
     if georeferenced:
         try:
-            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt")
+            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt", _configured_height_reference())
             save_georeference(outdir / "georeference.json", georeference)
             summary.settings["georeference_residual_m"] = georeference["residual_m"]
         except Exception as error:
@@ -1149,7 +1170,7 @@ def _resume_classification(
     georeferenced = (outdir / "gps_ref.txt").is_file()
     if georeferenced:
         try:
-            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt")
+            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt", _configured_height_reference())
             save_georeference(outdir / "georeference.json", georeference)
             summary.settings["georeference_residual_m"] = georeference["residual_m"]
         except Exception as error:
@@ -1295,9 +1316,116 @@ def _image_path_map(images_dir: Path) -> dict[str, Path]:
     return mapping
 
 
+def _resolve_control_points_mode(mode: str, control_points_dir: Path) -> str:
+    """Resolve the coordinate-aware default without changing explicit user choices."""
+    if mode != "auto":
+        return mode
+    csv_path = control_points_dir / "control_points.csv"
+    if not csv_path.is_file():
+        return "none"
+    try:
+        points = read_control_points(csv_path)
+    except (OSError, ValueError) as error:
+        print(f"WARNING: Automatic control points skipped: cannot read {csv_path.name}: {error}")
+        return "none"
+    coordinates = points[["x", "y", "z"]].to_numpy(dtype=float)
+    if len(points) >= 3 and np.isfinite(coordinates).all():
+        return "automatic"
+    print("Automatic control points skipped: at least three points with finite coordinates are required.")
+    return "none"
+
+
+def _evaluate_pre_gcp_checkpoints(
+    model_path: Path, images_dir: Path, points, control_points_crs: str, georef: dict,
+    settings: dict, report_dir: Path,
+) -> dict | None:
+    """Write the unadjusted checkpoint baseline; evaluation errors never stop processing."""
+    try:
+        import pycolmap
+        from pyproj import Transformer
+
+        from samcloud.drone.checkpoints import evaluate_checkpoints_model, render_markdown
+
+        scale = float(georef["scale"])
+        rotation = np.asarray(georef["rotation"], dtype=float)
+        translation = np.asarray(georef["translation"], dtype=float)
+        survey = {
+            str(row.name): np.asarray([row.x, row.y, row.z], dtype=float)
+            for row in points.itertuples(index=False)
+        }
+        to_survey = Transformer.from_crs("EPSG:4978", control_points_crs, always_xy=True)
+
+        def to_model(coordinates: np.ndarray) -> np.ndarray:
+            ecef = coordinates_to_ecef(np.asarray(coordinates, dtype=float), control_points_crs)
+            return (rotation.T @ ((ecef - translation) / scale).T).T
+
+        def from_model(coordinates: np.ndarray) -> np.ndarray:
+            ecef = (scale * (rotation @ np.asarray(coordinates, dtype=float).T)).T + translation
+            x, y, z = to_survey.transform(ecef[:, 0], ecef[:, 1], ecef[:, 2])
+            return np.column_stack((x, y, z))
+
+        result = evaluate_checkpoints_model(
+            pycolmap.Reconstruction(model_path), survey, _image_path_map(images_dir),
+            to_model=to_model, from_model=from_model, settings=settings, out_dir=report_dir,
+        )
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "checkpoints_pre_gcp.json").write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        (report_dir / "checkpoints_pre_gcp.md").write_text(
+            render_markdown(result, "pre_gcp"), encoding="utf-8",
+        )
+        return result
+    except Exception as error:  # checkpoint QA is informative and must not block GCP adjustment
+        print(f"WARNING: Pre-GCP checkpoint evaluation failed: {error}")
+        return None
+
+
+def _quick_height_correction(checkpoint_report: Path) -> dict | None:
+    """Estimate a safe vertical correction from the pre-GCP checkpoint report."""
+    try:
+        from samcloud.drone.height_correction import estimate_height_shift
+
+        estimate = estimate_height_shift(
+            checkpoint_report, exclude=("not_found", "implausible", "few_views"),
+            min_points=3, max_spread_m=0.05,
+        )
+    except Exception as error:  # the optional correction must never stop the pipeline
+        print(f"WARNING: Quick height correction was skipped: {error}")
+        return None
+    if estimate is None:
+        return None
+    if dataclasses.is_dataclass(estimate):
+        result = dataclasses.asdict(estimate)
+    elif isinstance(estimate, dict):
+        result = dict(estimate)
+    else:
+        result = {"shift_m": float(estimate)}
+    for key in ("height_offset_m", "shift_m", "shift", "height_shift_m"):
+        if key in result and np.isfinite(float(result[key])):
+            result["height_offset_m"] = float(result[key])
+            return result
+    print("WARNING: Quick height correction was skipped: no finite height shift was returned.")
+    return None
+
+
+def _apply_quick_height_correction(project_dir: Path, correction: dict | None) -> bool:
+    """Apply the checkpoint-derived height shift only after a failed GCP quality gate."""
+    if not correction or "height_offset_m" not in correction:
+        return False
+    try:
+        from samcloud.drone.height_correction import apply_height_shift
+
+        apply_height_shift(project_dir, correction)
+        return True
+    except Exception as error:  # a failed fallback must leave the pipeline reviewable
+        print(f"WARNING: Quick height correction could not be applied: {error}")
+        return False
+
+
 def _automatic_control_points(
     model_path: Path, model_txt: Path, images_dir: Path, control_points_dir: Path, control_points_crs: str,
-    gps_ref_path: Path, settings: dict, report_path: Path, *, rtk: bool,
+    gps_ref_path: Path, settings: dict, report_path: Path, *, rtk: bool, summary: RunSummary | None = None,
 ) -> Path | None:
     """Detect, adjust and transform GPS projects into the GCP-local ENU frame."""
     if not gps_ref_path.is_file():
@@ -1309,7 +1437,7 @@ def _automatic_control_points(
     ensure_text_model(model_path, model_txt)
 
     points = read_control_points(control_points_dir / "control_points.csv")
-    georef = fit_enu_to_ecef(model_txt, gps_ref_path)
+    georef = fit_enu_to_ecef(model_txt, gps_ref_path, _configured_height_reference())
     scale = float(georef["scale"])
     rotation = np.asarray(georef["rotation"], dtype=float)
     translation = np.asarray(georef["translation"], dtype=float)
@@ -1326,6 +1454,12 @@ def _automatic_control_points(
         for index, (_, row) in enumerate(points.set_index("name").iterrows())
     }
     roles = dict(zip(points["name"].astype(str), points["role"].astype(str), strict=True))
+    checkpoint_result = _evaluate_pre_gcp_checkpoints(
+        model_path, images_dir, points, control_points_crs, georef, settings, report_path.parent,
+    )
+    quick_correction = _quick_height_correction(report_path.parent / "checkpoints_pre_gcp.json") if checkpoint_result else None
+    if summary is not None and quick_correction is not None:
+        summary.settings["quick_correction"] = quick_correction
     paths = _image_path_map(images_dir)
     detections, detection_statistics = automatic_detection(
         pycolmap.Reconstruction(model_path), references, roles, paths, settings,
@@ -1337,7 +1471,7 @@ def _automatic_control_points(
         detections, detection_statistics, references,
         {str(name): ecef[index] for index, name in enumerate(points["name"].astype(str))},
         [str(name) for name in points.loc[points["role"] == "pass", "name"]],
-        rtk=rtk, use_pose_priors=True,
+        rtk=rtk, use_pose_priors=True, quick_correction=quick_correction, summary=summary,
     )
 
 
@@ -1345,7 +1479,7 @@ def _finish_control_point_adjustment(
     model_path: Path, control_points_dir: Path, control_points_crs: str, settings: dict, report_path: Path,
     detections: dict[str, dict], detection_statistics: dict, references: dict[str, np.ndarray],
     ecef_by_name: dict[str, np.ndarray], pass_names: list[str], *, rtk: bool, use_pose_priors: bool,
-    local_frame: bool = False,
+    local_frame: bool = False, quick_correction: dict | None = None, summary: RunSummary | None = None,
 ) -> Path | None:
     """Shared GCP adjustment: BA loop, gate, GCP-local ENU transform, leave-one-out, reports, georeference."""
     import pycolmap
@@ -1382,6 +1516,11 @@ def _finish_control_point_adjustment(
     if not gate[0]:
         report = build_control_point_report(detections, gate, before, adjustment["intrinsics"])
         report["detection_statistics"] = detection_statistics
+        if quick_correction is not None:
+            quick_correction = {**quick_correction, "applied": _apply_quick_height_correction(model_path.parents[2], quick_correction)}
+            report["quick_correction"] = quick_correction
+            if summary is not None:
+                summary.settings["quick_correction"] = quick_correction
         save_control_point_report(report_path, report)
         return None
     names = list(ecef_by_name)
@@ -1426,11 +1565,21 @@ def _finish_control_point_adjustment(
         print(f"{point['name']} | {error_text} | {point['projections']} | {point['status']}")
     save_detections(control_points_dir / "detections.json", detections)
     report["residual_m"] = residuals
+    if quick_correction is not None:
+        report["quick_correction"] = {**quick_correction, "applied": False}
+        if summary is not None:
+            summary.settings["quick_correction"] = report["quick_correction"]
     if local_frame and final_gate[0]:
         report["crs"] = "LOCAL"
         report["source_frame"] = report["method"] = LOCAL_TAGS_FRAME
     save_control_point_report(report_path, report)
     if not final_gate[0]:
+        if quick_correction is not None:
+            quick_correction = {**quick_correction, "applied": _apply_quick_height_correction(model_path.parents[2], quick_correction)}
+            report["quick_correction"] = quick_correction
+            if summary is not None:
+                summary.settings["quick_correction"] = quick_correction
+            save_control_point_report(report_path, report)
         return None
     if local_frame:
         # The model already is in the target frame; LOCAL -> LOCAL export needs no georeference.json.
@@ -2292,7 +2441,7 @@ def _reclassify_project(
     georeferenced = _is_georeferenced(outdir)
     if not georeferenced and (outdir / "gps_ref.txt").is_file():
         try:
-            save_georeference(outdir / "georeference.json", fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt"))
+            save_georeference(outdir / "georeference.json", fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt", _configured_height_reference()))
             georeferenced = True
         except Exception as error:  # noqa: BLE001
             print(f"WARNING: Could not create GPS georeference: {error}")
@@ -2493,9 +2642,9 @@ def main():
                     help="target CRS of the exported LAS file")
     ap.add_argument(
         "--control-points-mode",
-        choices=("none", "after_alignment", "automatic"),
-        default="none",
-        help="continue without control points, stop for manual points, or detect targets automatically",
+        choices=("none", "after_alignment", "automatic", "auto"),
+        default="auto",
+        help="use surveyed points automatically when available, or select an explicit control-point workflow",
     )
     ap.add_argument(
         "--stop-after-alignment",
@@ -2600,6 +2749,7 @@ def main():
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     control_points_dir = Path(args.control_points_dir).resolve() if args.control_points_dir else outdir.parent / "control_points"
+    args.control_points_mode = _resolve_control_points_mode(args.control_points_mode, control_points_dir)
     if args.control_points_mode == "automatic" and not (control_points_dir / "control_points.csv").is_file():
         print("Automatic control points skipped: control_points/control_points.csv is missing.")
         args.control_points_mode = "none"
@@ -2647,7 +2797,7 @@ def main():
         return
     if args.resume_after_control_points:
         resume_images = Path(args.images).resolve() if args.images else outdir / "dense" / "images"
-        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, resume_images)
+        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, resume_images, getattr(args, "capture_type", None))
         if dense_reason:
             print(dense_reason)
         summary.settings["dense_max_image_size"] = dense_max_image_size
@@ -2658,7 +2808,7 @@ def main():
         )
         return
     if args.resume_classification:
-        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images")
+        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images", getattr(args, "capture_type", None))
         if dense_reason:
             print(dense_reason)
         summary.settings["dense_max_image_size"] = dense_max_image_size
@@ -2669,7 +2819,7 @@ def main():
         )
         return
     if args.resume_dense_stereo:
-        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images")
+        dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, outdir / "dense" / "images", getattr(args, "capture_type", None))
         if dense_reason:
             print(dense_reason)
         summary.settings["dense_max_image_size"] = dense_max_image_size
@@ -2696,7 +2846,7 @@ def main():
     image_list_path = outdir / "image_list.txt"
     panorama_face_roots = ("front", "right", "back", "left", "up", "down") if is_panorama else None
     num_images = write_image_list(images_dir, image_list_path, include_roots=panorama_face_roots)
-    dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, images_dir)
+    dense_max_image_size, dense_reason = _dense_size_from_inputs(dense_config, outdir, images_dir, getattr(args, "capture_type", None))
     if dense_reason:
         print(dense_reason)
     summary.settings["dense_max_image_size"] = dense_max_image_size
@@ -2737,6 +2887,7 @@ def main():
         run([sys.executable, str(gps_script),
              "--images-dir", str(images_dir),
              "--out", str(gps_ref_path),
+             "--input-height", str(georeferencing_config.get("input_height", "ellipsoidal")),
              "--require-all"], summary=summary, stage="Preparing GPS references")
 
     # 1) Feature extraction
@@ -2959,11 +3110,18 @@ def main():
         run([colmap, "model_converter", "--input_path", str(model0), "--output_path", str(pristine_text), "--output_type", "TXT"], summary=summary, stage="Preparing automatic control points")
         if progress:
             progress.begin("control_points")
-        automatic_model = _automatic_control_points(
-            pristine_distorted, pristine_text, images_dir, control_points_dir, args.control_points_crs,
-            gps_ref_path, dict(load_global_config("defaults.yml").get("control_points", {})),
-            report_dir / "control_points_report.json", rtk=effective_rtk,
-        )
+        if _is_tag_project(control_points_dir, gps_ref_path):
+            automatic_model = _rerun_control_points(
+                pristine_distorted, pristine_text, images_dir, control_points_dir, args.control_points_crs,
+                gps_ref_path, dict(load_global_config("defaults.yml").get("control_points", {})),
+                report_dir / "control_points_report.json", rtk=effective_rtk,
+            )
+        else:
+            automatic_model = _automatic_control_points(
+                pristine_distorted, pristine_text, images_dir, control_points_dir, args.control_points_crs,
+                gps_ref_path, dict(load_global_config("defaults.yml").get("control_points", {})),
+                report_dir / "control_points_report.json", rtk=effective_rtk, summary=summary,
+            )
         if automatic_model is None:
             args.stop_after_alignment = True
             print("Automatic control-point quality gate did not pass. Waiting for control-point review.")
@@ -3031,7 +3189,7 @@ def main():
              "--output_type", "TXT"], summary=summary, stage="Preparing control points")
         if georeferenced and not tag_georeferenced:
             try:
-                georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path)
+                georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path, _configured_height_reference())
                 save_georeference(outdir / "georeference.json", georeference)
             except Exception as error:
                 print(f"WARNING: Could not create GPS georeference: {error}")
@@ -3078,7 +3236,7 @@ def main():
     if georeferenced and not tag_georeferenced:
         started_at = time.perf_counter()
         try:
-            georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path)
+            georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path, _configured_height_reference())
             save_georeference(georeference_path, georeference)
         except Exception as error:
             print(f"WARNING: Could not create GPS georeference: {error}")
@@ -3200,23 +3358,124 @@ _AUTO_DXF_REQUEST: dict | None = None
 
 
 def _request_auto_dxf(args) -> None:
-    """Remember whether the final DXF/IFC stage was requested (``--auto-dxf 1``) for this process."""
+    """Remember whether the final export stage was requested (``--auto-dxf 1``) for this process."""
     global _AUTO_DXF_REQUEST
     _AUTO_DXF_REQUEST = {
         "enabled": getattr(args, "auto_dxf", "0") == "1",
         "project_dir": Path(args.outdir).resolve().parent,
         "progress_file": args.progress_file,
         "started": time.time(),
+        "capture_type": getattr(args, "capture_type", ""),
+        "class_set": getattr(args, "class_set", ""),
+        "rerun_environment": bool(getattr(args, "refine_from_cache", False) or getattr(args, "reclassify", False)),
     }
 
 
+def _record_environment_stage(project_dir: Path, progress_file, result: dict | None, elapsed: float, error: Exception | None = None) -> None:
+    """Add the final outdoor stage to reports without changing the completed pipeline run."""
+    reports = project_dir / "reports"
+    result = result if isinstance(result, dict) else {}
+    steps = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+    statuses = {
+        str(name): str(value.get("status", "unknown")) if isinstance(value, dict) else "unknown"
+        for name, value in steps.items()
+    }
+    failures = [
+        f"{name}: {value.get('error') or value.get('reason') or 'failed'}"
+        for name, value in steps.items()
+        if isinstance(value, dict) and value.get("status") == "failed"
+    ]
+    if error is not None:
+        failures.append(str(error))
+    status = "failed" if failures else "completed"
+    report_path = Path(result.get("out_dir") or project_dir / "products" / "environment") / "environment_report.md"
+    stage = {
+        "status": status,
+        "total_seconds": round(elapsed, 3),
+        "steps": statuses,
+        "report": str(report_path),
+    }
+
+    try:
+        metrics_path = reports / "run_metrics.json"
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        run_id = metrics.get("run_id") if isinstance(metrics, dict) else None
+        metric_paths = [metrics_path]
+        if run_id:
+            metric_paths.append(reports / f"run_metrics_{run_id}.json")
+        for path in metric_paths:
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            data.setdefault("stage_seconds", {})["Umgebungsmodell"] = round(elapsed, 3)
+            data.setdefault("settings", {})["environment_model"] = stage
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except (OSError, ValueError, TypeError):
+        pass
+
+    lines = ["", "Umgebungsmodell", "-" * 16, f"Status: {status}", f"Bericht: {report_path}"]
+    lines.extend(f"{name}: {value}" for name, value in statuses.items())
+    if failures:
+        lines.append(f"WARNING [Umgebungsmodell] {'; '.join(failures)}")
+    try:
+        metrics = json.loads((reports / "run_metrics.json").read_text(encoding="utf-8"))
+        run_id = metrics.get("run_id") if isinstance(metrics, dict) else None
+        summary_paths = [reports / "run_summary.txt"]
+        if run_id:
+            summary_paths.append(reports / f"run_summary_{run_id}.txt")
+        for path in summary_paths:
+            if path.is_file():
+                path.write_text(path.read_text(encoding="utf-8").rstrip() + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+    except (OSError, ValueError, TypeError):
+        pass
+
+    if progress_file:
+        progress_path = Path(progress_file)
+        try:
+            payload = json.loads(progress_path.read_text(encoding="utf-8")) if progress_path.is_file() else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.update({
+                "percent": 100.0, "stage": "Umgebungsmodell", "detail": status,
+                "stage_key": None, "updated_at": time.time(), "environment_model": stage,
+            })
+            progress_path.parent.mkdir(parents=True, exist_ok=True)
+            progress_path.write_text(json.dumps(payload), encoding="utf-8")
+        except (OSError, ValueError, TypeError):
+            pass
+
+
 def run_auto_dxf_stage() -> None:
-    """Final stage after ``main()``: DXF/IFC export, only when requested and this run completed.
+    """Final stage after ``main()``: DXF/IFC or outdoor environment export, when requested and completed.
 
     run_metrics*.json and run_summary.txt are final at this point, so the pipeline's total time never
     contains the DXF/IFC time (the home page adds dxf_run_metrics.json separately). Never raises."""
     request = _AUTO_DXF_REQUEST
     if not request or not request["enabled"]:
+        return
+    if request.get("capture_type") == "drone_gps" or request.get("class_set") == "outdoor":
+        started = time.perf_counter()
+        result = None
+        error = None
+        try:
+            from samcloud.engine.auto_dxf import pipeline_run_completed
+            if not pipeline_run_completed(request["project_dir"], request["started"]):
+                return
+            from samcloud.drone.run_environment import run_environment
+            if request.get("rerun_environment"):
+                result = run_environment(request["project_dir"], steps=None, resume=False)
+            else:
+                result = run_environment(request["project_dir"], resume=True)
+        except Exception as caught:  # noqa: BLE001 - the classified cloud remains a valid successful result
+            error = caught
+            print(f"WARNING: Umgebungsmodell konnte nicht erstellt werden: {caught}", flush=True)
+        finally:
+            if result is not None or error is not None:
+                _record_environment_stage(request["project_dir"], request["progress_file"], result, time.perf_counter() - started, error)
+                report_path = request["project_dir"] / "products" / "environment" / "environment_report.md"
+                print(f"Umgebungsmodell-Bericht: {report_path}", flush=True)
         return
     try:
         from samcloud.engine.auto_dxf import run_after_pipeline

@@ -322,12 +322,44 @@ def _workflow_is_active(workflow: dict) -> bool:
     )
 
 
+def _auto_without_control_points(project: dict | None, project_directory: Path | None = None) -> bool:
+    """Whether the project is in ``auto`` mode but has no ``control_points.csv`` (so the GCP step does not apply)."""
+    if project is None:
+        return False
+    if project.get("workflow", {}).get("control_points_mode", "auto") != "auto":
+        return False
+    directory = project_directory if project_directory is not None else state.active_project_directory
+    if directory is None:
+        return True
+    return not (Path(directory) / "control_points" / "control_points.csv").is_file()
+
+
+def _control_points_status_text(project: dict | None, status: str) -> str:
+    """Status text of the control-point step; auto mode without control points reads 'skipped (no control points)'."""
+    if status in {"skipped", "not_started", "not started"} and _auto_without_control_points(project):
+        return t("home.status.skipped_no_control_points")
+    return _status_text(status)
+
+
 def _live_workflow(project: dict | None, snapshot: dict | None = None) -> dict:
-    """Overlay live pipeline progress onto persisted workflow statuses.
+    """Overlay live pipeline progress onto persisted workflow statuses, then skip the idle GCP step in auto mode.
 
     ``snapshot`` lets a caller pass the progress it already read, so statuses and phase texts
     come from the same snapshot.
     """
+    statuses = _overlay_live_progress(project, snapshot)
+    if (
+        project is not None
+        and project.get("workflow", {}).get("control_points") in {"not_started", "skipped"}
+        and statuses.get("control_points") in {"not_started", "completed"}
+        and _auto_without_control_points(project)
+    ):
+        statuses["control_points"] = "skipped"
+    return statuses
+
+
+def _overlay_live_progress(project: dict | None, snapshot: dict | None = None) -> dict:
+    """Overlay live pipeline progress onto persisted workflow statuses."""
     if project is None:
         return {}
     statuses = dict(project.get("workflow", {}))
@@ -645,7 +677,8 @@ def _render_workflow(project: dict | None) -> None:
                 status_label = ui.label(status.replace("_", " ")).classes("sam-step-status")
                 status_label.style("text-transform:none").mark("home-dxf-status")
             else:
-                status_label = ui.label(_status_text(status)).classes("sam-step-status")
+                status_text = _control_points_status_text(project, status) if key == "control_points" else _status_text(status)
+                status_label = ui.label(status_text).classes("sam-step-status")
                 if current_language() != "en":
                     # Translated statuses are already cased correctly; CSS capitalize would capitalize every word.
                     status_label.style("text-transform:none")
@@ -717,7 +750,10 @@ def _render_workflow(project: dict | None) -> None:
                 phase_labels[stage].set_text(_phase_text(stage, current_statuses, current_progress))
             for stage, label in status_labels.items():
                 if stage in current_statuses:
-                    label.set_text(_status_text(str(current_statuses[stage])))
+                    value = str(current_statuses[stage])
+                    label.set_text(
+                        _control_points_status_text(current_project, value) if stage == "control_points" else _status_text(value)
+                    )
 
         ui.timer(1.0, refresh_workflow)
 

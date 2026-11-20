@@ -43,6 +43,42 @@ CLASS_COLOURS: dict[str, tuple[float, float, float, float]] = {
     "IfcFurniture": (0.70, 0.55, 0.40, 1.0),
 }
 DEFAULT_COLOUR = (0.70, 0.70, 0.70, 1.0)
+
+# Optional grouping (``categorize=True``): IFC class -> viewer layer category.
+IFC_CATEGORIES: dict[str, str] = {
+    "IfcBuilding": "building",
+    "IfcWall": "building",
+    "IfcWallStandardCase": "building",
+    "IfcRoof": "building",
+    "IfcSlab": "building",
+    "IfcDoor": "building",
+    "IfcWindow": "building",
+    "IfcOpeningElement": "building",
+    "IfcSpace": "building",
+    "IfcBuildingElementProxy": "building",
+    "IfcGeographicElement": "vegetation",
+    "IfcPlant": "vegetation",
+    "IfcSite": "terrain",
+    "IfcGeotechnicalStratum": "terrain",
+    "IfcPavement": "pavement",
+    "IfcRoad": "pavement",
+    "IfcCurb": "pavement",
+    "IfcKerb": "pavement",
+    "IfcCivilElement": "pavement",
+    "IfcFurnishingElement": "furniture",
+    "IfcFurniture": "furniture",
+}
+DEFAULT_CATEGORY = "other"
+
+
+def category_for_ifc_class(ifc_class: str) -> str:
+    """Viewer category of one IFC class (``"other"`` when unknown)."""
+    return IFC_CATEGORIES.get(str(ifc_class), DEFAULT_CATEGORY)
+
+
+def categorize_nodes(extras_by_node: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Map node name -> category from each node's ``extras["ifc_class"]``."""
+    return {name: category_for_ifc_class(extras.get("ifc_class", "")) for name, extras in extras_by_node.items()}
 TRANSLUCENT_CLASSES = {"IfcSpace", "IfcOpeningElement"}
 
 
@@ -51,6 +87,7 @@ class ViewerAssets:
     glb_path: Path
     props_path: Path
     counts: dict[str, int] = field(default_factory=dict)
+    categories: dict[str, str] = field(default_factory=dict)  # node name -> category; only with categorize=True
 
 
 # --------------------------------------------------------------------------
@@ -302,8 +339,14 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.replace(temporary, path)
 
 
-def export_viewer_assets(ifc_path: Path, out_dir: Path, *, threads: int | None = None) -> ViewerAssets:
-    """Write ``model.glb`` and ``props.json`` for ``ifc_path`` into ``out_dir``."""
+def export_viewer_assets(
+    ifc_path: Path, out_dir: Path, *, threads: int | None = None, categorize: bool = False
+) -> ViewerAssets:
+    """Write ``model.glb`` and ``props.json`` for ``ifc_path`` into ``out_dir``.
+
+    With ``categorize=True`` every node also gets ``extras["category"]``, ``props.json`` gets a
+    ``categories`` map and the result carries ``ViewerAssets.categories``. The default output is unchanged.
+    """
     import ifcopenshell
 
     ifc_path = Path(ifc_path)
@@ -328,6 +371,8 @@ def export_viewer_assets(ifc_path: Path, out_dir: Path, *, threads: int | None =
             continue
         seen.add(guid)
         extras = {"ifc_class": ifc_class, "name": element.Name or ""}
+        if categorize:
+            extras["category"] = category_for_ifc_class(ifc_class)
         nodes.append((guid, extras, primitives))
         elements[guid] = _element_properties(element)
         counts[ifc_class] += 1
@@ -350,5 +395,8 @@ def export_viewer_assets(ifc_path: Path, out_dir: Path, *, threads: int | None =
         "classes": dict(sorted(counts.items())),
         "elements": elements,
     }
+    categories = categorize_nodes({guid: extras for guid, extras, _p in nodes}) if categorize else {}
+    if categorize:
+        props["categories"] = categories
     _atomic_write(props_path, json.dumps(props, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    return ViewerAssets(glb_path=glb_path, props_path=props_path, counts=dict(sorted(counts.items())))
+    return ViewerAssets(glb_path=glb_path, props_path=props_path, counts=dict(sorted(counts.items())), categories=categories)

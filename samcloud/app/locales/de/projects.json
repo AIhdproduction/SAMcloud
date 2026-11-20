@@ -20,6 +20,7 @@
     "indoor": "Innenbereich"
   },
   "control_points_mode": {
+    "auto": "Automatisch, wenn Passpunkte mit Koordinaten vorhanden",
     "none": "Keine Passpunkte – automatisch fortfahren",
     "after_alignment": "Passpunkte nach der Ausrichtung verwenden"
   },

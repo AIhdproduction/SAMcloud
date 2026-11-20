@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import html
 import json
+import logging
+import re
+import struct
+from pathlib import Path
 
+import numpy as np
 from nicegui import ui
 
 from samcloud.app.i18n import current_language, t, translate_or
 
 _LIB = "/assets-static/potree"
+LOGGER = logging.getLogger(__name__)
 
 _HEAD = f"""
 <link rel="stylesheet" type="text/css" href="{_LIB}/build/potree/potree.css">
@@ -25,7 +31,7 @@ _HEAD = f"""
 <script src="{_LIB}/libs/i18next/i18next.js"></script>
 <script src="{_LIB}/build/potree/potree.js"></script>
 <style>
-.sam-potree {{ position:relative; width:100%; height:calc(100vh - 150px); min-height:480px; overflow:hidden; border:1px solid #28475b; border-radius:9px; background:#050b12; }}
+.sam-potree {{ position:relative; z-index:0; isolation:isolate; width:100%; height:calc(100vh - 150px); min-height:480px; overflow:hidden; border:1px solid #28475b; border-radius:9px; background:#050b12; }}
 .sam-potree:fullscreen {{ width:100vw; height:100vh; border:0; border-radius:0; }}
 .sam-potree-area {{ position:absolute; inset:0; }}
 .sam-potree-toolbar {{ position:absolute; z-index:20; top:12px; left:12px; right:12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; pointer-events:none; }}
@@ -61,8 +67,513 @@ _HEAD = f"""
 .sam-potree-point-card {{ position:absolute; z-index:26; min-width:150px; max-width:260px; padding:9px 10px; border:1px solid #47718a; border-radius:7px; background:rgba(9,19,29,.96); color:#eaf2f8; font-size:12px; display:none; pointer-events:none; }}
 .sam-potree-point-card.is-open {{ display:block; }}
 .sam-potree-point-card strong {{ display:block; margin-bottom:3px; font-size:14px; }}
+.sam-potree-layers {{ position:absolute; z-index:21; top:64px; left:12px; max-height:calc(100% - 90px); overflow:auto; width:min(280px,34vw); padding:10px; border:1px solid #365c74; border-radius:8px; background:rgba(9,19,29,.94); color:#eaf2f8; font-size:12px; display:none; }}
+.sam-potree-layers.is-open {{ display:block; }}
+.sam-potree-layers h4 {{ margin:8px 0 4px; font-size:12px; color:#8fb3c9; text-transform:uppercase; letter-spacing:.04em; }}
+.sam-potree-layers h4:first-child {{ margin-top:0; }}
+.sam-potree-layers label {{ display:flex; align-items:center; gap:7px; padding:2px 0; cursor:pointer; }}
+.sam-potree-layers label.is-disabled {{ opacity:.45; cursor:not-allowed; }}
+.sam-potree-layers details {{ margin:2px 0 2px 18px; }}
+.sam-potree-layers summary {{ cursor:pointer; color:#8fb3c9; }}
+.sam-potree-layers details label {{ padding-left:4px; word-break:break-all; }}
 </style>
 """
+
+
+# ----------------------------------------------------------------------------------------
+# Outdoor product layers (environment.glb meshes next to the point cloud)
+# ----------------------------------------------------------------------------------------
+
+ENVIRONMENT_GLB_URL = "/api/environment/environment.glb"
+_ENVIRONMENT_GLB_REL = Path("products") / "environment" / "environment.glb"
+_IFC_VIEWER_REL = Path("products") / "environment" / "viewer"
+
+# Layer key -> (German label, node group it controls; None = not mesh based).
+LAYER_DEFINITIONS: dict[str, tuple[str, str | None]] = {
+    "rgb": ("RGB", None),
+    "classes": ("Klassen", None),
+    "dgm": ("DGM", "terrain"),
+    "dom": ("DOM", "dsm"),
+    "buildings": ("Gebäude", "building"),
+    "vegetation": ("Vegetation", "vegetation"),
+    "streets": ("Strassen/Beläge", "pavement"),
+    "model": ("Gesamtmodell", None),
+}
+GROUP_LABELS = {
+    "terrain": "DGM",
+    "dsm": "DOM",
+    "building": "Gebäude",
+    "vegetation": "Vegetation",
+    "pavement": "Strassen/Beläge",
+    "other": "Sonstiges",
+}
+_NOT_COMPUTED = "nicht berechnet"
+# Name tokens (prefix match) that put a GLB node into a group; checked in this order.
+_GROUP_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("dsm", ("dsm", "dom", "surface", "oberflaeche")),
+    ("terrain", ("terrain", "dgm", "ground", "boden", "gelaende", "dtm")),
+    ("building", ("building", "gebaeude", "haus", "house", "roof", "dach", "facade", "fassade")),
+    ("vegetation", ("veg", "tree", "baum", "bush", "strauch", "hedge", "hecke", "grass", "wiese", "forest", "wald")),
+    ("pavement", ("street", "road", "strasse", "pave", "belag", "sidewalk", "trottoir", "curb", "kerb", "parking", "path", "weg", "asphalt")),
+)
+_IFC_TO_GROUP = {"building": "building", "vegetation": "vegetation", "terrain": "terrain", "pavement": "pavement"}
+_ENVIRONMENT_ROUTES_REGISTERED = False
+
+
+def read_glb_document(path: Path | str) -> dict:
+    """Parse the JSON chunk of a GLB file (raises ValueError when it is not a valid GLB)."""
+    data = Path(path).read_bytes()
+    if len(data) < 20 or struct.unpack("<I", data[:4])[0] != 0x46546C67:
+        raise ValueError("not a GLB file")
+    length, kind = struct.unpack("<II", data[12:20])
+    if kind != 0x4E4F534A or 20 + length > len(data):
+        raise ValueError("GLB has no JSON chunk")
+    return json.loads(data[20:20 + length].decode("utf-8"))
+
+
+def node_group(name: str, extras: dict | None = None) -> str:
+    """Layer group of one GLB node: ``extras.category``/``extras.ifc_class`` first, then the node name."""
+    extras = extras or {}
+    category = str(extras.get("category") or "")
+    if category in GROUP_LABELS:
+        return category
+    if extras.get("ifc_class"):
+        from samcloud.bim.viewer_export import category_for_ifc_class
+
+        mapped = _IFC_TO_GROUP.get(category or category_for_ifc_class(str(extras["ifc_class"])))
+        if mapped:
+            return mapped
+    tokens = [token for token in re.split(r"[^a-z0-9]+", str(name).lower()) if token]
+    for group, prefixes in _GROUP_TOKENS:
+        if any(token.startswith(prefix) for token in tokens for prefix in prefixes):
+            return group
+    return "other"
+
+
+def _glb_nodes(document: dict) -> list[dict]:
+    """Named nodes of a GLB document that carry a mesh, with their group."""
+    result: list[dict] = []
+    for index, node in enumerate(document.get("nodes", [])):
+        if "mesh" not in node:
+            continue
+        name = str(node.get("name") or f"node_{index}")
+        result.append({"name": name, "group": node_group(name, node.get("extras"))})
+    return result
+
+
+def _scene_origin(document: dict) -> list[float] | None:
+    """``origin_lv95`` from the glTF scene extras (trimesh) or asset extras."""
+    candidates = [scene.get("extras") for scene in document.get("scenes", [])]
+    candidates += [document.get("extras"), (document.get("asset") or {}).get("extras")]
+    for extras in candidates:
+        origin = (extras or {}).get("origin_lv95")
+        if isinstance(origin, (list, tuple)) and len(origin) == 3:
+            return [float(value) for value in origin]
+    return None
+
+
+def environment_layers(project_dir: Path | str) -> dict:
+    """List the outdoor products of a project for the viewer layer panel (file system only, no browser).
+
+    Returns ``{"available", "glb": {available, path, url, origin_lv95, nodes, reason}, "groups": {group: [node names]},
+    "rasters": {dgm, dom, hillshade}, "ifc_viewer": {available, glb_path, props_path}, "layers": {key: {label,
+    group, available, reason}}}``. A missing or unreadable ``environment.glb`` marks every mesh layer unavailable.
+    """
+    project = Path(project_dir)
+    env_dir = project / "products" / "environment"
+    glb_path = project / _ENVIRONMENT_GLB_REL
+    glb: dict = {"available": False, "path": None, "url": None, "origin_lv95": None, "nodes": [], "reason": _NOT_COMPUTED}
+    groups: dict[str, list[str]] = {}
+    if glb_path.is_file():
+        try:
+            document = read_glb_document(glb_path)
+            nodes = _glb_nodes(document)
+            if nodes:
+                glb = {"available": True, "path": str(glb_path), "url": ENVIRONMENT_GLB_URL,
+                       "origin_lv95": _scene_origin(document), "nodes": nodes, "reason": None}
+                for node in nodes:
+                    groups.setdefault(node["group"], []).append(node["name"])
+            else:
+                glb["reason"] = "environment.glb enthält keine Objekte"
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            LOGGER.warning("environment.glb unreadable: %s", error)
+            glb["reason"] = "environment.glb nicht lesbar"
+
+    def first(*patterns: str) -> str | None:
+        for pattern in patterns:
+            matches = sorted(env_dir.glob(pattern)) if env_dir.is_dir() else []
+            if matches:
+                return str(matches[0])
+        return None
+
+    rasters = {
+        "dgm": first("*dgm*.tif", "*dtm*.tif", "*terrain*.tif"),
+        "dom": first("*dom*.tif", "*dsm*.tif"),
+        "hillshade": first("*hillshade*.png", "*hillshade*.tif"),
+    }
+    viewer_dir = project / _IFC_VIEWER_REL
+    ifc_viewer = {
+        "available": (viewer_dir / "model.glb").is_file() and (viewer_dir / "props.json").is_file(),
+        "glb_path": str(viewer_dir / "model.glb"),
+        "props_path": str(viewer_dir / "props.json"),
+    }
+
+    layers: dict[str, dict] = {}
+    for key, (label, group) in LAYER_DEFINITIONS.items():
+        if key in ("rgb", "classes"):
+            available, reason = True, None
+        elif key == "model":
+            available, reason = bool(glb["available"]), (None if glb["available"] else _NOT_COMPUTED)
+        else:
+            available = bool(groups.get(group or ""))
+            reason = None if available else _NOT_COMPUTED
+        layers[key] = {"label": label, "group": group, "available": available, "reason": reason}
+    return {"available": bool(glb["available"]), "glb": glb, "groups": groups, "rasters": rasters,
+            "ifc_viewer": ifc_viewer, "layers": layers}
+
+
+def local_to_viewer_matrix(project_dir: Path | str, origin_lv95: list[float] | tuple[float, ...]) -> list[float] | None:
+    """Row-major 4x4 that maps the GLB's local frame to the Potree scene frame, or ``None`` without georeference.
+
+    The Potree cloud is built from ``classified.ply`` and therefore lives in the raw COLMAP ENU frame, while the GLB
+    holds ``local = LV95(E, N, H_LN02) - origin_lv95`` (rotated ~1 degree against ENU). The georeference maps ENU to
+    LV95, so the matrix is its affine linearisation at the point whose LV95 position is ``origin_lv95`` (Newton
+    iteration from ENU 0, then ``enu = x + J^-1 (lv95 - f(x))`` with ``lv95 = local + origin_lv95``).
+    """
+    try:
+        from samcloud.drone import frames
+
+        georef = frames.project_georeference(project_dir)
+        target = np.asarray(origin_lv95, dtype=np.float64).reshape(3)
+        x = np.zeros(3)
+        for _ in range(3):
+            jac = frames.local_jacobian(x, georef)
+            x = x + np.linalg.solve(jac, target - frames.enu_to_lv95(x[None], georef)[0])
+        jac = frames.local_jacobian(x, georef)
+        inverse = np.linalg.inv(jac)
+        matrix = np.eye(4)
+        matrix[:3, :3] = inverse
+        matrix[:3, 3] = x + inverse @ (target - frames.enu_to_lv95(x[None], georef)[0])
+        return [float(value) for value in matrix.reshape(-1)]
+    except Exception as error:  # no georeference/grids: the viewer then assumes cloud and meshes share a frame
+        LOGGER.info("no local->viewer transform for the environment meshes: %s", error)
+        return None
+
+
+def register_environment_routes() -> None:
+    """Serve ``environment.glb`` of the active project at ``ENVIRONMENT_GLB_URL`` (idempotent)."""
+    global _ENVIRONMENT_ROUTES_REGISTERED
+    if _ENVIRONMENT_ROUTES_REGISTERED:
+        return
+    from nicegui import app
+    from starlette.responses import FileResponse, JSONResponse
+
+    from samcloud.app.state import state
+
+    @app.get(ENVIRONMENT_GLB_URL)
+    def environment_glb():
+        project = state.active_project_directory
+        path = Path(project) / _ENVIRONMENT_GLB_REL if project is not None else None
+        if path is None or not path.is_file():
+            return JSONResponse({"error": _NOT_COMPUTED}, status_code=404)
+        return FileResponse(path, media_type="model/gltf-binary", headers={"Cache-Control": "no-cache"})
+
+    _ENVIRONMENT_ROUTES_REGISTERED = True
+
+
+# ----------------------------------------------------------------------------------------
+# Control point markers (AprilTags + surveyed Passpunkte/Kontrollpunkte) of the dense viewer
+# ----------------------------------------------------------------------------------------
+
+CONTROL_POINT_MARKERS_URL = "/api/viewer/control-point-markers"
+_CONTROL_POINT_ROUTES_REGISTERED = False
+_ROLE_KIND = {"pass": "passpunkt", "control": "kontrollpunkt"}
+
+
+def _survey_files(project: Path) -> list[Path]:
+    """control_points/control_points.csv, else every inputs/survey/*.txt|*.csv (sorted)."""
+    primary = project / "control_points" / "control_points.csv"
+    if primary.is_file():
+        return [primary]
+    survey = project / "inputs" / "survey"
+    if not survey.is_dir():
+        return []
+    return sorted(path for path in survey.iterdir() if path.is_file() and path.suffix.lower() in {".txt", ".csv"})
+
+
+def _read_survey_points(project: Path) -> list[tuple[str, np.ndarray, str]]:
+    """Surveyed ``(name, [x, y, z] in the project CRS, role)``; unreadable files are skipped with a log entry."""
+    from samcloud.control_points.repository import read_control_points
+
+    points: list[tuple[str, np.ndarray, str]] = []
+    seen: set[str] = set()
+    for path in _survey_files(project):
+        try:
+            table = read_control_points(path)
+        except Exception as error:  # malformed survey file: skip, never break the viewer
+            LOGGER.warning("control points: cannot read %s: %s", path, error)
+            continue
+        for row in table.itertuples(index=False):
+            name = str(row.name)
+            xyz = np.array([row.x, row.y, row.z], dtype=np.float64)
+            if name in seen or not np.all(np.isfinite(xyz)):
+                continue
+            seen.add(name)
+            points.append((name, xyz, str(row.role)))
+    return points
+
+
+def _lv95_to_viewer(lv95_xyz: np.ndarray, georef: dict) -> np.ndarray:
+    """Inverse of ``frames.enu_to_lv95`` (LV95/LN02 -> raw COLMAP ENU = Potree frame) by Newton iteration."""
+    from samcloud.drone import frames
+
+    target = np.asarray(lv95_xyz, dtype=np.float64).reshape(-1, 3)
+    x = np.zeros_like(target)
+    jac = frames.local_jacobian(np.zeros(3), georef)
+    for step in range(8):
+        residual = target - frames.enu_to_lv95(x, georef)
+        x = x + np.linalg.solve(jac, residual.T).T
+        if step == 1:
+            jac = frames.local_jacobian(x.mean(axis=0), georef)
+        if float(np.abs(residual).max()) < 1e-6:
+            break
+    return x
+
+
+def _latest_checkpoints(project: Path) -> dict[str, dict]:
+    """Per-point results of the newest ``reports/checkpoints_*.json`` (empty when absent or unreadable)."""
+    reports = sorted((project / "reports").glob("checkpoints_*.json"), key=lambda path: path.stat().st_mtime) if (project / "reports").is_dir() else []
+    if not reports:
+        return {}
+    try:
+        data = json.loads(reports[-1].read_text(encoding="utf-8"))
+        return {str(item["name"]): item for item in data.get("points", []) if isinstance(item, dict) and "name" in item}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        LOGGER.warning("control points: cannot read %s: %s", reports[-1], error)
+        return {}
+
+
+def _checkpoint_tooltip(name: str, result: dict | None) -> tuple[str, bool]:
+    """Tooltip text ("PP1 · dH +0.212 m") and whether the point counts as not found/unusable."""
+    if not result:
+        return name, False
+    status = str(result.get("status", ""))
+    if status in {"ok", "implausible"} and isinstance(result.get("dH"), (int, float)):
+        text = f"{name} · dH {float(result['dH']):+.3f} m"
+        if status == "implausible":
+            text += " · unplausibel"
+        return text, status == "implausible"
+    if status == "few_views":
+        return f"{name} · zu wenige Ansichten", True
+    return f"{name} · nicht gefunden", True
+
+
+def _model_frame_points(project: Path) -> dict[str, list[float]]:
+    """Triangulated model coordinates per name from detections.json (the viewer frame, no georeference needed)."""
+    try:
+        from samcloud.app.gcp_review import marker_payload
+
+        return {str(item["name"]): [float(v) for v in item["coordinates"]]
+                for item in marker_payload(project).get("markers", [])
+                if isinstance(item.get("coordinates"), (list, tuple)) and len(item["coordinates"]) == 3}
+    except Exception as error:
+        LOGGER.info("control points: no model-frame detections: %s", error)
+        return {}
+
+
+def control_point_markers(project_dir: Path | str | None) -> list[dict]:
+    """AprilTag and surveyed control point markers of a project, positioned in the dense viewer frame.
+
+    AprilTags come unchanged from ``apriltag_marker_payload``. Surveyed points (``control_points.csv`` or
+    ``inputs/survey``) are converted LV95/LN02 -> ENU with the project georeference; without one the triangulated
+    model coordinates of ``detections.json`` are used. Each marker has ``name``, ``kind`` (apriltag | passpunkt |
+    kontrollpunkt), ``coordinates``, ``state_color`` and ``tooltip`` (checkpoint dH/status when a report exists).
+    Missing files or georeference give an empty list for that source and a log entry, never an exception.
+    """
+    if project_dir is None:
+        return []
+    project = Path(project_dir)
+    markers: list[dict] = []
+    try:
+        from samcloud.app.gcp_review import apriltag_marker_payload
+
+        for tag in apriltag_marker_payload(project):
+            tag = dict(tag)
+            tag.setdefault("tooltip", tag["name"])
+            markers.append(tag)
+    except Exception as error:
+        LOGGER.warning("control points: AprilTag markers unavailable: %s", error)
+    taken = {str(item["name"]) for item in markers}
+    try:
+        survey = [item for item in _read_survey_points(project) if item[0] not in taken]
+    except Exception as error:
+        LOGGER.warning("control points: survey unavailable: %s", error)
+        survey = []
+    if not survey:
+        return markers
+    positions: dict[str, list[float]] = {}
+    try:
+        from samcloud.drone import frames
+
+        enu = _lv95_to_viewer(np.vstack([item[1] for item in survey]), frames.project_georeference(project))
+        positions = {item[0]: [float(v) for v in row] for item, row in zip(survey, enu)}
+    except Exception as error:
+        LOGGER.info("control points: no georeference (%s); using triangulated model coordinates", error)
+        positions = _model_frame_points(project)
+    checkpoints = _latest_checkpoints(project)
+    for name, _xyz, role in survey:
+        coordinates = positions.get(name)
+        if coordinates is None or not all(np.isfinite(coordinates)):
+            continue
+        kind = _ROLE_KIND.get(role, "passpunkt")
+        tooltip, unusable = _checkpoint_tooltip(name, checkpoints.get(name))
+        markers.append({"name": name, "kind": kind, "role": role, "enabled": True, "coordinates": coordinates,
+                        "state_color": "disabled" if unusable else kind, "tooltip": tooltip})
+    return markers
+
+
+def register_control_point_routes() -> None:
+    """Serve ``control_point_markers`` of the active project at ``CONTROL_POINT_MARKERS_URL`` (idempotent)."""
+    global _CONTROL_POINT_ROUTES_REGISTERED
+    if _CONTROL_POINT_ROUTES_REGISTERED:
+        return
+    from nicegui import app
+    from starlette.responses import JSONResponse
+
+    from samcloud.app.state import state
+
+    @app.get(CONTROL_POINT_MARKERS_URL)
+    def control_point_marker_endpoint():
+        project = state.active_project_directory
+        warnings: list[str] = []
+        if project is not None:
+            try:
+                from samcloud.app.gcp_review import apriltag_warnings
+
+                warnings = apriltag_warnings(Path(project))
+            except Exception as error:
+                LOGGER.info("control points: no AprilTag warnings: %s", error)
+        return JSONResponse({"markers": control_point_markers(project), "warnings": warnings})
+
+    _CONTROL_POINT_ROUTES_REGISTERED = True
+
+
+def _environment_config(layers: dict | None, matrix: list[float] | None = None) -> dict:
+    """Browser-side description of the mesh layers (``glb_url`` is ``None`` when nothing was computed)."""
+    if not layers or not layers.get("available"):
+        return {"glb_url": None, "groups": {}, "matrix": None}
+    glb = layers["glb"]
+    return {"glb_url": glb["url"], "groups": layers["groups"], "origin_lv95": glb["origin_lv95"], "matrix": matrix}
+
+
+def _layers_panel_html(layers: dict) -> str:
+    """HTML of the layer panel; unavailable products are disabled with the tooltip "nicht berechnet"."""
+    def esc(value: object) -> str:
+        return html.escape(str(value), quote=True)
+
+    def toggle(key: str) -> str:
+        info = layers["layers"][key]
+        label = esc(info["label"])
+        if info["available"]:
+            return f'<label><input type="checkbox" data-layer="{key}" checked>{label}</label>'
+        return (f'<label class="is-disabled" title="{esc(info["reason"] or _NOT_COMPUTED)}">'
+                f'<input type="checkbox" data-layer="{key}" disabled>{label}</label>')
+
+    parts = ['<h4>Punktwolke</h4>',
+             '<label><input type="radio" name="sam-layer-cloud" data-cloud-mode="rgba" checked>RGB</label>',
+             '<label><input type="radio" name="sam-layer-cloud" data-cloud-mode="classification">Klassen</label>',
+             '<h4>Modelle</h4>']
+    parts += [toggle(key) for key in ("model", "dgm", "dom", "buildings", "vegetation", "streets")]
+    groups = layers.get("groups", {})
+    if groups:
+        parts.append("<h4>Einzelobjekte</h4>")
+        for group in ("building", "vegetation", "pavement", "terrain", "dsm", "other"):
+            names = groups.get(group)
+            if not names:
+                continue
+            items = "".join(f'<label><input type="checkbox" data-node="{esc(name)}" data-group="{group}" checked>{esc(name)}</label>'
+                            for name in names)
+            parts.append(f'<details><summary>{esc(GROUP_LABELS[group])} ({len(names)})</summary>{items}</details>')
+    disabled = "" if layers["available"] else " disabled"
+    parts.append('<h4>Deckkraft Modelle</h4>')
+    parts.append(f'<input type="range" data-layer-opacity min="0.1" max="1" step="0.05" value="1" style="width:100%"{disabled}>')
+    return f'<aside class="sam-potree-layers" data-layers-panel>{"".join(parts)}</aside>'
+
+
+_LAYERS_JS = """
+  /* Ebenen-Panel: Punktwolken-Attribut, Mesh-Ebenen aus environment.glb (Potree-Szene = COLMAP-ENU-Rahmen). */
+  const layersPanel = root.querySelector("[data-layers-panel]");
+  if (layersPanel) {
+    root.querySelector('[data-action="layers"]').addEventListener("click", () => layersPanel.classList.toggle("is-open"));
+    layersPanel.addEventListener("change", event => {
+      const mode = event.target.dataset && event.target.dataset.cloudMode;
+      if (mode && cloud) { cloud.material.activeAttributeName = mode; select(["rgb", "classification"], mode === "rgba" ? "rgb" : "classification"); }
+    });
+    const env = config.environment || {};
+    __ENV_MESH_JS__
+  }
+"""
+
+_ENV_MESH_JS = """
+    if (env.glb_url) {
+      const group = new THREE.Group();
+      group.matrixAutoUpdate = false;
+      /* lokal (LV95 - origin_lv95) -> Potree-Szene (ENU); env.matrix ist zeilenweise, ohne Georeferenz Identitaet. */
+      if (Array.isArray(env.matrix) && env.matrix.length === 16) group.matrix.set(...env.matrix);
+      group.matrixWorldNeedsUpdate = true;
+      group.add(new THREE.AmbientLight(0xffffff, 0.75));
+      const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(0.4, -0.3, 1); group.add(sun);
+      viewer.scene.scene.add(group);
+      const palette = { terrain: 0x9b8b6e, dsm: 0x8a9aa6, building: 0xd9d2c5, vegetation: 0x4f9a52, pavement: 0x6e7479, other: 0xb0b0b0 };
+      const groupOfNode = {};
+      for (const [name, names] of Object.entries(env.groups || {})) names.forEach(node => { groupOfNode[node] = name; });
+      const meshes = [];
+      let opacity = 1;
+      const layerOn = {};
+      const nodeOn = {};
+      const sync = () => {
+        for (const mesh of meshes) {
+          const g = mesh.userData.group;
+          mesh.visible = layerOn.model !== false && layerOn[g] !== false && nodeOn[mesh.name] !== false;
+          mesh.material.opacity = opacity; mesh.material.transparent = opacity < 1; mesh.material.depthWrite = opacity >= 1;
+        }
+      };
+      const layerGroups = { dgm: "terrain", dom: "dsm", buildings: "building", vegetation: "vegetation", streets: "pavement" };
+      layersPanel.addEventListener("change", event => {
+        const t = event.target; if (!t.dataset) return;
+        if (t.dataset.layer === "model") layerOn.model = t.checked;
+        else if (t.dataset.layer && layerGroups[t.dataset.layer]) layerOn[layerGroups[t.dataset.layer]] = t.checked;
+        else if (t.dataset.node !== undefined) nodeOn[t.dataset.node] = t.checked;
+        sync();
+      });
+      layersPanel.addEventListener("input", event => {
+        if (event.target.dataset && event.target.dataset.layerOpacity !== undefined) { opacity = Number(event.target.value); sync(); }
+      });
+      import("/assets-static/potree/libs/three.js/loaders/GLTFLoader.js").then(module => {
+        new module.GLTFLoader().load(env.glb_url, gltf => {
+          gltf.scene.traverse(object => {
+            if (!object.isMesh) return;
+            const g = groupOfNode[object.name] || "other";
+            if (!object.geometry.getAttribute("normal")) object.geometry.computeVertexNormals();
+            object.material = new THREE.MeshLambertMaterial({ color: palette[g] || palette.other, side: THREE.DoubleSide });
+            object.userData.group = g;
+            meshes.push(object);
+          });
+          group.add(gltf.scene);
+          sync();
+        }, undefined, error => console.warn("environment.glb konnte nicht geladen werden", error));
+      }).catch(error => console.warn("GLTFLoader nicht verfuegbar", error));
+    }
+"""
+
+
+def _layers_script(config: dict) -> str:
+    """JS block of the layer panel; the GLB loader call is only emitted when a GLB URL is configured."""
+    environment = config.get("environment")
+    if environment is None:
+        return ""
+    mesh_js = _ENV_MESH_JS if environment.get("glb_url") else ""
+    return _LAYERS_JS.replace("__ENV_MESH_JS__", mesh_js)
 
 
 def render_potree_viewer(
@@ -78,8 +589,12 @@ def render_potree_viewer(
     camera_endpoint: str | None = None,
 ) -> None:
     """Render a Potree viewer for the active project's sparse or dense cloud."""
+    markers_disabled = False
+    if kind == "dense" and marker_endpoint:
+        marker_endpoint, markers_disabled = _dense_marker_setup()
     config = _viewer_config(kind, title, class_colors, class_labels, class_names_de, instance_labels_de, marker_endpoint, camera_endpoint, fine_term_names_de)
     element_id = config["element_id"]
+    layers = _active_project_layers(config, kind)
     ui.add_head_html(_HEAD)
     ui.html(
         _html(
@@ -87,11 +602,49 @@ def render_potree_viewer(
             show_classes=config["show_classes"],
             show_markers=config["show_markers"],
             show_cameras=config["show_cameras"],
-            markers_label="AprilTags" if kind == "dense" else t("nav.control_points"),
+            markers_label=t("nav.control_points"),
+            markers_disabled=markers_disabled,
+            layers=layers,
         ),
         sanitize=False,
     ).classes("w-full")
     ui.add_body_html(_script(config))
+
+
+def _dense_marker_setup() -> tuple[str, bool]:
+    """Marker endpoint of the dense viewer and whether the button is disabled (no control points at all)."""
+    try:
+        from samcloud.app.state import state
+
+        register_control_point_routes()
+        return CONTROL_POINT_MARKERS_URL, not control_point_markers(state.active_project_directory)
+    except Exception as error:  # the markers are optional and must never break the viewer
+        LOGGER.warning("control point markers unavailable: %s", error)
+        return CONTROL_POINT_MARKERS_URL, True
+
+
+def _active_project_layers(config: dict, kind: str) -> dict | None:
+    """Layer panel data of the active project (dense cloud only); adds ``config["environment"]``."""
+    if kind != "dense":
+        return None
+    try:
+        from samcloud.app.state import state
+
+        project = state.active_project_directory
+        if project is None:
+            return None
+        layers = environment_layers(project)
+        matrix = None
+        origin = layers["glb"]["origin_lv95"]
+        if layers["available"]:
+            register_environment_routes()
+            matrix = local_to_viewer_matrix(project, origin) if origin else None
+        config["environment"] = _environment_config(layers, matrix)
+        return layers
+    except Exception as error:  # the panel is optional and must never break the viewer
+        LOGGER.warning("environment layers unavailable: %s", error)
+        config.pop("environment", None)
+        return None
 
 
 def _viewer_config(
@@ -240,17 +793,19 @@ def _html(
     show_markers: bool = False,
     show_cameras: bool = False,
     markers_label: str | None = None,
+    layers: dict | None = None,
+    markers_disabled: bool = False,
 ) -> str:
     def esc(value: str) -> str:
         return html.escape(value, quote=True)
 
     if markers_label is None:
         markers_label = t("nav.control_points")
-    markers_btn = (
-        f'    <button data-action="markers" class="is-selected">{esc(markers_label)}</button>\n'
-        if show_markers
-        else ""
-    )
+    if markers_disabled:
+        markers_html = f'<button data-action="markers" disabled title="{esc(t("viewer.markers.none"))}" style="opacity:.5;cursor:not-allowed">{esc(markers_label)}</button>'
+    else:
+        markers_html = f'<button data-action="markers" class="is-selected">{esc(markers_label)}</button>'
+    markers_btn = f"    {markers_html}\n" if show_markers else ""
     classes_btns = (
         '    <button data-action="rgb" class="is-selected">RGB</button>\n'
         f'    <button data-action="classification">{esc(t("viewer.toolbar.classification"))}</button>\n'
@@ -270,12 +825,14 @@ def _html(
         if show_cameras
         else ""
     )
+    layers_btn = (f'    <button data-action="layers">{esc("Ebenen")}</button>' + chr(10)) if layers else ""
+    layers_panel = _layers_panel_html(layers) if layers else ""
     return f"""
 <div id="{element_id}" class="sam-potree">
   <div class="sam-potree-area"></div>
   <div class="sam-potree-toolbar">
     <button data-action="fit">{esc(t("viewer.toolbar.fit"))}</button>
-{markers_btn}{cameras_btns}{classes_btns}    <button data-action="earth" class="is-selected">{esc(t("viewer.toolbar.terrain"))}</button>
+{markers_btn}{cameras_btns}{classes_btns}{layers_btn}    <button data-action="earth" class="is-selected">{esc(t("viewer.toolbar.terrain"))}</button>
     <button data-action="orbit">{esc(t("viewer.toolbar.orbit"))}</button>
     <button data-action="edl" class="is-selected">{esc(t("viewer.toolbar.shading"))}</button>
     <button data-action="fullscreen">{esc(t("viewer.toolbar.fullscreen"))}</button>
@@ -284,6 +841,7 @@ def _html(
 {camera_sliders}
   </div>
   <div class="sam-potree-classes"></div>
+  {layers_panel}
   <aside class="sam-potree-camera-card"></aside>
   <aside class="sam-potree-point-card"></aside>
   <div class="sam-potree-status">{esc(t("viewer.status.preparing"))}</div>
@@ -356,7 +914,15 @@ const start = () => {
   root.querySelector(".sam-potree-toolbar").addEventListener("click", event => {
     const action = event.target.dataset && event.target.dataset.action;
     if (!action) return;
-    if (action === "fit") viewer.fitToScreen(0.55);
+    if (action === "fit") {
+      try {
+        const box = viewer.getBoundingBox(viewer.scene.pointclouds).clone();
+        if (markersVisible) for (const item of markerObjects) box.expandByPoint(item.sphere.position);
+        const node = new THREE.Object3D();
+        node.boundingBox = box;
+        viewer.zoomTo(node, 0.55, 0);
+      } catch (_error) { viewer.fitToScreen(0.55); }
+    }
     if (action === "markers") {
       markersVisible = !markersVisible;
       for (const item of markerObjects) {
@@ -455,6 +1021,7 @@ const start = () => {
        syncCameraBillboards();
      });
    });
+__LAYERS_JS__
   const pageStarted = Date.now();
   let loadAttempts = 0;
   const formatElapsed = seconds => {
@@ -515,7 +1082,7 @@ const start = () => {
     setTimeout(pollStatus, 2000);
   };
   pollStatus();
-  const colours = { pass: "#26b7ef", control: "#ffb020", disabled: "#6b7c8a", needs_review: "#ff5a5a", apriltag: "#b06cff" };
+  const colours = { pass: "#26b7ef", control: "#ffb020", disabled: "#6b7c8a", needs_review: "#ff5a5a", apriltag: "#b06cff", passpunkt: "#ff9f1a", kontrollpunkt: "#18d6e6" };
   let markerWarnings = [];
   let highlightedTag = null;
   const markerObjects = [];
@@ -638,7 +1205,7 @@ const start = () => {
         const element = annotation.domElement && annotation.domElement[0];
         if (element) {
           element.style.setProperty("--sam-marker", colour);
-          element.title = tr("marker_open_review");
+          element.title = marker.tooltip || tr("marker_open_review");
           const titlebar = element.querySelector(".annotation-titlebar");
           if (titlebar) { titlebar.style.background = colour; }
           element.addEventListener("click", () => window.dispatchEvent(new CustomEvent("samcloud-marker-selected", { detail: { name: marker.name } })));
@@ -950,4 +1517,4 @@ const start = () => {
 };
 start();
 </script>
-""".replace("__STRINGS__", json.dumps(_viewer_strings()).replace("</", "<\\/")).replace("__CONFIG__", json.dumps(config))
+""".replace("__LAYERS_JS__", _layers_script(config)).replace("__STRINGS__", json.dumps(_viewer_strings()).replace("</", "<\\/")).replace("__CONFIG__", json.dumps(config))

@@ -321,6 +321,48 @@ def dense_profile(dense_config: dict[str, Any], capture_type: str | None) -> dic
     return profile
 
 
+def dense_size_settings(dense_config: dict[str, Any], capture_type: str | None) -> dict[str, Any]:
+    """Resolve ``max_image_size`` and the ``auto`` options, honouring a ``dense_size`` profile override.
+
+    A capture profile may set ``dense_size: {max_image_size: <int|auto>, ratio:, minimum:, maximum:}``.
+    Without it the global values are returned unchanged. Raises ``ValueError`` for invalid values.
+    """
+    max_image_size = dense_config.get("max_image_size", 3200)
+    auto = dict(dense_config.get("auto") or {})
+    override = ((dense_config.get("capture_profiles") or {}).get(capture_type or "", {}) or {}).get("dense_size")
+    if override:
+        if not isinstance(override, dict):
+            raise ValueError("dense_size override must be a mapping")
+        unknown = set(override) - {"max_image_size", "ratio", "minimum", "maximum"}
+        if unknown:
+            raise ValueError(f"Unknown dense_size keys: {sorted(unknown)}")
+        if "max_image_size" in override:
+            max_image_size = override["max_image_size"]
+        for key in ("ratio", "minimum", "maximum"):
+            if key in override:
+                auto[key] = override[key]
+        if max_image_size != "auto":
+            try:
+                if isinstance(max_image_size, bool) or int(max_image_size) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError(f"dense_size max_image_size must be 'auto' or a positive integer, got {max_image_size!r}") from None
+        for key in ("minimum", "maximum"):
+            if key in auto:
+                try:
+                    if isinstance(auto[key], bool) or int(auto[key]) <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise ValueError(f"dense_size {key} must be a positive integer, got {auto[key]!r}") from None
+        if "ratio" in auto:
+            try:
+                if isinstance(auto["ratio"], bool) or not 0 < float(auto["ratio"]) <= 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError(f"dense_size ratio must be in (0, 1], got {auto['ratio']!r}") from None
+    return {"max_image_size": max_image_size, "auto": auto}
+
+
 PATCH_MATCH_OPTIONS = {
     "window_radius": int,
     "window_step": int,
