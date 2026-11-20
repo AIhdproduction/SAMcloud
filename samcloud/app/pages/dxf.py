@@ -704,7 +704,7 @@ class DxfPage:
         self.result_fullscreen = False
         with ui.row().classes("w-full gap-4 no-wrap items-stretch") as result_row:
             self.result_row = result_row
-            with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:640px;min-width:0"):
+            with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:1280px;min-width:0"):
                 self.result_canvas = DxfReviewCanvas().classes("w-full h-full").mark("result-canvas")
                 self.result_canvas.show(payload_url(controller, level, "ortho"), image, bounds)
                 self.result_canvas.set_opacity(self._result_image_opacity(background), 1.0)
@@ -848,7 +848,7 @@ class DxfPage:
             self.ifc_fullscreen = False
             with ui.row().classes("w-full gap-4 no-wrap items-stretch") as ifc_row:
                 self.ifc_row = ifc_row
-                with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:520px;min-width:0"):
+                with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:1040px;min-width:0"):
                     self.ifc_viewer = IfcViewer().classes("w-full h-full").mark("ifc-viewer")
                     self.ifc_viewer.show(model_url(key, glb.stat().st_mtime_ns), by_node)
                     self.ifc_viewer.set_hidden_classes(self.ifc_hidden)
@@ -887,7 +887,7 @@ class DxfPage:
                         ui.switch(t("ifc.props.show_all"), value=False,
                                   on_change=lambda event: self.set_ifc_show_all(bool(event.value))).props("dense").classes("text-xs").mark("ifc-props-all")
                     self.ifc_props_box = ui.column().classes("gap-1 w-full").style(
-                        "max-height:340px;overflow-y:auto;padding-right:6px").mark("ifc-props")
+                        "max-height:600px;overflow-y:auto;padding-right:6px").mark("ifc-props")
                     self.ifc_show_all = False
                     self.ifc_picked: str | None = None
                     self.ifc_key = key
@@ -1087,7 +1087,7 @@ class DxfPage:
         if primary_result is None:
             return
         with ui.row().classes("w-full gap-4 no-wrap items-stretch"):
-            with ui.element("div").classes("flex-1").style("height:640px"):
+            with ui.element("div").classes("flex-1").style("height:1280px"):
                 self.review_canvas = DxfReviewCanvas().classes("w-full h-full").mark("review-canvas")
                 self.review_canvas.show(
                     payload_url(controller, level, primary_variant),

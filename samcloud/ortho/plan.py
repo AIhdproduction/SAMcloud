@@ -61,10 +61,14 @@ from samcloud.ortho.vector.vegetation import HedgeSettings, hedge_entities
 from samcloud.ortho.vector.kitchen_run import KitchenRunSettings, appliance_insert, build_kitchen_run
 from samcloud.ortho.vector.kitchen_layout import counter_lines, kitchen_cad_layout, tall_unit_entities
 from samcloud.ortho.vector.upper_cabinets import UpperCabinetSettings, detect_upper_cabinets, upper_band_mask
+from samcloud.bim.furniture_footprint import TightFootprintSettings, instance_point_sets
+from samcloud.ortho.vector.upper_points import UpperPointSettings, detect_upper_cabinets_from_points, load_class_points, measured_z_band
+from samcloud.bim.depth_evidence.plan_use import PlanDepth, open_plan_depth, plan_depth_fingerprint
 from samcloud.ortho.vector.room_names import RoomNameSettings, name_halls, name_rooms, room_label_text, tag_for_name
 from samcloud.ortho.vector.builtin_fronts import _absorb_einb, _absorb_furniture, resolve_builtin_fronts, tall_furniture_mask
 from samcloud.ortho.vector.niche import NicheSettings, content_mask, resolve_recessed_niches
-from samcloud.ortho.vector.footprints import _NON_FOOTPRINT_INSTANCE_LABELS, ISLAND_LABELS, FootprintFit, IslandSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
+from samcloud.ortho.vector.door_zones import DoorZoneSettings, drop_misplaced_builtins
+from samcloud.ortho.vector.footprints import _NON_FOOTPRINT_INSTANCE_LABELS, ISLAND_LABELS, FootprintFit, FurnitureSolidSettings, IslandSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, furniture_solid_parts, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
 from samcloud.ortho.vector.wall_lines import (
     WallFace,
     break_faces_at_openings,
@@ -78,6 +82,7 @@ from samcloud.ortho.vector.wall_tidy import tidy_wall_entities
 from samcloud.ortho.vector.double_walls import DoubleWallSettings, TallUnitEvidence, WallEvidence, bound_rooms_by_walls, build_double_walls, update_opening_symbols
 from samcloud.ortho.vector.labels import class_display_name, label_entities, load_label_settings, resolve_label_overlaps
 from samcloud.ortho.vector.door_rooms import DoorRoomSettings, door_bounded_rooms
+from samcloud.ortho.vector.sanitary_facing import SanitaryFacingSettings, orient_sanitary_inserts
 from samcloud.ortho.vector.plan_polish import PlanPolishSettings, fit_kitchen_to_walls, place_object_labels, regularize_furniture, rooms_from_wall_cells
 from samcloud.ortho.vector.lines import boundary_lines, trace_lines
 from samcloud.ortho.vector.raster_grid import RasterGrid, mask_to_polygons
@@ -121,9 +126,13 @@ class CleanPlanSettings:
     indoor_ceiling: CeilingSettings = CeilingSettings()
     indoor_island: IslandSettings = IslandSettings()
     indoor_niche: NicheSettings = NicheSettings()
+    indoor_door_zone: DoorZoneSettings = DoorZoneSettings()
     indoor_upper_cabinets: UpperCabinetSettings = UpperCabinetSettings()
+    indoor_upper_points: UpperPointSettings = UpperPointSettings()
+    indoor_tight_footprint: TightFootprintSettings = TightFootprintSettings()
     indoor_room_names: RoomNameSettings = RoomNameSettings()
     indoor_kitchen_run: KitchenRunSettings = KitchenRunSettings()
+    indoor_furniture_solids: FurnitureSolidSettings = FurnitureSolidSettings()
     walls: DoubleWallSettings = DoubleWallSettings()
     plan_polish: PlanPolishSettings = PlanPolishSettings()
     indoor_door_rooms: DoorRoomSettings = DoorRoomSettings()
@@ -200,9 +209,13 @@ def load_clean_plan_settings(path: Path | str | None = None) -> CleanPlanSetting
         indoor_ceiling=ceiling,
         indoor_island=section_of("indoor_island", IslandSettings),
         indoor_niche=section_of("indoor_niche", NicheSettings),
+        indoor_door_zone=section_of("indoor_door_zone", DoorZoneSettings),
         indoor_upper_cabinets=section_of("indoor_upper_cabinets", UpperCabinetSettings),
+        indoor_upper_points=section_of("indoor_upper_points", UpperPointSettings),
+        indoor_tight_footprint=section_of("indoor_tight_footprint", TightFootprintSettings),
         indoor_room_names=section_of("indoor_room_names", RoomNameSettings),
         indoor_kitchen_run=section_of("indoor_kitchen_run", KitchenRunSettings),
+        indoor_furniture_solids=section_of("indoor_furniture_solids", FurnitureSolidSettings),
         walls=section_of("walls", DoubleWallSettings),
         plan_polish=section_of("plan_polish", PlanPolishSettings),
         indoor_door_rooms=section_of("indoor_door_rooms", DoorRoomSettings),
@@ -234,7 +247,7 @@ def clean_plan_fingerprint(
     level: Level | None,
     settings: CleanPlanSettings | None = None,
 ) -> str:
-    """Fingerprint segment output, layer config, ortho_plan.yaml content, and plan settings."""
+    """Fingerprint inputs, settings, and the wall/opening code that produces pass 1."""
     project = Path(project_dir)
     plan_settings = _available_clean_plan_settings(project, level, settings)
     seg = load_segment_result(project, level, plan_settings.segment_source)
@@ -266,11 +279,36 @@ def clean_plan_fingerprint(
         "layers": layers_data,
         "ortho_plan_yaml": ortho_plan_content,
         "settings": asdict(plan_settings),
+        "pass1_code": _wall_pipeline_code_fingerprint(),
     }
     instances_path = project / "products" / "classified" / "instances.json"
     if instances_path.is_file():
         payload["instances_json"] = hashlib.sha256(instances_path.read_bytes()).hexdigest()
+    depth_key = plan_depth_fingerprint(project)
+    if depth_key is not None:  # only when depth is used: projects without a product keep their fingerprint
+        payload["depth_in_plan"] = depth_key
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _wall_pipeline_code_fingerprint() -> str:
+    """Return a deterministic digest of code that can change a pass-1 wall plan.
+
+    A cached pure pass 1 must not survive a code deployment: refined openings are
+    based on that geometry.  Settings alone are therefore not a sufficient key.
+    """
+    package = Path(__file__).resolve().parents[1]
+    roots = (package / "ortho", package / "bim" / "openings3d")
+    digest = hashlib.sha256()
+    files = sorted(
+        (path for root in roots if root.is_dir() for path in root.rglob("*.py") if path.is_file()),
+        key=lambda path: path.relative_to(package).as_posix(),
+    )
+    for path in files:
+        digest.update(path.relative_to(package).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def generate_clean_plan(
@@ -789,8 +827,10 @@ def _generate_indoor_clean_plan(
 
     report_progress(progress, 0.18, "Building indoor section occupancy")
     units_per_metre, bands = _indoor_scale_and_bands(level, plan_settings)
+    # Optional compact depth evidence (COLMAP-supported voxels for faces, free space for occupancy); None = point cloud only.
+    plan_depth = open_plan_depth(project, frame, level.floor_z, units_per_metre)
     wall_evidence, section, low, high, wall_points, vertical = _section_occupancy(
-        project, ortho.stats, point_source, frame, grid, level, cancel, bands, units_per_metre, plan_settings.indoor_vertical,
+        project, ortho.stats, point_source, frame, grid, level, cancel, bands, units_per_metre, plan_settings.indoor_vertical, plan_depth,
     )
     structural_codes = _indoor_structural_codes(indoor_layers)
     if not wall_evidence.any():
@@ -954,10 +994,27 @@ def _generate_indoor_clean_plan(
             insert["_wall_aligned"] = aligned
             output_layers["P-SANI" if code in sanitary_codes else "A-FURN"].append(insert)
         fixture_coverage[component_slice] |= component
+    objects_dsm = dsm
+    depth_filled_cells = 0
+    if plan_depth is not None and plan_depth.settings.get("plan_height_fill", True):
+        # Unmeasured cells (no point above the floor) take the COLMAP-supported furniture top of the depth product; measured cells keep the cloud.
+        depth_top = plan_depth.top_height_map(grid, z_low=0.05 * units_per_metre, z_high=0.97 * ceiling_height)
+        unmeasured = (~np.isfinite(dsm) | (dsm - level.floor_z < 0.05 * units_per_metre)) & np.isfinite(depth_top)
+        # Only holes of / beside objects the cloud measured: a depth-only island must not become a new object.
+        measured_objects = np.isfinite(dsm) & (dsm - level.floor_z >= 0.05 * units_per_metre)
+        reach = max(1, int(round(plan_depth.settings.get("plan_height_fill_reach_m", 0.15) * units_per_metre / grid.pixel_size)))
+        near_objects = cv2.dilate(measured_objects.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1))).astype(bool)
+        unmeasured &= near_objects
+        depth_filled_cells = int(unmeasured.sum())
+        if depth_filled_cells:
+            objects_dsm = dsm.copy()
+            objects_dsm[unmeasured] = (depth_top[unmeasured] + level.floor_z).astype(np.float32)
     instances, footprint_metrics, height_map = object_instances(
-        dsm, level.floor_z, classes, fine_classes, fine_confidence, fine_names, grid, units_per_metre, ceiling_height, wall_lines,
+        objects_dsm, level.floor_z, classes, fine_classes, fine_confidence, fine_names, grid, units_per_metre, ceiling_height, wall_lines,
         free_space | closed_floor, outer_band | wall_evidence, view_count, instance_raster, instance_labels,
     )
+    footprint_metrics["depth_in_plan"] = plan_depth is not None
+    footprint_metrics["depth_height_cells_filled"] = depth_filled_cells
     labelled_instances = [item for item in instances if item.has_fine_label]
     instances = [
         item for item in instances
@@ -1082,6 +1139,12 @@ def _generate_indoor_clean_plan(
         furniture_insert = _furniture_catalogue_insert(str(instance.label or "").strip().lower(), fit, wall_lines, units_per_metre) if fit.kind in {"rect", "rect_free"} and not clutter and not own_chairs else None
         if furniture_insert is not None and not _insert_duplicates_existing(furniture_insert, output_layers):
             furniture_insert["attributes"] = {"LABEL": display}
+            insert_parts = furniture_solid_parts(instance, height_map, grid, units_per_metre, fit.polygon, plan_settings.indoor_furniture_solids)
+            if insert_parts:
+                furniture_insert["_solid_parts"] = [
+                    {"footprint": part["footprint"], "z_min": float(level.floor_z), "z_max": float(level.floor_z) + float(part["z_max_m"]) * units_per_metre}
+                    for part in insert_parts
+                ]
             if instance.instance_id > 0:
                 furniture_insert["attributes"]["INSTANCE"] = str(instance.instance_id)
             furniture_id += 1
@@ -1098,11 +1161,16 @@ def _generate_indoor_clean_plan(
             free_footprint_labels.append(display)
         footprint_dev90_max = max(footprint_dev90_max, fit.dev90)
         furniture_id += 1
+        solid_parts = furniture_solid_parts(instance, height_map, grid, units_per_metre, fit.polygon, plan_settings.indoor_furniture_solids)
         output_layers["A-FURN"].append({
             "type": "polyline", "points": _polygon_points(fit.polygon), "closed": True, "holes": [], "_furn_id": furniture_id,
             "_hausdorff": fit.dev90, "_label": display, "_footprint_kind": fit.kind,
             "_footprint_dev90": fit.dev90, "_wall_aligned": aligned, "_semantic_label": str(instance.label or display),
             **({"_instance_id": int(instance.instance_id)} if instance.instance_id > 0 else {}),
+            **({"_solid_parts": [
+                {"footprint": part["footprint"], "z_min": float(level.floor_z), "z_max": float(level.floor_z) + float(part["z_max_m"]) * units_per_metre}
+                for part in solid_parts
+            ]} if solid_parts else {}),
         })
         if not clutter:
             measured = _footprint_evidence(component, local_grid, units_per_metre)
@@ -1175,9 +1243,52 @@ def _generate_indoor_clean_plan(
         _kitchen_runs(output_layers["A-EINB"]), upper_band_mask(vertical.bitmask, ceiling_height, units_per_metre, upper_settings),
         vertical.full | vertical.counter, wall_evidence, grid, wall_lines, units_per_metre, upper_settings,
     )
-    output_layers["A-OBEN"].extend({"type": "polyline", "points": _polygon_points(polygon), "closed": True, "holes": [], "_upper_cabinet": True} for polygon in upper_polygons)
-    footprint_metrics["upper_cabinets"] = len(upper_polygons)
+    # Kitchen-class points of the cloud (+ COLMAP depth voxels): the measured band gives every upper cabinet its height, and hanging units
+    # without a base run below them (above a tall appliance) are found from the points alone.
+    upper_points = np.empty((0, 3), dtype=float)
+    row_points = np.empty((0, 3), dtype=float)
+    instance_points: dict[int, np.ndarray] = {}
+    upper_bands: list[tuple[float, float] | None] = [None] * len(upper_polygons)
+    point_uppers: list[tuple[Polygon, tuple[float, float]]] = []
+    if plan_settings.indoor_upper_points.enabled:
+        all_points, all_classes, all_instances = load_class_points(point_source or _find_point_source(project, ortho.stats), frame, level.floor_z, min_z=0.0)
+        high_points = all_points[:, 2] >= 0.9 * units_per_metre if len(all_points) else np.zeros(0, dtype=bool)
+        cloud_points, cloud_classes, _cloud_instances = all_points[high_points], all_classes[high_points], all_instances[high_points]
+        row_points = all_points
+        # Hanging kitchen units are class 18 (appliances / kitchen); furniture-class shelves and TV units must not become upper cabinets.
+        kitchen_cloud = cloud_points[cloud_classes == 18] if len(cloud_points) else cloud_points
+        upper_points = kitchen_cloud
+        depth_points = None
+        kitchen_depth = np.empty((0, 3), dtype=float)
+        if plan_depth is not None:
+            depth_points, depth_classes = plan_depth.furniture_points(colmap_only=True)
+            keep_depth = depth_points[:, 2] >= 0.9 * units_per_metre
+            depth_points, depth_classes = depth_points[keep_depth], depth_classes[keep_depth]
+            kitchen_depth = depth_points[depth_classes == 18]
+            all_depth, _ = plan_depth.furniture_points(colmap_only=True)
+            if len(all_depth):
+                row_points = np.vstack((row_points, all_depth)) if len(row_points) else all_depth
+            upper_points = np.vstack((kitchen_cloud, kitchen_depth)) if len(kitchen_cloud) else kitchen_depth
+        upper_bands = [measured_z_band(upper_points, polygon, units_per_metre) for polygon in upper_polygons]
+        if plan_settings.indoor_tight_footprint.enabled:
+            instance_points = instance_point_sets(cloud_points, _cloud_instances, None if plan_depth is None else depth_points, units_per_metre)
+        if kitchen_zone is not None:
+            point_uppers = detect_upper_cabinets_from_points(
+                upper_points, wall_lines, kitchen_zone.buffer(plan_settings.indoor_door_zone.kitchen_zone_margin_m * units_per_metre), upper_polygons,
+                units_per_metre, plan_settings.indoor_upper_points,
+            )
+    output_layers["A-OBEN"].extend(
+        {"type": "polyline", "points": _polygon_points(polygon), "closed": True, "holes": [], "_upper_cabinet": True, **({"_z_range_m": [band[0], band[1]], "_z_source": "points"} if band else {})}
+        for polygon, band in zip(upper_polygons, upper_bands, strict=True)
+    )
+    output_layers["A-OBEN"].extend(
+        {"type": "polyline", "points": _polygon_points(polygon), "closed": True, "holes": [], "_upper_cabinet": True, "_z_range_m": [band[0], band[1]], "_z_source": "points", "_upper_from_points": True}
+        for polygon, band in point_uppers
+    )
+    footprint_metrics["upper_cabinets"] = len(upper_polygons) + len(point_uppers)
+    footprint_metrics["upper_cabinets_from_points"] = len(point_uppers)
     footprint_metrics["builtin_furniture_absorbed"] = builtin_front_stats["builtin_furniture_absorbed"]
+    footprint_metrics.update(drop_misplaced_builtins(output_layers, openings, door_leaf_lines, kitchen_zone, units_per_metre, plan_settings.indoor_door_zone))
 
     double_walls_done = False
     plan_wall_pieces: list[dict[str, Any]] | None = None
@@ -1195,10 +1306,11 @@ def _generate_indoor_clean_plan(
         wall_evidence_rasters = WallEvidence(
             wall_bits=vertical.wall_bits, all_bits=vertical.bitmask, bins=plan_settings.indoor_vertical.bins, storey_height=ceiling_height,
             section=section, low=low, floor=free_space, door=door_mask, cameras=_level_camera_centres(project, ortho.stats, frame, level, ceiling_height),
+            depth_points=None if plan_depth is None else plan_depth.wall_points(0.30 * ceiling_height, 0.95 * ceiling_height),
         )
         double = build_double_walls(
             output_layers["A-WALL"], openings, rooms_data.polygons, free_space | closed_floor, classes != 0, grid, units_per_metre,
-            replace(plan_settings.walls, refined_openings=True) if openings_3d_info.get("applied") else plan_settings.walls,
+            _wall_settings_for_pass(plan_settings.walls, openings_3d_info),
             furniture=ceiling_furniture_mask | tall_mask, evidence=wall_evidence_rasters,
             builtins=[Polygon(entity["points"]) for entity in output_layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed") and entity.get("_einb_kind") == "builtin_front" and len(entity.get("points", [])) >= 3],
             tall_units=tall_unit_evidence(fine_classes, fine_names, classes, height_map, units_per_metre),
@@ -1275,6 +1387,13 @@ def _generate_indoor_clean_plan(
         kept_rooms = [polygon for polygon, decision in zip(sorted_rooms, room_names, strict=True) if decision.keep]
         # The kitchen run ends at a tall unit like at a wall.
         kitchen_walls = unary_union([polish_walls, *(shape for shape, _ in tall_units)]) if tall_units and polish_walls is not None else polish_walls
+        footprint_metrics.update(orient_sanitary_inserts(
+            output_layers, polish_walls, units_per_metre,
+            SanitaryFacingSettings(
+                enabled=plan_settings.plan_polish.sanitary_facing, max_gap_m=plan_settings.plan_polish.sanitary_back_gap_m,
+                tie_m=plan_settings.plan_polish.sanitary_tie_m, snap_angle_deg=plan_settings.plan_polish.sanitary_snap_deg,
+            ),
+        ))
         if plan_settings.plan_polish.kitchen:
             footprint_metrics.update(fit_kitchen_to_walls(output_layers, kept_rooms, kitchen_walls, theta, units_per_metre, plan_settings.plan_polish))
         if plan_settings.plan_polish.kitchen and plan_settings.plan_polish.kitchen_layout:
@@ -1339,6 +1458,7 @@ def _generate_indoor_clean_plan(
             rooms=[(polygon, decision.name or "Zimmer") for polygon, decision in zip(sorted_rooms, room_names, strict=True) if decision.keep],
             wall_pieces=plan_wall_pieces, wall_bodies=plan_wall_bodies, result_fingerprint=result.settings_fingerprint,
             instances_path=project / "products" / "classified" / "instances.json", source_extra={"openings_3d": openings_3d_info} if openings_3d_info else None,
+            instance_points=instance_points, tight_settings=plan_settings.indoor_tight_footprint, depth=plan_depth, class_points=row_points,
         ), cache_dir)
         _store_pass1_snapshot(cache_dir, openings_3d_info, result.settings_fingerprint)
     except Exception:
@@ -1415,8 +1535,12 @@ def _indoor_scale_and_bands(level: Level, settings: CleanPlanSettings) -> tuple[
     }
 
 
-def _section_occupancy(project: Path, stats: dict[str, Any], point_source: Path | None, frame: Frame, grid: RasterGrid, level: Level, cancel: CancelToken | None, bands: dict[str, tuple[float, float]], units_per_metre: float, vertical_settings: VerticalSettings = VerticalSettings()) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, VerticalEvidence]:
-    """Rasterise section and vertical occupancy in a single point-cloud stream."""
+def _section_occupancy(project: Path, stats: dict[str, Any], point_source: Path | None, frame: Frame, grid: RasterGrid, level: Level, cancel: CancelToken | None, bands: dict[str, tuple[float, float]], units_per_metre: float, vertical_settings: VerticalSettings = VerticalSettings(), depth: PlanDepth | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, VerticalEvidence]:
+    """Rasterise section and vertical occupancy in a single point-cloud stream.
+
+    ``depth`` is accepted for API symmetry; the depth product does not enter the section rasters (it refines faces and thickness later,
+    in the double-wall stage, where its COLMAP voxels can be tested against measured faces).
+    """
     source = point_source or _find_point_source(project, stats)
     wall_counts = np.zeros((grid.height, grid.width), dtype=np.uint16)
     wall_min_z = np.full((grid.height, grid.width), np.inf, dtype=np.float32)
@@ -2372,10 +2496,18 @@ def _raster_bool(mask: np.ndarray, grid: RasterGrid, x: float, y: float) -> bool
     return 0 <= row < mask.shape[0] and 0 <= col < mask.shape[1] and bool(mask[row, col])
 
 
+def _wall_settings_for_pass(settings: Any, openings_3d_info: dict[str, Any]) -> Any:
+    """Wall settings of this plan pass: with the refined openings applied the 3D openings are final (``refined_openings``)."""
+    return replace(settings, refined_openings=True) if openings_3d_info.get("applied") else settings
+
+
 def _door_leaf_lines(openings: list[Opening]) -> list[LineString]:
     """Reconstruct measured leaves so A-EINB cannot redraw them as built-ins."""
     lines: list[LineString] = []
     for opening in openings:
+        if opening.kind == "DOOR" and opening.leaf_hinge is not None and opening.leaf_free is not None:
+            lines.append(LineString((tuple(opening.leaf_hinge), tuple(opening.leaf_free))))  # measured leaf of the 3D refinement
+            continue
         if opening.kind != "DOOR" or opening.leaf_angle_deg is None or opening.hinge_side is None:
             continue
         axis = np.asarray((math.cos(opening.axis_angle), math.sin(opening.axis_angle)))

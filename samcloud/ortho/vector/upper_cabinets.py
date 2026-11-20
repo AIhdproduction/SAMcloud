@@ -28,6 +28,7 @@ class UpperCabinetSettings:
     depth_m: float = 0.35
     min_length_m: float = 0.40
     min_coverage: float = 0.50
+    min_run_depth_m: float = 0.25  # a base run thinner than this is a sliver, not a counter: no unit hangs above it
     gap_fill_m: float = 0.15
     bins: int = 16
 
@@ -66,7 +67,11 @@ def detect_upper_cabinets(
     """Return hanging-cabinet footprints above each base run that shows upper-band evidence."""
     upm = max(float(units_per_metre), 1e-9)
     walls = list(wall_lines)
-    candidate = np.asarray(upper_mask, dtype=bool) & ~np.asarray(floor_connected, dtype=bool) & ~np.asarray(wall_evidence, dtype=bool)
+    # Upper fronts can project into a cell that also has lower cabinet evidence.
+    # Reject only an entirely floor-connected candidate (a tall unit), rather
+    # than masking such cells before their upper-band evidence is evaluated.
+    candidate = np.asarray(upper_mask, dtype=bool) & ~np.asarray(wall_evidence, dtype=bool)
+    grounded = np.asarray(floor_connected, dtype=bool)
     output: list[Polygon] = []
     for base in base_polygons:
         rectangle = base.minimum_rotated_rectangle
@@ -77,7 +82,7 @@ def detect_upper_cabinets(
         long_index = int(np.argmax([float(np.hypot(*edges[0])), float(np.hypot(*edges[1]))]))
         run_length = float(np.hypot(*edges[long_index]))
         run_depth = float(np.hypot(*edges[1 - long_index]))
-        if run_length < settings.min_length_m * upm:
+        if run_length < settings.min_length_m * upm or run_depth < settings.min_run_depth_m * upm:
             continue
         u = edges[long_index] / run_length
         v = np.asarray((-u[1], u[0]))
@@ -89,6 +94,8 @@ def detect_upper_cabinets(
         hits = candidate & _polygon_raster(rectangle.buffer(0.03 * upm), grid)
         rows, cols = np.nonzero(hits)
         if not len(rows):
+            continue
+        if float(grounded[rows, cols].mean()) >= 0.95:
             continue
         points = np.asarray([grid.pixel_to_local(float(r), float(c)) for r, c in zip(rows, cols, strict=True)])
         along = (points - back) @ u

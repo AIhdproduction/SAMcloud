@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from samcloud.bim.invariants import refinement_violations
 from samcloud.bim.plan_model import BuildingPlan, load_refine_plan
 from samcloud.dxf.cancel import Cancelled
 
@@ -196,8 +197,12 @@ def _unconfirmed(plan: BuildingPlan, evidence: dict[str, LineEvidence], detectio
 
 def _classify_doors(detection: Detection, lines: list[WallLine], evidence_points: Any, plan: BuildingPlan, config: Settings) -> dict[str, Any]:
     """Classify door / passage / none, assign open leaves, scan for entrances (in place on ``detection``)."""
-    kept, dropped, summary = classify_openings(detection.openings, lines, evidence_points, plan, config)
+    kept, dropped, summary = classify_openings(detection.openings, lines, evidence_points, plan, config, detection.duplicates)
     detection.openings = kept
+    violations = refinement_violations(kept)
+    summary["invariant_violations"] = violations
+    for item in violations:
+        _LOGGER.warning("openings3d: invariant violated (%s) by %s: %s", item["rule"], item["opening"], item["reason"])
     for item in dropped:
         detection.rejected.append({"what": "door candidate", "center": item["center"], "line": item["line"], "reason": f"classified as no opening: {item['reason']}", "features": item["features"]})
     detection.closed = [{key: item[key] for key in ("center", "width_m", "axis_angle", "wall_thickness_m", "host_wall_id", "line", "u", "reason")} for item in dropped]

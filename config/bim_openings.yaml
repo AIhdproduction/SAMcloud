@@ -12,6 +12,7 @@ walls:                            # plan walls -> collinear wall lines (gaps = o
   max_gap_m: 3.0
   min_line_length_m: 0.3
   min_piece_length_m: 0.1
+  seed_extend_max_m: 1.0          # a wall line continues over a plan door/passage gap that lies beyond its end (door at the end of a wall) up to this far
   end_pad_m: 3.0                  # a line continues up to this far into the gap to the next collinear line (not bridged: gap > max_gap_m)
 
 selection:                        # which photographs look at which wall face
@@ -122,6 +123,7 @@ doors:
   snap_centre_cells: 4
   seed_search_cells: 6
   line_distance_m: 0.5
+  seed_axis_tolerance_deg: 20.0   # a plan door seed is measured only on wall lines running within this angle of its own wall direction (never on a crossing wall nearby)
   evidence_rows_m: [0.2, 1.9]
   door_fraction_min: 0.15
   door_prob_min: 0.2
@@ -223,6 +225,7 @@ classify:                         # door / passage / none from the frame measure
   weak_door_fraction: 0.15        # door-class share of the opening cells that keeps a candidate a door
   host_reach_m: 1.5               # wall stretches of the original host wall this far beside a door / passage are kept (closed where the measured faces leave them open)
   host_min_stretch_m: 0.2         # shorter stretches of the host wall beside a door are jamb stubs and are not continued
+  leaf_shadow_distance_m: 0.45    # a candidate without any casing strip this close to the measured open leaf of a door on another wall line is that leaf, not an opening (the frame decides where a door is)
   min_head_m: 1.8                 # a measured head below this is not a door head (furniture, closed leaf): the detected head stays
 
 scan:                             # door frames on wall lines without opening (entrances, scan.py)

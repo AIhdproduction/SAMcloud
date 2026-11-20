@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import yaml
 from shapely.geometry import LineString, MultiPoint, Point, Polygon
+from shapely.ops import unary_union
 
 SCHEMA_VERSION = 1
 PLAN_MODEL_FILENAME = "plan_model.json"
@@ -120,6 +121,15 @@ class PlanFurniture:
     confidence: float | None = None
     default_height_m: float | None = None  # metric default used when z_min/z_max are None
     default_z_m: list[float] | None = None  # metric [low, high] for hanging units (A-OBEN)
+    # Optional measured sub-solids.  Each entry carries a local-plan footprint and
+    # local z range; together they cover ``footprint`` without changing the DXF outline.
+    parts: list[dict[str, Any]] = field(default_factory=list)
+    # True when depth evidence found furniture-class voxels at floor level inside the footprint (stands on the floor); None = unknown / no depth
+    floor_contact: bool | None = None
+    # Sanitary block (WC, washbasin): direction the front looks (degrees counter-clockwise from +X of the local plan) and the wall
+    # whose face carries its back.  Same values for the DXF block and the IFC property set; None = no facing rule applied.
+    facing_deg: float | None = None
+    back_wall_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)
@@ -313,8 +323,10 @@ def load_instance_hulls(instances_path: Path | str | None, frame: Any) -> list[d
     return hulls
 
 
+_TALL_COLUMN_LABELS = frozenset({"chest of drawers", "dresser", "cupboard"})
 _UPPER_LABELS = frozenset({"kitchen cabinet", "cabinet", "kitchen counter", "shelf", "bookcase"})
 _TALL_LABELS = frozenset({"refrigerator", "fridge", "kitchen cabinet", "cabinet", "wardrobe", "oven", "microwave oven"})
+_WALL_MOUNTED_KINDS = frozenset({"upper_cabinet", "washbasin", "lavabo", "wall shelf", "hood", "wall tv", "mirror cabinet"})
 
 
 def _measured_instance(
@@ -475,36 +487,49 @@ def _default_height(config: dict[str, Any], kind: str | None, label: str, einb_k
 def _furniture(
     layers: dict[str, list[dict[str, Any]]], z_ranges: dict[int, tuple[float, float, float | None]], config: dict[str, Any],
     instances: list[dict[str, Any]] | None = None, floor_z: float = 0.0, units_per_metre: float = 1.0,
+    footprints: Any = None, depth: Any = None, depth_report: dict[str, Any] | None = None,
+    row_points: np.ndarray | None = None, wall_union: Any = None, wall_lines: list[LineString] | None = None, row_settings: Any = None,
 ) -> list[PlanFurniture]:
     result: list[PlanFurniture] = []
     instances = instances or []
     upm = max(float(units_per_metre), 1e-9)
     kitchen_cfg = config["defaults"]
     seen_runs: set[tuple[tuple[float, float], ...]] = set()
+    kitchen_legs: list[Polygon] = []
     for layer in FURNITURE_LAYERS:
         for entity in layers.get(layer, []):
             outline = entity.get("_counter_outline") or (entity.get("points") if entity.get("_run_legs") and entity.get("closed") else None)
             if outline and len(outline) >= 3:
-                # A kitchen run (drawn as open front / end lines): base cabinets and worktop, once per run.
-                key = tuple((round(float(x), 3), round(float(y), 3)) for x, y in outline)
-                if key in seen_runs:
+                # A U/L run is represented by its measured rectangular legs, not its
+                # enclosing outline.  The latter would incorrectly turn the free
+                # centre of the kitchen into a solid slab.
+                leg_outlines = entity.get("_run_legs") or [outline]
+                emitted = False
+                for leg_outline in leg_outlines:
+                    if not leg_outline or len(leg_outline) < 3:
+                        continue
+                    key = tuple((round(float(x), 3), round(float(y), 3)) for x, y in leg_outline)
+                    if key in seen_runs:
+                        continue
+                    seen_runs.add(key)
+                    run = Polygon(leg_outline)
+                    run = run if run.is_valid else run.buffer(0)
+                    if run.is_empty or run.geom_type != "Polygon":
+                        continue
+                    emitted = True
+                    kitchen_legs.append(run)
+                    ring = _points(list(run.exterior.coords)[:-1])
+                    base, top = float(kitchen_cfg["kitchen_base_height_m"]), float(kitchen_cfg["kitchen_worktop_top_m"])
+                    result.append(PlanFurniture(
+                        id=f"F{len(result) + 1:03d}", instance_id=None, label="Unterschrank", semantic_label="kitchen cabinet", catalogue_kind="kitchen_base",
+                        layer=layer, footprint=ring, default_height_m=base,
+                    ))
+                    result.append(PlanFurniture(
+                        id=f"F{len(result) + 1:03d}", instance_id=None, label="Arbeitsplatte", semantic_label="worktop", catalogue_kind="worktop",
+                        layer=layer, footprint=ring, default_z_m=[base, top],
+                    ))
+                if emitted:
                     continue
-                seen_runs.add(key)
-                run = Polygon(outline)
-                run = run if run.is_valid else run.buffer(0)
-                if run.is_empty or run.geom_type != "Polygon":
-                    continue
-                ring = _points(list(run.exterior.coords)[:-1])
-                base, top = float(kitchen_cfg["kitchen_base_height_m"]), float(kitchen_cfg["kitchen_worktop_top_m"])
-                result.append(PlanFurniture(
-                    id=f"F{len(result) + 1:03d}", instance_id=None, label="Unterschrank", semantic_label="kitchen cabinet", catalogue_kind="kitchen_base",
-                    layer=layer, footprint=ring, default_height_m=base,
-                ))
-                result.append(PlanFurniture(
-                    id=f"F{len(result) + 1:03d}", instance_id=None, label="Arbeitsplatte", semantic_label="worktop", catalogue_kind="worktop",
-                    layer=layer, footprint=ring, default_z_m=[base, top],
-                ))
-                continue
             kind_name: str | None = None
             einb_kind: str | None = None
             instance_id: int | None = None
@@ -550,6 +575,11 @@ def _furniture(
                 # On the worktop: the sink basin sits flush in it, the hob lies on it.
                 top = float(kitchen_cfg["kitchen_worktop_top_m"])
                 default_z = [float(kitchen_cfg["kitchen_sink_bottom_m"]), top] if kind_name == "KITCHEN_SINK" else [top, top + float(kitchen_cfg["kitchen_hob_height_m"])]
+            measured_band = entity.get("_z_range_m")
+            if measured_band and layer == "A-OBEN" and z_source == "default":
+                # An upper cabinet hangs at the robust (p5..p95) band of its own points, not at a loose instance bounding box.
+                z_min, z_max = floor_z + float(measured_band[0]) * upm, floor_z + float(measured_band[1]) * upm
+                z_source, default_z = "points", None
             if z_source == "default" and instances and layer in ("A-OBEN", "A-EINB") and kind_name in ("upper_cabinet", "tall_unit", "builtin_front"):
                 hanging = kind_name == "upper_cabinet"
                 match = _measured_instance(
@@ -562,13 +592,356 @@ def _furniture(
                     if not hanging:
                         z_min = min(z_min, floor_z)
                     default_z = None
+            # Bounding boxes often omit the lower, occluded portion of a
+            # standing object.  Persist its physically plausible floor origin
+            # in the plan model; only explicitly wall-mounted kinds may float.
+            mounted = layer == "A-OBEN" or any(str(value or "").strip().lower() in _WALL_MOUNTED_KINDS for value in (kind_name, semantic, label))
+            if z_source == "instance_bbox" and z_min is not None and not mounted:
+                z_min = min(float(z_min), floor_z)
             result.append(PlanFurniture(
                 id=f"F{len(result) + 1:03d}", instance_id=instance_id, label=label, semantic_label=semantic,
                 catalogue_kind=kind_name, layer=layer, footprint=ring, z_min=z_min, z_max=z_max, z_source=z_source,
                 confidence=confidence, default_height_m=None if default_z else (default_height_override if default_height_override is not None else _default_height(config, kind_name, semantic, einb_kind)),
                 default_z_m=default_z,
+                parts=_parts_matching_footprint(entity.get("_solid_parts"), footprint, units_per_metre=upm),
+                facing_deg=None if entity.get("_facing_deg") is None else float(entity["_facing_deg"]),
             ))
+    # A tall kitchen appliance may be visible only as an instance front, while
+    # the 2D kitchen run has no matching catalogue block.  Add it only when
+    # measured tall evidence is immediately next to a measured kitchen leg and
+    # no regular furniture object already owns that instance.
+    if kitchen_legs:
+        kitchen_area = unary_union(kitchen_legs).buffer(0.35 * upm)
+        represented = {item.instance_id for item in result if item.instance_id is not None}
+        for item in sorted(instances, key=lambda value: int(value["id"])):
+            # An instance bounding box is a loose world AABB (a diamond in the plan): with instance points the hull is the tight,
+            # wall-aligned footprint.  A "chest of drawers" as high as a kitchen column next to a kitchen run is an oven tower.
+            candidate_label = item["label"] in _TALL_LABELS or item["label"] in _TALL_COLUMN_LABELS
+            tight = footprints.footprint(item["id"]) if footprints is not None and candidate_label else None
+            if item["id"] in represented or not (item["label"] in _TALL_LABELS or (tight is not None and item["label"] in _TALL_COLUMN_LABELS)):
+                continue
+            bottom = (float(item["z_min"]) - floor_z) / upm
+            top = (float(item["z_max"]) - floor_z) / upm
+            hull = tight if tight is not None else item["hull"]
+            if bottom > 0.80 or top < float(kitchen_cfg.get("kitchen_tall_min_top_m", 1.80)) or hull.distance(kitchen_area) > 1e-9:
+                continue
+            # A tall unit is one narrow cabinet column: a merged instance (hood + oven + counter) is wider than that.
+            rectangle = hull.minimum_rotated_rectangle
+            if rectangle.geom_type == "Polygon":
+                corners = list(rectangle.exterior.coords)
+                narrow = min(math.dist(corners[0], corners[1]), math.dist(corners[1], corners[2])) / upm
+                if narrow > float(kitchen_cfg.get("kitchen_tall_max_width_m", 1.0)):
+                    continue
+            result.append(PlanFurniture(
+                id=f"F{len(result) + 1:03d}", instance_id=int(item["id"]), label="Tall unit", semantic_label="kitchen cabinet",
+                catalogue_kind="tall_unit", layer="A-EINB", footprint=_points(list(hull.exterior.coords)[:-1]),
+                z_min=min(float(item["z_min"]), floor_z), z_max=float(item["z_max"]), z_source="instance_bbox", confidence=item["confidence"],
+            ))
+    if footprints is not None:
+        _complete_thin_slabs(result, footprints, upm, floor_z, depth_report)
+    if kitchen_legs:
+        _square_kitchen_inserts(result, kitchen_legs, upm, depth_report)
+        if row_points is not None and len(row_points):
+            result = _apply_tall_rows(result, kitchen_legs, row_points, wall_union, wall_lines or [], footprints, upm, floor_z, _row_settings(config, row_settings), depth_report)
+    if depth is not None:
+        result = _apply_depth_rules(result, depth, upm, floor_z, depth_report)
     return result
+
+
+def _assign_back_walls(items: list[PlanFurniture], walls: list[PlanWall], upm: float) -> None:
+    """``back_wall_id`` of every item with a facing: the wall face nearest to the midpoint of the footprint side opposite its front."""
+    faces = [(wall.id, LineString(np.asarray(face, dtype=float))) for wall in walls for face in (wall.face_a, wall.face_b) if face and len(face) >= 2]
+    if not faces:
+        return
+    for item in items:
+        if item.facing_deg is None:
+            continue
+        polygon = _footprint_polygon(item)
+        if polygon is None:
+            continue
+        front = np.asarray((math.cos(math.radians(item.facing_deg)), math.sin(math.radians(item.facing_deg))))
+        coords = np.asarray(polygon.exterior.coords[:-1], dtype=float)
+        extent = coords @ front
+        back = Point(*(coords[np.argsort(extent)[:2]].mean(axis=0)))
+        item.back_wall_id = min(faces, key=lambda entry: entry[1].distance(back))[0]
+
+
+def _row_settings(config: dict[str, Any], settings: Any) -> Any:
+    """Tall-row settings: the explicit object, else ``kitchen_rows:`` of bim_export.yaml, else the defaults."""
+    from samcloud.bim.kitchen_rows import KitchenRowSettings
+
+    if settings is not None:
+        return settings
+    section = config.get("kitchen_rows") or {}
+    return KitchenRowSettings(**{key: value for key, value in section.items() if key in KitchenRowSettings.__dataclass_fields__})
+
+
+_FRIDGE_NAMES = frozenset({"refrigerator", "fridge", "k\u00fchlschrank", "kuehlschrank"})
+
+
+def _is_fridge(item: PlanFurniture) -> bool:
+    return any(str(value or "").strip().lower() in _FRIDGE_NAMES for value in (item.label, item.semantic_label, item.catalogue_kind))
+
+
+def _leg_angle(leg: Polygon) -> float:
+    rectangle = leg.minimum_rotated_rectangle
+    if rectangle.geom_type != "Polygon":
+        return 0.0
+    corners = list(rectangle.exterior.coords)
+    first, second = np.asarray(corners[1]) - np.asarray(corners[0]), np.asarray(corners[2]) - np.asarray(corners[1])
+    edge = first if np.hypot(*first) >= np.hypot(*second) else second
+    return float(math.atan2(edge[1], edge[0]))
+
+
+def _square_kitchen_inserts(items: list[PlanFurniture], legs: list[Polygon], upm: float, report: dict[str, Any] | None) -> None:
+    """A sink / hob lies inside its kitchen run and is square to it: a diagonal or protruding insert is clipped to the leg it stands on."""
+    from shapely import affinity
+    from shapely.geometry import box as _box
+
+    union = unary_union(legs).buffer(0.01 * upm)
+    for item in items:
+        if item.catalogue_kind not in ("KITCHEN_SINK", "COOKTOP") or item.layer == "A-OBEN":
+            continue
+        polygon = _footprint_polygon(item)
+        if polygon is None:
+            continue
+        best = max(legs, key=lambda leg: polygon.intersection(leg).area)
+        angle = _leg_angle(best)
+        local = affinity.rotate(polygon, -angle, origin=(0.0, 0.0), use_radians=True)
+        x0, y0, x1, y1 = local.bounds
+        straight = abs(local.area - (x1 - x0) * (y1 - y0)) <= 0.01 * max(local.area, 1e-12)
+        if straight and union.covers(polygon):
+            continue
+        clipped = polygon.intersection(best)
+        if clipped.is_empty or clipped.area < 0.35 * polygon.area:
+            if report is not None:
+                report.setdefault("kitchen_inserts_unsquared", []).append({"id": item.id, "label": item.label})
+            continue
+        cx0, cy0, cx1, cy1 = affinity.rotate(clipped, -angle, origin=(0.0, 0.0), use_radians=True).bounds
+        squared = affinity.rotate(_box(cx0, cy0, cx1, cy1), angle, origin=(0.0, 0.0), use_radians=True).intersection(best)
+        if squared.is_empty or squared.geom_type != "Polygon":
+            continue
+        item.footprint = _points(list(squared.exterior.coords)[:-1])
+        if report is not None:
+            report.setdefault("kitchen_inserts_squared", []).append({"id": item.id, "label": item.label})
+
+
+def _apply_tall_rows(
+    items: list[PlanFurniture], legs: list[Polygon], points: np.ndarray, wall_union: Any, wall_lines: list[LineString], footprints: Any,
+    upm: float, floor_z: float, settings: Any, report: dict[str, Any] | None,
+) -> list[PlanFurniture]:
+    """Tall kitchen rows measured from the points: fridge / oven tower / tall cabinet from the front face back to the wall.
+
+    An existing fridge keeps its own item and height but takes the row's depth and its along-range; every other item that stands in
+    the row (its footprint or its instance points mostly inside) is replaced by the row's units.
+    """
+    from shapely import contains_xy
+
+    from samcloud.bim.kitchen_rows import detect_tall_rows, dominant_angle, split_row
+
+    if not settings.enabled:
+        return items
+    area = unary_union(legs)
+    angle = dominant_angle(wall_lines, (area.centroid.x, area.centroid.y)) if wall_lines else 0.0
+    rows = detect_tall_rows(points, wall_union, area, upm, angle, settings, area)
+    if not rows:
+        return items
+    hob_legs: list[Polygon] = []
+    for item in items:
+        polygon = _footprint_polygon(item) if item.catalogue_kind == "COOKTOP" else None
+        if polygon is not None:
+            hob_legs.extend(leg for leg in legs if leg.distance(polygon) <= 0.05 * upm)
+    hob_area = unary_union(hob_legs) if hob_legs else None
+    protected = {"kitchen_base", "worktop", "KITCHEN_SINK", "COOKTOP", "upper_cabinet"}
+    next_number = max([int(item.id[1:]) for item in items if item.id[1:].isdigit()] or [0]) + 1
+    oven_assigned = False
+    produced: list[dict[str, Any]] = []
+    for row in rows:
+        grown = row.polygon.buffer(0.10 * upm)
+        owned: list[PlanFurniture] = []
+        fixed: list[PlanFurniture] = []
+        for item in items:
+            if item.layer == "A-OBEN" or item.catalogue_kind in protected:
+                continue
+            polygon = _footprint_polygon(item)
+            inside = 0.0 if polygon is None else polygon.intersection(grown).area / max(polygon.area, 1e-12)
+            if inside < 0.5 and footprints is not None and footprints.has(item.instance_id):
+                member = footprints.points[int(item.instance_id)]
+                inside = float(contains_xy(grown, member[:, 0], member[:, 1]).mean())
+            if inside >= 0.5:
+                (fixed if _is_fridge(item) else owned).append(item)
+        for item in owned:
+            items.remove(item)
+        usable = [(item, _footprint_polygon(item)) for item in fixed]
+        usable = [(item, polygon) for item, polygon in usable if polygon is not None]
+        units = split_row(row.polygon, [polygon for _, polygon in usable], upm, settings.min_unit_m)
+        top = floor_z + row.top_m * upm
+        unit_ids: list[str] = []
+        for polygon, index in units:
+            ring = _points(list(polygon.exterior.coords)[:-1])
+            if index is not None:
+                usable[index][0].footprint = ring
+                unit_ids.append(usable[index][0].id)
+                continue
+            oven = False
+            if hob_area is not None and not oven_assigned and polygon.distance(hob_area) <= 0.15 * upm:
+                oven = oven_assigned = True
+            item = PlanFurniture(
+                id=f"F{next_number:03d}", instance_id=None, label="Backofen" if oven else "Hochschrank", semantic_label="oven tower" if oven else "tall unit",
+                catalogue_kind="oven_tower" if oven else "tall_unit", layer="A-EINB", footprint=ring, z_min=floor_z, z_max=top, z_source="points",
+                floor_contact=True,
+            )
+            next_number += 1
+            items.append(item)
+            unit_ids.append(item.id)
+        produced.append({
+            "units": unit_ids, "bbox_m": [round(float(v) / upm, 3) for v in row.polygon.bounds], "top_m": round(row.top_m, 3), "front": row.front,
+            "replaced": [{"id": item.id, "label": item.label, "instance_id": item.instance_id} for item in owned],
+        })
+    new_ids = {unit for entry in produced for unit in entry["units"]}
+    row_union = unary_union([row.polygon for row in rows])
+    trimmed: list[str] = []
+    for item in list(items):
+        if item.id in new_ids or item.layer == "A-OBEN" or item.catalogue_kind != "tall_unit":
+            continue
+        polygon = _footprint_polygon(item)
+        if polygon is None or polygon.intersection(row_union).area <= 0.02 * polygon.area:
+            continue
+        rectangle: Polygon | None = polygon
+        for row in sorted(rows, key=lambda candidate: -polygon.intersection(candidate.polygon).area):
+            if rectangle is not None and rectangle.intersection(row.polygon).area > 0.02 * rectangle.area:
+                rectangle = _largest_free_rectangle(rectangle, row.polygon, settings.min_unit_m * upm)
+        if rectangle is None:
+            items.remove(item)
+        else:
+            item.footprint = _points(list(rectangle.exterior.coords)[:-1])
+        trimmed.append(item.id)
+    if report is not None:
+        report["kitchen_rows"] = produced
+        if trimmed:
+            report["kitchen_rows_trimmed_neighbours"] = trimmed
+    return items
+
+
+def _largest_free_rectangle(polygon: Polygon, blocked: Any, minimum: float) -> Polygon | None:
+    """The biggest rectangle (in the frame of ``polygon``'s minimum rectangle) of ``polygon`` that keeps clear of ``blocked``; None when it is too small."""
+    from shapely import affinity
+    from shapely.geometry import box as _box
+
+    angle = _leg_angle(polygon)
+    local = affinity.rotate(polygon, -angle, origin=(0.0, 0.0), use_radians=True)
+    x0, y0, x1, y1 = local.bounds
+    cut = affinity.rotate(polygon.intersection(blocked), -angle, origin=(0.0, 0.0), use_radians=True)
+    if cut.is_empty:
+        return polygon
+    cx0, cy0, cx1, cy1 = cut.bounds
+    candidates = [(x0, y0, cx0, y1), (cx1, y0, x1, y1), (x0, y0, x1, cy0), (x0, cy1, x1, y1)]
+    best: tuple[float, Polygon] | None = None
+    for a, b, c, d in candidates:
+        if c - a < minimum or d - b < minimum:
+            continue
+        rectangle = affinity.rotate(_box(a, b, c, d), angle, origin=(0.0, 0.0), use_radians=True).intersection(polygon)
+        if isinstance(rectangle, Polygon) and not rectangle.is_empty and (best is None or rectangle.area > best[0]):
+            best = (rectangle.area, rectangle)
+    return None if best is None else best[1]
+
+
+def _drop_unmounted_uppers(items: list[PlanFurniture], walls: list[PlanWall], upm: float, maximum_m: float, report: dict[str, Any] | None) -> list[PlanFurniture]:
+    """Upper cabinets hang on a wall: drop one with no wall face / centreline within ``maximum_m`` of its footprint in the FINAL plan."""
+    lines = [LineString(np.asarray(points, dtype=float)) for wall in walls for points in (wall.face_a, wall.face_b, wall.centreline) if points and len(points) >= 2]
+    if not lines:
+        return items
+    kept: list[PlanFurniture] = []
+    for item in items:
+        polygon = _footprint_polygon(item) if item.layer == "A-OBEN" else None
+        if polygon is not None and min(line.distance(polygon) for line in lines) > maximum_m * upm:
+            if report is not None:
+                report.setdefault("uppers_dropped_no_wall", []).append({"id": item.id, "label": item.label})
+            continue
+        kept.append(item)
+    return kept
+
+
+def _footprint_polygon(item: PlanFurniture) -> Polygon | None:
+    try:
+        polygon = Polygon(item.footprint)
+        polygon = polygon if polygon.is_valid else polygon.buffer(0)
+    except (ValueError, TypeError):
+        return None
+    return polygon if isinstance(polygon, Polygon) and not polygon.is_empty else None
+
+
+def _complete_thin_slabs(items: list[PlanFurniture], footprints: Any, upm: float, floor_z: float, report: dict[str, Any] | None) -> None:
+    """A tall standing slab (a fridge seen only from the front) takes the measured, wall-completed depth of its instance points."""
+    from samcloud.bim.furniture_footprint import narrow_side_m
+
+    settings = footprints.settings
+    for item in items:
+        if item.instance_id is None or item.layer == "A-OBEN" or item.parts or not footprints.has(item.instance_id):
+            continue
+        polygon = _footprint_polygon(item)
+        if polygon is None or narrow_side_m(polygon, upm) >= settings.thin_depth_m:
+            continue
+        top = (float(item.z_max) - floor_z) / upm if item.z_max is not None else float(item.default_height_m or 0.0)
+        if top < 1.0:
+            continue
+        tight = footprints.footprint(item.instance_id)
+        if tight is None or narrow_side_m(tight, upm) < 0.40 or polygon.intersection(tight).area < 0.5 * polygon.area:
+            continue
+        item.footprint = _points(list(tight.exterior.coords)[:-1])
+        if report is not None:
+            report.setdefault("thin_slabs_completed", []).append({"id": item.id, "label": item.label, "depth_m": round(narrow_side_m(tight, upm), 3)})
+
+
+def _apply_depth_rules(items: list[PlanFurniture], depth: Any, upm: float, floor_z: float, report: dict[str, Any] | None) -> list[PlanFurniture]:
+    """Depth evidence on furniture: seen-empty space rejects boxes, floor-level voxels confirm floor contact."""
+    contact_z = float(depth.settings["plan_floor_contact_z_m"]) * upm
+    kept: list[PlanFurniture] = []
+    furniture_points, _ = depth.furniture_points(colmap_only=False)
+    low = furniture_points[furniture_points[:, 2] <= contact_z]
+    for item in items:
+        polygon = _footprint_polygon(item)
+        if polygon is None:
+            kept.append(item)
+            continue
+        z0 = (float(item.z_min) - floor_z) if item.z_min is not None else (float(item.default_z_m[0]) * upm if item.default_z_m else 0.0)
+        z1 = (float(item.z_max) - floor_z) if item.z_max is not None else (float(item.default_z_m[1]) * upm if item.default_z_m else float(item.default_height_m or 0.0) * upm)
+        if item.layer != "A-OBEN":
+            z0 = max(z0, 0.05 * upm)
+        share = depth.free_share(polygon, z0 + 0.03 * upm, z1 - 0.03 * upm) if z1 - z0 > 0.10 * upm else 0.0
+        if report is not None:
+            report.setdefault("free_share", {})[item.id] = round(share, 3)
+        if share >= float(depth.settings["plan_empty_share"]):
+            if report is not None:
+                report.setdefault("rejected_in_free_space", []).append({"id": item.id, "label": item.label, "free_share": round(share, 3)})
+            continue
+        if len(low) and item.layer != "A-OBEN":
+            item.floor_contact = bool(int(depth.points_inside(polygon.buffer(0.03 * upm), low).sum()) >= 8)
+        kept.append(item)
+    return kept
+
+
+def _parts_matching_footprint(parts: Any, footprint: Polygon, minimum_iou: float = 0.70, units_per_metre: float = 1.0) -> list[dict[str, Any]]:
+    """Keep measured solid parts only when together they cover (about) the exported footprint.
+
+    A catalogue insert can be placed slightly differently from the fitted outline the parts were measured in;
+    mismatching parts would then draw a different body than the DXF footprint, so one plain box is kept instead.
+    """
+    items = [dict(part) for part in (parts or []) if isinstance(part, dict) and len(part.get("footprint") or []) >= 3]
+    if not items:
+        return []
+    try:
+        union = unary_union([Polygon(part["footprint"]).buffer(0) for part in items]).buffer(0)
+        overlap = union.intersection(footprint).area / max(union.union(footprint).area, 1e-12)
+    except Exception:  # noqa: BLE001 - unusable measured geometry falls back to a single box
+        return []
+    if overlap < minimum_iou:
+        return []
+    # The parts become exact tiles of the exported footprint: unseen cells and cells under objects lying on the item are interpolated
+    # from the nearest measured level, so the solids have no holes and no gaps.
+    from samcloud.bim.furniture_parts import tile_parts_to_footprint
+
+    return tile_parts_to_footprint(items, footprint, units_per_metre)
 
 
 def build_plan_model(
@@ -586,6 +959,11 @@ def build_plan_model(
     instances_path: Path | str | None = None,
     config: dict[str, Any] | None = None,
     source_extra: dict[str, Any] | None = None,
+    instance_points: dict[int, np.ndarray] | None = None,
+    tight_settings: Any = None,
+    depth: Any = None,
+    class_points: np.ndarray | None = None,
+    row_settings: Any = None,
 ) -> BuildingPlan:
     """Assemble the BuildingPlan from the objects that also produce the DXF entities.
 
@@ -608,15 +986,31 @@ def build_plan_model(
         )
         for index, (polygon, name) in enumerate(rooms, start=1)
     ]
+    footprints = None
+    wall_lines = [LineString(np.asarray(face, dtype=float)) for wall in walls for face in (wall.face_a, wall.face_b) if face and len(face) >= 2]
+    wall_union = unary_union([Polygon(body.exterior) for body in bodies]) if bodies else (unary_union(wall_lines).buffer(0.01 * upm) if wall_lines else None)
+    if instance_points:
+        from samcloud.bim.furniture_footprint import InstanceFootprints, TightFootprintSettings
+
+        footprints = InstanceFootprints(instance_points, wall_lines, wall_union, upm, tight_settings or TightFootprintSettings())
+    depth_report: dict[str, Any] = {}
+    furniture = _furniture(
+        layers, load_instance_z_ranges(instances_path, frame), cfg, load_instance_hulls(instances_path, frame), float(level.floor_z), upm,
+        footprints=footprints, depth=depth, depth_report=depth_report,
+        row_points=class_points, wall_union=wall_union, wall_lines=wall_lines, row_settings=row_settings,
+    )
+    _assign_back_walls(furniture, walls, upm)
+    furniture = _drop_unmounted_uppers(furniture, walls, upm, float(cfg["defaults"].get("upper_cabinet_wall_max_m", 0.30)), depth_report)
+    extra = {**(source_extra or {})}
+    if depth_report:
+        extra["depth_furniture"] = depth_report
     return BuildingPlan(
         project_name=project_name, level_id=str(level.id), level_name=str(level.name), units_per_metre=upm,
         frame={"origin": [float(v) for v in frame.origin], "scale_factor": float(frame.scale_factor), "rotation": np.asarray(frame.rotation, dtype=float).tolist()},
         floor_z=float(level.floor_z), ceiling_z=None if level.ceiling_z is None else float(level.ceiling_z),
         walls=walls, rooms=plan_rooms, openings=_openings(openings, walls, upm, cfg),
-        furniture=_furniture(
-            layers, load_instance_z_ranges(instances_path, frame), cfg, load_instance_hulls(instances_path, frame), float(level.floor_z), upm,
-        ),
-        wall_bodies=[_polygon_dict(body) for body in bodies], source={"result_fingerprint": result_fingerprint, **(source_extra or {})},
+        furniture=furniture,
+        wall_bodies=[_polygon_dict(body) for body in bodies], source={"result_fingerprint": result_fingerprint, **extra},
     )
 
 

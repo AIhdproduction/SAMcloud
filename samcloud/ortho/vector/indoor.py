@@ -37,6 +37,8 @@ class Opening:
     hinge_side: str | None = None
     swing_side: int | None = None
     leaf_detected: bool | None = None
+    leaf_hinge: tuple[float, float] | None = None  # measured open leaf (plan units): hinge point and free end, only from the 3D refinement
+    leaf_free: tuple[float, float] | None = None
     # Measured by the 3D refinement (samcloud.bim.openings3d); None / empty for 2D-only openings.
     sill_m: float | None = None
     head_m: float | None = None

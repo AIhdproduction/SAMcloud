@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 from shapely.geometry import LineString
 
+from samcloud.bim.invariants import door_backing
 from samcloud.bim.plan_model import load_refine_plan
 from samcloud.ortho.vector.indoor import Opening
 
@@ -123,20 +124,25 @@ def to_plan_opening(refined: RefinedOpening, units_per_metre: float, center: tup
     kind = {"door": "DOOR", "window": "WINDOW"}.get(refined.kind, "passage")
     return Opening(
         kind=kind, center=center, width=float(refined.width_m) * units_per_metre, axis_angle=axis_angle,
-        wall_thickness=float(refined.wall_thickness_m) * units_per_metre, evidence=f"3d:{refined.height_source}; {refined.evidence}"[:200],
+        wall_thickness=float(refined.wall_thickness_m) * units_per_metre, evidence=f"3d:{refined.height_source}; backing={door_backing(refined) or 'none'}; {refined.evidence}"[:200],
         class_evidence=float(refined.confidence), sill_m=float(refined.sill_m), head_m=float(refined.head_m), height_source=refined.height_source,
         mullion_u=tuple(float(value) for value in refined.mullion_u), glazed=bool(refined.glazed), confidence=float(refined.confidence),
-        **_leaf_fields(refined),
+        **_leaf_fields(refined, units_per_metre),
     )
 
 
-def _leaf_fields(refined: RefinedOpening) -> dict[str, Any]:
+def _leaf_fields(refined: RefinedOpening, units_per_metre: float = 1.0) -> dict[str, Any]:
     """Measured open leaf of a door (hinge / swing / angle); windows, passages and doors without a leaf carry none."""
     if refined.kind != "door" or not refined.leaf_detected:
         return {}  # no leaf measured: leaf_detected stays None, the 2D leaf detection of the clean plan still runs for this door
-    return {
+    fields: dict[str, Any] = {
         "hinge_side": refined.hinge_side, "swing_side": refined.swing_side, "leaf_angle_deg": refined.leaf_angle_deg, "leaf_detected": True, "leaf_mode": "open",
     }
+    leaf = refined.leaf or {}
+    if leaf.get("hinge") and leaf.get("free"):  # the measured leaf segment (plan units): the wall stage must never build a wall there
+        fields["leaf_hinge"] = (float(leaf["hinge"][0]) * units_per_metre, float(leaf["hinge"][1]) * units_per_metre)
+        fields["leaf_free"] = (float(leaf["free"][0]) * units_per_metre, float(leaf["free"][1]) * units_per_metre)
+    return fields
 
 
 def apply_refined_openings(

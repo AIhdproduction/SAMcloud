@@ -66,7 +66,7 @@ from samcloud.bim.core.model.elements import (
 )
 from samcloud.bim.core.model.scene import Building, Site, Storey
 from samcloud.bim.furniture import FurnitureMapping, load_furniture_mapping
-from samcloud.bim.plan_model import BuildingPlan, PlanOpening, PlanWall
+from samcloud.bim.plan_model import BuildingPlan, PlanFurniture, PlanOpening, PlanWall
 
 NAMESPACE = uuid.UUID("3f6c1c0e-8d0a-5b0e-9c55-53414d636c64")
 """Fixed namespace of the deterministic scene element ids."""
@@ -912,7 +912,9 @@ def build_scene(
             sill = max(0.0, float(opening.sill_m))
         else:
             sill = 0.0
-        top = min(float(opening.head_m), wall_height)
+        # A passage is open up to the ceiling (measured: no point up to the ceiling): no lintel is built above it.  A door keeps its measured
+        # (or default) head; the lintel above it exists where the points showed a head strip / wall above the opening.
+        top = wall_height if opening.kind == "passage" else min(float(opening.head_m), wall_height)
         op_height = top - sill
         if op_height < 0.1:
             report.warnings.append(f"opening {opening.id}: head {opening.head_m} m below sill, skipped")
@@ -1169,16 +1171,22 @@ def _add_furniture(
             layer=item.layer,
         )
         # heights relative to the storey (m)
-        if item.z_source == "instance_bbox" and item.z_min is not None and item.z_max is not None:
+        if item.z_source in ("instance_bbox", "points") and item.z_min is not None and item.z_max is not None:
             z0 = float(item.z_min) / upm - elevation
             z1 = float(item.z_max) / upm - elevation
-            if -0.05 <= z0 < 0.0:
-                z0 = 0.0
         elif item.default_z_m:
             z0, z1 = float(item.default_z_m[0]), float(item.default_z_m[1])
         else:
             z0 = 0.0
             z1 = float(item.default_height_m or mapping.fallback_height_m)
+        # Depth evidence of furniture voxels at floor level inside the footprint says the object stands on the floor (a shelf unit beside a wall).
+        hanging = _is_wall_mounted_furniture(item) and _furniture_near_wall(polygon, plan, upm) and item.floor_contact is not True
+        elevated_component = (item.catalogue_kind or "").lower() in {"worktop", "kitchen_sink", "cooktop"}
+        # Scan bboxes often start at the visible tabletop, mattress or fridge
+        # front.  Everything that can stand therefore starts on the floor; only
+        # verified wall-mounted objects retain a measured suspended height.
+        if not hanging and not elevated_component:
+            z0 = 0.0
         z1 = min(z1, height)
         if z1 - z0 < 0.02:
             report.warnings.append(f"furniture {item.id} {item.label!r}: height {z1 - z0:.3f} m, skipped")
@@ -1195,6 +1203,7 @@ def _add_furniture(
                 space_id = nearest[0]
         label = (item.label or klass.key).strip()
         counters[label] = counters.get(label, 0) + 1
+        solid_parts = _furniture_parts(item, upm, elevation, polygon, z0, z1, hanging or elevated_component, float(fcfg["min_area_m2"]), float(fcfg["simplify_m"]))
         scene.add(
             FurnitureElement(
                 id=_uid(plan, "furniture", item.id),
@@ -1209,6 +1218,8 @@ def _add_furniture(
                     footprint=[[float(x), float(y)] for x, y in _ring(polygon)],
                     z_bottom=elevation + z0,
                     z_top=elevation + z1,
+                    parts=solid_parts,
+                    mounting="hanging" if hanging else "grounded",
                     object_type=object_type,
                     colour=list(klass.colour),
                     label=item.label,
@@ -1219,10 +1230,63 @@ def _add_furniture(
                     layer=item.layer,
                     catalogue_kind=item.catalogue_kind,
                     class_key=klass.key,
+                    facing_deg=item.facing_deg,
+                    back_wall_id=item.back_wall_id,
                 ),
             )
         )
         report.furniture_out += 1
+
+
+_WALL_MOUNTED_FURNITURE = frozenset({
+    "upper_cabinet", "wall cabinet", "washbasin", "lavabo", "wall shelf", "shelf", "hood", "wall tv", "tv", "television", "mirror cabinet",
+})
+
+
+def _is_wall_mounted_furniture(item: PlanFurniture) -> bool:
+    """Whether the semantic kind is allowed to retain a suspended z origin."""
+    names = (item.catalogue_kind or "", item.semantic_label or "", item.label or "")
+    return item.layer == "A-OBEN" or any(str(name).strip().lower() in _WALL_MOUNTED_FURNITURE for name in names)
+
+
+def _furniture_near_wall(polygon: Polygon, plan: BuildingPlan, upm: float, maximum_m: float = 0.30) -> bool:
+    """Require a wall face within a small metric distance for hanging furniture."""
+    if not plan.walls:
+        return False
+    limit = maximum_m
+    for wall in plan.walls:
+        for points in (wall.face_a, wall.face_b, wall.centreline):
+            if not points or len(points) < 2:
+                continue
+            line = LineString(np.asarray(points, dtype=float) / upm)
+            if line.length and polygon.distance(line) <= limit:
+                return True
+    return False
+
+
+def _furniture_parts(
+    item: PlanFurniture, upm: float, elevation: float, fallback: Polygon, z0: float, z1: float, hanging: bool,
+    min_area: float, simplify: float,
+) -> list[dict[str, Any]]:
+    """Convert optional local-plan stepped parts to scene metres, with safe fallback."""
+    output: list[dict[str, Any]] = []
+    for raw in item.parts:
+        if not isinstance(raw, dict):
+            continue
+        polygon = _furniture_polygon(raw.get("footprint") or [], upm, simplify)
+        if polygon is None or polygon.area < min_area:
+            continue
+        low = float(raw.get("z_min", item.z_min if item.z_min is not None else elevation * upm)) / upm - elevation
+        high = float(raw.get("z_max", item.z_max if item.z_max is not None else z1 * upm)) / upm - elevation
+        if not hanging:
+            low = 0.0
+        high = min(high, z1)
+        if high - low < 0.02:
+            continue
+        output.append({"footprint": [[float(x), float(y)] for x, y in _ring(polygon)], "z_bottom": elevation + low, "z_top": elevation + high})
+    if output:
+        return output
+    return [{"footprint": [[float(x), float(y)] for x, y in _ring(fallback)], "z_bottom": elevation + z0, "z_top": elevation + z1}]
 
 
 def _mullion_positions(opening: PlanOpening, wall: "_Wall", width: float) -> list[float]:

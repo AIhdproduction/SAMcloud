@@ -1,0 +1,350 @@
+"""Tall kitchen rows (fridge, oven tower, tall cabinets) from measured furniture-class points.
+
+A tall row is seen from the room: its front face (and sometimes the top) is scanned, the rest of the body - back to the wall - is
+hidden.  The detector works on the cloud points of the furniture classes (+ COLMAP depth points) around the kitchen:
+
+1. a plan cell (``cell_m``) is *tall* when it holds points above ``tall_min_m`` AND points in the mid band (``mid_low_m`` ..
+   ``mid_high_m``): a hanging upper cabinet leaves that band free, a tall unit does not;
+2. connected tall cells near the kitchen run are decomposed into straight front-face segments along the wall axes (an L-shaped
+   cluster = two rows), longest first, an overlapping duplicate (the end face of a row) is dropped;
+3. each segment is completed from its front face to the wall behind it (within ``wall_reach_m``, never deeper than ``max_depth_m``)
+   and along the row to the next wall / kitchen leg (within ``along_reach_m``);
+4. the row top is the robust measured top of its points.
+
+``split_row`` cuts a row into units around fixed items (a fridge) that already own part of it.  All coordinates are plan-local units;
+``units_per_metre`` converts the metric thresholds.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+from scipy import ndimage
+from shapely import affinity
+from shapely.geometry import LineString, Point, Polygon, box
+from shapely.ops import unary_union
+
+
+@dataclass(frozen=True, slots=True)
+class KitchenRowSettings:
+    """Metric thresholds of the tall-row detection (config ``kitchen_rows`` in bim_export.yaml)."""
+
+    enabled: bool = True
+    cell_m: float = 0.05
+    # a tall cell holds points higher than tall_min_m and points in the mid band (a hanging unit leaves the mid band free)
+    tall_min_m: float = 1.80
+    tall_max_m: float = 2.70
+    mid_low_m: float = 1.00
+    mid_high_m: float = 1.30
+    min_cell_points: int = 3
+    # only clusters this close to a kitchen run are kitchen rows
+    kitchen_reach_m: float = 1.20
+    # a front face is at least this long; runs split by up to gap_cells empty cells stay one run
+    min_run_m: float = 0.30
+    gap_cells: int = 2
+    # the wall behind the front face (the row fills front -> wall) within this distance; never deeper than max_depth_m
+    wall_reach_m: float = 0.90
+    max_depth_m: float = 0.80
+    # a row end snaps to a wall / kitchen leg within this distance along the row
+    along_reach_m: float = 0.40
+    min_length_m: float = 0.30
+    min_area_m2: float = 0.15
+    # a segment overlapping an accepted one by this share of its own area is a face of the same body (end face)
+    duplicate_share: float = 0.30
+    # a row piece shorter than this next to a fixed item (fridge) is absorbed by it
+    min_unit_m: float = 0.30
+    min_top_points: int = 8
+    # a row of fewer cells than this fraction touching the mid band is dropped
+    ceiling_margin_m: float = 0.02
+
+
+@dataclass(slots=True)
+class TallRow:
+    """One detected row: plan polygon, measured top (metres above the floor), along axis angle and front side."""
+
+    polygon: Polygon
+    top_m: float
+    angle: float  # direction of the row (radians) in plan
+    cells: int = 0
+    front: str = ""
+
+
+def dominant_angle(wall_lines: list[LineString], centre: tuple[float, float]) -> float:
+    """Wall direction (radians, folded into 0..pi/2) of the nearest wall segment; 0 without walls."""
+    from samcloud.bim.furniture_footprint import nearest_wall_angle
+
+    angle = nearest_wall_angle(np.asarray(centre, dtype=float), wall_lines)
+    return 0.0 if angle is None else float(angle % (math.pi / 2.0))
+
+
+def _runs(mask: np.ndarray, along_axis: int, min_cells: int, gap: int) -> list[tuple[int, int, int]]:
+    """(line index, first, last) of maximal runs of True along ``along_axis`` (empty gaps up to ``gap`` cells are bridged)."""
+    runs: list[tuple[int, int, int]] = []
+    lines = mask.shape[1 - along_axis]
+    for line in range(lines):
+        values = mask[:, line] if along_axis == 0 else mask[line, :]
+        index = np.flatnonzero(values)
+        if not len(index):
+            continue
+        splits = np.flatnonzero(np.diff(index) > gap + 1)
+        for chunk in np.split(index, splits + 1):
+            if int(chunk[-1] - chunk[0] + 1) >= min_cells:
+                runs.append((line, int(chunk[0]), int(chunk[-1])))
+    return runs
+
+
+def _group_runs(runs: list[tuple[int, int, int]]) -> list[list[tuple[int, int, int]]]:
+    """Runs on neighbouring lines (<= 2 apart) that overlap along the line belong to one face (a face is seen 1-3 cells thick)."""
+    parent = list(range(len(runs)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for first in range(len(runs)):
+        for second in range(first + 1, len(runs)):
+            a, b = runs[first], runs[second]
+            if abs(a[0] - b[0]) <= 2 and min(a[2], b[2]) - max(a[1], b[1]) + 1 >= 0.5 * min(a[2] - a[1] + 1, b[2] - b[1] + 1):
+                parent[find(first)] = find(second)
+    groups: dict[int, list[tuple[int, int, int]]] = {}
+    for index, run in enumerate(runs):
+        groups.setdefault(find(index), []).append(run)
+    return list(groups.values())
+
+
+def _ray(origin: np.ndarray, direction: np.ndarray, length: float, obstacle: Any) -> float | None:
+    """Distance from ``origin`` along ``direction`` to the first contact with ``obstacle`` within ``length``."""
+    if obstacle is None or obstacle.is_empty:
+        return None
+    line = LineString([tuple(origin), tuple(origin + direction * length)])
+    hit = line.intersection(obstacle)
+    if hit.is_empty:
+        return None
+    if Point(*origin).intersects(obstacle):
+        return 0.0
+    return float(Point(*origin).distance(hit))
+
+
+def detect_tall_rows(
+    points: np.ndarray,
+    wall_union: Any,
+    kitchen_area: Polygon,
+    units_per_metre: float,
+    angle: float,
+    settings: KitchenRowSettings = KitchenRowSettings(),
+    obstacles: Any = None,
+) -> list[TallRow]:
+    """Tall rows near ``kitchen_area`` from ``points`` (x, y, z in plan units, z above the floor).
+
+    ``wall_union`` = wall bodies, ``obstacles`` = extra stops along a row (kitchen legs).  ``angle`` = wall axis (radians).
+    """
+    upm = max(float(units_per_metre), 1e-9)
+    pts = np.asarray(points, dtype=float)
+    if not settings.enabled or kitchen_area is None or kitchen_area.is_empty or len(pts) < settings.min_cell_points * 4:
+        return []
+    reach = settings.kitchen_reach_m * upm
+    minx, miny, maxx, maxy = kitchen_area.buffer(reach + 1.0 * upm).bounds
+    near = (pts[:, 0] >= minx) & (pts[:, 0] <= maxx) & (pts[:, 1] >= miny) & (pts[:, 1] <= maxy)
+    pts = pts[near]
+    if len(pts) < settings.min_cell_points * 4:
+        return []
+    cos, sin = math.cos(angle), math.sin(angle)
+    u = pts[:, 0] * cos + pts[:, 1] * sin
+    v = -pts[:, 0] * sin + pts[:, 1] * cos
+    z = pts[:, 2] / upm
+    step = settings.cell_m * upm
+    u0, v0 = float(u.min()) - 2 * step, float(v.min()) - 2 * step
+    nu, nv = int((u.max() - u0) / step) + 3, int((v.max() - v0) / step) + 3
+    iu, iv = ((u - u0) / step).astype(np.int64), ((v - v0) / step).astype(np.int64)
+    tall = np.zeros((nv, nu), dtype=np.int32)
+    mid = np.zeros((nv, nu), dtype=np.int32)
+    is_tall = (z >= settings.tall_min_m) & (z <= settings.tall_max_m)
+    is_mid = (z >= settings.mid_low_m) & (z <= settings.mid_high_m)
+    np.add.at(tall, (iv[is_tall], iu[is_tall]), 1)
+    np.add.at(mid, (iv[is_mid], iu[is_mid]), 1)
+    mask = (tall >= settings.min_cell_points) & (mid >= 2)
+    if not mask.any():
+        return []
+    # the mid band of a front face is seen sparsely: close one-cell holes before looking for faces
+    mask = ndimage.binary_closing(mask, structure=np.ones((3, 3), bool)) | mask
+    labels, count = ndimage.label(mask, structure=np.ones((3, 3), bool))
+    wall_stop = unary_union([wall_union]) if wall_union is not None and not wall_union.is_empty else None
+    stops = unary_union([item for item in (wall_stop, obstacles) if item is not None and not item.is_empty]) if (wall_stop is not None or (obstacles is not None and not obstacles.is_empty)) else None
+    rows: list[TallRow] = []
+    accepted: list[Polygon] = []
+    min_cells = max(2, int(round(settings.min_run_m * upm / step)))
+
+    def to_plan(a: float, b: float) -> tuple[float, float]:
+        return (a * cos - b * sin, a * sin + b * cos)
+
+    segments: list[dict[str, Any]] = []
+    for number in range(1, count + 1):
+        member = labels == number
+        cells = int(member.sum())
+        if cells < 4:
+            continue
+        rr, cc = np.nonzero(member)
+        cluster = box(u0 + cc.min() * step, v0 + rr.min() * step, u0 + (cc.max() + 1) * step, v0 + (rr.max() + 1) * step)
+        cluster_plan = affinity.rotate(cluster, angle, origin=(0.0, 0.0), use_radians=True)
+        if cluster_plan.distance(kitchen_area) > reach:
+            continue
+        for along_axis, name in ((1, "u"), (0, "v")):
+            for group in _group_runs(_runs(member, along_axis, min_cells, settings.gap_cells)):
+                lines = [run[0] for run in group]
+                first, last = min(run[1] for run in group), max(run[2] for run in group)
+                segments.append({
+                    "axis": name, "lines": (min(lines), max(lines) + 1), "along": (first, last + 1), "cells": sum(run[2] - run[1] + 1 for run in group),
+                    "length": (last + 1 - first) * step, "member": number,
+                })
+    segments.sort(key=lambda item: (-item["length"], item["axis"], item["lines"], item["along"]))
+    for segment in segments:
+        axis = segment["axis"]
+        a0, a1 = u0 + segment["along"][0] * step, u0 + segment["along"][1] * step
+        # (axis u: the face runs along u at v = lines) / (axis v: the face runs along v at u = lines)
+        c_low, c_high = (v0 if axis == "u" else u0) + segment["lines"][0] * step, (v0 if axis == "u" else u0) + segment["lines"][1] * step
+        if axis == "v":
+            a0, a1 = v0 + segment["along"][0] * step, v0 + segment["along"][1] * step
+        along_mid = (a0 + a1) / 2.0
+        # which side holds the wall behind the face: sample the rays at 25 / 50 / 75 % of the face
+        best: tuple[float, int] | None = None
+        for sign in (1, -1):
+            edge = c_low if sign == 1 else c_high
+            hits: list[float] = []
+            for share in (0.2, 0.5, 0.8):
+                position = a0 + share * (a1 - a0)
+                origin = np.asarray(to_plan(position, edge) if axis == "u" else to_plan(edge, position), dtype=float)
+                direction = np.asarray(to_plan(0.0, sign) if axis == "u" else to_plan(sign, 0.0), dtype=float)
+                hit = _ray(origin, direction, settings.wall_reach_m * upm, wall_union)
+                if hit is not None:
+                    hits.append(hit)
+            if len(hits) >= 2:
+                distance = float(np.median(hits))
+                if best is None or distance < best[0]:
+                    best = (distance, sign)
+        if best is None:
+            continue
+        distance, sign = best
+        depth = min(distance, settings.max_depth_m * upm)
+        front = c_low if sign == 1 else c_high
+        far = front + sign * depth
+        c0, c1 = (min(front, far), max(front, far))
+        # along the row: snap each end to a wall / kitchen leg within along_reach_m
+        ends = [a0, a1]
+        centre_across = (c0 + c1) / 2.0
+        for index, direction_sign in ((0, -1), (1, 1)):
+            origin = np.asarray(to_plan(ends[index], centre_across) if axis == "u" else to_plan(centre_across, ends[index]), dtype=float)
+            direction = np.asarray(to_plan(direction_sign, 0.0) if axis == "u" else to_plan(0.0, direction_sign), dtype=float)
+            hit = _ray(origin, direction, settings.along_reach_m * upm, stops)
+            if hit is not None:
+                ends[index] = ends[index] + direction_sign * hit
+        a0, a1 = ends
+        if (a1 - a0) < settings.min_length_m * upm:
+            continue
+        rect = box(a0, c0, a1, c1) if axis == "u" else box(c0, a0, c1, a1)
+        polygon = affinity.rotate(rect, angle, origin=(0.0, 0.0), use_radians=True)
+        if stops is not None:
+            polygon = polygon.difference(stops)
+            pieces = [piece for piece in getattr(polygon, "geoms", [polygon]) if isinstance(piece, Polygon)]
+            if not pieces:
+                continue
+            polygon = max(pieces, key=lambda piece: piece.area)
+            # slivers left by a stop that overlaps the row obliquely are opened away; the rest stays a rectangle along the walls
+            opened = polygon.buffer(-0.07 * upm, join_style=2).buffer(0.07 * upm, join_style=2)
+            pieces = [piece for piece in getattr(opened, "geoms", [opened]) if isinstance(piece, Polygon) and not piece.is_empty]
+            if not pieces:
+                continue
+            polygon = max(pieces, key=lambda piece: piece.area)
+        if polygon.area < settings.min_area_m2 * upm * upm:
+            continue
+        if any(polygon.intersection(other).area > settings.duplicate_share * polygon.area for other in accepted):
+            continue
+        accepted.append(polygon)
+        top = _row_top(pts, polygon, upm, settings)
+        if top is None:
+            continue
+        rows.append(TallRow(polygon, top, angle + (0.0 if axis == "u" else math.pi / 2.0), segment["cells"], f"{axis}{'+' if sign == 1 else '-'}"))
+    return rows
+
+
+def _row_top(pts: np.ndarray, polygon: Polygon, upm: float, settings: KitchenRowSettings) -> float | None:
+    grown = polygon.buffer(0.05 * upm)
+    minx, miny, maxx, maxy = grown.bounds
+    near = (pts[:, 0] >= minx) & (pts[:, 0] <= maxx) & (pts[:, 1] >= miny) & (pts[:, 1] <= maxy)
+    candidate = pts[near]
+    if not len(candidate):
+        return None
+    from shapely import contains_xy
+
+    inside = candidate[contains_xy(grown, candidate[:, 0], candidate[:, 1])]
+    z = inside[:, 2] / upm
+    z = z[(z >= settings.tall_min_m) & (z <= settings.tall_max_m)]
+    if len(z) < settings.min_top_points:
+        return None
+    return float(np.percentile(z, 90))
+
+
+def split_row(row: Polygon, fixed: list[Polygon], units_per_metre: float, min_unit_m: float = 0.30) -> list[tuple[Polygon, int | None]]:
+    """Units of a straight rectangular row around fixed items: [(polygon, index of the fixed item or None)].
+
+    A fixed item (a fridge) owns the along-range of its footprint (clipped to the row) over the full depth of the row; the
+    remaining along-ranges become free units; a piece shorter than ``min_unit_m`` is absorbed by the neighbouring fixed item.
+    """
+    upm = max(float(units_per_metre), 1e-9)
+    rectangle = row.minimum_rotated_rectangle
+    if rectangle.geom_type != "Polygon":
+        return [(row, None)]
+    corners = list(rectangle.exterior.coords)[:4]
+    edge_a = np.asarray(corners[1]) - np.asarray(corners[0])
+    edge_b = np.asarray(corners[2]) - np.asarray(corners[1])
+    long_edge = edge_a if np.hypot(*edge_a) >= np.hypot(*edge_b) else edge_b
+    angle = math.atan2(long_edge[1], long_edge[0])
+    local = affinity.rotate(row, -angle, origin=(0.0, 0.0), use_radians=True)
+    x0, y0, x1, y1 = local.bounds
+    ranges: list[tuple[float, float, int]] = []
+    for index, item in enumerate(fixed):
+        clipped = affinity.rotate(item, -angle, origin=(0.0, 0.0), use_radians=True).intersection(box(x0, y0, x1, y1))
+        if clipped.is_empty:
+            continue
+        low, high = clipped.bounds[0], clipped.bounds[2]
+        if high - low > 0.15 * upm:
+            ranges.append((max(low, x0), min(high, x1), index))
+    ranges.sort()
+    # overlapping fixed ranges: the earlier one keeps its range
+    cleaned: list[tuple[float, float, int]] = []
+    for low, high, index in ranges:
+        if cleaned and low < cleaned[-1][1]:
+            low = cleaned[-1][1]
+        if high - low > 0.15 * upm:
+            cleaned.append((low, high, index))
+    if not cleaned:
+        return [(row, None)]
+    # absorb short free pieces into the neighbouring fixed item
+    spans: list[list[float | int | None]] = []
+    cursor = x0
+    for low, high, index in cleaned:
+        if low - cursor > 1e-9:
+            spans.append([cursor, low, None])
+        spans.append([low, high, index])
+        cursor = high
+    if x1 - cursor > 1e-9:
+        spans.append([cursor, x1, None])
+    for position, span in enumerate(spans):
+        if span[2] is None and float(span[1]) - float(span[0]) < min_unit_m * upm:
+            for neighbour in (position - 1, position + 1):
+                if 0 <= neighbour < len(spans) and spans[neighbour][2] is not None:
+                    spans[neighbour][0] = min(float(spans[neighbour][0]), float(span[0]))
+                    spans[neighbour][1] = max(float(spans[neighbour][1]), float(span[1]))
+                    span[2] = -1
+                    break
+    output: list[tuple[Polygon, int | None]] = []
+    for low, high, index in spans:
+        if index == -1:
+            continue
+        piece = affinity.rotate(box(float(low), y0, float(high), y1), angle, origin=(0.0, 0.0), use_radians=True)
+        output.append((piece, None if index is None else int(index)))
+    return output

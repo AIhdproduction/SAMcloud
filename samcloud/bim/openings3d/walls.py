@@ -8,7 +8,7 @@ two faces are summed again before detection.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -17,6 +17,9 @@ from samcloud.bim.plan_model import BuildingPlan, PlanWall
 from samcloud.dxf.las_source import Frame
 
 from .config import Settings
+
+
+SYNTHETIC_WALL_EVIDENCE = frozenset({"door-host"})
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,8 @@ def wall_lines(plan: BuildingPlan, config: Settings) -> list[WallLine]:
     cfg = config.walls
     pieces: list[dict[str, Any]] = []
     for wall in plan.walls:
+        if wall.evidence in SYNTHETIC_WALL_EVIDENCE:
+            continue  # door-host pieces are only hosts the wall stage builds for doors without a wall; they are no measured wall to scan
         a, b = np.asarray(wall.centreline[0], float), np.asarray(wall.centreline[1], float)
         length = float(np.linalg.norm(b - a))
         if length < cfg.min_piece_length_m * upm:
@@ -127,6 +132,50 @@ def wall_lines(plan: BuildingPlan, config: Settings) -> list[WallLine]:
             kind = "exterior" if any(item[2]["kind"] == "exterior" for item in group) else group[0][2]["kind"]
             line_id = ids[0] + (f"+{len(ids) - 1}" if len(ids) > 1 else "")
             result.append(WallLine(line_id, tuple(ids), origin, d, n0, float(length), float(length) / upm, thickness, kind, pad_start / upm, pad_end / upm))
+    return _extend_to_seed_gaps(result, plan, config)
+
+
+def _extend_to_seed_gaps(lines: list[WallLine], plan: BuildingPlan, config: Settings) -> list[WallLine]:
+    """Continue a wall line over a plan door/passage gap that lies beyond its end (a gap at the end of a wall).
+
+    A door in the last stretch of a wall (the plan wall ends at the jamb, the gap runs on to the crossing wall) has no wall line
+    around it, so the door would be measured on whatever other wall passes nearby.  The collinear line is continued to the far edge
+    of the gap (at most ``walls.seed_extend_max_m``) and the continuation counts as padding (an artificial end, like a bridged gap).
+    """
+    cfg = config.walls
+    upm = plan.units_per_metre
+    sin_limit = math.sin(math.radians(cfg.merge_angle_deg))
+    reach = float(cfg.seed_extend_max_m) * upm
+    result = list(lines)
+    for opening in sorted((o for o in plan.openings if o.kind in ("door", "passage")), key=lambda o: o.id):
+        axis = np.array([math.cos(opening.axis_angle), math.sin(opening.axis_angle)])
+        centre = np.asarray(opening.center, float)
+        half = float(opening.width_m) * upm / 2.0
+        covered = False
+        candidates: list[tuple[float, int, float]] = []
+        for index, line in enumerate(result):
+            if abs(float(line.d[0] * axis[1] - line.d[1] * axis[0])) >= sin_limit:
+                continue
+            relative = centre - line.a
+            if abs(float(relative @ line.n)) >= cfg.merge_offset_m * upm:
+                continue
+            u = float(relative @ line.d)
+            if -half * 0.5 <= u <= line.length + half * 0.5:
+                covered = True
+                break
+            gap = -u if u < 0 else u - line.length
+            if gap <= half + 1e-9 and gap + half <= reach:
+                candidates.append((gap, index, u))
+        if covered or not candidates:
+            continue
+        _, index, u = min(candidates)
+        line = result[index]
+        if u < 0:
+            extra = -(u - half)
+            result[index] = replace(line, a=line.a + line.d * (u - half), length=line.length + extra, length_m=(line.length + extra) / upm, pad_start_m=line.pad_start_m + extra / upm)
+        else:
+            extra = (u + half) - line.length
+            result[index] = replace(line, length=line.length + extra, length_m=(line.length + extra) / upm, pad_end_m=line.pad_end_m + extra / upm)
     return result
 
 

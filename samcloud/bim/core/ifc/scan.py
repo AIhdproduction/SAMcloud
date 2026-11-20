@@ -143,6 +143,21 @@ def write_furniture(ctx: ExportContext) -> int:
         if z1 - z0 < MIN_BODY_HEIGHT:
             ctx.flag(element.id, "furniture height below 1 cm: not exported")
             continue
+        solid_parts: list[tuple[list[tuple[float, float]], Polygon, float, float]] = []
+        for part in extra.get("parts") or [{"footprint": raw, "z_bottom": z0, "z_top": z1}]:
+            if not isinstance(part, dict):
+                continue
+            part_ring = _clean_ring(part.get("footprint") or [])
+            part_polygon = Polygon(part_ring)
+            bottom = float(part.get("z_bottom", z0))
+            top = float(part.get("z_top", z1))
+            if len(part_ring) >= 3 and part_polygon.is_valid and part_polygon.area > 1e-6 and top - bottom >= MIN_BODY_HEIGHT:
+                solid_parts.append((part_ring, part_polygon, bottom, top))
+        if not solid_parts:
+            ctx.flag(element.id, "furniture has no valid solid parts: not exported")
+            continue
+        z0 = min(part[2] for part in solid_parts)
+        z1 = max(part[3] for part in solid_parts)
 
         ifc_class = element.ifc_class or "IfcFurniture"
         predefined = element.predefined_type or "NOTDEFINED"
@@ -162,14 +177,20 @@ def write_furniture(ctx: ExportContext) -> int:
         product.PredefinedType = predefined
         product.ObjectType = object_type or _type_name(ifc_class, predefined, object_type)
 
-        min_x = min(p[0] for p in ring)
-        min_y = min(p[1] for p in ring)
-        max_x = max(p[0] for p in ring)
-        max_y = max(p[1] for p in ring)
+        min_x = min(point[0] for part in solid_parts for point in part[0])
+        min_y = min(point[1] for part in solid_parts for point in part[0])
+        max_x = max(point[0] for part in solid_parts for point in part[0])
+        max_y = max(point[1] for part in solid_parts for point in part[0])
         shapes.place(ctx, product, (min_x, min_y, z0))
         local = [(x - min_x, y - min_y) for x, y in ring]
-        solid = shapes.extrusion(f, shapes.polygon_profile(f, local), z1 - z0)
-        body = shapes.swept_solid_representation(ctx, [solid])
+        solids = [
+            shapes.extrusion(
+                f, shapes.polygon_profile(f, [(x - min_x, y - min_y) for x, y in part_ring]), top - bottom,
+                origin=(0.0, 0.0, bottom - z0),
+            )
+            for part_ring, _part_polygon, bottom, top in solid_parts
+        ]
+        body = shapes.swept_solid_representation(ctx, solids)
         colour = extra.get("colour")
         if colour:
             ifcopenshell.api.style.assign_representation_styles(
@@ -204,11 +225,16 @@ def write_furniture(ctx: ExportContext) -> int:
             "Width": f.create_entity("IfcLengthMeasure", float(edges[0])),
             "Height": f.create_entity("IfcLengthMeasure", float(z1 - z0)),
             "ZMin": f.create_entity("IfcLengthMeasure", float(z0)),
+            "PartCount": len(solid_parts),
         }
         if extra.get("instance_id") is not None:
             props["InstanceId"] = int(extra["instance_id"])
         if extra.get("confidence") is not None:
             props["Confidence"] = float(extra["confidence"])
+        if extra.get("facing_deg") is not None:
+            props["FacingDeg"] = float(extra["facing_deg"])
+        if extra.get("back_wall_id"):
+            props["BackWallId"] = str(extra["back_wall_id"])
         product.Description = element.description or (
             f"{_type_name(ifc_class, predefined, object_type)}, "
             f"{edges[1]:.2f} x {edges[0]:.2f} x {z1 - z0:.2f} m"

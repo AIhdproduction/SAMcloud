@@ -2032,6 +2032,24 @@ def _refine_after_classification(
             summary.record_stage("Superpoint voting", time.perf_counter() - started_at)
             print(f"Superpoint voting changed {report.get('changed_points', {}).get('count', 0):,} points.")
         summary.settings["superpoint_vote"] = report
+    # The depth maps and SAM rasters are released immediately below.  Preserve
+    # their fused BIM evidence first, independently of keep_processing_cache.
+    if getattr(args, "class_set", None) == "indoor":
+        started_at = time.perf_counter()
+        try:
+            from samcloud.bim.depth_evidence import build_depth_product
+
+            if progress:
+                progress.update(96, "Writing compact depth evidence")
+            report = build_depth_product(dense_dir.parent.parent, dense_dir=dense_dir, classified_path=classified_raw)
+        except Exception as error:  # noqa: BLE001 - evidence must never fail the processing run
+            print(f"WARNING: Compact depth evidence was skipped: {error}")
+            report = {"enabled": True, "written": False, "error": str(error)}
+        else:
+            summary.record_stage("Depth evidence", time.perf_counter() - started_at)
+            if report.get("written"):
+                print(f"Compact depth evidence wrote {report.get('points', 0):,} points from {report.get('views_used', 0)} views.")
+        summary.settings["depth_evidence"] = report
     if keep_caches:  # running on the processing cache itself: never delete it
         return
     if (dense_dir.parent.parent / "project.samcloud.yml").is_file():

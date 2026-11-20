@@ -70,6 +70,11 @@ class PlanPolishSettings:
     kitchen_end_reach_m: float = 0.30
     kitchen_segment_reach_m: float = 0.15
     kitchen_layout: bool = True
+    # Sanitary blocks (WC, washbasin): back on the nearest final wall face, front into the room (sanitary_facing.py).
+    sanitary_facing: bool = True
+    sanitary_back_gap_m: float = 0.35
+    sanitary_tie_m: float = 0.03
+    sanitary_snap_deg: float = 12.0
 
 
 # Labels whose object cannot be this large / tall; a bigger object keeps its outline but a generic name.
@@ -872,7 +877,8 @@ def fit_kitchen_to_walls(
             if leg.snap_back(local_walls, settings.kitchen_wall_reach_m * upm):
                 leg.set_depth(thickness)
                 shape = _largest(leg.polygon(theta).difference(walls))
-                if shape is not None:
+                # Cutting the wall bodies out of a unit that was pushed into them can leave a sliver: keep the unit as detected then.
+                if shape is not None and shape.area >= 0.5 * Polygon(entity["points"]).area:
                     entity["points"] = _points(shape)
                     stats["kitchen_upper_snapped"] += 1
     return stats

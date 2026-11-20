@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import warnings
 from typing import Any, Iterable
 
 import cv2
@@ -48,6 +49,18 @@ class FootprintFit:
     dev90: float
     iou: float
     radius: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FurnitureSolidSettings:
+    """Metric thresholds for point-measured stepped furniture solids."""
+
+    min_points: int = 24
+    min_level_delta_m: float = 0.15
+    min_part_area_m2: float = 0.08
+    max_parts: int = 4
+    # A level below this height is scan noise near the floor, not a furniture part; its cells join the next level up.
+    min_level_z_m: float = 0.20
 
 
 def object_instances(
@@ -1046,6 +1059,130 @@ def height_step_details(instance: ObjectInstance, hm: np.ndarray, grid: RasterGr
             if line.length >= 0.15 * units_per_metre and overlap <= 0.50 * line.length:
                 details.append(line)
     return sorted(details, key=lambda item: item.length, reverse=True)[:2]
+
+
+def _level_centres(values: np.ndarray, settings: FurnitureSolidSettings, min_cells: int) -> list[float]:  # values in metres
+    """Deterministic 1-D k-means: the largest k whose centres are distinct and every cluster is a real part."""
+    values = np.sort(np.asarray(values, dtype=float))
+    for count in range(settings.max_parts, 1, -1):
+        centres = np.percentile(values, np.linspace(10, 90, count))
+        for _ in range(30):
+            assign = np.argmin(np.abs(values[:, None] - centres[None, :]), axis=1)
+            updated = np.asarray([values[assign == index].mean() if np.any(assign == index) else centres[index] for index in range(count)])
+            if np.allclose(updated, centres, atol=1e-5):
+                break
+            centres = updated
+        centres = np.sort(centres)
+        centres = centres[centres >= settings.min_level_z_m]
+        if len(centres) < 2:
+            continue
+        assign = np.argmin(np.abs(values[:, None] - centres[None, :]), axis=1)
+        sizes = np.bincount(assign, minlength=count)
+        if np.all(np.diff(centres) >= settings.min_level_delta_m) and np.all(sizes >= min_cells):
+            return [float(value) for value in centres]
+    return []
+
+
+def furniture_solid_parts(
+    instance: ObjectInstance,
+    height_map: np.ndarray,
+    grid: RasterGrid,
+    units_per_metre: float,
+    outline: Polygon,
+    settings: FurnitureSolidSettings = FurnitureSolidSettings(),
+) -> list[dict[str, Any]]:
+    """Return clean, point-measured stepped solids for one furniture footprint.
+
+    The per-instance DSM is reduced to coarse cells (median height, holes filled
+    from the nearest measured cell, majority-filtered), clustered into 2..max_parts
+    height levels and split into connected parts.  Cells without data take the
+    lowest level, so the union of the parts stays the drawn 2D footprint.
+    Returns [] (one plain box) when the scan shows no distinct, sizeable level.
+    """
+    upm = max(float(units_per_metre), 1e-9)
+    mask = np.asarray(instance.mask, dtype=bool)
+    heights = np.asarray(height_map, dtype=float)
+    if mask.shape != heights.shape or int(mask.sum()) < settings.min_points:
+        return []
+    inside = _polygon_mask(outline, grid)
+    rows, cols = np.nonzero(inside | mask)
+    if not len(rows):
+        return []
+    block = max(1, int(round(0.05 * upm / grid.pixel_size)))
+    r0, c0 = int(rows.min()) // block * block, int(cols.min()) // block * block
+    r1, c1 = -(-(int(rows.max()) + 1) // block) * block, -(-(int(cols.max()) + 1) // block) * block
+    height_rows, height_cols = min(r1, heights.shape[0]) - r0, min(c1, heights.shape[1]) - c0
+
+    def reduce(array: np.ndarray, fill: float) -> np.ndarray:
+        canvas = np.full((r1 - r0, c1 - c0), fill, dtype=float)
+        canvas[:height_rows, :height_cols] = array[r0:r0 + height_rows, c0:c0 + height_cols]
+        return canvas.reshape((r1 - r0) // block, block, (c1 - c0) // block, block)
+
+    sample = np.where(mask & np.isfinite(heights) & (heights > 0.05 * upm), heights, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        coarse = np.nanmedian(reduce(sample, np.nan), axis=(1, 3))
+    coarse_inside = reduce(inside.astype(float), 0.0).mean(axis=(1, 3)) >= 0.5
+    measured = np.isfinite(coarse) & coarse_inside
+    cell_area = (block * grid.pixel_size) ** 2
+    min_cells = max(1, int(math.ceil(settings.min_part_area_m2 * upm * upm / cell_area)))
+    if int(measured.sum()) < min_cells * 2:
+        return []
+    # Holes of the sparse scan take the nearest measured height; a 3x3 median removes isolated depth spikes.
+    nearest = ndimage.distance_transform_edt(~measured, return_distances=False, return_indices=True)
+    filled = coarse[tuple(nearest)]
+    filled = ndimage.median_filter(filled, size=3, mode="nearest")
+    centres = _level_centres(filled[coarse_inside] / upm, settings, min_cells)
+    if not centres:
+        return []
+    levels = np.asarray(centres) * upm
+    labels = np.argmin(np.abs(filled[..., None] - levels[None, None, :]), axis=2)
+    labels = np.where(coarse_inside, labels, -1)
+    for _ in range(3):
+        # Majority filter, then give fragments smaller than a part to the level they touch most.
+        counts = np.stack([ndimage.uniform_filter((labels == index).astype(float), size=3, mode="nearest") for index in range(len(levels))], axis=2)
+        labels = np.where(coarse_inside, np.argmax(counts, axis=2), -1)
+        changed = False
+        for index in range(len(levels)):
+            count, comps = cv2.connectedComponents((labels == index).astype(np.uint8), connectivity=4)
+            for comp in range(1, count):
+                region = comps == comp
+                if int(region.sum()) >= min_cells:
+                    continue
+                ring = ndimage.binary_dilation(region, iterations=1) & ~region & coarse_inside
+                neighbours = labels[ring]
+                neighbours = neighbours[neighbours != index]
+                if len(neighbours):
+                    labels[region] = int(np.bincount(neighbours).argmax())
+                    changed = True
+        if not changed:
+            break
+    min_area = settings.min_part_area_m2 * upm * upm
+    parts: list[tuple[float, Polygon]] = []
+    for index in range(len(levels)):
+        coarse_region = labels == index
+        if not coarse_region.any():
+            continue
+        full = np.zeros(heights.shape, dtype=bool)
+        expanded = np.kron(coarse_region, np.ones((block, block), dtype=bool))[:height_rows, :height_cols]
+        full[r0:r0 + height_rows, c0:c0 + height_cols] = expanded
+        z_top = float(np.median(filled[coarse_region]) / upm)
+        for polygon in mask_to_polygons(full, grid):
+            clipped = polygon.intersection(outline).buffer(0)
+            for piece in getattr(clipped, "geoms", [clipped]):
+                if isinstance(piece, Polygon) and piece.area >= min_area:
+                    parts.append((z_top, Polygon(piece.exterior).simplify(0.01 * upm)))
+    if len(parts) < 2 or len({round(z, 2) for z, _ in parts}) < 2 or len(parts) > settings.max_parts:
+        return []
+    parts.sort(key=lambda item: item[0])
+    # The lowest level also carries cells the scan did not see, so nothing of the footprint is lost.
+    higher = unary_union([polygon for _, polygon in parts[1:]]).buffer(0)
+    base = outline.difference(higher).buffer(0)
+    base_pieces = [piece for piece in getattr(base, "geoms", [base]) if isinstance(piece, Polygon) and piece.area >= 0.5 * min_area]
+    output = [{"footprint": [[float(x), float(y)] for x, y in list(Polygon(piece.exterior).exterior.coords)[:-1]], "z_max_m": parts[0][0]} for piece in base_pieces]
+    for z_top, polygon in parts[1:]:
+        output.append({"footprint": [[float(x), float(y)] for x, y in list(polygon.exterior.coords)[:-1]], "z_max_m": z_top})
+    return output if 2 <= len(output) <= settings.max_parts else []
 
 
 def _make_instance(mask: np.ndarray, label: str | None, classes: np.ndarray, hm: np.ndarray, grid: RasterGrid, *, instance_id: int = 0) -> ObjectInstance | None:

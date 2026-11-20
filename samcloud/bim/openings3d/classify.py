@@ -140,6 +140,46 @@ def assign_leaves(records: list[RefinedOpening], door_points: np.ndarray | None,
     return result
 
 
+def _segment_distance(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    along = b - a
+    norm2 = float(along @ along)
+    t = 0.0 if norm2 <= 0.0 else float(np.clip((point - a) @ along / norm2, 0.0, 1.0))
+    return float(np.linalg.norm(point - (a + along * t)))
+
+
+def drop_leaf_shadows(records: list[RefinedOpening], config: Settings, units_per_metre: float) -> tuple[list[RefinedOpening], list[dict[str, Any]]]:
+    """Remove door candidates that are only the open leaf of another door lying along / inside their wall.
+
+    A leaf that swung open flat beside a wall fills the wall plane with door-class points and looks like a closed leaf in a gap
+    (a door in the wall where the leaf lies).  The FRAME decides where a door is: a candidate without any casing strip (no jamb strip,
+    no head strip) whose centre lies within ``classify.leaf_shadow_distance_m`` of the measured leaf of a door on ANOTHER wall line is
+    that leaf and no opening.  A candidate with frame evidence is never dropped here.
+    """
+    reach = float(config.classify.leaf_shadow_distance_m)
+    dropped: list[dict[str, Any]] = []
+    kept: list[RefinedOpening] = []
+    for record in records:
+        framed = bool(record.frame_jambs) or record.head_frame
+        shadow_of = None
+        if record.kind in ("door", "passage") and not framed and not record.leaf_detected:
+            centre = np.asarray(record.center, float) / units_per_metre
+            for other in records:
+                if other is record or not other.leaf_detected or not other.leaf or other.line == record.line:
+                    continue
+                if _segment_distance(centre, np.asarray(other.leaf["hinge"], float), np.asarray(other.leaf["free"], float)) <= reach:
+                    shadow_of = other
+                    break
+        if shadow_of is None:
+            kept.append(record)
+            continue
+        dropped.append({
+            "center": record.center, "width_m": record.width_m, "axis_angle": record.axis_angle, "wall_thickness_m": record.wall_thickness_m, "host_wall_id": record.host_wall_id,
+            "line": record.line, "u": [record.u0, record.u1], "plan_seed": record.plan_seed, "features": {}, "was": record.kind,
+            "reason": f"no frame evidence and within {reach:.2f} m of the open leaf of the door on {shadow_of.line} (hinge {shadow_of.leaf['hinge']}): this is that leaf, not an opening",
+        })
+    return kept, dropped
+
+
 # --------------------------------------------------------------------------
 # exterior / entrance door scan
 # --------------------------------------------------------------------------
@@ -315,8 +355,35 @@ def resolve_overlaps(
     return [item[0] for item in items if item is not None], dropped
 
 
+def restore_framed_duplicates(
+    kept: list[RefinedOpening], duplicates: list[RefinedOpening], by_line: dict[str, WallLine], evidence_points: PointEvidence, plan: BuildingPlan, config: Settings,
+) -> list[RefinedOpening]:
+    """A door / passage candidate with frame evidence (jamb strip AND head strip) is never lost to the duplicate filter.
+
+    The duplicate filter ranks candidates by confidence before anything is measured; a window rectangle or a leaf-made candidate can
+    outrank a real doorway.  A rejected duplicate that is measured as a framed door and whose span no kept opening of its wall line covers
+    (more than ``classify.min_overlap_m``) is restored (at worst without a measured leaf).
+    """
+    ceiling = storey_height_m(plan)
+    margin = float(config.classify.min_overlap_m)
+    restored: list[RefinedOpening] = []
+    for record in sorted(duplicates, key=lambda item: (item.line or "", item.u0)):
+        line = by_line.get(record.line or "")
+        if record.kind not in ("door", "passage") or line is None or "any" not in evidence_points.grids.get(line.id, {}):
+            continue
+        features = measure_opening(evidence_points.grids[line.id], record.u0, record.u1, ceiling, config)
+        if not (features.frame_jambs and features.head_frame):
+            continue
+        if any(other.line == record.line and min(other.u1, record.u1) - max(other.u0, record.u0) > margin for other in [*kept, *restored]):
+            continue
+        kind, reason = classify_features(features, config, seeded=record.plan_seed is not None)
+        if kind == "door":
+            restored.append(_apply_features(record, kind, f"{reason}; restored after the duplicate filter (frame evidence)", features, line, config))
+    return restored
+
+
 def classify_openings(
-    openings: list[RefinedOpening], lines: list[WallLine], evidence_points: PointEvidence, plan: BuildingPlan, config: Settings,
+    openings: list[RefinedOpening], lines: list[WallLine], evidence_points: PointEvidence, plan: BuildingPlan, config: Settings, duplicates: list[RefinedOpening] | None = None,
 ) -> tuple[list[RefinedOpening], list[dict[str, Any]], dict[str, Any]]:
     """(kept openings, dropped candidates with their measurements, summary) after classification and the entrance scan."""
     by_line = {line.id: line for line in lines}
@@ -338,9 +405,12 @@ def classify_openings(
     resolved, trimmed_out = resolve_overlaps(measured, evidence_points, plan, config)
     dropped.extend(trimmed_out)
     kept.extend(resolved)
+    kept.extend(restore_framed_duplicates(kept, duplicates or [], by_line, evidence_points, plan, config))
     added, scan_report = scan_entrances(lines, evidence_points, plan, kept, config)
     kept.extend(added)
     kept = assign_leaves(kept, evidence_points.door_points, config, plan.units_per_metre)
+    kept, shadows = drop_leaf_shadows(kept, config, plan.units_per_metre)
+    dropped.extend(shadows)
     ordered = sorted(kept, key=lambda item: (item.center[1], item.center[0]))
     for index, record in enumerate(ordered, start=1):
         record.id = f"C{index:03d}"

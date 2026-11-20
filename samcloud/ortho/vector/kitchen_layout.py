@@ -8,8 +8,8 @@ heights and the appliance labels it
 * finds a raised bar on a free-standing leg (peninsula): a band beside it standing above the counter top up to
   ``bar_max_m`` along most of its length becomes part of the counter, the step is drawn as an inner line;
 * re-mounts the cooktop and the sink ON the counter at the position of their labels at counter height (a block
-  centred in the counter depth and lying fully inside it; a sink in a chamfered inner corner sits on the
-  diagonal);
+  centred in the counter depth and lying fully inside it, square to the leg; with ``appliance_on_chamfer`` a sink in a
+  chamfered inner corner may sit on the diagonal);
 * marks tall units at a leg end (full-depth evidence above ``tall_min_m``) as full-depth rectangles with a
   diagonal cross and "KS" (fridge label) or "HS" (unless the wall stage already resolved the unit there); a leg
   end within ``tall_snap_m`` of a tall unit's side reaches it;
@@ -64,6 +64,9 @@ class KitchenLayoutSettings:
     tall_share: float = 0.50
     tall_min_length_m: float = 0.45
     tall_snap_m: float = 0.30
+    # A sink / hob on the diagonal of a chamfered inner corner would be a 45 degree solid sticking out of the counter: every kitchen insert
+    # is square to its run and lies inside it (round 5, owner feedback); the diagonal mounting is only kept when this is switched on.
+    appliance_on_chamfer: bool = False
 
 
 SINK_KINDS = ("KITCHEN_SINK",)
@@ -485,12 +488,16 @@ def _mount(kind: str, points: np.ndarray, legs: list[_LegBox], counter: Polygon,
     centre = np.median(points, axis=0)
     entries = sorted(CATALOGUE[kind], key=lambda entry: entry.width_m)
     inside = counter.buffer(1e-4 * upm)
-    # an appliance in a chamfered inner corner sits on the diagonal
+    # an appliance in a chamfered inner corner sits on the diagonal (off by default: inserts stay square to their run)
     for chamfer in chamfers:
         if chamfer.buffer(0.15 * upm).contains(Point(*centre)):
-            placed = _mount_on_chamfer(kind, chamfer, counter, entries, upm, label)
-            if placed is not None:
-                return placed
+            if settings.appliance_on_chamfer:
+                placed = _mount_on_chamfer(kind, chamfer, counter, entries, upm, label)
+                if placed is not None:
+                    return placed
+            else:
+                # a label on the diagonal corner unit: the insert stands square on the nearest leg instead (the leg ends reach the chamfer)
+                reach = max(reach, 0.60 * upm)
     cos, sin = math.cos(theta), math.sin(theta)
     u, v = centre[0] * cos + centre[1] * sin, -centre[0] * sin + centre[1] * cos
     backed = [leg for leg in legs if leg.back is not None]

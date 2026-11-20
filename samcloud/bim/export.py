@@ -27,6 +27,7 @@ from samcloud.bim.core.geometry import compute_scene_geometry
 from samcloud.bim.core.ifc import write_ifc
 from samcloud.bim.core.model import ElementKind
 from samcloud.bim.core.qa.validate import validate_ifc
+from samcloud.bim.invariants import plan_violations
 from samcloud.bim.plan_model import BuildingPlan, load_plan_model
 from samcloud.bim.scene_builder import build_scene
 
@@ -240,6 +241,9 @@ def _qa_payload(
     opening_check = check_openings_consistency(plan, ifc_path or export.path, build.get("skipped_openings", []))
     for error in opening_check["errors"]:
         warnings.append(f"openings_consistency: {error['kind']} {error['id']}: {error['reason']}")
+    door_invariants = plan_violations(plan)
+    for item in door_invariants:
+        warnings.append(f"door_invariants: {item['rule']} {item['opening']}: {item['reason']}")
     area_check = check_room_areas(build)
     for error in area_check["errors"]:
         warnings.append(f"room_areas: {error['room']} {error['name']}: plan {error['plan_m2']} m2 vs IFC {error['ifc_m2']} m2")
@@ -273,6 +277,7 @@ def _qa_payload(
         "consistency": consistency,
         "openings_consistency": opening_check,
         "room_area_check": area_check,
+        "door_invariants": {"ok": not door_invariants, "violations": door_invariants},
         "openings_consistency_errors": opening_check["errors"],
         "ids_failure_details": [failure.to_dict() for failure in report.ids_failures[:100]],
         "express_finding_details": list(report.express_findings[:100]),

@@ -40,6 +40,7 @@ class Detection:
     curtain_regions: list[dict[str, Any]] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
     closed: list[dict[str, Any]] = field(default_factory=list)  # door candidates classified as no opening (the wall closes)
+    duplicates: list[RefinedOpening] = field(default_factory=list)  # candidates the dedupe rejected (a framed door among them is restored by classify)
 
 
 def runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -394,12 +395,21 @@ def door_extent(ev: LineEvidence, c0: int, c1: int, config: Settings) -> tuple[f
     return c0 * cell, c1 * cell, head_points, head_photo
 
 
-def _line_of_point(evidence: dict[str, LineEvidence], point: list[float], plan: BuildingPlan, config: Settings) -> tuple[float, str, float] | None:
+def _line_of_point(evidence: dict[str, LineEvidence], point: list[float], plan: BuildingPlan, config: Settings, axis_angle: float | None = None) -> tuple[float, str, float] | None:
+    """Wall line nearest to ``point`` (plan units) and the position along it.
+
+    With ``axis_angle`` (the direction of the wall a seed door sits in) only lines running that way qualify: a door whose gap
+    lies in a vertical wall is never measured on a horizontal wall that happens to pass nearby (its open leaf may lie along it).
+    """
     upm = plan.units_per_metre
     tolerance = config.doors.line_distance_m
+    sin_limit = math.sin(math.radians(config.doors.seed_axis_tolerance_deg))
+    axis = None if axis_angle is None else np.array([math.cos(axis_angle), math.sin(axis_angle)])
     best = None
     for line_id, ev in evidence.items():
         line = ev.line
+        if axis is not None and abs(float(line.d[0] * axis[1] - line.d[1] * axis[0])) > sin_limit:
+            continue
         relative = np.asarray(point, float) - line.a
         u = float(relative @ line.d) / upm
         across = abs(float(relative @ line.n)) / upm
@@ -418,7 +428,7 @@ def detect_doors(evidence: dict[str, LineEvidence], seeds: list[SeedLike], plan:
     used: list[tuple[str, int, int]] = []
     orphans: list[Any] = []
     for seed in seeds:
-        found = _line_of_point(evidence, seed.center, plan, config)
+        found = _line_of_point(evidence, seed.center, plan, config, seed.axis_angle)
         if found is None:
             orphans.append(seed)
             continue
@@ -628,7 +638,7 @@ def _distance_m(a: list[float], b: list[float], upm: float) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1]) / upm
 
 
-def _deduplicate(records: list[RefinedOpening], plan: BuildingPlan, config: Settings, rejected: list[dict[str, Any]]) -> list[RefinedOpening]:
+def _deduplicate(records: list[RefinedOpening], plan: BuildingPlan, config: Settings, rejected: list[dict[str, Any]], duplicates: list[RefinedOpening] | None = None) -> list[RefinedOpening]:
     cfg = config.dedupe
     upm = plan.units_per_metre
     kept: list[RefinedOpening] = []
@@ -642,6 +652,8 @@ def _deduplicate(records: list[RefinedOpening], plan: BuildingPlan, config: Sett
                 duplicate = True
         if duplicate:
             rejected.append({"what": "duplicate", "center": record.center, "reason": "overlaps higher-confidence opening"})
+            if duplicates is not None:
+                duplicates.append(record)
             continue
         kept.append(record)
     return kept
@@ -661,7 +673,8 @@ def build_detection(evidence: dict[str, LineEvidence], orphan_seeds: list[Any], 
     for ev in evidence.values():
         for item in ev.items:
             records.append(_window_record(item, ev.line, plan, config) if item["type"] == "window" else _door_record(item, ev.line, plan, config))
-    kept = _deduplicate(records, plan, config, rejected)
+    duplicates: list[RefinedOpening] = []
+    kept = _deduplicate(records, plan, config, rejected, duplicates)
     kept = _number(kept)
     for seed in orphan_seeds:
         near = [r for r in kept if _distance_m(r.center, list(seed.center), upm) < config.dedupe.plan_door_merge_distance_m]
@@ -685,7 +698,7 @@ def build_detection(evidence: dict[str, LineEvidence], orphan_seeds: list[Any], 
                 "wall": ev.line.id, "host_wall_id": host, "u_range": [curtain["u0"], curtain["u1"]], "v_range": [curtain["v0"], curtain["v1"]],
                 "flag": "curtain_covered", "windows_inside": curtain.get("covers_windows", []), "obs_frac": round(curtain["obs_frac"], 2),
             })
-    return Detection(kept, curtains, rejected)
+    return Detection(kept, curtains, rejected, duplicates=duplicates)
 
 
 def detect_openings(evidence: dict[str, LineEvidence], seeds: list[SeedLike], plan: BuildingPlan, config: Settings) -> Detection:

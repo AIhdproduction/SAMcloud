@@ -173,8 +173,61 @@ indoor_upper_cabinets:
   depth_m: 0.35
   min_length_m: 0.40
   min_coverage: 0.50
+  # A base run thinner than this (metres) is a sliver: no upper cabinet hangs above it.
+  min_run_depth_m: 0.25
   gap_fill_m: 0.15
   bins: 16
+
+# Upper cabinets from kitchen-class points (cloud + COLMAP depth), also without a base run below them.
+# A hanging unit is point evidence in the band band_min_m..band_max_m that leaves gap_low_m..gap_high_m free (a tall unit does not),
+# close to a wall face and inside the kitchen zone. Its height is the measured p5..p95 band of its points.
+indoor_upper_points:
+  enabled: true
+  band_min_m: 1.40
+  band_max_m: 2.25
+  gap_low_m: 1.00
+  gap_high_m: 1.25
+  cell_m: 0.05
+  min_points_per_cell: 4
+  # Evidence farther than this (metres) from a wall face is no hanging unit.
+  max_wall_distance_m: 0.70
+  min_length_m: 0.40
+  max_length_m: 4.00
+  min_depth_m: 0.20
+  max_depth_m: 0.60
+  # A measured band thinner than this is no cabinet (shelf edge, lamp).
+  min_z_span_m: 0.40
+  # A hanging unit is mounted on the wall (its footprint reaches back to the wall face); evidence starting farther than this (metres)
+  # from the wall plane is no wall unit (shelf on a stand, lamp).
+  max_wall_gap_m: 0.25
+  # A point cluster overlapping a run-based detection by this share is the same unit.
+  duplicate_overlap: 0.50
+  min_band_points: 40
+  # A hanging unit leaves the gap band free: at most this share of its upper-band points may lie in it (a tall unit fills it).
+  gap_max_ratio: 0.15
+
+# Tight, wall-aligned footprints from an instance's own points (cloud + depth) for tall kitchen units and thin slabs (fridge seen only from the front).
+indoor_tight_footprint:
+  enabled: true
+  cell_m: 0.05
+  # A cell counts with this many points; the largest connected cluster is the footprint.
+  min_cell_points: 3
+  min_points: 80
+  # A footprint thinner than this (metres) is a slab; it is completed towards a wall closer than back_reach_m behind it, up to max_depth_m deep.
+  thin_depth_m: 0.25
+  back_reach_m: 0.80
+  max_depth_m: 0.80
+  tall_min_top_m: 1.80
+  tall_max_width_m: 1.00
+
+# Measured furniture tops become up to four clean IFC solids while DXF keeps one outline.
+indoor_furniture_solids:
+  min_points: 24
+  min_level_delta_m: 0.15
+  min_part_area_m2: 0.08
+  max_parts: 4
+  # A height level below this (metres) is floor noise, not a part: its cells join the next level up.
+  min_level_z_m: 0.20
 
 # Double-line indoor walls (both faces of every wall, default). false = the single measured face lines.
 # Thicknesses in metres, scaled by the project units per metre. Interior thickness classes are
@@ -182,6 +235,41 @@ indoor_upper_cabinets:
 # exterior_thickness_m. See docs/ortho_plan.md "Double-line walls".
 walls:
   double_line: true
+  # An open door leaf is never a wall: a wall run lying along the measured open leaf of a door (both ends within leaf_run_distance_m of the
+  # leaf, not longer than the leaf + leaf_run_extra_m) is dropped.
+  leaf_walls: true
+  leaf_run_distance_m: 0.20
+  leaf_run_extra_m: 0.25
+  # Closed outlines: room-edge steps up to jog_merge_m are straightened onto the neighbouring parallel wall; free wall ends that face each
+  # other across a step up to close_step_max_m (ends aligned within close_step_align_m) get a connecting wall piece.
+  close_walls: true
+  jog_merge_m: 0.25
+  close_step_max_m: 0.80
+  close_step_align_m: 0.35
+  free_end_reach_m: 0.12
+  # Depth evidence (only when the project has a depth product and depth_evidence.use_in_plan is true): COLMAP class-2 voxels the cloud
+  # lacks continue a measured face along its own line (tolerance, max extension per end, along-bin) and measure the thickness of a wall
+  # whose second face the cloud did not see (>= depth_cover_min_m and >= depth_cover_min_share of the run, voxels on >= min height bins).
+  depth_faces: true
+  # ... the two uses are switched separately. Both default OFF (measured: continuation added 2 door candidates on v12; thickness raised wall steps 7 -> 10 on v8):
+  depth_extend: false
+  depth_thickness: false
+  depth_face_tolerance_m: 0.03
+  depth_extend_max_m: 0.50
+  depth_bin_m: 0.05
+  depth_min_voxels: 3
+  depth_min_height_bins: 3
+  depth_cover_min_m: 0.30
+  depth_cover_min_share: 0.30
+  # A door / passage is an opening in ONE host wall: parallel wall runs other than the host (offset > door_host_collinear_m from its centreline)
+  # are cut back to the jambs (remnants shorter than door_min_piece_m vanish), perpendicular runs that begin inside the span and enter it by more
+  # than door_span_enter_m are cut back, and a door without any wall run gets a door-host piece between its jambs (thickness of the nearest wall
+  # within door_fill_reach_m).  The pieces it builds (evidence door-host) are no wall lines for the 3D refinement.
+  door_spans: true
+  door_host_collinear_m: 0.03
+  door_span_enter_m: 0.20
+  door_min_piece_m: 0.17
+  door_fill_reach_m: 1.5
   min_thickness_m: 0.06
   max_thickness_m: 0.45
   exterior_thickness_m: 0.30
@@ -194,6 +282,12 @@ walls:
   pair_gap_m: 1.0
   pair_angle_deg: 3.0
   collinear_offset_m: 0.04
+  # Chained wall fragments across a door/passage share one centreline and thickness up to this offset/gap.  A real offset stays only
+  # when both faces are independently measured for step_proof_face_length_m and differ by at least step_proof_offset_m.
+  flush_line_offset_m: 0.20
+  flush_chain_gap_m: 1.50
+  step_proof_face_length_m: 0.30
+  step_proof_offset_m: 0.06
   cluster_gap_m: 0.04
   cluster_snap_m: 0.04
   joint_tolerance_m: 0.04
@@ -308,6 +402,12 @@ plan_polish:
   kitchen_depth_tol_m: 0.15
   kitchen_end_reach_m: 0.30
   kitchen_segment_reach_m: 0.15
+  # Sanitary blocks (WC, washbasin): the side of the block nearest to a final wall face is its back (snapped flush, no gap,
+  # no overlap), the front looks into the room.  Farther than sanitary_back_gap_m from every wall = free standing, untouched.
+  sanitary_facing: true
+  sanitary_back_gap_m: 0.35
+  sanitary_tie_m: 0.03              # sides closer than this to equally near walls: keep the current back, else prefer the block's width edges
+  sanitary_snap_deg: 12.0           # back edge within this angle of the wall face: block turned square onto the face
   # CAD kitchen (kitchen_layout.py): legs extended along measured counter heights, raised bar on a peninsula,
   # cooktop / sink mounted on the counter at their labels, tall units with a cross, upper cabinets with a cross,
   # counter drawn by its front and end lines.
@@ -409,3 +509,12 @@ outdoor_roof:
   flat_roof_difference_m: 0.5
   text_height_m: 0.8
   min_area_m2: 20.0
+
+# Door keep-clear zones: kitchen built-ins (niche, upper cabinet, built-in front) never stand on a door span, its casing or its open leaf;
+# niches and upper cabinets only exist in the kitchen room.
+indoor_door_zone:
+  margin_m: 0.10
+  leaf_buffer_m: 0.12
+  max_overlap_share: 0.25
+  # Niches / upper cabinets belong to the kitchen zone widened by this much (the room outline stops at the counter front).
+  kitchen_zone_margin_m: 0.80

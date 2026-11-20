@@ -58,6 +58,12 @@ class DoubleWallSettings:
     pair_gap_m: float = 1.0
     pair_angle_deg: float = 3.0
     collinear_offset_m: float = 0.04
+    # Collinear fragments can be separated by a doorway or a room-edge artefact.  They
+    # share a centreline and thickness unless two independently measured faces prove a step.
+    flush_line_offset_m: float = 0.20
+    flush_chain_gap_m: float = 1.50
+    step_proof_face_length_m: float = 0.30
+    step_proof_offset_m: float = 0.06
     cluster_gap_m: float = 0.04
     cluster_snap_m: float = 0.04
     joint_tolerance_m: float = 0.04
@@ -132,6 +138,41 @@ class DoubleWallSettings:
     cabinet_remnant_min_m: float = 0.45  # what is left of the run beside a removed column is kept only when it is at least this long (no wall stubs)
     cabinet_run_min_share: float = 0.40
     cabinet_run_max_support: float = 0.15
+    # An open door leaf is never a wall: a wall run whose centreline lies along the measured open leaf of a door (both ends within
+    # leaf_run_distance_m of the leaf segment, not longer than the leaf + leaf_run_extra_m) is that leaf and is dropped.
+    leaf_walls: bool = True
+    leaf_run_distance_m: float = 0.20
+    leaf_run_extra_m: float = 0.25
+    # Steps in a wall line that the room outline invented (parallel room-edge run within jog_merge_m of a neighbouring parallel run that
+    # touches or overlaps it) are straightened onto the neighbour's line; remaining free ends that face each other across a step of at
+    # most close_step_max_m (ends aligned within close_step_align_m) are joined by a connecting wall, so the walls form closed outlines.
+    close_walls: bool = True
+    jog_merge_m: float = 0.25
+    close_step_max_m: float = 0.80
+    close_step_align_m: float = 0.35
+    free_end_reach_m: float = 0.12
+    # A door / passage is an opening in ONE host wall: parallel wall runs other than the host (offset more than door_host_collinear_m from the
+    # host's centreline) are cut back to the jambs, perpendicular runs entering the span by more than door_span_enter_m are cut back, and a
+    # door without any wall run gets a door-host piece between its jambs (thickness of the nearest wall within door_fill_reach_m).
+    # Depth evidence (COLMAP-supported class-2 voxels the cloud lacks, ``WallEvidence.depth_points``): a measured face continues along
+    # its own line (within depth_face_tolerance_m) over unseen stretches of at most depth_extend_max_m; a wall whose thickness is not
+    # measured from two cloud faces takes the offset of a depth face on its solid side (>= depth_cover_min_m of the run, voxels on
+    # >= depth_min_height_bins height bins).  Never used without depth points.
+    depth_faces: bool = True
+    depth_extend: bool = True
+    depth_thickness: bool = True
+    depth_face_tolerance_m: float = 0.03
+    depth_extend_max_m: float = 0.50
+    depth_bin_m: float = 0.05
+    depth_min_voxels: int = 3
+    depth_min_height_bins: int = 3
+    depth_cover_min_m: float = 0.30
+    depth_cover_min_share: float = 0.30
+    door_spans: bool = True
+    door_host_collinear_m: float = 0.03
+    door_span_enter_m: float = 0.20
+    door_min_piece_m: float = 0.17
+    door_fill_reach_m: float = 1.5
 
 
 @dataclass(slots=True)
@@ -170,6 +211,7 @@ class WallEvidence:
     floor: np.ndarray | None = None
     door: np.ndarray | None = None
     cameras: np.ndarray | None = None
+    depth_points: np.ndarray | None = None  # (N, 3) plan x, y and height above floor of COLMAP class-2 gap-fill voxels (local units)
 
 
 @dataclass(slots=True)
@@ -294,7 +336,11 @@ def build_double_walls(
     faces, isolated = _split_isolated(faces, upm, settings, room_list)
     if settings.keep_isolated_faces:
         passthrough.extend((-1, {**face.entity, "points": [face.start.tolist(), face.end.tolist()], "_isolated_face": True}) for face in isolated)
-    stats: dict[str, Any] = {"double_wall_faces": len(faces), "double_wall_passthrough": len(passthrough), "double_wall_isolated_faces": len(isolated), "double_wall_reveals_dropped": len(reveals), **face_stats}
+    depth_points = None if evidence is None or not settings.depth_faces else evidence.depth_points
+    depth_stats: dict[str, Any] = {}
+    if depth_points is not None and len(depth_points) and faces and settings.depth_extend:
+        depth_stats["double_wall_depth_faces_extended"] = _depth_extend_faces(faces, depth_points, openings, upm, settings, evidence, np.asarray(free_floor, dtype=bool), grid)
+    stats: dict[str, Any] = {"double_wall_faces": len(faces), "double_wall_passthrough": len(passthrough), "double_wall_isolated_faces": len(isolated), "double_wall_reveals_dropped": len(reveals), **face_stats, **depth_stats}
     if not faces:
         return DoubleWallResult(list(entities), [], [], [], [], [], [], [(0.0, 0.0)] * len(openings), stats, openings=list(openings), openings_changed=_opening_changes(original_openings, openings))
 
@@ -323,6 +369,9 @@ def build_double_walls(
     interior_clusters, exterior_value, learn_stats = _learn_thickness(runs, samples, pairs, upm, settings)
     stats.update(learn_stats)
     _assign_thickness(runs, faces, samples, groups, interior_clusters, exterior_value, upm, settings, pairs)
+    if depth_points is not None and len(depth_points) and settings.depth_thickness:
+        stats["double_wall_depth_thickness_runs"] = _depth_thickness(runs, faces, depth_points, upm, settings, evidence)
+    stats["double_wall_flush_runs"] = _flush_collinear_runs(runs, faces, upm, settings)
     if settings.room_edge_walls:
         added = _room_edge_runs(faces, runs, room_list, roomish, valid_mask, openings, grid, upm, settings, exterior_value, [item for item in builtins if isinstance(item, Polygon) and not item.is_empty])
         stats["double_wall_room_edge_pieces"] = len(added)
@@ -335,6 +384,8 @@ def build_double_walls(
         cabinet_stats, cabinet_units = _cabinet_wall_runs(runs, faces, tall_units.cabinet, evidence, grid, upm, settings, [item for item in builtins if isinstance(item, Polygon) and not item.is_empty], free)
         stats.update(cabinet_stats)
         unit_shapes.extend(cabinet_units)
+    if settings.leaf_walls:
+        stats["double_wall_leaf_runs_dropped"] = _drop_leaf_runs(runs, faces, openings, upm, settings)
     close_stats = _close_spans(list(close_spans), runs, faces, upm)
     if close_stats:
         stats["double_wall_spans_closed"] = close_stats
@@ -344,6 +395,13 @@ def build_double_walls(
         detected = _detect_wall_doors(runs, faces, openings, evidence, grid, upm, settings)
         stats["double_wall_doors_detected"] = len(detected)
         openings = list(openings) + detected
+
+    # after the door detection: every opening, also the ones found in the wall bodies, is judged
+    if settings.door_spans:
+        stats["double_wall_door_spans"] = _enforce_door_spans(runs, faces, openings, upm, settings)
+    if settings.close_walls:
+        stats["double_wall_jogs_merged"] = _merge_jogs(runs, faces, upm, settings)
+        stats["double_wall_closing_pieces"] = _close_free_ends(runs, faces, openings, upm, settings)
 
     bands_closed, opening_slabs, cut_shapes, jamb_lines = _wall_bodies(runs, faces, openings, upm, settings, roomish, grid)
     closed_union = _clean_union(bands_closed, upm, settings)
@@ -1063,6 +1121,240 @@ def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_
         runs.append(WallRun(filler.index, 0.0, filler.length, run.thickness, run.kind, "door-fill", group=run.group))
         closed += 1
     return closed
+
+
+def _run_centre(run: WallRun, face: _Face, along: float) -> np.ndarray:
+    return face.point(along, run.thickness / 2.0)
+
+
+def _segment_distance(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    vector = b - a
+    norm2 = float(vector @ vector)
+    t = 0.0 if norm2 <= 0.0 else float(np.clip((point - a) @ vector / norm2, 0.0, 1.0))
+    return float(np.linalg.norm(point - (a + vector * t)))
+
+
+def _drop_leaf_runs(runs: list[WallRun], faces: list[_Face], openings: list[Any], upm: float, settings: DoubleWallSettings) -> int:
+    """Remove wall runs that are the measured open leaf of a door (a leaf is evidence for hinge/swing, never a wall); returns how many."""
+    leaves = []
+    for opening in openings:
+        hinge, free = getattr(opening, "leaf_hinge", None), getattr(opening, "leaf_free", None)
+        if str(getattr(opening, "kind", "")) == "DOOR" and hinge is not None and free is not None:
+            leaves.append((np.asarray(hinge, dtype=float), np.asarray(free, dtype=float)))
+    if not leaves:
+        return 0
+    face_of = {face.index: face for face in faces}
+    reach = settings.leaf_run_distance_m * upm
+    dropped = 0
+    for run in list(runs):
+        face = face_of[run.face]
+        a, b = _run_centre(run, face, run.start), _run_centre(run, face, run.end)
+        length = float(np.linalg.norm(b - a))
+        for hinge, free in leaves:
+            if length > float(np.linalg.norm(free - hinge)) + settings.leaf_run_extra_m * upm:
+                continue
+            if _segment_distance(a, hinge, free) <= reach and _segment_distance(b, hinge, free) <= reach:
+                runs.remove(run)
+                dropped += 1
+                break
+    return dropped
+
+
+def _enforce_door_spans(runs: list[WallRun], faces: list[_Face], openings: list[Any], upm: float, settings: DoubleWallSettings) -> dict[str, int]:
+    """A door is never a wall: every door / passage has exactly one host wall run and nothing else stands in its span.
+
+    Per opening: the host is the parallel run whose centreline passes the opening centre (smallest offset, then longest cover of the span).
+    Other parallel runs (a duplicate / learned run beside the host) are cut back to the jambs, perpendicular runs that reach into the span
+    (an open leaf, a stub) are cut back to the span edge.  Without a host a door-host piece between the jambs is built.
+    """
+    counts = {"hosts_built": 0, "runs_cut": 0, "runs_removed": 0}
+    face_of = {face.index: face for face in faces}
+    min_piece = settings.door_min_piece_m * upm
+    for opening in openings:
+        if str(getattr(opening, "kind", "")) not in ("DOOR", "passage"):
+            continue
+        axis = _axis_of(opening)
+        normal = np.asarray((-axis[1], axis[0]))
+        centre = np.asarray(getattr(opening, "center"), dtype=float)[:2]
+        half = float(getattr(opening, "width")) / 2.0
+        depth = max(float(getattr(opening, "wall_thickness", 0.0)), 0.1 * upm) / 2.0
+        parallel: list[tuple[float, WallRun, _Face, float, float, float]] = []  # (distance to the centre, run, face, span low, span high, offset)
+        for run in runs:
+            face = face_of[run.face]
+            if run.thickness <= 0.0 or not _parallel(face.direction, axis, 10.0):
+                continue
+            left = np.asarray((-face.direction[1], face.direction[0]))
+            first, last = _run_centre(run, face, run.start), _run_centre(run, face, run.end)
+            offset = float(np.dot(centre - first, left))
+            distance = float(LineString([tuple(first), tuple(last)]).distance(Point(float(centre[0]), float(centre[1]))))
+            a = float(np.dot(centre - axis * half - face.start, face.direction))
+            b = float(np.dot(centre + axis * half - face.start, face.direction))
+            # same host criterion as the plan model: the centreline passes the opening centre within half its width plus the wall body
+            if abs(offset) <= run.thickness / 2.0 + 0.05 * upm and distance <= half + run.thickness / 2.0 + 0.05 * upm:
+                parallel.append((distance, run, face, min(a, b), max(a, b), offset))
+        if not parallel:
+            nearest = None
+            for run in runs:
+                face = face_of[run.face]
+                if run.thickness <= 0.0 or not _parallel(face.direction, axis, 10.0):
+                    continue
+                gap = float(LineString([tuple(_run_centre(run, face, run.start)), tuple(_run_centre(run, face, run.end))]).distance(Point(float(centre[0]), float(centre[1]))))
+                if gap <= settings.door_fill_reach_m * upm and (nearest is None or gap < nearest[0]):
+                    nearest = (gap, run)
+            thickness = nearest[1].thickness if nearest is not None else max(float(getattr(opening, "wall_thickness", 0.0)), 0.15 * upm)
+            kind = nearest[1].kind if nearest is not None else "interior"
+            start = centre - axis * (half + 0.02 * upm) - normal * thickness / 2.0
+            end = centre + axis * (half + 0.02 * upm) - normal * thickness / 2.0
+            filler = _Face(len(faces), start, end, {"type": "polyline", "points": [], "closed": False, "_source": "door_host"}, side=1)
+            faces.append(filler)
+            face_of[filler.index] = filler
+            runs.append(WallRun(filler.index, 0.0, filler.length, thickness, kind, "door-host"))
+            counts["hosts_built"] += 1
+            continue
+        host = min(parallel, key=lambda item: (round(item[0], 3), abs(item[5])))
+        host_normal = np.asarray((-host[2].direction[1], host[2].direction[0]))
+        host_line = float(np.dot(_run_centre(host[1], host[2], host[1].start), host_normal))
+        for _, run, face, low, high, _ in parallel:
+            if run is host[1] or max(0.0, min(run.end, high) - max(run.start, low)) <= 0.0:
+                continue  # not in the span: a piece beside the opening
+            if abs(float(np.dot(_run_centre(run, face, run.start), host_normal)) - host_line) <= settings.door_host_collinear_m * upm:
+                continue  # a collinear piece of the host wall: the opening cut ends it at the jamb
+            runs.remove(run)
+            kept = [(lo, hi) for lo, hi in ((run.start, min(run.end, low)), (max(run.start, high), run.end)) if hi - lo >= min_piece]
+            counts["runs_cut" if kept else "runs_removed"] += 1
+            for lo, hi in kept:
+                runs.append(WallRun(run.face, lo, hi, run.thickness, run.kind, run.evidence, group=run.group, extend_start=run.extend_start if lo == run.start else 0.0, extend_end=run.extend_end if hi == run.end else 0.0))
+        zone = Polygon([tuple(centre - axis * (half - 0.05 * upm) - normal * depth), tuple(centre + axis * (half - 0.05 * upm) - normal * depth), tuple(centre + axis * (half - 0.05 * upm) + normal * depth), tuple(centre - axis * (half - 0.05 * upm) + normal * depth)])
+        for run in list(runs):
+            face = face_of[run.face]
+            if run.thickness <= 0.0 or _parallel(face.direction, axis, 30.0):
+                continue
+            segment = LineString([tuple(_run_centre(run, face, run.start)), tuple(_run_centre(run, face, run.end))])
+            inside = segment.intersection(zone)
+            if inside.is_empty or inside.length <= settings.door_span_enter_m * upm:
+                continue
+            # only a run that BEGINS inside the span (hangs from the jamb into the opening: an open leaf, a stub) is cut; a wall that merely
+            # passes the lower or upper end of the span (a door at a wall junction) is a real crossing wall
+            reach_zone = zone.buffer(0.05 * upm)
+            if not any(reach_zone.contains(Point(float(end[0]), float(end[1]))) for end in segment.coords):
+                continue
+            runs.remove(run)
+            counts["runs_removed"] += 1
+            length = run.end - run.start
+            first = float(segment.project(Point(*inside.coords[0]))) if inside.geom_type == "LineString" else 0.0
+            last = float(segment.project(Point(*inside.coords[-1]))) if inside.geom_type == "LineString" else length
+            lo_in, hi_in = min(first, last), max(first, last)
+            for lo, hi in ((0.0, lo_in), (hi_in, length)):
+                if hi - lo >= min_piece:
+                    runs.append(WallRun(run.face, run.start + lo, run.start + hi, run.thickness, run.kind, run.evidence, group=run.group))
+                    counts["runs_removed"] -= 1
+                    counts["runs_cut"] += 1
+    return counts
+
+
+def _free_ends(runs: list[WallRun], faces: list[_Face], openings: list[Any], upm: float, settings: DoubleWallSettings) -> list[tuple[WallRun, int, np.ndarray, np.ndarray]]:
+    """(run, end 0/1, centreline end point, outward direction) of every run end that touches no other wall and no opening jamb."""
+    face_of = {face.index: face for face in faces}
+    centre_lines = []
+    for run in runs:
+        face = face_of[run.face]
+        centre_lines.append((run, LineString([tuple(_run_centre(run, face, run.start)), tuple(_run_centre(run, face, run.end))])))
+    jambs = []
+    for opening in openings:
+        axis = _axis_of(opening)
+        centre = np.asarray(getattr(opening, "center"), dtype=float)[:2]
+        half = float(getattr(opening, "width")) / 2.0
+        jambs.extend([centre - axis * half, centre + axis * half])
+    free = []
+    for run, line in centre_lines:
+        face = face_of[run.face]
+        reach = run.thickness / 2.0 + settings.free_end_reach_m * upm
+        for end, along in enumerate((run.start, run.end)):
+            point = _run_centre(run, face, along)
+            probe = Point(float(point[0]), float(point[1]))
+            if any(other is not run and probe.distance(other_line) <= reach for other, other_line in centre_lines):
+                continue
+            if any(float(np.linalg.norm(point - jamb)) <= reach + 0.10 * upm for jamb in jambs):
+                continue
+            free.append((run, end, point, face.direction * (-1.0 if end == 0 else 1.0)))
+    return free
+
+
+def _merge_jogs(runs: list[WallRun], faces: list[_Face], upm: float, settings: DoubleWallSettings) -> int:
+    """Straighten a room-edge run that is offset by a small step from a longer parallel neighbour it touches or overlaps."""
+    face_of = {face.index: face for face in faces}
+    limit = settings.jog_merge_m * upm
+    merged = 0
+    uses: dict[int, int] = {}
+    for run in runs:
+        uses[run.face] = uses.get(run.face, 0) + 1
+    for run in sorted(runs, key=lambda item: item.end - item.start):
+        if run.evidence != "room-edge" or uses.get(run.face, 0) != 1:
+            continue
+        face = face_of[run.face]
+        a, b = _run_centre(run, face, run.start), _run_centre(run, face, run.end)
+        length = float(np.linalg.norm(b - a))
+        best = None
+        for other in runs:
+            if other is run:
+                continue
+            other_face = face_of[other.face]
+            if not _parallel(face.direction, other_face.direction, 5.0):
+                continue
+            oa, ob = _run_centre(other, other_face, other.start), _run_centre(other, other_face, other.end)
+            if float(np.linalg.norm(ob - oa)) < length:
+                continue
+            offset = float(np.dot(oa - a, face.normal))
+            if not 0.04 * upm < abs(offset) <= limit:
+                continue
+            lo, hi = sorted((float(np.dot(oa - a, face.direction)), float(np.dot(ob - a, face.direction))))
+            if max(lo - length, -hi, 0.0) > 0.30 * upm:
+                continue
+            if best is None or abs(offset) < abs(best):
+                best = offset
+        if best is None:
+            continue
+        shift = face.normal * best
+        face.start, face.end = face.start + shift, face.end + shift
+        merged += 1
+    return merged
+
+
+def _close_free_ends(runs: list[WallRun], faces: list[_Face], openings: list[Any], upm: float, settings: DoubleWallSettings) -> int:
+    """Join two free ends that face each other across a small step with a connecting wall piece; returns the pieces added."""
+    free = _free_ends(runs, faces, openings, upm, settings)
+    used: set[tuple[int, int]] = set()
+    added = 0
+    limit, align = settings.close_step_max_m * upm, settings.close_step_align_m * upm
+    for i, (run_a, end_a, point_a, direction_a) in enumerate(free):
+        if (id(run_a), end_a) in used:
+            continue
+        step = np.asarray((-direction_a[1], direction_a[0]))
+        best = None
+        for run_b, end_b, point_b, direction_b in free[i + 1:]:
+            if run_b is run_a or (id(run_b), end_b) in used or not _parallel(direction_a, direction_b, 10.0):
+                continue
+            delta = point_b - point_a
+            along, across = abs(float(np.dot(delta, direction_a))), abs(float(np.dot(delta, step)))
+            if along > align or not 0.04 * upm < across <= limit:
+                continue
+            if best is None or across < best[0]:
+                best = (across, run_b, end_b, point_b)
+        if best is None:
+            continue
+        across, run_b, end_b, point_b = best
+        thickness = (run_a.thickness + run_b.thickness) / 2.0
+        sign = 1.0 if float(np.dot(point_b - point_a, step)) >= 0.0 else -1.0
+        e = step * sign  # from the centreline of A to the centreline of B
+        n = np.asarray((-e[1], e[0]))
+        midpoint_a = point_a + direction_a * (float(np.dot(point_b - point_a, direction_a)) / 2.0)  # between the two ends along the walls
+        base = midpoint_a - e * (thickness / 2.0)  # the piece overlaps both walls by half a thickness: no notch at the corners
+        face = _Face(len(faces), base - n * thickness / 2.0, base + e * (across + thickness) - n * thickness / 2.0, {"type": "polyline", "points": [], "closed": False, "_source": "wall_closure"}, side=1)
+        faces.append(face)
+        runs.append(WallRun(face.index, 0.0, face.length, thickness, run_a.kind, "closure"))
+        used.update({(id(run_a), end_a), (id(run_b), end_b)})
+        added += 1
+    return added
 
 
 def _reject_solid_doors(openings: list[Any], runs: list[WallRun], faces: list[_Face], evidence: WallEvidence, grid: RasterGrid, upm: float) -> tuple[list[Any], int]:
@@ -2217,6 +2509,255 @@ def _snap(value: float, clusters: list[tuple[float, int]], tolerance: float) -> 
     return nearest if abs(nearest - value) <= tolerance else value
 
 
+def _depth_frame(face: _Face, points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Along / across coordinates (relative to the face line, ``across`` along ``face.normal``) and height of depth voxels near a face."""
+    relative = points[:, :2] - face.start
+    return relative @ face.direction, relative @ face.normal, points[:, 2]
+
+
+def _covered_bins(along: np.ndarray, height: np.ndarray, low: float, count: int, bin_size: float, height_bin: float, settings: DoubleWallSettings) -> np.ndarray:
+    """Per along-bin flag: enough voxels spread over enough height bins to be a wall surface (not a lamp, not a floor spill)."""
+    covered = np.zeros(count, dtype=bool)
+    if not len(along) or count <= 0:
+        return covered
+    index = np.floor((along - low) / bin_size).astype(np.int64)
+    inside = (index >= 0) & (index < count)
+    index, bins = index[inside], np.clip(np.floor(height[inside] / max(height_bin, 1e-9)).astype(np.int64), 0, 40)
+    if not len(index):
+        return covered
+    voxels = np.bincount(index, minlength=count)
+    pairs = np.unique(index * 64 + bins)
+    height_bins = np.bincount(pairs // 64, minlength=count)
+    return (voxels >= settings.depth_min_voxels) & (height_bins >= settings.depth_min_height_bins)
+
+
+def _depth_extend_faces(faces: list[_Face], points: np.ndarray, openings: list[Any], upm: float, settings: DoubleWallSettings, evidence: WallEvidence | None, free: np.ndarray | None = None, grid: RasterGrid | None = None) -> int:
+    """Continue a measured face over an unseen stretch where COLMAP depth voxels lie on its own line (within the face tolerance).
+
+    The extension stops before an opening span and never exceeds ``depth_extend_max_m`` per end; a gap bin of one is tolerated.
+    With the measured free floor (``free``) the extension also stops at the first cell of walkable floor: a door or passage
+    gap has floor in it, an unseen stretch of wall does not.  Returns the number of face ends extended.
+    """
+    tolerance = settings.depth_face_tolerance_m * upm
+    bin_size = settings.depth_bin_m * upm
+    reach = settings.depth_extend_max_m * upm
+    height_bin = 0.10 * max(float(evidence.storey_height if evidence is not None else 0.0), 1e-9) if evidence is not None and evidence.storey_height else 0.10 * upm
+    spans = []
+    for opening in openings:
+        axis = _axis_of(opening)
+        centre = np.asarray(getattr(opening, "center"), dtype=float)[:2]
+        half = float(getattr(opening, "width")) / 2.0
+        spans.append((centre - axis * half, centre + axis * half))
+    extended = 0
+    for face in faces:
+        if face.length < settings.min_face_m * upm:
+            continue
+        box = np.maximum(np.abs(points[:, 0] - (face.start[0] + face.end[0]) / 2.0), np.abs(points[:, 1] - (face.start[1] + face.end[1]) / 2.0)) <= face.length / 2.0 + reach + tolerance
+        near = points[box]
+        if not len(near):
+            continue
+        along, across, height = _depth_frame(face, near)
+        on_line = np.abs(across) <= tolerance
+        along, height = along[on_line], height[on_line]
+        if not len(along):
+            continue
+        new_ends: list[np.ndarray | None] = [None, None]
+        for end in (0, 1):
+            sign = -1.0 if end == 0 else 1.0
+            origin = 0.0 if end == 0 else face.length
+            low = origin if end == 1 else origin - reach
+            count = int(math.ceil(reach / bin_size))
+            if end == 1:
+                covered = _covered_bins(along, height, low, count, bin_size, height_bin, settings)
+            else:
+                covered = _covered_bins(along, height, low, count, bin_size, height_bin, settings)[::-1]
+            # bin k (k = 0 next to the face end) is covered[k]
+            length = 0
+            gap = 0
+            for flag in covered:
+                if flag:
+                    length += 1 + gap
+                    gap = 0
+                else:
+                    gap += 1
+                    if gap > 1:
+                        break
+            if length * bin_size < 0.10 * upm:
+                continue
+            grow = length * bin_size
+            if free is not None and grid is not None:
+                origin_point = face.start if end == 0 else face.end
+                steps = np.arange(0.0, grow + 0.5 * bin_size, 0.02 * upm)
+                probes = origin_point[None, :] + sign * face.direction[None, :] * steps[:, None]
+                walkable = np.flatnonzero(_lookup(free, grid, probes))
+                if len(walkable):
+                    grow = max(0.0, float(steps[walkable[0]]) - 0.02 * upm)
+                    if grow < 0.10 * upm:
+                        continue
+            target = (face.start if end == 0 else face.end) + sign * face.direction * grow
+            if any(float(np.linalg.norm(target - jamb)) <= 0.05 * upm or LineString([tuple(a), tuple(b)]).distance(Point(float(target[0]), float(target[1]))) <= 0.05 * upm for a, b in spans for jamb in (a, b)):
+                continue
+            new_ends[end] = target
+        if new_ends[0] is not None:
+            face.start = new_ends[0]
+            extended += 1
+        if new_ends[1] is not None:
+            face.end = new_ends[1]
+            extended += 1
+    return extended
+
+
+def _depth_thickness(runs: list[WallRun], faces: list[_Face], points: np.ndarray, upm: float, settings: DoubleWallSettings, evidence: WallEvidence | None) -> int:
+    """Measure the thickness of a wall run whose second face the cloud did not see from COLMAP depth voxels on its solid side.
+
+    Only runs whose thickness is a room-edge / learned estimate are touched.  The far face is the dominant offset (1 cm bins)
+    of wall voxels over at least ``depth_cover_min_m`` (and ``depth_cover_min_share`` of the run) of the run, between the minimum and
+    maximum wall thickness; its offset becomes the run's thickness (evidence ``depth``).
+    """
+    low_thickness, high_thickness = settings.min_thickness_m * upm, settings.max_thickness_m * upm
+    tolerance = settings.depth_face_tolerance_m * upm
+    bin_size = settings.depth_bin_m * upm
+    height_bin = 0.10 * evidence.storey_height if evidence is not None and evidence.storey_height else 0.10 * upm
+    face_of = {face.index: face for face in faces}
+    changed = 0
+    for run in runs:
+        # Only interior estimates (room edge / learned): an exterior default stays, because the outer face is mostly seen from a window
+        # only and a measured interior-looking offset there would step against its (default-thickness) neighbours.
+        if run.kind == "partition" or run.evidence not in {"room", "learned"}:
+            continue
+        face = face_of[run.face]
+        normal = face.solid_normal
+        direction = face.direction
+        length = run.end - run.start
+        if length < settings.depth_cover_min_m * upm:
+            continue
+        middle = face.point((run.start + run.end) / 2.0)
+        reach = length / 2.0 + tolerance
+        box = np.maximum(np.abs(points[:, 0] - middle[0]), np.abs(points[:, 1] - middle[1])) <= reach + high_thickness + tolerance
+        near = points[box]
+        if not len(near):
+            continue
+        relative = near[:, :2] - face.start
+        along, across, height = relative @ direction, relative @ normal, near[:, 2]
+        keep = (along >= run.start) & (along <= run.end) & (across >= low_thickness - tolerance) & (across <= high_thickness + tolerance)
+        along, across, height = along[keep], across[keep], height[keep]
+        if len(along) < settings.depth_min_voxels:
+            continue
+        histogram, edges = np.histogram(across, bins=np.arange(low_thickness - tolerance, high_thickness + 2 * tolerance, 0.01 * upm))
+        smoothed = np.convolve(histogram, np.ones(3), mode="same")
+        peak = int(np.argmax(smoothed))
+        offset = float((edges[peak] + edges[peak + 1]) / 2.0)
+        on_face = np.abs(across - offset) <= tolerance
+        count = max(1, int(math.ceil(length / bin_size)))
+        covered = _covered_bins(along[on_face], height[on_face], run.start, count, bin_size, height_bin, settings)
+        covered_length = float(covered.sum()) * bin_size
+        if covered_length < min(settings.depth_cover_min_m * upm, length) or covered_length < settings.depth_cover_min_share * length:
+            continue
+        measured = float(np.median(across[on_face]))
+        if not low_thickness <= measured <= high_thickness:
+            continue
+        run.thickness, run.evidence = measured, "depth"
+        changed += 1
+    return changed
+
+
+def _flush_collinear_runs(runs: list[WallRun], faces: list[_Face], upm: float, settings: DoubleWallSettings) -> int:
+    """Give chained pieces of one wall a common centreline and thickness.
+
+    A room outline can split a single measured wall around a door and displace one
+    fragment by the estimated wall thickness.  Keeping both fragments makes a false
+    jog (and sometimes a diagonal bridge) in the wall body.  A real step is retained
+    only when both overlapping pieces are independently supported by measured face
+    pairs for the configured minimum length.
+    """
+    if len(runs) < 2:
+        return 0
+    face_of = {face.index: face for face in faces}
+    parent = list(range(len(runs)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def join(first: int, second: int) -> None:
+        first, second = find(first), find(second)
+        if first != second:
+            parent[second] = first
+
+    limit = settings.flush_line_offset_m * upm
+    chain_gap = settings.flush_chain_gap_m * upm
+    proof_length = settings.step_proof_face_length_m * upm
+    proof_offset = settings.step_proof_offset_m * upm
+    for first_index, first in enumerate(runs):
+        first_face = face_of[first.face]
+        first_start = _run_centre(first, first_face, first.start)
+        first_end = _run_centre(first, first_face, first.end)
+        for second_index in range(first_index + 1, len(runs)):
+            second = runs[second_index]
+            second_face = face_of[second.face]
+            if not _parallel(first_face.direction, second_face.direction, settings.pair_angle_deg):
+                continue
+            if float(np.dot(first_face.solid_normal, second_face.solid_normal)) <= 0.0:
+                continue
+            offset = abs(float(np.dot(_run_centre(second, second_face, (second.start + second.end) / 2.0) - first_start, first_face.solid_normal)))
+            if offset > limit:
+                continue
+            second_positions = sorted(float(np.dot(point - first_start, first_face.direction)) for point in (_run_centre(second, second_face, second.start), _run_centre(second, second_face, second.end)))
+            first_positions = sorted((0.0, float(np.dot(first_end - first_start, first_face.direction))))
+            overlap = min(first_positions[1], second_positions[1]) - max(first_positions[0], second_positions[0])
+            gap = max(first_positions[0] - second_positions[1], second_positions[0] - first_positions[1], 0.0)
+            if gap > chain_gap:
+                continue
+            # ``face`` is emitted only when the paired face measurements support
+            # this run.  Two such long, offset measurements are the available
+            # generic proof of an intentional step.
+            if offset >= proof_offset and overlap >= proof_length and first.evidence == second.evidence == "face":
+                continue
+            join(first_index, second_index)
+
+    components: dict[int, list[WallRun]] = {}
+    for index, run in enumerate(runs):
+        components.setdefault(find(index), []).append(run)
+    strength = {"face": 4, "depth": 3, "face-collinear": 3, "face-beside": 3, "room": 2, "niche": 1, "learned": 1, "exterior": 1, "door-host": 1, "door-fill": 1, "closure": 1}
+    changed = 0
+    for component in components.values():
+        if len(component) < 2:
+            continue
+        best_strength = max(strength.get(run.evidence, 0) for run in component)
+        anchors = [run for run in component if strength.get(run.evidence, 0) == best_strength]
+        reference = anchors[0]
+        reference_face = face_of[reference.face]
+        reference_point = _run_centre(reference, reference_face, (reference.start + reference.end) / 2.0)
+        weights = np.asarray([max(run.end - run.start, 1e-9) for run in anchors], dtype=float)
+        offsets = np.asarray([
+            float(np.dot(_run_centre(run, face_of[run.face], (run.start + run.end) / 2.0) - reference_point, reference_face.solid_normal))
+            for run in anchors
+        ])
+        target_offset = float(np.average(offsets, weights=weights))
+        target_thickness = float(np.average(np.asarray([run.thickness for run in anchors]), weights=weights))
+        target_thickness = min(max(target_thickness, settings.min_thickness_m * upm), settings.max_thickness_m * upm)
+        shifted_faces: set[int] = set()
+        for run in component:
+            face = face_of[run.face]
+            if run.face not in shifted_faces:
+                # Compare using the shared target thickness: changing a run's
+                # thickness must not displace its already selected centreline.
+                centre = face.point((run.start + run.end) / 2.0, target_thickness / 2.0)
+                delta = target_offset - float(np.dot(centre - reference_point, reference_face.solid_normal))
+                if abs(delta) > 1e-9:
+                    face.start = face.start + face.solid_normal * delta
+                    face.end = face.end + face.solid_normal * delta
+                    changed += 1
+                shifted_faces.add(run.face)
+            if abs(run.thickness - target_thickness) > 1e-9:
+                run.thickness = target_thickness
+                changed += 1
+            run.group = reference.group
+    return changed
+
+
 def _assign_thickness(runs: list[WallRun], faces: list[_Face], samples: list[_Samples], groups: dict[int, int], interior: list[tuple[float, int]], exterior: float, upm: float, settings: DoubleWallSettings, measured_pairs: dict[int, list[tuple[float, float, float, int, bool]]] | None = None) -> None:
     low, high = settings.min_thickness_m * upm, settings.max_thickness_m * upm
     snap = settings.cluster_snap_m * upm
@@ -2270,7 +2811,7 @@ def _assign_thickness(runs: list[WallRun], faces: list[_Face], samples: list[_Sa
     for group_runs in by_group.values():
         if len(group_runs) < 2:
             continue
-        strength = {"face": 4, "face-collinear": 3, "face-beside": 3, "room": 2, "niche": 1, "learned": 1, "exterior": 1}
+        strength = {"face": 4, "depth": 3, "face-collinear": 3, "face-beside": 3, "room": 2, "niche": 1, "learned": 1, "exterior": 1}
         ordered = sorted(group_runs, key=lambda item: (-strength.get(item.evidence, 0), -(item.end - item.start)))
         for run in group_runs:
             for anchor in ordered:

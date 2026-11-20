@@ -21,6 +21,18 @@ def _snapshot_length(directory: Path) -> float:
     return json.loads(pass1_plan_path(directory).read_text())["walls"][0]["centreline"][1][0]
 
 
+def test_pass1_fingerprint_changes_when_wall_pipeline_code_changes(tmp_path: Path, monkeypatch) -> None:
+    """A code-only deploy invalidates the pure pass-1 snapshot."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(plan_module, "_available_clean_plan_settings", lambda project, level, settings: plan_module.CleanPlanSettings())
+    monkeypatch.setattr(plan_module, "load_segment_result", lambda project, level, source: SimpleNamespace(fingerprint="segment"))
+    monkeypatch.setattr(plan_module, "_wall_pipeline_code_fingerprint", lambda: "wall-code-a")
+    before = plan_module.clean_plan_fingerprint(tmp_path, None)
+    monkeypatch.setattr(plan_module, "_wall_pipeline_code_fingerprint", lambda: "wall-code-b")
+    assert plan_module.clean_plan_fingerprint(tmp_path, None) != before
+
+
 def test_snapshot_is_written_when_no_refined_openings_were_applied(tmp_path: Path) -> None:
     _write_plan(tmp_path, 4.0, "fp1")
     plan_module._store_pass1_snapshot(tmp_path, {}, "fp1")

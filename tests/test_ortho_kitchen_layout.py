@@ -12,7 +12,7 @@ from shapely import affinity
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
-from samcloud.ortho.vector.kitchen_layout import _block_footprint, counter_lines, kitchen_cad_layout
+from samcloud.ortho.vector.kitchen_layout import KitchenLayoutSettings, _block_footprint, counter_lines, kitchen_cad_layout
 from samcloud.ortho.vector.plan_polish import fit_kitchen_to_walls
 
 UPMS = (1.0, 0.8124)
@@ -72,7 +72,8 @@ def _counter(layers) -> Polygon:
 
 
 @pytest.mark.parametrize("upm", UPMS)
-def test_cad_kitchen_extends_legs_finds_bar_and_mounts_appliances(upm: float) -> None:
+@pytest.mark.parametrize("on_chamfer", [False, True])
+def test_cad_kitchen_extends_legs_finds_bar_and_mounts_appliances(upm: float, on_chamfer: bool) -> None:
     walls, room, layers = _scene(upm)
     fit_kitchen_to_walls(layers, [room], walls, 0.0, upm)
     assert layers["A-EINB"][0]["_chamfers"], "the diagonal inner-corner unit survives the wall fit"
@@ -84,7 +85,7 @@ def test_cad_kitchen_extends_legs_finds_bar_and_mounts_appliances(upm: float) ->
         "COOKTOP": _grid_points(_s(box(2.0, 4.25, 2.5, 4.6), upm), 0.01 * upm),
         "KITCHEN_SINK": _grid_points(_s(box(0.9, 3.85, 1.2, 4.1), upm), 0.01 * upm),
     }
-    stats = kitchen_cad_layout(layers, [room], walls, 0.0, upm, heights, appliances)
+    stats = kitchen_cad_layout(layers, [room], walls, 0.0, upm, heights, appliances, KitchenLayoutSettings(appliance_on_chamfer=on_chamfer))
     counter = _counter(layers)
     # north leg grown along the measured counter to the stub face (x 3.6), never into it
     assert stats["kitchen_legs_extended_m"] == pytest.approx(0.70, abs=0.06)
@@ -103,7 +104,14 @@ def test_cad_kitchen_extends_legs_finds_bar_and_mounts_appliances(upm: float) ->
     assert cooktop.centroid.y == pytest.approx(4.45 * upm, abs=0.02 * upm)  # centred in the 0.60 m counter depth
     sink = _block_footprint(inserts["KITCHEN_SINK"], upm)
     assert counter.buffer(1e-4 * upm).covers(sink)
-    assert abs(((inserts["KITCHEN_SINK"]["rotation"] % 90.0) - 45.0)) <= 2.0  # on the diagonal corner unit
+    if on_chamfer:
+        assert abs(((inserts["KITCHEN_SINK"]["rotation"] % 90.0) - 45.0)) <= 2.0  # opt-in: on the diagonal corner unit
+    else:
+        # default (owner feedback round 5): the sink is square to its run, lies inside a leg and never sticks out of the counter
+        rotation = inserts["KITCHEN_SINK"]["rotation"] % 90.0
+        assert min(rotation, 90.0 - rotation) <= 0.5
+        assert counter.buffer(1e-4 * upm).covers(sink)
+        assert sink.minimum_rotated_rectangle.area == pytest.approx(sink.area, rel=1e-6)
     assert stats["kitchen_appliances_mounted"] == ["KITCHEN_SINK", "COOKTOP"]
     assert stats["kitchen_upper_crosses"] == 1
     assert len([item for item in layers["A-OBEN"] if item.get("_upper_cross")]) == 2

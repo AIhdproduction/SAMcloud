@@ -13,6 +13,12 @@ defaults:
   kitchen_worktop_top_m: 0.90
   kitchen_sink_bottom_m: 0.80
   kitchen_hob_height_m: 0.03
+  # A tall kitchen unit seen only as an instance: its top reaches at least this high and its narrow side is at most this wide.
+  kitchen_tall_min_top_m: 1.80
+  kitchen_tall_max_width_m: 1.00
+  # A hanging upper cabinet is mounted on a wall: one that lies farther than this (metres) from every wall face / centreline of the final
+  # plan has no mounting (its detection-time wall was moved or removed by the wall stage) and is dropped instead of becoming a floor box.
+  upper_cabinet_wall_max_m: 0.30
 
 # Default furniture heights by catalogue kind (samcloud/ortho/vector/symbols.py CATALOGUE keys).
 furniture_height_by_kind_m:
@@ -72,3 +78,90 @@ furniture_height_by_einb_kind_m:
   island: 0.9
   builtin_front: 2.1
   tall_unit: 2.1
+
+# Compact labelled depth evidence retained for BIM after dense caches are cleaned.
+# COLMAP geometric samples win; aligned Depth-Anything fills only absent samples.
+depth_evidence:
+  enabled: true
+  # Voxel size of the retained labelled depth points (per-voxel mean position, label vote, confidence).
+  voxel_m: 0.015
+  # Seen-empty grid; rays are marched in numpy (vectorised) and only a coarse pixel grid casts rays.
+  free_space_voxel_m: 0.05
+  free_ray_stride: 24
+  # Pixel stride of the back-projected samples. Measured on 64 v12 views at 0.015 m voxels:
+  # stride 4 -> 1.67 M voxels, 3 -> 2.09 M, 2 -> 2.67 M. Stride 2 keeps the 1 cm sample spacing at 3 m range.
+  stride: 2
+  # 0 = every usable view (never cap the retained product); N>0 only for previews.
+  max_views: 0
+  # Views per streaming batch (memory bound: a batch is reduced to voxel statistics before the next one).
+  batch_views: 128
+  workers: 8
+  max_geometric_depth_m: 10.0
+  max_prior_depth_m: 6.0
+  # Depth-Anything-only voxels (no COLMAP depth) need this many distinct views.
+  min_prior_views: 2
+  # Consumers should require this many views for a label to count as agreed (stored as n_views).
+  min_label_views: 2
+  min_free_through: 2
+  # Pixels whose 5x5 neighbourhood spans more than this relative depth jump are dropped (edges, grazing angles).
+  depth_edge_rel: 0.04
+  # A product voxel is "gap fill" when no classified-cloud point lies within this radius.
+  gap_radius_m: 0.03
+  instance_radius_m: 0.08
+  alignment_max_residual_m: 0.08
+  alignment_sample: 400000
+  # --- use of the product in the indoor plan (walls, furniture, kitchen) -------------------------------------
+  # Master switch. false (or a project without products/depth) = the plan is built from the point cloud alone.
+  # Rule: dimensions, edges and faces only from COLMAP-flagged voxels with >= 2 views; Depth-Anything-only voxels
+  # are occupancy evidence only ("something is here" / "this is free").
+  use_in_plan: true
+  # Wall faces: class-2 COLMAP gap-fill voxels seen from at least this many views join the wall-face evidence.
+  plan_wall_min_views: 2
+  # Furniture / kitchen classes 17-19: gap-fill voxels with this support extend footprints and top-height maps.
+  plan_furniture_min_views: 2
+  plan_furniture_min_confidence: 0.5
+  # Two face measurements closer than this (metres) are the same face.
+  plan_face_tolerance_m: 0.03
+  # Unmeasured cells (no point above the floor) of the furniture top-height map take the COLMAP furniture top of the product.
+  # Default OFF: measured on v12 it filled 2345 cells but changed no sofa / bed level and added one doubtful 0.63 x 0.30 m "bed" in the hall.
+  plan_height_fill: false
+  # ... only within this distance (metres) of cells the cloud measured as an object (no new object arises from depth alone).
+  plan_height_fill_reach_m: 0.15
+  # A region is "seen empty" when at least this share of its volume was crossed by camera rays (plan_min_through views).
+  plan_empty_share: 0.80
+  plan_min_through: 2
+  # ... and at most this many rays may end inside the cell (0 = a cell where any ray hit a surface is not empty; measured on v12:
+  # "through > ending" leaves 88 % of the sofa's points in "free" cells, "ending == 0" <= 8 %).
+  plan_free_max_ending: 0
+  # Furniture-class gap-fill voxels below this height (metres) confirm floor contact of a standing object.
+  plan_floor_contact_z_m: 0.20
+
+# Tall kitchen rows (fridge / oven tower / tall cabinets) measured from furniture-class points (cloud + COLMAP depth), samcloud/bim/kitchen_rows.py.
+# A row is seen from the room (front face); the body is modelled from the measured front face back to the wall behind it and along the row to the
+# next wall / kitchen leg, floor to the measured top. An existing fridge keeps its own item and takes the row's depth.
+kitchen_rows:
+  enabled: true
+  # A plan cell is "tall" when it holds >= min_cell_points points above tall_min_m AND points in the mid band (a hanging upper cabinet leaves it free).
+  cell_m: 0.05
+  tall_min_m: 1.80
+  tall_max_m: 2.70
+  mid_low_m: 1.00
+  mid_high_m: 1.30
+  min_cell_points: 3
+  # Only clusters within kitchen_reach_m of a kitchen run are kitchen rows.
+  kitchen_reach_m: 1.20
+  # A front face is at least min_run_m long (gaps up to gap_cells cells are bridged).
+  min_run_m: 0.30
+  gap_cells: 2
+  # The wall behind a front face within wall_reach_m: the row fills front -> wall (never deeper than max_depth_m).
+  wall_reach_m: 0.90
+  max_depth_m: 0.80
+  # A row end snaps to a wall / kitchen leg within along_reach_m.
+  along_reach_m: 0.40
+  min_length_m: 0.30
+  min_area_m2: 0.15
+  # A segment overlapping an accepted row by this share of its own area is the end face of the same body.
+  duplicate_share: 0.30
+  # A row piece shorter than min_unit_m next to a fridge is absorbed by it.
+  min_unit_m: 0.30
+  min_top_points: 8
