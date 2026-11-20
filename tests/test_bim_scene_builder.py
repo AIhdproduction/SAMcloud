@@ -285,6 +285,50 @@ def test_units_per_metre_is_applied() -> None:
     assert areas == pytest.approx([3.75 * 4.7, 3.75 * 4.7], rel=1e-6)
 
 
+def test_room_drops_degenerate_and_sliver_holes(tmp_path: Path) -> None:
+    plan = make_plan()
+    plan.rooms = [
+        PlanRoom(
+            "R_BAD",
+            "Bad",
+            {
+                "exterior": _rect(0.5, 0.5, 3.5, 4.5),
+                "holes": [
+                    [[1.0, 1.0], [1.01, 1.0], [1.02, 1.0]],
+                    _rect(2.0, 2.0, 2.005, 2.005),
+                ],
+            },
+            12.0,
+            [2.0, 2.5],
+        )
+    ]
+
+    scene = build_scene(plan)
+    space = scene.elements_of(ElementKind.SPACE)[0]
+
+    assert space.params.holes == []
+    assert Path(write_ifc(scene, tmp_path / "sliver_holes.ifc").path).is_file()
+
+
+def test_room_keeps_real_hole() -> None:
+    plan = make_plan()
+    plan.rooms = [
+        PlanRoom(
+            "R_HOLE",
+            "Shaft",
+            {"exterior": _rect(0.5, 0.5, 3.5, 4.5), "holes": [_rect(2.0, 2.0, 2.3, 2.3)]},
+            11.91,
+            [1.0, 1.0],
+        )
+    ]
+
+    scene = build_scene(plan)
+    space = scene.elements_of(ElementKind.SPACE)[0]
+
+    assert len(space.params.holes) == 1
+    assert Polygon(space.params.holes[0]).area == pytest.approx(0.09)
+
+
 def test_single_line_wall_gets_the_default_thickness() -> None:
     plan = make_plan()
     plan.walls[4].thickness_m = 0.0
@@ -334,6 +378,59 @@ def test_crossing_walls_are_split_into_two_t_joins() -> None:
 
     assert scene.derived["samcloud_build"]["split_crossings"] == 1
     assert scene.derived["samcloud_build"]["wall_overlaps"] == []
+
+
+def test_exterior_t_junction_next_to_window_jamb_closes_the_envelope() -> None:
+    """A noisy exterior split beside a window must not become an IFC slot at a partition."""
+    plan = make_plan()
+    plan.walls = [
+        _wall("W001", (0.01, 0.0), (3.05, 0.01), 0.28, "exterior"),
+        _wall("W002", (3.64, -0.01), (8.0, 0.0), 0.29, "exterior"),
+        _wall("W003", (8.0, 0.0), (8.0, 5.0), 0.30, "exterior"),
+        _wall("W004", (8.0, 5.0), (0.0, 5.0), 0.30, "exterior"),
+        _wall("W005", (0.0, 5.0), (0.0, 0.0), 0.30, "exterior"),
+        _wall("W006", (3.47, 0.23), (3.49, 4.95), 0.27, "interior"),
+    ]
+    plan.openings = [
+        PlanOpening("O001", "window", [1.88, 0.005], 1.72, 0.004, 0.28, host_wall_id="W001", sill_m=0.9, head_m=2.1),
+    ]
+
+    scene = build_scene(plan)
+    geometry = compute_scene_geometry(scene)
+    footprints = unary_union([Polygon(item.footprint) for item in geometry.walls.values()])
+
+    assert scene.derived["samcloud_build"]["envelope_bridged"] == 1
+    assert footprints.buffer(1e-6).covers(Polygon([(3.18, -0.04), (3.51, -0.04), (3.51, 0.04), (3.18, 0.04)]))
+    window = next(item for item in scene.elements.values() if item.name == "Window opening O001")
+    assert window.params.width == pytest.approx(1.72)
+    assert scene.derived["samcloud_build"]["joins_t"] >= 1
+
+
+def test_door_gap_never_merges_a_thin_partition_with_an_offset_thick_wall() -> None:
+    """A door between a thin partition and a thick wall piece 0.19 m beside its axis keeps both axes (no skewed merged solid)."""
+    plan = make_plan()
+    plan.walls = [
+        _wall("W001", (0.0, 0.01), (8.0, 0.0), 0.30, "exterior"),
+        _wall("W002", (8.0, 0.0), (8.0, 5.0), 0.30, "exterior"),
+        _wall("W003", (8.0, 5.0), (0.0, 5.01), 0.30, "exterior"),
+        _wall("W004", (0.0, 5.0), (0.0, 0.0), 0.30, "exterior"),
+        _wall("W005", (4.0, 0.15), (4.01, 1.80), 0.17, "interior"),
+        _wall("W006", (4.19, 3.25), (4.18, 4.85), 0.30, "exterior"),
+    ]
+    plan.openings = [PlanOpening("O001", "door", [4.0, 2.52], 1.0, 1.5707963, 0.17, host_wall_id="W005", sill_m=0.0, head_m=2.05)]
+    plan.rooms = []
+    plan.furniture = []
+
+    scene = build_scene(plan)
+    report = scene.derived["samcloud_build"]
+    geometry = compute_scene_geometry(scene)
+    footprints = sorted((Polygon(item.footprint) for item in geometry.walls.values() if item.footprint), key=lambda poly: poly.bounds[1])
+    partition_side = [poly for poly in footprints if poly.bounds[2] - poly.bounds[0] < 0.4 and poly.bounds[3] - poly.bounds[1] < 3.0 and 3.5 < (poly.bounds[0] + poly.bounds[2]) / 2 < 4.4]
+
+    assert report["bridged"] == 0
+    # the partition solid stays 0.17 m thick around x = 4.0; it is not widened to the 0.30 m piece
+    assert any(abs((poly.bounds[2] - poly.bounds[0]) - 0.17) < 0.02 and abs((poly.bounds[0] + poly.bounds[2]) / 2 - 4.0) < 0.03 for poly in partition_side)
+    assert any(item.name == "Door opening O001" for item in scene.elements.values())
 
 
 def test_export_level_writes_files_and_qa(tmp_path: Path) -> None:

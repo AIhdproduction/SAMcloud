@@ -386,7 +386,15 @@ def build_double_walls(
         unit_shapes.extend(cabinet_units)
     if settings.leaf_walls:
         stats["double_wall_leaf_runs_dropped"] = _drop_leaf_runs(runs, faces, openings, upm, settings)
-    close_stats = _close_spans(list(close_spans), runs, faces, upm)
+    spans = list(close_spans)
+    if settings.refined_openings:
+        # A refined window is final: its host wall must exist.  Where the measured faces left the window's wall out (glazing
+        # reflects no wall points) the wall is continued across the window and up to the neighbouring wall pieces.
+        spans.extend(
+            {"center": tuple(opening.center), "axis_angle": float(opening.axis_angle), "width": float(opening.width), "bridge": True}
+            for opening in openings if str(getattr(opening, "kind", "")) == "WINDOW"
+        )
+    close_stats = _close_spans(spans, runs, faces, upm)
     if close_stats:
         stats["double_wall_spans_closed"] = close_stats
     if evidence is not None and settings.door_detect and not settings.refined_openings:
@@ -1078,6 +1086,30 @@ def _reorient_door_leaves(openings: list[Any], faces: list[_Face], evidence: Wal
     return output
 
 
+WINDOW_BRIDGE_M = 1.0  # a wall gap this short between a window span and the next collinear wall piece is closed with the window
+
+
+def _bridge_to_neighbours(runs: list[WallRun], face_of: dict[int, _Face], face: _Face, host: WallRun, low: float, high: float, reach: float) -> tuple[float, float]:
+    """Extend ``[low, high]`` (positions along ``face``) to the nearest collinear wall piece on each side when it is within ``reach``."""
+    below, above = low, high
+    for run in runs:
+        other = face_of[run.face]
+        if run.thickness <= 0.0:
+            continue
+        if abs(float(np.dot(other.direction, face.direction))) < math.cos(math.radians(5.0)):
+            continue
+        if abs(float(np.dot(other.start - face.start, face.solid_normal))) > 0.5 * max(host.thickness, 1e-9):
+            continue
+        a = float(np.dot(other.point(run.start) - face.start, face.direction))
+        b = float(np.dot(other.point(run.end) - face.start, face.direction))
+        start, end = min(a, b), max(a, b)
+        if end <= low and low - end <= reach:
+            below = min(below, end)
+        elif start >= high and start - high <= reach:
+            above = max(above, start)
+    return below, above
+
+
 def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_Face], upm: float, reach_m: float = 1.5) -> int:
     """Continue the host wall across spans that are no opening (a gap between the measured faces); returns how many were closed.
 
@@ -1114,6 +1146,8 @@ def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_
         if distance > reach:
             continue
         low, high = low - 0.02 * upm, high + 0.02 * upm
+        if span.get("bridge"):
+            low, high = _bridge_to_neighbours(runs, face_of, face, run, low, high, WINDOW_BRIDGE_M * upm)
         filler = _Face(len(faces), face.point(low), face.point(high), {"type": "polyline", "points": [], "closed": False, "_source": "door_fill"}, side=face.side)
         filler.start, filler.end = face.start + face.direction * low, face.start + face.direction * high
         faces.append(filler)

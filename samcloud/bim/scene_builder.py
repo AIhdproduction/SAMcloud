@@ -71,6 +71,9 @@ from samcloud.bim.plan_model import BuildingPlan, PlanFurniture, PlanOpening, Pl
 NAMESPACE = uuid.UUID("3f6c1c0e-8d0a-5b0e-9c55-53414d636c64")
 """Fixed namespace of the deterministic scene element ids."""
 
+_MIN_INTERIOR_AREA_M2 = 1e-4
+"""Smallest meaningful plan opening; smaller rings are clipping artefacts."""
+
 _DEFAULTS: dict[str, Any] = {
     "storey": {"fallback_height_m": 2.5},
     "slab": {"thickness_m": 0.20, "close_gap_m": 0.02, "simplify_m": 0.01, "min_hole_area_m2": 0.5, "min_area_m2": 0.5},
@@ -135,6 +138,7 @@ class SceneBuildReport:
     split_crossings: int = 0
     trimmed_overlaps: int = 0
     bridged: int = 0
+    envelope_bridged: int = 0
     single_line_default_thickness: int = 0
     joins_l: int = 0
     joins_t: int = 0
@@ -187,6 +191,22 @@ def _polygons(geometry: BaseGeometry) -> list[Polygon]:
             result.extend(_polygons(part))
         return result
     return []
+
+
+def _clean_polygon(geometry: BaseGeometry) -> Polygon | None:
+    """Return the largest valid polygon, discarding non-polygonal repair remnants."""
+    pieces = sorted(_polygons(make_valid(geometry)), key=lambda polygon: -polygon.area)
+    return pieces[0] if pieces else None
+
+
+def _interior_rings(polygon: Polygon, *, min_area_m2: float) -> list[list[tuple[float, float]]]:
+    """Convert only valid, meaningful interior rings to parameter outlines."""
+    rings: list[list[tuple[float, float]]] = []
+    for ring in polygon.interiors:
+        hole = Polygon(ring)
+        if hole.is_valid and not hole.is_empty and hole.area >= min_area_m2:
+            rings.append(_ring(hole, ccw=False))
+    return rings
 
 
 def _ring(polygon: Polygon, *, ccw: bool = True) -> list[tuple[float, float]]:
@@ -322,6 +342,96 @@ def _dedup(walls: list[_Wall], cfg: dict[str, Any], report: SceneBuildReport) ->
             target = merged_into[target]
         merged_into[key] = target
     return walls, merged_into
+
+
+def _opening_spans_gap(
+    first: _Wall, start: float, end: float, openings: list[PlanOpening], upm: float, cfg: dict[str, Any]
+) -> bool:
+    """Whether an opening occupies a proposed collinear exterior-wall bridge."""
+    axis_tolerance = float(cfg["openings"]["host_angle_deg"])
+    for opening in openings:
+        axis = np.array([math.cos(opening.axis_angle), math.sin(opening.axis_angle)])
+        if _angle_between(first.direction, axis) > axis_tolerance:
+            continue
+        centre = np.asarray(opening.center, dtype=float) / upm
+        reach = max(first.thickness, float(opening.wall_thickness_m)) / 2.0 + float(cfg["openings"]["host_offset_m"])
+        if abs(first.offset(centre)) > reach:
+            continue
+        half = float(opening.width_m) / 2.0
+        lo = first.along(centre - axis * half)
+        hi = first.along(centre + axis * half)
+        # A jamb may coincide with the bridge endpoint.  Only an opening that reaches
+        # materially into the bridge blocks it; a touching span is exactly the case to close.
+        if max(min(lo, hi), start) + 0.005 < min(max(lo, hi), end):
+            return True
+    return False
+
+
+def _bridge_exterior_t_gaps(
+    walls: list[_Wall],
+    openings: list[PlanOpening],
+    upm: float,
+    cfg: dict[str, Any],
+    report: SceneBuildReport,
+    merged_into: dict[str, str],
+) -> list[_Wall]:
+    """Join exterior fragments separated only by an interior T-junction.
+
+    The IFC join kernel cuts only wall ends.  If a noisy extraction stops two collinear exterior
+    runs on either side of a partition, an L join between the partition and one fragment leaves a
+    full-height slot in the envelope.  The source wall bodies already prove that this is one wall;
+    merge the exterior pieces before joins are made.  A real opening is always kept separate.
+    """
+    dcfg = cfg["walls"]["dedup"]
+    reach = float(cfg["walls"]["join"]["reach_m"])
+    changed = True
+    while changed:
+        changed = False
+        exterior = sorted((wall for wall in walls if wall.kind == "exterior"), key=lambda wall: wall.id)
+        for index, first in enumerate(exterior):
+            for second in exterior[index + 1:]:
+                if not _collinear(first, second, dcfg["max_angle_deg"], dcfg["offset_factor"]):
+                    continue
+                projected = sorted((first.along(second.p0), first.along(second.p1)))
+                if projected[0] >= first.length:
+                    start, end = first.length, projected[0]
+                elif projected[1] <= 0.0:
+                    start, end = projected[1], 0.0
+                else:
+                    continue
+                gap = end - start
+                # The existing join reach bounds this repair.  It is deliberately not a broad
+                # facade completion: an interior endpoint must also land inside the short gap.
+                if gap <= 0.005 or gap > 2.0 * reach:
+                    continue
+                if _opening_spans_gap(first, start, end, openings, upm, cfg):
+                    continue
+                has_t = False
+                for candidate in walls:
+                    if candidate is first or candidate is second:
+                        continue
+                    if _angle_between(first.direction, candidate.direction) < cfg["walls"]["join"]["min_angle_deg"]:
+                        continue
+                    for endpoint in (candidate.p0, candidate.p1):
+                        along = first.along(endpoint)
+                        contact = abs(first.offset(endpoint)) <= (first.thickness + candidate.thickness) / 2.0 + 0.01
+                        if contact and start - first.thickness <= along <= end + first.thickness:
+                            has_t = True
+                            break
+                    if has_t:
+                        break
+                if not has_t:
+                    continue
+                keep, other = (first, second) if (first.length, first.id) >= (second.length, second.id) else (second, first)
+                _merge_pair(keep, other)
+                merged_into[other.id] = keep.id
+                walls.remove(other)
+                report.envelope_bridged += 1
+                changed = True
+                break
+            if changed:
+                break
+    return walls
 
 
 def _trim_overlaps(
@@ -582,6 +692,11 @@ def _resolve_openings(
             for _, other in candidates[1:]:
                 if other is host or not _collinear(host, other, ocfg["host_angle_deg"], 1.0):
                     continue
+                # Two pieces on either side of an opening are one wall only when their axes really coincide.  A thin partition
+                # next to a thick exterior piece (offset 0.1-0.2 m) is a different wall: merging them skews the merged axis and
+                # the solid then cuts into the neighbouring room.
+                if abs(host.offset((other.p0 + other.p1) / 2.0)) > 0.5 * min(host.thickness, other.thickness):
+                    continue
                 d = host.direction
                 a, b = sorted((float(np.dot(other.p0 - host.p0, d)), float(np.dot(other.p1 - host.p0, d))))
                 if b < lo - ocfg["bridge_gap_m"] or a > hi + ocfg["bridge_gap_m"]:
@@ -797,6 +912,13 @@ def build_scene(
     walls = _split_crossings(walls, cfg, report)
     merged_into = {k: v for k, v in merged_into.items()}
     hosted = _resolve_openings(plan, walls, merged_into, cfg, report)
+    walls = _bridge_exterior_t_gaps(walls, plan.openings, upm, cfg, report, merged_into)
+    live_walls = {wall.id: wall for wall in walls}
+    for key, (wall, opening) in list(hosted.items()):
+        target = wall.id
+        while target in merged_into:
+            target = merged_into[target]
+        hosted[key] = (live_walls.get(target, wall), opening)
     walls = _trim_overlaps(walls, cfg, report, {id(w) for w, _ in hosted.values()})
     joins = _build_joins(walls, cfg)
 
@@ -1007,15 +1129,16 @@ def build_scene(
     for room in sorted(plan.rooms, key=lambda r: r.id):
         exterior = np.asarray(room.polygon["exterior"], dtype=float) / upm
         holes = [np.asarray(h, dtype=float) / upm for h in room.polygon.get("holes", [])]
-        original = make_valid(Polygon(exterior, holes))
-        pieces = sorted(_polygons(original), key=lambda p: -p.area)
-        if not pieces:
+        original = _clean_polygon(Polygon(exterior, holes))
+        if original is None:
             report.warnings.append(f"room {room.id} {room.name!r}: empty polygon, skipped")
             report.room_areas.append({"id": room.id, "name": room.name, "plan_m2": float(room.area_m2), "ifc_m2": 0.0})
             continue
-        original = pieces[0]
         clipped_all = _polygons(original.difference(room_wall_union)) if not room_wall_union.is_empty else [original]
-        clipped_all = sorted([p for p in clipped_all if p.area >= 0.05], key=lambda p: -p.area)
+        clipped_all = sorted(
+            [cleaned for piece in clipped_all if (cleaned := _clean_polygon(piece)) is not None and cleaned.area >= 0.05],
+            key=lambda p: -p.area,
+        )
         if not clipped_all:
             report.warnings.append(f"room {room.id} {room.name!r}: nothing left after wall clipping, skipped")
             report.room_areas.append({"id": room.id, "name": room.name, "plan_m2": float(room.area_m2), "ifc_m2": 0.0})
@@ -1030,9 +1153,7 @@ def build_scene(
             )
         report.room_areas.append({"id": room.id, "name": room.name, "plan_m2": float(room.area_m2), "ifc_m2": 0.0})
         for piece_index, piece in enumerate(kept_pieces):
-            clipped = piece.simplify(1e-4, preserve_topology=True)
-            if not isinstance(clipped, Polygon) or clipped.is_empty:
-                clipped = piece
+            clipped = _clean_polygon(piece.simplify(1e-4, preserve_topology=True)) or piece
             piece_key = room.id if piece_index == 0 else f"{room.id}.{piece_index}"
             space_id = _uid(plan, "space", piece_key)
             space = SpaceElement(
@@ -1044,7 +1165,7 @@ def build_scene(
                 params=SpaceParams(
                     name=room.name,
                     outline=_ring(clipped),
-                    holes=[_ring(Polygon(ring), ccw=False) for ring in clipped.interiors],
+                    holes=_interior_rings(clipped, min_area_m2=_MIN_INTERIOR_AREA_M2),
                 ),
                 param_origin={"name": ParamOrigin.MEASURED, "outline": ParamOrigin.FITTED},
                 properties={
@@ -1094,14 +1215,8 @@ def build_scene(
         for component in sorted(_polygons(union), key=lambda p: (p.bounds[0], p.bounds[1])):
             if component.area < slab_cfg["min_area_m2"] or not component.intersects(room_union):
                 continue
-            simple = component.simplify(float(slab_cfg["simplify_m"]), preserve_topology=True)
-            if not isinstance(simple, Polygon) or simple.is_empty:
-                simple = component
-            holes = [
-                _ring(Polygon(ring), ccw=False)
-                for ring in simple.interiors
-                if Polygon(ring).area >= slab_cfg["min_hole_area_m2"]
-            ]
+            simple = _clean_polygon(component.simplify(float(slab_cfg["simplify_m"]), preserve_topology=True)) or component
+            holes = _interior_rings(simple, min_area_m2=float(slab_cfg["min_hole_area_m2"]))
             index += 1
             scene.add(
                 SlabElement(

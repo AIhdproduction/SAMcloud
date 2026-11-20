@@ -247,6 +247,37 @@ def test_door_in_an_unmeasured_wall_keeps_the_host_wall_on_both_sides(upm: float
 
 
 @pytest.mark.parametrize("upm", UNITS)
+def test_refined_window_in_an_unmeasured_wall_gets_its_host_wall(upm: float) -> None:
+    import dataclasses
+
+    import test_ortho_double_walls as walls
+    from samcloud.ortho.vector.double_walls import build_double_walls
+    from samcloud.ortho.vector.indoor import Opening
+
+    faces, rooms, free, valid, grid = walls._two_rooms(upm)
+    kept = []
+    for face in faces:  # room A's bottom wall (y = 0, x 0..4 m) measured only at both ends: glazing reflected no wall points between them
+        (x0, y0), (x1, y1) = face["points"]
+        if abs(y0) < 1e-9 and abs(y1) < 1e-9 and abs(x0) < 1e-9 and abs(x1 - 4.0 * upm) < 1e-9:
+            kept += [walls._face(0.0, 0.0, 0.8 * upm, 0.0), walls._face(3.2 * upm, 0.0, 4.0 * upm, 0.0)]
+        else:
+            kept.append(face)
+    window = Opening("WINDOW", (2.0 * upm, 0.003 * upm), 0.9 * upm, 0.002, 0.3 * upm)
+    refined = dataclasses.replace(walls.SETTINGS, refined_openings=True)
+
+    def covered(result, xs):  # the closed wall bodies: the window cut itself is made in the plan model
+        body = unary_union(result.closed_polygons)
+        return [body.contains(Point(x * upm, -0.05 * upm)) for x in xs]
+
+    first_pass = build_double_walls(kept, [window], [], free, valid, grid, upm, walls.SETTINGS)
+    assert not any(covered(first_pass, [1.7, 2.0, 2.3]))  # without the refinement nothing is built under the window
+    result = build_double_walls(kept, [window], [], free, valid, grid, upm, refined)
+    assert all(covered(result, [1.7, 2.0, 2.3]))  # a refined window is final: its wall stands
+    assert all(covered(result, [1.0, 1.3, 2.7, 3.0]))  # up to the neighbouring wall pieces (gaps below 1 m are closed)
+    assert result.stats["double_wall_spans_closed"] == 1
+
+
+@pytest.mark.parametrize("upm", UNITS)
 def test_host_side_spans_leave_other_openings_on_the_line_open(upm: float) -> None:
     from openings3d_doors_synth import make_wall_plan
     from samcloud.bim.openings3d.apply import host_side_spans
