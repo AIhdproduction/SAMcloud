@@ -801,6 +801,8 @@ def _phase_percent(stage: str, statuses: dict, progress: dict) -> float:
 
 
 def _render_recent_projects() -> None:
+    from samcloud.app.pages.projects import format_created
+
     projects = state.projects.discover_projects()
     with ui.element("section").classes("sam-surface sam-recent"):
         with ui.row().classes("sam-recent-head items-center justify-between w-full"):
@@ -816,6 +818,9 @@ def _render_recent_projects() -> None:
                 with ui.column().classes("gap-0 flex-1").style("min-width: 0"):
                     ui.label(project["project"]["name"]).classes("sam-project-name")
                     ui.label(str(project_directory)).classes("sam-project-path")
+                created_text = format_created(project, project_directory, current_language())
+                if created_text:
+                    ui.label(created_text).classes("text-xs text-slate-500 whitespace-nowrap")
                 ui.button(t("common.open"), on_click=lambda path=project_directory: _open_project(path)).props("flat no-caps").classes("text-cyan-4")
 
 

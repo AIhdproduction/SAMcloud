@@ -68,7 +68,8 @@
   },
   "existing": {
     "title": "Existing projects",
-    "empty": "No saved projects found."
+    "empty": "No saved projects found.",
+    "created": "Created {date}"
   },
   "delete": {
     "busy": "This project is still processing and cannot be deleted.",

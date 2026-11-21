@@ -1,6 +1,7 @@
 """Project creation and reopening page."""
 
 import tempfile
+from datetime import datetime
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from tkinter import TclError, Tk, filedialog
@@ -8,13 +9,14 @@ from typing import Any
 
 from nicegui import events, ui
 
-from samcloud.app.i18n import t, translate_or
+from samcloud.app.i18n import catalogue, current_language, t, translate_or
 from samcloud.app.layout import render_page
 from samcloud.app.pages.control_points import crs_options, local_crs_hint
 from samcloud.app.state import state
 from samcloud.classification.custom import standard_classes
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_deletion import delete_project
+from samcloud.core.project_manager import PROJECT_FILENAME
 from samcloud.core.storage import DEFAULT_STORAGE
 
 
@@ -359,7 +361,10 @@ def render() -> None:
                                 else t("projects.capture_type.legacy")
                             )
                             ui.label(capture_label).classes("text-xs text-slate-500")
-                        with ui.row().classes("items-center gap-2"):
+                        with ui.row().classes("items-center gap-2 no-wrap"):
+                            created_text = format_created(project, project_directory, current_language())
+                            if created_text:
+                                ui.label(created_text).classes("text-xs text-slate-500 whitespace-nowrap")
                             ui.button(
                                 t("common.open"),
                                 on_click=lambda path=project_directory: _open_project(path),
@@ -375,6 +380,33 @@ def render() -> None:
         render_existing_projects()
 
     render_page(t("nav.projects"), content, current_path="/projects")
+
+
+def format_created(project: Mapping[str, Any], project_directory: Path, language: str | None) -> str | None:
+    """Return the localized creation label for a project, or None if unknown."""
+    moment: datetime | None = None
+    try:
+        raw = project["project"]["created_at"]
+        if isinstance(raw, datetime):
+            moment = raw
+        elif isinstance(raw, str):
+            moment = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        moment = None
+    if moment is None:
+        try:
+            moment = datetime.fromtimestamp((Path(project_directory) / PROJECT_FILENAME).stat().st_mtime)
+        except (OSError, OverflowError, ValueError):
+            return None
+    try:
+        local = moment.astimezone()
+    except (OSError, OverflowError, ValueError):
+        return None
+    pattern = "%d.%m.%Y %H:%M" if str(language or "").lower().startswith("de") else "%Y-%m-%d %H:%M"
+    template = catalogue(str(language or "")).get("projects.existing.created")
+    if not template:
+        return t("projects.existing.created", date=local.strftime(pattern))
+    return template.replace("{date}", local.strftime(pattern))
 
 
 def _open_project(project_directory: Path) -> None:

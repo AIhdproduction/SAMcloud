@@ -68,7 +68,8 @@
   },
   "existing": {
     "title": "Vorhandene Projekte",
-    "empty": "Keine gespeicherten Projekte gefunden."
+    "empty": "Keine gespeicherten Projekte gefunden.",
+    "created": "Erstellt {date}"
   },
   "delete": {
     "busy": "Dieses Projekt wird noch verarbeitet und kann nicht gelöscht werden.",
