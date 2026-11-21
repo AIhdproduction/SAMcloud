@@ -17,8 +17,8 @@ categories:
   road:           {label: Strasse,        layer: S-PAVE,       rgb: [125, 133, 144], aci: 8,   transparency: 0.0}
   path:           {label: Weg,            layer: S-PATH,       rgb: [168, 159, 145], aci: 252, transparency: 0.0}
   sidewalk:       {label: Trottoir,       layer: S-WALK,       rgb: [195, 200, 207], aci: 9,   transparency: 0.0}
-  lawn:           {label: Rasen,          layer: S-VEG,        rgb: [120, 184, 72],  aci: 73,  transparency: 0.0}
   curb:           {label: Randstein,      layer: S-CURB,       rgb: [74, 79, 87],    aci: 137, transparency: 0.0}
+  gutter:         {label: Wasserstein,    layer: S-GUTR,       rgb: [160, 165, 172], aci: 251, transparency: 0.0}
   building_wall:  {label: Gebäude-Wand,   layer: S-BLDG,       rgb: [227, 207, 168], aci: 41,  transparency: 0.0}
   roof:           {label: Dach,           layer: S-BLDG-ROOF,  rgb: [200, 100, 60],  aci: 23,  transparency: 0.0}
   window:         {label: Fenster,        layer: S-BLDG-WIND,  rgb: [159, 211, 240], aci: 141, transparency: 0.4}
@@ -31,5 +31,6 @@ categories:
   marking:        {label: Markierung,     layer: S-MARK,       rgb: [255, 255, 255], aci: 7,   transparency: 0.0}
   contour_major:  {label: Höhenlinie Haupt, layer: S-TOPO-MAJR, rgb: [150, 60, 40],  aci: 34,  transparency: 0.0, ifc: false}
   contour_minor:  {label: Höhenlinie Neben, layer: S-TOPO-MINR, rgb: [190, 140, 100], aci: 43, transparency: 0.0, ifc: false}
+  contour_label:  {label: Höhenlinie Beschriftung, layer: S-TOPO-TEXT, rgb: [150, 60, 40], aci: 34, transparency: 0.0, ifc: false}
   spot_elevation: {label: Kote,           layer: S-ELEV,       rgb: [0, 0, 0],       aci: 7,   transparency: 0.0, ifc: false}
   boundary:       {label: Grenze,         layer: S-ANNO-GRENZE, rgb: [220, 30, 30],  aci: 1,   transparency: 0.0, ifc: false}

@@ -477,6 +477,10 @@ class TreeParams(ParamsBase):
     height: Positive | None = None
     crown_diameter: Positive | None = None
     trunk_diameter: Positive | None = None
+    crown_shape: str | None = None            # sphere|ellipsoid|cone|umbrella|cylinder
+    crown_base_z: Real | None = None          # absolute Z of the crown base (= trunk top)
+    crown_offset: Point2 | None = None        # crown centre minus trunk position
+    trunk_measured: bool | None = None        # False -> the trunk diameter is a stylised stand-in
 
 
 class ShrubParams(ParamsBase):
@@ -498,6 +502,8 @@ class SiteWallParams(ParamsBase):
     thickness: Positive | None = None
     base_z: Real | None = None
     top_z: Real = 1.0
+    top_z_axis: list[Real] | None = None   # top height per axis vertex (triangulated solid when it varies)
+    base_z_axis: list[Real] | None = None  # base height per axis vertex (terrain; triangulated solid when it varies)
 
     @model_validator(mode="after")
     def _validate(self) -> SiteWallParams:
@@ -515,8 +521,10 @@ class SiteWallParams(ParamsBase):
 
 
 class FenceParams(ParamsBase):
-    axis: list[Point3]
+    axis: list[Point3]               # top edge polyline (z = top)
     height: Positive
+    bottom_z: list[Real] | None = None   # bottom edge height per axis vertex (terrain)
+    thickness: Positive = 0.04
 
     @model_validator(mode="after")
     def _validate(self) -> FenceParams:
@@ -533,8 +541,15 @@ class PavementParams(MeshParams):
 class CurbParams(ParamsBase):
     axis: list[Point3]
     width: Positive = 0.12
-    height: Positive = 0.25
+    height: Positive = 0.25          # body height when no foot heights are known
     curb_sweep: Literal["auto", "extrude_only"] = "auto"
+    foot_z: list[Real] | None = None  # road-side surface height per axis vertex; axis z = curb top
+    road_side: Literal[-1, 0, 1] = 0  # +1 road on the left of the axis direction, -1 right, 0 unknown
+    gutter_width: NonNegative = 0.0   # gutter stone (Wasserstein) width on the road side, 0 = none
+    gutter_thickness: Positive = 0.12
+    gutter_axis: list[Point3] | None = None  # dense stations (x, y, z at the curb-side edge of the gutter top); default: axis + foot_z
+    gutter_z_outer: list[Real] | None = None  # gutter top at the outer edge per gutter_axis station (draped on the surface)
+    embed: NonNegative = 0.15         # body extends this far below the foot level
 
     @model_validator(mode="after")
     def _validate(self) -> CurbParams:
@@ -558,6 +573,7 @@ class ManholeParams(ParamsBase):
     center: Point3
     diameter: Positive
     type: str = ""
+    thickness: Positive = 0.05        # cover body thickness; its top is the cover height
 
 
 class VegetationAreaParams(ParamsBase):

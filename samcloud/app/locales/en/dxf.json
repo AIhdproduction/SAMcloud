@@ -273,16 +273,17 @@
     "layers": "DXF layers",
     "all": "All",
     "none": "None",
-    "hint": "Mouse wheel zooms, drag pans.",
-    "open_png": "Open PNG"
+    "hint": "Wheel zooms (text stays sharp), drag pans, double-click fits.",
+    "open_png": "Open PNG",
+    "rendering_svg": "Vector preview is being created ..."
   },
   "ifc_outdoor": {
-    "lawns": "Lawns",
     "paths": "Paths",
     "terrain": "Terrain",
     "pavements": "Pavements",
     "sidewalks": "Sidewalks",
     "curbs": "Curbs",
+    "gutters": "Gutter stones",
     "buildings": "Building walls",
     "roofs": "Roofs",
     "site_walls": "Site walls",

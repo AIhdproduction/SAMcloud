@@ -102,9 +102,10 @@ def triangulated_face_set(
     return ifc.createIfcTriangulatedFaceSet(points, None, True, indices, None)
 
 
-def tessellation_representation(ctx: ExportContext, item: Entity) -> Entity:
-    """Body/Tessellation representation for a triangulated mesh item."""
-    return ctx.file.createIfcShapeRepresentation(ctx.body, "Body", "Tessellation", [item])
+def tessellation_representation(ctx: ExportContext, item: Entity | Sequence[Entity]) -> Entity:
+    """Body/Tessellation representation for one triangulated mesh item or several items in ONE representation."""
+    items = list(item) if isinstance(item, (list, tuple)) else [item]
+    return ctx.file.createIfcShapeRepresentation(ctx.body, "Body", "Tessellation", items)
 
 
 def swept_curb(
@@ -112,9 +113,14 @@ def swept_curb(
     axis: Sequence[Vec3],
     width: float = 0.12,
     height: float = 0.25,
+    *,
+    down: bool = False,
 ) -> Entity:
-    """Create an IfcFixedReferenceSweptAreaSolid along a three-dimensional polyline."""
-    profile = rectangle_profile(ifc, (0.0, -height / 2.0), width, height)
+    """Create an IfcFixedReferenceSweptAreaSolid along a three-dimensional polyline.
+
+    The curb stands on the directrix by default; with ``down`` it hangs below it (directrix = top edge).
+    """
+    profile = rectangle_profile(ifc, (0.0, height / 2.0 if down else -height / 2.0), width, height)
     directrix = ifc.createIfcPolyline([_point3(ifc, point) for point in axis])
     # Directrix uses absolute coordinates, so the solid position stays at the origin
     # (an axis[0] offset here would be applied a second time). IfcOpenShell maps the
@@ -126,6 +132,97 @@ def swept_curb(
     )
 
 
+_CROWN_SECTORS = 12
+# Unit profiles (height fraction h from the crown base, radius fraction r) of the lathe crown meshes.
+# Radius 0 at an end closes it with a single pole vertex, otherwise with a centre-fan cap.
+_CROWN_PROFILES: dict[str, list[tuple[float, float]]] = {
+    "ellipsoid": [(0.0, 0.0), (0.25, float(np.cos(np.pi / 6.0))), (0.5, 1.0), (0.75, float(np.cos(np.pi / 6.0))), (1.0, 0.0)],
+    "cone": [(0.0, 1.0), (1.0 / 3.0, 2.0 / 3.0), (2.0 / 3.0, 1.0 / 3.0), (1.0, 0.0)],
+    "umbrella": [(0.0, 0.6), (0.4, 1.0), (0.75, 0.85), (1.0, 0.0)],   # flattened, rounded dome
+    "cylinder": [(0.0, 1.0), (0.5, 1.0), (1.0, 1.0)],
+}
+_CROWN_PROFILES["sphere"] = _CROWN_PROFILES["ellipsoid"]
+
+
+def crown_mesh(
+    centre_xy: Vec2, base_z: float, height: float, diameter: float, shape: str = "ellipsoid",
+) -> tuple[list[Vec3], list[tuple[int, int, int]]]:
+    """Closed lathe mesh (72 triangles) of a crown whose lowest point is exactly ``base_z``.
+
+    ``shape`` is sphere/ellipsoid, cone (apex up), umbrella (flat dome) or cylinder (72 triangles each,
+    so that crown + trunk mesh stay within the 60..120 triangle budget); unknown names fall back to the ellipsoid.
+    """
+    profile = _CROWN_PROFILES.get(shape, _CROWN_PROFILES["ellipsoid"])
+    radius = diameter / 2.0
+    cx, cy = centre_xy
+    vertices: list[Vec3] = []
+    rings: list[int | None] = []      # first vertex index of each full ring, None for a pole
+    pole_index: dict[int, int] = {}
+    for position, (h, rr) in enumerate(profile):
+        z = base_z + height * h
+        if rr <= 1e-9:
+            pole_index[position] = len(vertices)
+            vertices.append((cx, cy, z))
+            rings.append(None)
+            continue
+        rings.append(len(vertices))
+        for sector in range(_CROWN_SECTORS):
+            azimuth = 2.0 * np.pi * sector / _CROWN_SECTORS
+            vertices.append((cx + radius * rr * np.cos(azimuth), cy + radius * rr * np.sin(azimuth), z))
+    triangles: list[tuple[int, int, int]] = []
+    last = len(profile) - 1
+    # Bottom end: pole fan, or a centre vertex closing the first ring.
+    if rings[0] is None:
+        bottom_pole, first = pole_index[0], rings[1]
+    else:
+        bottom_pole, first = len(vertices), rings[0]
+        vertices.append((cx, cy, base_z))
+    for sector in range(_CROWN_SECTORS):
+        triangles.append((bottom_pole, first + (sector + 1) % _CROWN_SECTORS, first + sector))
+    for position in range(last):
+        lower, upper = rings[position], rings[position + 1]
+        if lower is None or upper is None:
+            continue
+        for sector in range(_CROWN_SECTORS):
+            nxt = (sector + 1) % _CROWN_SECTORS
+            triangles.append((lower + sector, lower + nxt, upper + nxt))
+            triangles.append((lower + sector, upper + nxt, upper + sector))
+    if rings[last] is None:
+        top_pole, ring = pole_index[last], rings[last - 1]
+    else:
+        top_pole, ring = len(vertices), rings[last]
+        vertices.append((cx, cy, base_z + height))
+    for sector in range(_CROWN_SECTORS):
+        triangles.append((ring + sector, ring + (sector + 1) % _CROWN_SECTORS, top_pole))
+    return vertices, triangles
+
+
+def trunk_mesh(
+    centre_xy: Vec2, base_z: float, height: float, diameter: float, sides: int = 12,
+) -> tuple[list[Vec3], list[tuple[int, int, int]]]:
+    """Closed triangulated cylinder (``sides`` sides, 2*sides + 2*(sides-2) triangles; 44 for 12 sides)."""
+    cx, cy = centre_xy
+    radius = diameter / 2.0
+    vertices: list[Vec3] = []
+    for z in (base_z, base_z + height):
+        for k in range(sides):
+            az = 2.0 * np.pi * k / sides
+            vertices.append((cx + radius * np.cos(az), cy + radius * np.sin(az), z))
+    triangles: list[tuple[int, int, int]] = []
+    for k in range(sides):
+        n = (k + 1) % sides
+        triangles.append((k, n, sides + n))
+        triangles.append((k, sides + n, sides + k))
+    for k in range(1, sides - 1):
+        triangles.append((0, k + 1, k))                                  # bottom fan (faces down)
+        triangles.append((sides, sides + k, sides + k + 1))              # top fan (faces up)
+    return vertices, triangles
+
+
+_MIN_CROWN_CLEARANCE_M = 0.3     # crown base at least this far above the terrain
+_TRUNK_INTO_CROWN = 0.15         # the trunk reaches this fraction of the crown height into the crown
+
+
 def stylised_tree(
     ifc: ifcopenshell.file,
     trunk_xy: Vec2,
@@ -133,53 +230,34 @@ def stylised_tree(
     height: float,
     crown_diameter: float,
     trunk_diameter: float,
+    crown_shape: str = "ellipsoid",
+    crown_base_z: float | None = None,
+    crown_offset: Vec2 = (0.0, 0.0),
 ) -> tuple[Entity, Entity]:
-    """Return a 12-sided trunk extrusion and a 72-triangle ellipsoid crown mesh."""
-    crown_height = max(height * 0.55, crown_diameter * 0.6)
-    crown_base = base_z + height - crown_height
-    radius = crown_diameter / 2.0
-    trunk = polygon_profile(
-        ifc,
-        [
-            (
-                trunk_diameter / 2.0 * np.cos(2.0 * np.pi * index / 12.0),
-                trunk_diameter / 2.0 * np.sin(2.0 * np.pi * index / 12.0),
-            )
-            for index in range(12)
-        ],
-    )
-    trunk_solid = extrusion(ifc, trunk, crown_base - base_z, origin=(trunk_xy[0], trunk_xy[1], base_z))
-    vertices: list[Vec3] = [(trunk_xy[0], trunk_xy[1], crown_base)]
-    # Five latitude rings plus two poles produce 72 triangles with 12 sectors.
-    for ring in range(1, 6):
-        angle = -np.pi / 2.0 + np.pi * ring / 6.0
-        for sector in range(12):
-            azimuth = 2.0 * np.pi * sector / 12.0
-            vertices.append(
-                (
-                    trunk_xy[0] + radius * np.cos(angle) * np.cos(azimuth),
-                    trunk_xy[1] + radius * np.cos(angle) * np.sin(azimuth),
-                    crown_base + crown_height / 2.0 * (1.0 + np.sin(angle)),
-                )
-            )
-    top_index = len(vertices)
-    vertices.append((trunk_xy[0], trunk_xy[1], crown_base + crown_height))
-    triangles: list[tuple[int, int, int]] = []
-    for sector in range(12):
-        next_sector = (sector + 1) % 12
-        triangles.append((0, 1 + next_sector, 1 + sector))
-    for ring in range(4):
-        start = 1 + ring * 12
-        following = start + 12
-        for sector in range(12):
-            next_sector = (sector + 1) % 12
-            triangles.extend(((start + sector, start + next_sector, following + next_sector), (start + sector, following + next_sector, following + sector)))
-    start = 1 + 4 * 12
-    for sector in range(12):
-        triangles.append((start + sector, start + (sector + 1) % 12, top_index))
-    crown = triangulated_face_set(ifc, vertices, triangles)
-    assert 60 <= len(triangles) <= 120
-    return trunk_solid, crown
+    """Return ``(trunk, crown)`` as two closed IfcTriangulatedFaceSet items for ONE Body/Tessellation representation.
+
+    The trunk is a 12-sided cylinder from the terrain (``base_z``) to the crown base; the crown (72 triangles)
+    is centred on ``trunk_xy + crown_offset`` (the trunk may stand off-centre under the crown).  Its lowest point is ``crown_base_z`` (default: the
+    legacy ``height - max(0.55 * height, 0.6 * crown_diameter)`` rule, never below ``base_z + 0.3``); the trunk
+    runs up to ``crown_base + 0.15 * crown height`` so that both meshes overlap and look connected.
+    """
+    if crown_base_z is None:
+        crown_height = max(height * 0.55, crown_diameter * 0.6)
+        crown_base = base_z + height - crown_height
+    else:
+        crown_base = float(crown_base_z)
+        crown_height = base_z + height - crown_base
+        if crown_height < 0.2 * height or crown_height <= 0.0:
+            crown_height = max(height * 0.55, crown_diameter * 0.6)
+            crown_base = base_z + height - crown_height
+    if crown_base < base_z + _MIN_CROWN_CLEARANCE_M:
+        crown_base = base_z + _MIN_CROWN_CLEARANCE_M
+        crown_height = max(base_z + height - crown_base, 0.2 * height)
+    tv, tt = trunk_mesh(trunk_xy, base_z, crown_base + _TRUNK_INTO_CROWN * crown_height - base_z, trunk_diameter)
+    centre = (trunk_xy[0] + crown_offset[0], trunk_xy[1] + crown_offset[1])
+    cv, ct = crown_mesh(centre, crown_base, crown_height, crown_diameter, crown_shape)
+    assert len(ct) <= 120 and 60 <= len(ct) + len(tt) <= 120
+    return triangulated_face_set(ifc, tv, tt), triangulated_face_set(ifc, cv, ct)
 
 
 def axis_representation(ctx: ExportContext, length: float) -> Entity:

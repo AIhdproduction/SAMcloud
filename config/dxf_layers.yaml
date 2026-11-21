@@ -43,9 +43,11 @@ outdoor_extra_layers:
   - {name: S-BLDG-DOOR, color: 37, linetype: CONTINUOUS, lineweight: 18}
   - {name: S-SHRUB, color: 81, linetype: CONTINUOUS, lineweight: 18}
   - {name: S-PATH, color: 252, linetype: CONTINUOUS}
+  - {name: S-GUTR, color: 251, linetype: CONTINUOUS, lineweight: 25}
   - {name: S-TOPO-TIN, color: 53, linetype: CONTINUOUS, frozen: true}
   # Outdoor colours (ACI + true colour) come from config/outdoor_style.yaml (single source of truth); the ACI values here only mirror it as a fallback.
   - {name: S-TOPO-MAJR, color: 34, true_color: [150, 60, 40], linetype: CONTINUOUS, lineweight: 25}
   - {name: S-TOPO-MINR, color: 43, true_color: [190, 140, 100], linetype: CONTINUOUS, lineweight: 13}
+  - {name: S-TOPO-TEXT, color: 34, true_color: [150, 60, 40], linetype: CONTINUOUS, lineweight: 18}
   - {name: S-ELEV, color: 7, linetype: CONTINUOUS, lineweight: 18}
   - {name: S-ANNO-GRENZE, color: 1, linetype: DASHED, lineweight: 25}

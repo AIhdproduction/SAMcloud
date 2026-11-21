@@ -595,17 +595,21 @@ def to_dxf_entities(elements: Iterable, frame: c.LocalFrame, *, config: dict | N
     return out
 
 
-def curb_dxf_entities(curbs: Iterable, frame: c.LocalFrame, *, config: dict | None = None) -> dict[str, list[dict]]:
+def curb_dxf_entities(curbs: Iterable, frame: c.LocalFrame, *, config: dict | None = None, exclude_ids: Iterable[int] = ()) -> dict[str, list[dict]]:
     """``S-CURB`` entities for fitted curbs (``samcloud.terrain.edges.FittedCurb``).
 
     Flat curbs (Z range <= ``edges.dxf_curb_flat_z_m``) become an elevated LWPOLYLINE with bulges for the
     arcs; others a 3D polyline with the arcs densified at sagitta <= ``edges.fit.sagitta_m``.
     """
     cfg = _pave_cfg(config)
-    flat_limit = float(cfg.get("edges", {}).get("dxf_curb_flat_z_m", 0.05))
+    # a flat LWPOLYLINE sits at the median z: only axes this flat may use it, so no IFC curb body can rise above the DXF line
+    flat_limit = min(float(cfg.get("edges", {}).get("dxf_curb_flat_z_m", 0.05)), float(cfg.get("curb", {}).get("dxf_flat_tol_m", 0.003)))
     out: list[dict] = []
     min_length = float(cfg.get("curb", {}).get("curb_min_length_m", cfg.get("curb", {}).get("min_length_m", 0.3)))
+    skip = {int(i) for i in exclude_ids}
     for fc in curbs:
+        if int(fc.curb_id) in skip:
+            continue  # exported from its (clipped) element axis instead
         if fc.status == "rejected" or float(np.hypot(*np.diff(fc.dense_xyz[:, :2], axis=0).T).sum()) < min_length:
             continue  # not emitted as a curb element either
         z = np.asarray(fc.z, dtype=np.float64)

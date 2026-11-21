@@ -140,3 +140,151 @@ def test_black_layer_is_drawn_white_on_dark_background(tmp_path: Path) -> None:
     assert _has_colour(out, (255, 255, 255))
     legend = {item["name"]: item["color"] for item in dxf_preview.layer_legend(dxf)}
     assert legend["S-ELEV"] == "#ffffff"
+
+
+# ------------------------------------------------------------------------------------------- vector (SVG) preview
+
+import re
+import xml.etree.ElementTree as ET
+
+import pytest
+
+SVG_NS = "{http://www.w3.org/2000/svg}"
+LV95_X, LV95_Y = 2_699_800.0, 1_221_200.0
+
+
+def _write_entity_dxf(path: Path, *, origin: tuple[float, float] = (0.0, 0.0)) -> Path:
+    ox, oy = origin
+    doc = ezdxf.new("R2018")
+    for name, rgb in (("S-LINE", RED), ("S-POLY", GREEN), ("S-ROUND", BLUE), ("S-TXT", (255, 255, 0)),
+                      ("S-TREE", (0, 200, 90)), ("S-TIN", FROZEN)):
+        doc.layers.add(name).rgb = rgb
+    doc.layers.get("S-TIN").freeze()
+    block = doc.blocks.new("TREEB")
+    block.add_circle((0, 0), 1.0)
+    block.add_attdef("KRONE", (1.2, -1.2), height=0.2, text="KRONE=?")
+    hidden = block.add_attdef("HEIGHT", (0, -0.1), height=0.05, text="h")
+    hidden.dxf.flags = 1
+    msp = doc.modelspace()
+    msp.add_line((ox, oy), (ox + 10.0, oy + 5.0), dxfattribs={"layer": "S-LINE"})
+    msp.add_lwpolyline([(ox, oy + 20, 0, 0, 0), (ox + 10, oy + 20, 0, 0, 0.5), (ox + 10, oy + 30, 0, 0, 0),
+                        (ox, oy + 30, 0, 0, 0)], format="xyseb", close=True, dxfattribs={"layer": "S-POLY"})
+    msp.add_polyline3d([(ox, oy + 40, 1), (ox + 5, oy + 41, 2), (ox + 10, oy + 40, 3)], dxfattribs={"layer": "S-POLY"})
+    msp.add_spline([(ox, oy + 50), (ox + 3, oy + 55), (ox + 6, oy + 50), (ox + 9, oy + 56)], dxfattribs={"layer": "S-POLY"})
+    msp.add_circle((ox + 20, oy + 5), 2.0, dxfattribs={"layer": "S-ROUND"})
+    msp.add_arc((ox + 20, oy + 20), 3.0, 10, 200, dxfattribs={"layer": "S-ROUND"})
+    msp.add_text("Contour 902.0", height=0.25, dxfattribs={"layer": "S-TXT", "insert": (ox + 30, oy + 5), "rotation": 30})
+    insert = msp.add_blockref("TREEB", (ox + 40, oy + 10), dxfattribs={"layer": "S-TREE"})
+    insert.add_auto_attribs({"KRONE": "KRONE=1.99 m", "HEIGHT": "HIDDEN"})
+    msp.add_3dface([(ox, oy), (ox + 1, oy), (ox + 1, oy + 1), (ox, oy + 1)], dxfattribs={"layer": "S-TIN"})
+    doc.saveas(path)
+    return path
+
+
+def _groups(svg: Path) -> dict[str, ET.Element]:
+    root = ET.parse(svg).getroot()
+    return {g.get("data-layer"): g for g in root.iter(f"{SVG_NS}g") if g.get("data-layer")}
+
+
+def test_svg_has_one_group_per_layer_with_all_entity_types(tmp_path: Path) -> None:
+    dxf = _write_entity_dxf(tmp_path / "plan.dxf")
+    svg = dxf_preview.render_dxf_svg(dxf, tmp_path / "preview.svg")
+    root = ET.parse(svg).getroot()  # valid XML
+    assert root.tag == f"{SVG_NS}svg" and root.get("viewBox")
+    groups = _groups(svg)
+    assert set(groups) == {"S-LINE", "S-POLY", "S-ROUND", "S-TXT", "S-TREE"}  # frozen S-TIN hidden
+    assert groups["S-LINE"].get("stroke") == "#ff0000"
+    assert len(groups["S-LINE"].findall(f"{SVG_NS}path")) == 1
+    assert len(groups["S-POLY"].findall(f"{SVG_NS}path")) == 3  # LWPOLYLINE with bulge, POLYLINE 3D, SPLINE
+    assert any(p.get("d", "").endswith("Z") for p in groups["S-POLY"].findall(f"{SVG_NS}path"))
+    assert len(groups["S-ROUND"].findall(f"{SVG_NS}circle")) == 1 and len(groups["S-ROUND"].findall(f"{SVG_NS}path")) == 1
+    texts = [element.text for element in groups["S-TXT"].findall(f"{SVG_NS}text")]
+    assert texts == ["Contour 902.0"]
+    assert "rotate(-30" in groups["S-TXT"].find(f"{SVG_NS}text").get("transform")
+    tree = groups["S-TREE"]
+    assert len(tree.findall(f"{SVG_NS}circle")) == 1  # block geometry exploded
+    assert [element.text for element in tree.findall(f"{SVG_NS}text")] == ["KRONE=1.99 m"]  # invisible attribute skipped
+    assert "S-TIN" not in svg.read_text(encoding="utf-8")
+    meta = dxf_preview.load_svg_meta(svg)
+    assert meta is not None and {item["name"] for item in meta["layers"]} == set(groups)
+
+
+def test_svg_includes_frozen_layer_when_requested(tmp_path: Path) -> None:
+    dxf = _write_entity_dxf(tmp_path / "plan.dxf")
+    svg = dxf_preview.render_dxf_svg(dxf, tmp_path / "preview.svg", frozen_layers_hidden=False, force=True)
+    assert "S-TIN" in _groups(svg)
+
+
+def test_svg_uses_local_origin_for_lv95_coordinates(tmp_path: Path) -> None:
+    dxf = _write_entity_dxf(tmp_path / "plan.dxf", origin=(LV95_X, LV95_Y))
+    svg = dxf_preview.render_dxf_svg(dxf, tmp_path / "preview.svg")
+    text = svg.read_text(encoding="utf-8")
+    viewbox = [float(v) for v in ET.parse(svg).getroot().get("viewBox").split()]
+    assert all(abs(v) < 10_000 for v in viewbox)
+    values = [float(n) for attr in re.findall(r'(?:d|x|y|cx|cy)="([^"]*)"', text) for n in re.findall(r"-?\d+(?:\.\d+)?", attr)]
+    assert values and max(abs(v) for v in values) < 10_000
+    meta = dxf_preview.load_svg_meta(svg)
+    assert meta is not None and abs(meta["origin"][0] - LV95_X) < 100 and abs(meta["origin"][1] - LV95_Y) < 100
+
+
+def test_svg_cache_rebuilds_only_when_dxf_is_newer(tmp_path: Path) -> None:
+    dxf = _write_entity_dxf(tmp_path / "plan.dxf")
+    out = tmp_path / "preview.svg"
+    dxf_preview.render_dxf_svg(dxf, out)
+    assert dxf_preview.svg_is_fresh(dxf, out)
+    first = out.stat().st_mtime_ns
+    time.sleep(0.05)
+    dxf_preview.render_dxf_svg(dxf, out)
+    assert out.stat().st_mtime_ns == first  # cache hit
+    old = time.time() - 100
+    for stale in (out, out.with_name(dxf_preview.SVG_META_NAME)):
+        os.utime(stale, (old, old))
+    os.utime(dxf, (old + 50, old + 50))
+    assert not dxf_preview.svg_is_fresh(dxf, out)
+    dxf_preview.render_dxf_svg(dxf, out)
+    assert out.stat().st_mtime_ns > int(old * 1e9) + 10**9
+    assert dxf_preview.svg_is_fresh(dxf, out)
+
+
+def test_svg_path_helper_and_controller(tmp_path: Path) -> None:
+    outdoor = DxfPageController(_project(tmp_path, "outdoor_svg", drone=True))
+    svg = outdoor.dxf_preview_svg_path()
+    assert svg is not None and svg.name == "preview.svg" and svg.parent.name == "export"
+    assert dxf_preview.svg_preview_path(tmp_path / "preview.png") == tmp_path / "preview.svg"
+
+
+def _page_route() -> None:
+    from samcloud.app.pages import dxf as dxf_page
+
+    dxf_page.render()
+
+
+_page_route.__module__ = "tests.dxf_preview_route"
+
+
+@pytest.mark.anyio
+async def test_page_builds_card_with_svg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nicegui import ui
+    from nicegui.testing.user_simulation import user_simulation
+
+    from samcloud.app.pages import dxf as dxf_page
+    from samcloud.app.state import state as app_state
+
+    from dxf_synthetic import write_outdoor_scene
+
+    project = _project(tmp_path, "outdoor_page", drone=True)
+    write_outdoor_scene(project / "products" / "classified" / "classified.las")
+    dxf = next((project / "products" / "dxf" / "export").glob("*.dxf"))
+    _write_entity_dxf(dxf)
+    dxf_preview.render_dxf_svg(dxf, dxf.parent / "preview.svg")
+    monkeypatch.setattr(app_state, "active_project_directory", project)
+    monkeypatch.setattr(dxf_page, "_RUNNERS", {})
+    async with user_simulation(root=lambda: None) as user:
+        ui.page("/dxf")(_page_route)
+        await user.open("/dxf")
+        await user.should_see(marker="dxf-preview-card")
+        await user.should_see(marker="dxf-preview-svg")
+        await user.should_see(marker="dxf-preview-layer-S-TREE")
+        await user.should_not_see(marker="dxf-preview-spinner")
+        response = dxf_page.dxf_preview_file("preview.svg")  # served as SVG, never re-rendered
+        assert getattr(response, "media_type", "") == "image/svg+xml"

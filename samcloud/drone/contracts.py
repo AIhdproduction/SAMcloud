@@ -40,7 +40,7 @@ WINDOW = 104
 ROOF_INCLINED = 144
 ROOF_FLAT = 145
 
-TIN_LABELS: dict[str, int] = {"terrain": 0, "road": 1, "sidewalk": 2, "path": 3, "lawn": 4}
+TIN_LABELS: dict[str, int] = {"terrain": 0, "road": 1, "sidewalk": 2, "path": 3, "lawn": 4, "step": 5}  # step: 1 cm vertical faces of terrain/curb steps (samcloud/terrain/steps.py)
 PAVEMENT_KINDS = ("road", "sidewalk", "path")
 Status = Literal["ok", "warning", "failed", "rejected"]
 
@@ -178,10 +178,16 @@ class PavementPolygon:
 @dataclass
 class CurbAxis:
     curb_id: int
-    points: np.ndarray            # (M,3) local, DP-thinned
+    points: np.ndarray            # (M,3) local, DP-thinned; z = curb top
     evidence: Evidence = field(default_factory=Evidence)
     status: Status = "ok"
     reason: str = ""
+    foot_z: np.ndarray | None = None   # (M,) road-side surface height per vertex (None = not analysed)
+    road_side: int = 0                 # +1 road on the left of the axis direction, -1 right, 0 unknown
+    gutter_width: float = 0.0          # gutter stone width (m); 0 = none
+    gutter_measured: bool = False      # True when the width was measured, False when assumed
+    flush: bool = False                # mostly flush with the surrounding surface
+    flush_stations: int = 0            # stations lowered to the surface
 
 
 @dataclass
@@ -196,6 +202,14 @@ class TreeInstance:
     evidence: Evidence = field(default_factory=Evidence)
     status: Status = "ok"
     reason: str = ""
+    # Crown shape fit (defaults keep old pickles / positional constructions valid).
+    crown_shape: str = "ellipsoid"          # sphere|ellipsoid|cone|umbrella|cylinder
+    crown_shape_status: str = "assumed"     # "measured" (fitted) | "assumed" (too few crown points)
+    crown_base_z: float | None = None       # local Z of the crown base = trunk top
+    crown_top_z: float | None = None
+    crown_offset_xy: tuple[float, float] = (0.0, 0.0)   # crown centre minus trunk position
+    trunk_measured: bool = False            # True only for a circle fit that passed all trunk gates
+    crown_fit_residual: float | None = None  # normalised profile residual of the chosen shape
 
 
 @dataclass
@@ -266,6 +280,11 @@ _DEFAULT_CONFIG: dict = {
             "tolerance_m": 0.03, "tolerance_pavement_m": 0.02, "tolerance_terrain_m": 0.04, "initial_spacing_m": 2.0, "support_spacing_m": 0.50, "max_vertices": 60000,
             "max_refinement_rounds": 2,
         },
+        "lawn_ground_percentile": 20.0, "lawn_ground_min_points": 4, "lawn_ground_max_lowering_m": 0.25,
+        "manhole_ring_segments": 16, "manhole_below_m": 0.001,
+        "step": {"enabled": True, "min_slope_deg": 60.0, "min_length_m": 1.0, "probe_m": 0.15, "min_jump_m": 0.04,
+                 "offset_m": 0.01, "min_run_m": 0.5, "sample_m": 0.25, "dtm_features": True, "wall_min_jump_m": 0.25},
+        "flush": {"enabled": True, "blend_m": 1.0, "probe_m": 0.15, "sample_m": 0.25, "step_clear_m": 0.05, "qa_tol_m": 0.01},
     },
     "buildings": {
         "ransac_distance_m": 0.05,
@@ -275,6 +294,8 @@ _DEFAULT_CONFIG: dict = {
         "max_seconds_per_building": 60,
         "roof": {"min_plane_area_m2": 4.0, "inlier_tolerance_m": 0.08, "min_roof_height_m": 1.5, "region_simplify_m": 0.35, "step_simplify_m": 0.12, "outline_simplify_m": 0.3, "min_region_area_m2": 1.0,
                  "min_feature_area_m2": 6.0, "min_step_m": 0.35, "merge_normal_deg": 4.0, "merge_offset_m": 0.15},
+        "dxf": {"coplanar_deg": 2.0},
+        "base": {"mode": "terrain", "embed_m": 0.02, "max_edge_m": 2.0, "follow_tol_m": 0.03},
         "plausibility": {"min_width_m": 2.5, "min_area_m2": 10.0, "min_height_m": 2.5, "min_plane_area_m2": 4.0},
         "regularize": {
             "angle_tol_deg": 12, "merge_offset_m": 0.3, "min_edge_m": 0.5,
@@ -290,6 +311,11 @@ _DEFAULT_CONFIG: dict = {
         "tree_min_height_m": 2.0, "tree_min_points": 200,
         "crown_triangles": {"min": 60, "max": 120},
         "default_trunk_diameter_m": 0.30,
+        "crown": {"min_crown_points": 150, "slices": 12, "min_slice_points": 15, "base_radius_fraction": 0.2,
+                  "sphere_aspect_tol": 0.15, "margin": 0.15, "cone_rho": -0.6, "cylinder_aspect": 1.8,
+                  "cylinder_cv": 0.15, "envelope_percentile": 90.0, "umbrella_aspect": 0.6},
+        "trunk": {"max_rms_m": 0.03, "min_points": 20, "min_diameter_m": 0.05, "max_diameter_m": 2.0,
+                  "band_m": [0.5, 1.6], "search_radius_m": 1.0},
     },
     "pavement": {
         "min_thickness_m": 0.10, "snap_tolerance_m": 0.01, "max_gap_overlap_cm2": 1.0,
@@ -303,15 +329,41 @@ _DEFAULT_CONFIG: dict = {
     "edges": {"enabled": True,
               "fit": {"min_radius_m": 1.0, "max_radius_m": 200.0, "tolerance_m": 0.05, "sample_m": 0.10,
                       "tangent_deg": 10.0, "merge_deg": 3.0, "sagitta_m": 0.01, "curb_match_m": 0.12},
-              "dxf_curb_flat_z_m": 0.05},
+              "dxf_curb_flat_z_m": 0.05,
+              "image": {"enabled": True, "cell_m": 0.03, "z_percentile": 0.7, "hole_fill_cells": 3, "search_m": 0.30,
+                        "step_m": 0.02, "window_m": 0.06, "along_m": 0.6, "sigma_m": 0.03, "weight_color": 1.0,
+                        "weight_height": 1.0, "min_contrast": 5.0, "prior_per_m": 1.0, "smooth_cost": 1.5, "max_step": 3,
+                        "passes": 2, "pass2_search_m": 0.10, "fit_tolerance_m": 0.03, "straight": True, "min_segment_m": 1.5, "inlier_m": 0.04, "merge_deg": 4.0, "snap_deg": 6.0,
+                        "min_arc_radius_m": 2.0, "ransac_trials": 150, "hough": True, "hough_parallel_deg": 8.0,
+                        "hough_min_len_m": 1.0, "min_support": 0.60, "agree_m": 0.04,
+                        "max_area_change": 0.05, "min_edge_m": 0.5, "zigzag_dev_m": 0.05, "node_shift_m": 0.45,
+                        "min_chain_m": 1.0, "side_offset_m": 0.15, "merge_gap_samples": 8},
+              "clean": {"enabled": True, "spike_m": 0.25, "spike_protrude_m": 0.10, "line_tol_m": 0.08, "min_segment_m": 1.5,
+                        "merge_gap_samples": 40, "max_shift_m": 0.25, "max_area_change": 0.05}},
     "curb": {
         "min_length_m": 0.3, "dp_tolerance_m": 0.015, "section_width_m": 0.12, "section_height_m": 0.25,
         "arc_fit_max_residual_m": 0.01, "arc_max_radius_m": 50.0, "arc_min_points": 4,
+        "dedupe_offset_m": 0.5, "dedupe_angle_deg": 10.0, "dedupe_overlap": 0.5,
+        "gutter_width_m": 0.30, "gutter_thickness_m": 0.12, "gutter_min_band_m": 0.15, "gutter_z_tol_m": 0.03,
+        "embed_m": 0.15, "flush_max_m": 0.03, "flush_min_run": 3, "default_reveal_m": 0.12, "max_reveal_m": 0.35,
+        "section_halfwidth_m": 0.6, "section_step_m": 0.25, "dxf_flat_tol_m": 0.003, "surface_probe_m": 0.06, "gutter_station_m": 0.5, "gutter_pavement_reach_m": 0.3,
     },
+    "site": {
+        "fence": {"eps_m": 0.3, "step_m": 0.25, "min_points": 4, "min_station_points": 2, "branch_offset_m": 0.3,
+                  "top_percentile": 95.0, "smooth_window": 5, "dp_m": 0.02, "thickness_m": 0.04, "min_height_m": 0.2, "min_length_m": 0.5, "bottom_percentile": 3.0, "bottom_smooth_window": 9,
+                  "bottom_dp_m": 0.03, "ground_snap_m": 0.15, "terrain_radius_m": 0.5, "merge_gap_m": 1.0,
+                  "merge_angle_deg": 15.0, "merge_height_diff_m": 0.3},
+        "wall": {"eps_m": 0.75, "step_m": 0.4, "min_points": 4, "min_station_points": 3, "branch_offset_m": 0.8,
+                 "top_percentile": 95.0, "smooth_window": 5, "dp_m": 0.02, "min_thickness_m": 0.1,
+                 "top_variation_m": 0.10, "terrain_radius_m": 0.5},
+    },
+    "manhole": {"thickness_m": 0.05},
     "dxf": {
         "local_origin": False, "hatch": False, "contour_major_m": 1.0,
         "contour_minor_m": "auto", "spline_contours": True, "tin_layer_frozen": True,
-        "spot_spacing_m": 10.0,
+        "spot_spacing_m": 10.0, "spot_heights": False, "contour_label_spacing_m": 10.0, "contour_label_height_m": 0.25, "contour_building_gap_m": 0.10,
+        "block_text_height_m": 0.2,
+        "fence_bottom_line": False,
     },
     "ifc": {"curb_sweep": "auto", "epsg": 2056, "vertical_datum": "LN02"},
     "cloud_filter": {

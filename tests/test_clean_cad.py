@@ -93,7 +93,8 @@ def test_terrain_contours_and_spots_stay_in_measured_cells() -> None:
     entities, _ = terrain.terrain_dxf_entities([], FRAME, tin=tin, dtm=dtm, validity=validity,
                                                 dtm_bounds=(0, 0, 12, 12), resolution=1.0,
                                                 config={"dxf": {"contour_major_m": 1.0, "contour_minor_m": 0.5,
-                                                                "spline_contours": True, "spot_spacing_m": 2.0}})
+                                                                "spline_contours": True, "spot_spacing_m": 2.0,
+                                                                "spot_heights": True}})
     assert entities.get("S-TOPO-MAJR") or entities.get("S-TOPO-MINR")
     assert entities.get("S-ELEV")
 

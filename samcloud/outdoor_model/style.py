@@ -17,9 +17,9 @@ STYLE_PATH = CONFIG_DIRECTORY / "outdoor_style.yaml"
 
 # Categories that must exist in the style file (IFC and DXF).
 REQUIRED_CATEGORIES: tuple[str, ...] = (
-    "terrain", "road", "path", "sidewalk", "lawn", "curb", "building_wall", "roof", "window", "door",
-    "site_wall", "fence", "tree", "shrub", "manhole", "marking",
-    "contour_major", "contour_minor", "spot_elevation", "boundary",
+    "terrain", "road", "path", "sidewalk", "curb", "building_wall", "roof", "window", "door",
+    "site_wall", "fence", "gutter", "tree", "shrub", "manhole", "marking",
+    "contour_major", "contour_minor", "contour_label", "spot_elevation", "boundary",
 )
 
 

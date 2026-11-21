@@ -951,6 +951,11 @@ class DxfPageController:
         dxf = self.outdoor_export_files().get("dxf")
         return None if dxf is None else dxf.parent / "preview.png"
 
+    def dxf_preview_svg_path(self) -> Path | None:
+        """Target ``preview.svg`` (vector preview) next to the published outdoor DXF; None without a DXF."""
+        png = self.dxf_preview_path()
+        return None if png is None else png.with_name("preview.svg")
+
     def cancel_job(self) -> None:
         """Signal background job to cancel and terminate process if needed."""
         self.runner.cancel()

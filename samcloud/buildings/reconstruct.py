@@ -8,6 +8,7 @@ import time
 import numpy as np
 from shapely.geometry import Point, Polygon
 
+from samcloud.buildings.base import base_settings, make_ground_function
 from samcloud.buildings.extrude import extrude_lod1, extrude_lod13, extrude_lod22
 from samcloud.buildings.footprint import detect_facade_planes, footprint_from_facades
 from samcloud.buildings.labeling import LabelResult, label_cells
@@ -156,6 +157,8 @@ def _lod2_candidate(
     settings: dict,
     *,
     ground: float,
+    ground_fn=None,
+    max_edge_m: float | None = None,
     started: float,
     raster_resolution: float | None = None,
     low_xyz: np.ndarray | None = None,
@@ -181,7 +184,7 @@ def _lod2_candidate(
             time_limit=remaining,
         )
     try:
-        vertices, faces, roles = extrude_lod22(partition, labels.labels, label_planes, footprint, ground)
+        vertices, faces, roles = extrude_lod22(partition, labels.labels, label_planes, footprint, ground if ground_fn is None else ground_fn, max_edge_m)
     except ValueError:
         if raster_resolution is None or not len(roof_xyz):
             raise
@@ -189,7 +192,7 @@ def _lod2_candidate(
         partition, cell_labels = partition_from_raster(footprint, roof_xyz, label_planes, resolution=raster_resolution, low_xyz=low_xyz, ridge_snap_m=0.0, **_partition_options(settings))
         labels = LabelResult(cell_labels, 0.0, 0, False, [], 0.0)
         footprint = partition.footprint or footprint
-        vertices, faces, roles = extrude_lod22(partition, labels.labels, label_planes, footprint, ground)
+        vertices, faces, roles = extrude_lod22(partition, labels.labels, label_planes, footprint, ground if ground_fn is None else ground_fn, max_edge_m)
     on_raster = raster_resolution is not None and len(roof_xyz) > 0
     exclude = partition.feature_geometry.buffer(0.3) if on_raster and getattr(partition, "feature_geometry", None) is not None else None
     report = validate_model(vertices, faces, check_xyz if on_raster and check_xyz is not None and len(check_xyz) else roof_xyz, footprint, vertical=on_raster, exclude=exclude)
@@ -214,6 +217,7 @@ def reconstruct_building(
     building_id,
     *,
     dtm_sampler,
+    base_sampler=None,
     config=None,
     dsm_roof_points: np.ndarray | None = None,
     dsm_cell_area_m2: float = 0.01,
@@ -254,6 +258,9 @@ def reconstruct_building(
         if len(raster_xyz):
             roof_source = PointSet(raster_xyz, np.full(len(raster_xyz), ROOF_FLAT, dtype=np.uint16))
         ground = _ground_value(dtm_sampler, footprint)
+        base_cfg = base_settings(settings)
+        ground_fn = make_ground_function(base_sampler or dtm_sampler, footprint, base_cfg) if (base_sampler or dtm_sampler) is not None else None
+        max_edge_m = float(base_cfg["max_edge_m"]) if ground_fn is not None else None
         plausibility_cfg = settings.get("plausibility", {"min_width_m": 2.5, "min_area_m2": 10.0, "min_height_m": 2.5})
         plausibility = _plausibility(footprint, np.asarray(roof_source.xyz, dtype=float), ground, plausibility_cfg, cut_by_boundary=cut_by_boundary)
         if plausibility["decision"] == "rejected":
@@ -284,7 +291,7 @@ def reconstruct_building(
                 timings["total"] = time.perf_counter() - started
                 return BuildingModel(building_id, "1.2", np.empty((0, 3)), np.empty((0, 3), dtype=int), np.empty(0, dtype=np.uint8), "failed", f"plausibility rejected: {plausibility['reason']}", heights={"timings": timings, "plausibility": plausibility})
         stage = time.perf_counter()
-        baseline = _robust_candidate(roof_source, footprint, planes, settings, ground=ground, started=started, raster_resolution=raster_res, low_xyz=low_xyz, check_xyz=check_xyz)
+        baseline = _robust_candidate(roof_source, footprint, planes, settings, ground=ground, ground_fn=ground_fn, max_edge_m=max_edge_m, started=started, raster_resolution=raster_res, low_xyz=low_xyz, check_xyz=check_xyz)
         timings["labeling"] = time.perf_counter() - stage
         reg_settings = regularize_settings(settings.get("regularize"))
         regular_footprint, footprint_report = regularize_footprint(footprint, reg_settings)
@@ -294,7 +301,7 @@ def reconstruct_building(
         # the raster path only the footprint is regularised.
         regular_planes = planes if on_raster else regularize_roof_planes(planes, regular_footprint, xyz=xyz, settings=reg_settings)
         stage = time.perf_counter()
-        regular = _robust_candidate(roof_source, regular_footprint, regular_planes, settings, ground=ground, started=started, raster_resolution=raster_res, low_xyz=low_xyz, check_xyz=check_xyz)
+        regular = _robust_candidate(roof_source, regular_footprint, regular_planes, settings, ground=ground, ground_fn=ground_fn, max_edge_m=max_edge_m, started=started, raster_resolution=raster_res, low_xyz=low_xyz, check_xyz=check_xyz)
         timings["regularization"] = time.perf_counter() - stage
         baseline_report, regular_report = baseline[-1], regular[-1]
         use_regular = regular_report["status"] == "ok"
@@ -361,13 +368,13 @@ def reconstruct_building(
             lod2_reason = "labeling timed out"
         else:
             lod2_reason = report["reason"]
-        vertices, faces, roles = extrude_lod13(partition, roof_height, ground)
+        vertices, faces, roles = extrude_lod13(partition, roof_height, ground if ground_fn is None else ground_fn, max_edge_m)
         report = validate_model(vertices, faces, roof_xyz, selected_footprint)
         if report["status"] == "ok":
             height_info["timings"]["total"] = time.perf_counter() - started
             return BuildingModel(building_id, "1.3", vertices, faces, roles, "lod1_fallback", lod2_reason, report["rmse"], report["coverage"], height_info)
         top = float(np.percentile(roof_xyz[:, 2], 50)) if len(roof_xyz) else ground + 3.0
-        vertices, faces, roles = extrude_lod1(selected_footprint, top, ground)
+        vertices, faces, roles = extrude_lod1(selected_footprint, top, ground if ground_fn is None else ground_fn, max_edge_m)
         report = validate_model(vertices, faces, roof_xyz, selected_footprint)
         if report["status"] == "ok":
             height_info["timings"]["total"] = time.perf_counter() - started

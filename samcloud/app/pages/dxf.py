@@ -6,6 +6,8 @@ is started by an explicit button through DxfPageController.start_job. Settings o
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -140,38 +142,16 @@ _STYLE = """
 .sam-dxfp { position:relative; overflow:hidden; cursor:grab; touch-action:none; border-radius:6px; }
 .sam-dxfp.is-dragging { cursor:grabbing; }
 .sam-dxfp-stage { position:absolute; left:0; top:0; width:100%; height:100%; transform-origin:0 0; }
+.sam-dxfp-svgbox { position:absolute; inset:0; }
+.sam-dxfp-svgbox svg { width:100%; height:100%; display:block; user-select:none; }
 .sam-dxfp-stage img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; pointer-events:none; user-select:none; }
 .sam-dxf-log { max-height:220px; overflow:auto; white-space:pre-wrap; font-family:monospace; font-size:11px; color:#c9d8e4; background:#050b12; border:1px solid #20394b; border-radius:6px; padding:8px; }
 </style>
 """
 
 
-_PREVIEW_SCRIPT = """
-<script>
-(function () {
-  function view(vp) { if (!vp._v) vp._v = {k: 1, x: 0, y: 0}; return vp._v; }
-  function apply(vp) { var v = view(vp); vp.firstElementChild.style.transform = 'translate(' + v.x + 'px,' + v.y + 'px) scale(' + v.k + ')'; }
-  window.samDxfpFit = function (id) { var vp = document.getElementById(id); if (!vp) return; vp._v = {k: 1, x: 0, y: 0}; apply(vp); };
-  document.addEventListener('wheel', function (e) {
-    var vp = e.target.closest && e.target.closest('.sam-dxfp'); if (!vp) return;
-    e.preventDefault();
-    var v = view(vp), r = vp.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
-    var k = Math.max(0.5, Math.min(200, v.k * Math.exp(-e.deltaY * 0.0015)));
-    v.x = px - (px - v.x) * k / v.k; v.y = py - (py - v.y) * k / v.k; v.k = k; apply(vp);
-  }, {passive: false});
-  var drag = null;
-  document.addEventListener('pointerdown', function (e) {
-    var vp = e.target.closest && e.target.closest('.sam-dxfp'); if (!vp || e.button !== 0) return;
-    var v = view(vp); drag = {vp: vp, sx: e.clientX, sy: e.clientY, ox: v.x, oy: v.y}; vp.classList.add('is-dragging');
-  });
-  document.addEventListener('pointermove', function (e) {
-    if (!drag) return; var v = view(drag.vp); v.x = drag.ox + e.clientX - drag.sx; v.y = drag.oy + e.clientY - drag.sy; apply(drag.vp);
-  });
-  document.addEventListener('pointerup', function () { if (drag) { drag.vp.classList.remove('is-dragging'); drag = null; } });
-  document.addEventListener('dblclick', function (e) { var vp = e.target.closest && e.target.closest('.sam-dxfp'); if (vp) window.samDxfpFit(vp.id); });
-})();
-</script>
-"""
+_PREVIEW_SCRIPT = "<script>" + (Path(__file__).resolve().parents[1] / "dxf_preview_svg.js").read_text(encoding="utf-8") + "</script>"
+"""Zoom/pan/layer script of the DXF preview (vector mode via viewBox, raster fallback via CSS transform)."""
 
 PREVIEW_ROUTE = "/api/dxf-preview"
 _PREVIEW_RENDERING: set[Path] = set()
@@ -180,20 +160,22 @@ _PREVIEW_RENDERING: set[Path] = set()
 
 @app.get(PREVIEW_ROUTE + "/{name}")
 def dxf_preview_file(name: str, v: str | None = None):
-    """Serve ``preview.png`` or a layer image of the active outdoor project's DXF preview; never renders."""
+    """Serve ``preview.svg``/``preview.png`` or a layer image of the active outdoor project's DXF preview; never renders."""
     project_directory = state.active_project_directory
     if project_directory is None:
         return JSONResponse({"error": "no project"}, status_code=404)
     export_dir = (Path(project_directory) / "products" / "dxf" / "export").resolve()
-    path = export_dir / name if name == dxf_preview.PREVIEW_NAME else export_dir / dxf_preview.LAYER_DIR / name
+    top_level = name in (dxf_preview.PREVIEW_NAME, dxf_preview.SVG_NAME)
+    path = export_dir / name if top_level else export_dir / dxf_preview.LAYER_DIR / name
     try:
         path = path.resolve()
         path.relative_to(export_dir)
     except (OSError, ValueError):
         return JSONResponse({"error": "invalid"}, status_code=400)
-    if path.suffix != ".png" or not path.is_file():
+    if path.suffix not in (".png", ".svg") or not path.is_file():
         return JSONResponse({"error": "not found"}, status_code=404)
-    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-cache"})
+    media_type = "image/svg+xml" if path.suffix == ".svg" else "image/png"
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "no-cache"})
 
 
 def runner_for(project_directory: Path) -> DxfJobRunner:
@@ -990,34 +972,47 @@ class DxfPage:
     # ------------------------------------------------------------------ DXF preview (outdoor)
 
     def build_dxf_preview_card(self) -> None:
-        """Zoomable raster preview of the published DXF with a layer legend (re-rendered when the DXF is newer)."""
+        """Vector (SVG) preview of the published DXF with a layer legend; rebuilt when the DXF is newer.
+
+        Falls back to the zoomable raster preview when the SVG cannot be built."""
         self.dxfp_images: dict[str, ui.element] = {}
         self.dxfp_checks: dict[str, ui.checkbox] = {}
+        self.dxfp_view_id = f"samdxfp-{id(self)}"
+        self.dxfp_vector = False
         with ui.card().classes("w-full gap-3").mark("dxf-preview-card"):
             ui.label(t("dxf.dxf_preview.title")).classes("sam-section-title")
             self.dxfp_body = ui.column().classes("w-full gap-2")
             target = self.controller.dxf_preview_path()
-            if target is None:
+            svg = self.controller.dxf_preview_svg_path()
+            if target is None or svg is None:
                 with self.dxfp_body:
                     ui.label(t("dxf.dxf_preview.empty")).classes("sam-muted").mark("dxf-preview-empty")
                 return
             dxf = self.controller.outdoor_export_files()["dxf"]
-            if dxf_preview.preview_is_fresh(dxf, target) and dxf_preview.load_preview_meta(target) is not None:
-                self.fill_dxf_preview(target)
+            if dxf_preview.svg_is_fresh(dxf, svg) and dxf_preview.load_svg_meta(svg) is not None:
+                self.fill_dxf_preview_svg(svg)
             else:
                 with self.dxfp_body:
                     with ui.row().classes("items-center gap-2").mark("dxf-preview-spinner"):
                         ui.spinner(size="md")
-                        ui.label(t("dxf.dxf_preview.rendering")).classes("sam-muted")
-                ui.timer(0.2, lambda: self.render_dxf_preview(dxf, target), once=True)
+                        ui.label(t("dxf.dxf_preview.rendering_svg")).classes("sam-muted")
+                ui.timer(0.2, lambda: self.render_dxf_preview(dxf, target, svg), once=True)
 
-    async def render_dxf_preview(self, dxf: Path, target: Path) -> None:
-        """Render in a worker thread so the UI stays responsive, then swap the spinner for the viewer."""
+    async def render_dxf_preview(self, dxf: Path, target: Path, svg: Path | None = None) -> None:
+        """Build the SVG (raster as fallback) in a worker thread so the UI stays responsive, then show the viewer."""
         if target in _PREVIEW_RENDERING:
             return
         _PREVIEW_RENDERING.add(target)
+        vector = False
         try:
-            await run.io_bound(dxf_preview.render_dxf_preview, dxf, target)
+            if svg is not None:
+                try:
+                    await run.io_bound(dxf_preview.render_dxf_svg, dxf, svg)
+                    vector = True
+                except Exception:  # fall back to the raster preview
+                    logging.getLogger(__name__).exception("SVG preview failed, using the raster preview")
+            if not vector:
+                await run.io_bound(dxf_preview.render_dxf_preview, dxf, target)
         except Exception as error:  # a broken DXF must not break the page
             if self.dxfp_body is not None and not self.dxfp_body.is_deleted:
                 self.dxfp_body.clear()
@@ -1028,27 +1023,51 @@ class DxfPage:
             _PREVIEW_RENDERING.discard(target)
         if self.dxfp_body is not None and not self.dxfp_body.is_deleted:
             self.dxfp_body.clear()
-            self.fill_dxf_preview(target)
+            if vector and svg is not None:
+                self.fill_dxf_preview_svg(svg)
+            else:
+                self.fill_dxf_preview(target)
+
+    def fill_dxf_preview_svg(self, svg: Path) -> None:
+        """Vector viewer: the SVG is fetched into an inline element; layers are <g data-layer> groups."""
+        meta = dxf_preview.load_svg_meta(svg) or {}
+        layers = list(meta.get("layers", []))
+        version = svg.stat().st_mtime_ns
+        self.dxfp_vector = True
+        self.dxfp_images = {}
+        self.dxfp_checks = {}
+        self.build_dxfp_viewer(layers, meta.get("background", dxf_preview.DEFAULT_BACKGROUND), vector=True)
+        ui.run_javascript(f"samDxfpLoad('{self.dxfp_view_id}', '{PREVIEW_ROUTE}/{dxf_preview.SVG_NAME}?v={version}')")
 
     def fill_dxf_preview(self, target: Path) -> None:
+        """Raster fallback viewer (stack of layer PNGs)."""
         meta = dxf_preview.load_preview_meta(target) or {}
         layers = [item for item in meta.get("layers", []) if item.get("file")]
         version = target.stat().st_mtime_ns
+        self.dxfp_vector = False
         self.dxfp_images = {}
         self.dxfp_checks = {}
+        self.build_dxfp_viewer(layers, meta.get("background", dxf_preview.DEFAULT_BACKGROUND), vector=False, version=version)
+
+    def build_dxfp_viewer(self, layers: list[dict[str, Any]], background: str, *, vector: bool, version: int = 0) -> None:
         self.dxfp_fullscreen = False
-        view_id = f"samdxfp-{id(self)}"
+        view_id = self.dxfp_view_id
         with self.dxfp_body:
             with ui.row().classes("w-full gap-4 no-wrap items-stretch") as row:
                 self.dxfp_row = row
                 with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:1040px;min-width:0"):
                     viewport = ui.element("div").classes("sam-dxfp w-full h-full").props(f"id={view_id}").style(
-                        f"background:{meta.get('background', dxf_preview.DEFAULT_BACKGROUND)}").mark("dxf-preview-view")
+                        f"background:{background}").mark("dxf-preview-view")
+                    if vector:
+                        viewport.classes("sam-dxfp-svg")
                     with viewport:
-                        with ui.element("div").classes("sam-dxfp-stage"):
-                            for item in layers:
-                                image = ui.element("img").props(f'src="{PREVIEW_ROUTE}/{item["file"]}?v={version}" draggable=false')
-                                self.dxfp_images[item["name"]] = image
+                        if vector:
+                            ui.element("div").classes("sam-dxfp-svgbox").mark("dxf-preview-svg")
+                        else:
+                            with ui.element("div").classes("sam-dxfp-stage"):
+                                for item in layers:
+                                    image = ui.element("img").props(f'src="{PREVIEW_ROUTE}/{item["file"]}?v={version}" draggable=false')
+                                    self.dxfp_images[item["name"]] = image
                     self.dxfp_fullscreen_button = ui.button(icon="fullscreen", on_click=self.toggle_dxfp_fullscreen).props(
                         "flat round dense color=white").classes("absolute").style(
                         "top:8px;left:8px;z-index:10;background:rgba(9,19,29,.65)").mark("dxf-preview-fullscreen")
@@ -1057,7 +1076,7 @@ class DxfPage:
                     ui.keyboard(on_key=self.on_dxfp_key, ignore=["input", "select", "textarea"])
                 with ui.column().classes("w-80 gap-2 sam-result-side"):
                     with ui.row().classes("items-center gap-2"):
-                        ui.button(t("dxf.dxf_preview.fit"), on_click=lambda: ui.run_javascript(f"samDxfpFit('{view_id}')")).props("flat no-caps")
+                        ui.button(t("dxf.dxf_preview.fit"), on_click=lambda: ui.run_javascript(f"samDxfpFit('{view_id}')")).props("flat no-caps").mark("dxf-preview-fit")
                         ui.button(t("dxf.dxf_preview.all"), on_click=lambda: self.set_all_dxfp_layers(True)).props("flat no-caps").mark("dxf-preview-all")
                         ui.button(t("dxf.dxf_preview.none"), on_click=lambda: self.set_all_dxfp_layers(False)).props("flat no-caps").mark("dxf-preview-none")
                     ui.label(t("dxf.dxf_preview.hint")).classes("sam-muted text-xs")
@@ -1072,13 +1091,16 @@ class DxfPage:
                             ui.label(str(item["count"])).classes("sam-muted text-xs")
 
     def toggle_dxfp_layer(self, layer: str, visible: bool) -> None:
+        if self.dxfp_vector:
+            ui.run_javascript(f"samDxfpLayer('{self.dxfp_view_id}', {json.dumps(layer)}, {'true' if visible else 'false'})")
+            return
         image = self.dxfp_images.get(layer)
         if image is not None:
             image.set_visibility(visible)
 
     def set_all_dxfp_layers(self, visible: bool) -> None:
         for box in self.dxfp_checks.values():
-            box.value = visible  # the checkbox handler toggles the image
+            box.value = visible  # the checkbox handler toggles the layer
 
     def toggle_dxfp_fullscreen(self) -> None:
         row = self.dxfp_row

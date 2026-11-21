@@ -35,4 +35,4 @@ def test_swept_curb_vertices_follow_axis(tmp_path: Path) -> None:
             for a, b in zip(xy_axis, xy_axis[1:])
         )
         assert d < 0.2, (x, y, d)
-        assert z0 - 0.01 <= z <= z0 + height + 0.01, z
+        assert z0 - height - 0.01 <= z <= z0 + 0.01, z  # the axis is the curb top: the body hangs below it

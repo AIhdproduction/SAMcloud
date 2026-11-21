@@ -6,11 +6,13 @@ the IFC export moves them to the lawn surface elements. Because pavement and ter
 share the boundary vertices, so there is no gap and no overlap.
 
 DXF: the full TIN as 3DFACE on S-TOPO-TIN (the writer freezes that layer), contours (SPLINE) on
-S-TOPO-MAJR / S-TOPO-MINR restricted to the measured part of the DTM, spot heights on S-ELEV.
+S-TOPO-MAJR / S-TOPO-MINR restricted to the measured part of the DTM, height labels of the major contours on
+S-TOPO-TEXT (``dxf.contour_label_spacing_m``). Spot heights (S-ELEV) are only written with ``dxf.spot_heights``.
 """
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable, Sequence
 
 import numpy as np
@@ -28,6 +30,7 @@ LAWN_TRIANGLE_KEY = "lawn_triangle_indices"
 TIN_LAYER = "S-TOPO-TIN"
 MAJOR_LAYER = "S-TOPO-MAJR"
 MINOR_LAYER = "S-TOPO-MINR"
+LABEL_LAYER = "S-TOPO-TEXT"
 SPOT_LAYER = "S-ELEV"
 MEASURED = 1  # validity code of measured DTM cells
 MIN_TRIANGLE_AREA_M2 = 1e-6
@@ -181,6 +184,7 @@ def build_terrain_elements(
         # Indices (into this element's triangles) of the lawn-labelled triangles: the IFC writer hands
         # exactly these over to the lawn surface elements (samcloud/bim/core/ifc/outdoor.py).
         LAWN_TRIANGLE_KEY: [int(i) for i in np.flatnonzero(np.asarray(terrain.labels)[~bad] == c.TIN_LABELS["lawn"])],
+        "step_triangles": int((np.asarray(terrain.labels)[~bad] == c.TIN_LABELS["step"]).sum()),
         "pavement_triangles_removed": int(len(tin.triangles) - len(terrain.triangles)),
         "area_m2": round(float(_xy_area(verts, tri_idx)), 3),
         "z_range_m": round(float(verts[:, 2].max() - verts[:, 2].min()), 3),
@@ -225,7 +229,7 @@ def _tin_faces(vertices: np.ndarray, triangles: np.ndarray, frame: c.LocalFrame)
 
 def _contours(
     dtm: np.ndarray, validity: np.ndarray, bounds: tuple[float, float, float, float], resolution: float,
-    frame: c.LocalFrame, cfg: dict,
+    frame: c.LocalFrame, cfg: dict, footprints: Sequence = (),
 ) -> tuple[dict[str, list[dict]], dict]:
     from samcloud.dxf.writer import contours_as_splines
     from samcloud.ortho.vector.contours import ContourSettings, contour_entities
@@ -246,10 +250,126 @@ def _contours(
         ent = {**ent, "points": pts.tolist()}
         layer = MAJOR_LAYER if ent.get("layer_role") == "major" else MINOR_LAYER
         out.setdefault(layer, []).append(ent)
+    clipped = {"before": int(sum(len(v) for v in out.values())), "after": None}
+    if len(footprints):
+        from shapely import affinity
+        from shapely.ops import unary_union
+
+        gap = float(dcfg.get("contour_building_gap_m", 0.10))
+        forbidden = affinity.translate(unary_union(list(footprints)).buffer(gap), float(frame.origin_lv95[0]), float(frame.origin_lv95[1]))
+        out = {layer: clip_contours(ents, forbidden) for layer, ents in out.items()}
+        clipped["after"] = int(sum(len(v) for v in out.values()))
+    labels = contour_labels(out.get(MAJOR_LAYER, []), spacing_m=float(dcfg.get("contour_label_spacing_m", 10.0)),
+                            text_height_m=float(dcfg.get("contour_label_height_m", 0.25)))
+    if labels:
+        out[LABEL_LAYER] = labels
     if bool(dcfg.get("spline_contours", True)):
         out = {layer: contours_as_splines(ents) for layer, ents in out.items()}
-    info = {**info, "major_interval_m": major, "contour_count": int(len(raw))}
+    info = {**info, "major_interval_m": major, "contour_count": int(len(raw)), "contour_labels": int(len(labels)), "contour_pieces": clipped}
     return out, info
+
+
+def building_footprints(elements: Iterable) -> list:
+    """Plan footprint (shapely geometry, local frame) of every ``BuildingElement``: the union of its projected triangles
+    (walls and roof, so eaves count)."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    from samcloud.bim.core.model import BuildingElement
+
+    out = []
+    for element in elements:
+        if not isinstance(element, BuildingElement) or not element.params.triangles:
+            continue
+        vertices = np.asarray(element.params.vertices, dtype=float)
+        triangles = np.asarray(element.params.triangles, dtype=np.int64)
+        polygons = [Polygon(tri) for tri in vertices[triangles][:, :, :2] if abs(np.cross(tri[1] - tri[0], tri[2] - tri[0])) > 1e-9]
+        if polygons:
+            out.append(unary_union(polygons))
+    return out
+
+
+def clip_contours(entities: Iterable[dict], forbidden, *, min_length_m: float = 0.5) -> list[dict]:
+    """Cut contour polylines (``points`` (N,3)) at ``forbidden`` (shapely geometry, same frame): the parts inside are
+    removed, parts shorter than ``min_length_m`` are dropped. The elevation of every piece stays that of the contour."""
+    from shapely.geometry import LineString
+
+    if forbidden is None or forbidden.is_empty:
+        return list(entities)
+    import shapely
+
+    shapely.prepare(forbidden)
+    out: list[dict] = []
+    for entity in entities:
+        points = np.asarray(entity["points"], dtype=float)
+        if len(points) < 2 or not shapely.intersects(forbidden, LineString(points[:, :2])):
+            out.append(entity)
+            continue
+        z = float(np.median(points[:, 2]))
+        rest = LineString(points[:, :2]).difference(forbidden)
+        pieces = [rest] if rest.geom_type == "LineString" else [g for g in getattr(rest, "geoms", ()) if g.geom_type == "LineString"]
+        for piece in pieces:
+            if piece.is_empty or piece.length < min_length_m:
+                continue
+            xy = np.asarray(piece.coords, dtype=float)[:, :2]
+            out.append({**{k: v for k, v in entity.items() if k != "points"}, "points": np.column_stack((xy, np.full(len(xy), z))).tolist(), "closed": False})
+    return out
+
+
+def contour_labels(
+    entities: Iterable[dict], *, spacing_m: float = 10.0, text_height_m: float = 0.25, layer_role: str = "contour_label",
+) -> list[dict]:
+    """Height labels (TEXT) along major contour polylines.
+
+    Every ``polyline3d`` / ``spline`` with ``layer_role == "major"`` and an ``elevation`` gets a label each
+    ``spacing_m`` metres along the line (``round(length / spacing_m)`` labels spread evenly, at least one; a line
+    shorter than the spacing gets one label in the middle). The text is the absolute elevation with one decimal
+    ("432.0"), rotated along the line and never upside down (angle in (-90, 90]). Lines too short to carry the text
+    stay unlabelled. Coordinates are used as given (already LV95 in the DXF chain).
+    """
+    labels: list[dict] = []
+    spacing = max(float(spacing_m), 0.5)
+    for entity in entities:
+        if entity.get("layer_role") != "major" or "elevation" not in entity:
+            continue
+        key = "points" if "points" in entity else "fit_points" if "fit_points" in entity else None
+        if key is None:
+            continue
+        points = np.asarray(entity[key], dtype=float)
+        if points.ndim != 2 or len(points) < 2:
+            continue
+        closed = bool(entity.get("closed")) or bool(np.allclose(points[0], points[-1]) and len(points) > 3)
+        coords = points if not closed or np.allclose(points[0], points[-1]) else np.vstack((points, points[:1]))
+        steps = np.linalg.norm(np.diff(coords[:, :2], axis=0), axis=1)
+        length = float(steps.sum())
+        text = f"{float(entity['elevation']):.1f}"
+        width = 0.7 * float(text_height_m) * len(text)
+        if length < 1.5 * width:
+            continue
+        cumulative = np.r_[0.0, np.cumsum(steps)]
+        count = max(1, int(round(length / spacing)))
+        for index in range(count):
+            arc = (index + 0.5) * length / count
+            centre = _point_on(coords, cumulative, arc)
+            before = _point_on(coords, cumulative, max(0.0, arc - 0.5 * width))
+            after = _point_on(coords, cumulative, min(length, arc + 0.5 * width))
+            tangent = after[:2] - before[:2]
+            angle = math.degrees(math.atan2(tangent[1], tangent[0])) if np.hypot(*tangent) > 1e-9 else 0.0
+            if angle > 90.0:
+                angle -= 180.0
+            elif angle <= -90.0:
+                angle += 180.0
+            labels.append({"type": "text", "text": text, "point": [float(centre[0]), float(centre[1]), float(centre[2])],
+                           "height": float(text_height_m), "rotation": float(angle), "align": "MIDDLE_CENTER",
+                           "layer_role": layer_role, "elevation": float(entity["elevation"])})
+    return labels
+
+
+def _point_on(coords: np.ndarray, cumulative: np.ndarray, arc: float) -> np.ndarray:
+    index = int(np.clip(np.searchsorted(cumulative, arc, side="right") - 1, 0, len(coords) - 2))
+    span = cumulative[index + 1] - cumulative[index]
+    fraction = 0.0 if span <= 1e-12 else (arc - cumulative[index]) / span
+    return coords[index] * (1.0 - fraction) + coords[index + 1] * fraction
 
 
 def _spots(
@@ -300,6 +420,7 @@ def terrain_dxf_entities(
     resolution: float | None = None,
     curbs: Sequence = (),
     manholes: Sequence = (),
+    footprints: Sequence = (),
     config: dict | None = None,
 ) -> tuple[dict[str, list[dict]], dict]:
     """Like :func:`to_dxf_entities` but also returns the contour report (interval choice, counts)."""
@@ -317,9 +438,9 @@ def terrain_dxf_entities(
         out[TIN_LAYER] = _tin_faces(vertices, triangles, frame)
     info: dict = {}
     if dtm is not None and validity is not None and dtm_bounds is not None and resolution is not None:
-        contours, info = _contours(dtm, validity, dtm_bounds, resolution, frame, cfg)
+        contours, info = _contours(dtm, validity, dtm_bounds, resolution, frame, cfg, footprints)
         out.update(contours)
-    if len(triangles):
+    if len(triangles) and bool(cfg.get("dxf", {}).get("spot_heights", False)):
         spots = _spots(TinSampler(vertices, triangles), frame, float(cfg.get("dxf", {}).get("spot_spacing_m", 10.0)),
                        curbs, manholes, validity, dtm_bounds, resolution)
         if spots:
@@ -333,7 +454,10 @@ def to_dxf_entities(elements: Iterable, frame: c.LocalFrame, **kwargs) -> dict[s
     * ``S-TOPO-TIN``: 3DFACE per triangle of the full TIN (``tin=``; default the terrain element mesh).
     * ``S-TOPO-MAJR`` / ``S-TOPO-MINR``: SPLINE contours (``dxf.spline_contours``) from the DTM raster
       (``dtm=``, ``validity=``, ``dtm_bounds=(xmin, ymin, xmax, ymax)``, ``resolution=``), measured cells only.
-    * ``S-ELEV``: spot crosses + height text on a thinned grid (``dxf.spot_spacing_m``, default 10 m), at manholes
-      (``manholes=`` xy list) and at curb break points (``curbs=`` CurbAxis list).
+    * Contours are cut at ``footprints=`` (building footprints, local frame, see :func:`building_footprints`) buffered by
+      ``dxf.contour_building_gap_m`` (0.10 m); pieces under 0.5 m are dropped and labels sit on the remaining pieces only.
+    * ``S-TOPO-TEXT``: height label every ``dxf.contour_label_spacing_m`` (default 10 m) along each major contour.
+    * ``S-ELEV``: only with ``dxf.spot_heights: true`` (default off): spot crosses + height text on a thinned grid
+      (``dxf.spot_spacing_m``), at manholes (``manholes=`` xy list) and at curb break points (``curbs=`` CurbAxis list).
     """
     return terrain_dxf_entities(elements, frame, **kwargs)[0]

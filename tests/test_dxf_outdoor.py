@@ -18,7 +18,7 @@ from samcloud.dxf.writer import (
     outdoor_symbol_insert,
 )
 
-NEW_LAYERS = ("S-BLDG-ROOF", "S-BLDG-WIND", "S-BLDG-DOOR", "S-SHRUB", "S-PATH", "S-TOPO-TIN", "S-TOPO-MAJR", "S-TOPO-MINR", "S-ELEV", "S-ANNO-GRENZE")
+NEW_LAYERS = ("S-BLDG-ROOF", "S-BLDG-WIND", "S-BLDG-DOOR", "S-SHRUB", "S-PATH", "S-TOPO-TIN", "S-TOPO-MAJR", "S-TOPO-MINR", "S-TOPO-TEXT", "S-ELEV", "S-ANNO-GRENZE", "S-GUTR")
 
 
 def _result(layers: dict[str, list[dict]], bounds=(0.0, 0.0, 10.0, 10.0)) -> DxfPlanResult:
@@ -72,9 +72,11 @@ def test_tree_insert_attributes_and_scale(tmp_path: Path) -> None:
     inserts = [entity for entity in loaded.modelspace() if entity.dxftype() == "INSERT"]
     assert len(inserts) == 2
     first, second = inserts
-    assert _attribs(first) == {"HEIGHT": "8.40", "CROWN_DIA": "5.00", "TRUNK_DIA": "0.35"}
+    assert _attribs(first) == {"HEIGHT": "8.40", "CROWN_DIA": "5.00", "TRUNK_DIA": "0.35", "KRONE": "KRONE=5.00 m",
+                               "STAMM": "STAMM=0.35 m", "HOEHE": "HOEHE=8.40 m"}
     assert first.dxf.xscale == pytest.approx(2.5) and first.dxf.yscale == pytest.approx(2.5)
-    assert _attribs(second) == {"HEIGHT": "6.00", "CROWN_DIA": "n/a", "TRUNK_DIA": "n/a"}
+    assert _attribs(second) == {"HEIGHT": "6.00", "CROWN_DIA": "n/a", "TRUNK_DIA": "n/a", "KRONE": "KRONE=n/a",
+                                "STAMM": "STAMM=nicht gemessen", "HOEHE": "HOEHE=6.00 m"}
     assert second.dxf.xscale == pytest.approx(1.0)
     assert {"S-TREE"} == {entity.dxf.layer for entity in inserts}
 

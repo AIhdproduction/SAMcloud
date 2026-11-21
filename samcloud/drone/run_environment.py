@@ -21,7 +21,7 @@ LOGGER = logging.getLogger(__name__)
 
 STEPS = ("load", "semantics", "terrain", "vegetation", "pavement", "tin", "buildings", "site", "scene", "export", "qa", "report")
 DEPENDENCIES = {"semantics": ("load",), "terrain": ("load",), "vegetation": ("terrain",), "pavement": ("terrain",),
-                "tin": ("terrain", "pavement"), "buildings": ("terrain", "semantics"), "site": ("terrain",),
+                "tin": ("terrain", "pavement"), "buildings": ("terrain", "semantics", "tin"), "site": ("terrain",),
                 "scene": ("vegetation", "pavement", "tin", "buildings", "site"), "export": ("scene",), "qa": ("export",), "report": ("qa",)}
 
 
@@ -199,10 +199,21 @@ def _step_terrain(project, out, cfg, cache):
                            dtm_raw.shape, float(clean_cfg.get("protect_dilate_m", .5)))
     dtm_clean, clean_report = clean_dtm(dtm_raw, terrain["validity"], float(terrain["resolution"]), protect=protect, config=cfg)
     terrain.update(dtm_raw=dtm_raw, dtm_clean=dtm_clean, dtm=dtm_clean.copy(), clean_report=clean_report)
+    # former lawn: grass tops are not ground -> low robust percentile per cell, holes interpolated from the surrounding ground
+    from samcloud.terrain.clean import lawn_ground_dtm, points_in_mask
+    lawn_report: dict = {"cells": 0}
+    low_vegetation = ps.xyz[ps.classes == c.LOW_VEGETATION]
+    lawn_mask = None
+    if len(low_vegetation):
+        support = ps.xyz[np.isin(ps.classes, (c.GROUND, c.LOW_VEGETATION))]
+        lawn_dtm, lawn_mask, lawn_report = lawn_ground_dtm(dtm_clean, terrain["bounds"], float(terrain["resolution"]), low_vegetation, support, protect=protect, config=cfg)
+        terrain.update(dtm_clean=lawn_dtm, dtm=lawn_dtm.copy(), lawn_mask=lawn_mask, lawn_report=lawn_report)
     if ground is not None:
+        if lawn_mask is not None and lawn_mask.any():  # the lawn cells are judged separately (grass tops would count as errors)
+            ground = ground[~points_in_mask(ground, lawn_mask, terrain["bounds"], float(terrain["resolution"]))]
         step = int(np.ceil(len(ground) / int(cfg.get("terrain", {}).get("deviation", {}).get("max_points", 400_000))))
         terrain["ground_sample"] = np.asarray(ground[::max(step, 1)], dtype=np.float64)
-    _dump(cache / "terrain.pkl", terrain); return {"files": terrain.get("files", {}), "clean": clean_report}
+    _dump(cache / "terrain.pkl", terrain); return {"files": terrain.get("files", {}), "clean": clean_report, "lawn": lawn_report}
 
 
 def _step_vegetation(project, out, cfg, cache):
@@ -215,11 +226,61 @@ def _step_vegetation(project, out, cfg, cache):
 
 
 def _step_pavement(project, out, cfg, cache):
-    from samcloud.environment.pavement import lawn_polygons, pavement_polygons
+    from samcloud.environment.pavement import pavement_polygons
     from samcloud.environment.curbs import curb_axes
     ps, _frame = _working_pointset(cache), _load(cache / "load.pkl")[1]
-    result = {"polygons": pavement_polygons(ps), "lawns": lawn_polygons(ps), "curbs": curb_axes(ps)}
-    _dump(cache / "pavement.pkl", result); return {k: len(v) for k, v in result.items()}
+    curb_report: dict = {}
+    result = {"polygons": pavement_polygons(ps), "lawns": [], "curbs": curb_axes(ps, config=cfg, report=curb_report)}  # lawn is no output category: former lawn is plain terrain
+    ortho_info = _write_ortho(ps, _frame, out, cfg, cache)
+    if ortho_info:
+        result["ortho_cache"] = ortho_info["cache"]
+    _dump(cache / "pavement.pkl", result)
+    counts = {k: len(v) for k, v in result.items() if k != "ortho_cache"}
+    if ortho_info:
+        counts["ortho"] = ortho_info
+    return {**counts, **{f"curb_{k}": v for k, v in curb_report.items() if k != "removed_axes"}}
+
+
+def _write_ortho(ps, frame, out: Path, cfg: dict, cache: Path):
+    """Top-down RGB raster of the coloured cloud for the image edge refinement (None without colours)."""
+    from samcloud.environment.image_edges import image_settings
+    from samcloud.environment.ortho_rgb import build_ortho_rgb
+    icfg = image_settings(cfg)
+    if not icfg["enabled"] or getattr(ps, "rgb", None) is None:
+        return None
+    started = time.perf_counter()
+    ortho = build_ortho_rgb(ps.xyz, ps.rgb, cell_m=float(icfg["cell_m"]), z_percentile=float(icfg["z_percentile"]),
+                            hole_fill_cells=int(icfg["hole_fill_cells"]))
+    if ortho is None:
+        return None
+    tif = ortho.to_geotiff(out / "ortho_rgb.tif", frame)
+    _dump(cache / "ortho_rgb.pkl", ortho)
+    return {"cache": str(cache / "ortho_rgb.pkl"), "tif": str(tif), "cell_m": ortho.cell, "shape": list(ortho.shape),
+            "valid_fraction": round(float(ortho.valid.mean()), 3), "seconds": round(time.perf_counter() - started, 1)}
+
+
+def _refine_with_image(kinds: dict, regions: dict, pave: dict, cfg: dict):
+    """Move the boundaries between road/sidewalk/path/terrain onto the image edges (falls back to the input)."""
+    from dataclasses import replace
+    from samcloud.environment.image_edges import clean_settings, image_settings, refine_partition
+    from samcloud.environment.ortho_rgb import OrthoRGB
+    ortho = _load(Path(pave["ortho_cache"])) if pave.get("ortho_cache") and image_settings(cfg)["enabled"] else None
+    if not isinstance(ortho, OrthoRGB):
+        ortho = None   # no colours: only the geometric clean-up acts
+    if ortho is None and not clean_settings(cfg)["enabled"]:
+        return kinds, regions
+    result = refine_partition(regions, ortho, pave.get("curbs", ()), config=cfg)
+    pave["image_edges"] = result.report
+    if "fallback" in result.report:
+        return kinds, regions
+    new_kinds = {}
+    for kind, items in kinds.items():
+        new_kinds[kind] = []
+        for item, faces in zip(items, result.regions[kind]):
+            for n, face in enumerate(faces, start=1):
+                new_kinds[kind].append(replace(item, polygon=face, pavement_id=item.pavement_id if len(faces) == 1 else f"{item.pavement_id}_{n}"))
+    new_regions = {**{k: [p.polygon for p in v] for k, v in new_kinds.items()}, "lawn": [f for faces in result.regions.get("lawn", []) for f in faces]}
+    return new_kinds, new_regions
 
 
 def _apply_edge_fit(topo, pave: dict, cfg: dict):
@@ -229,21 +290,25 @@ def _apply_edge_fit(topo, pave: dict, cfg: dict):
     from samcloud.terrain.edges import fit_surfaces
     kinds = {k: [p for p in topo.polygons if p.kind == k] for k in c.PAVEMENT_KINDS}
     regions = {**{k: [p.polygon for p in v] for k, v in kinds.items()}, "lawn": list(topo.lawns)}
+    kinds, regions = _refine_with_image(kinds, regions, pave, cfg)
     fit = fit_surfaces(regions, pave.get("curbs", ()), config=cfg)
     if "fallback" in fit.report:
         return fit
+    from samcloud.environment.image_edges import close_slivers
+    fit.report["slivers_closed"] = close_slivers(fit.regions)  # refitting can leave cm-wide slivers between neighbours
     polygons = []
     for kind, items in kinds.items():
         for item, faces in zip(items, fit.regions[kind]):
             for n, face in enumerate(faces, start=1):
                 polygons.append(replace(item, polygon=face, pavement_id=item.pavement_id if len(faces) == 1 else f"{item.pavement_id}_{n}"))
     topo.polygons = polygons
-    topo.lawns = [face for faces in fit.regions["lawn"] for face in faces]
+    topo.lawns = [face for faces in fit.regions.get("lawn", []) for face in faces]
     named = {k: [p.polygon for p in polygons if p.kind == k] for k in c.PAVEMENT_KINDS}
     named["lawn"] = topo.lawns
     topo.report = {f"{a}|{b}": r for (a, b), r in env_topology.pairwise_report({k: v for k, v in named.items() if v}, tolerance=0.05).items()}
     by_id = {fc.curb_id: fc for fc in fit.curbs}
-    pave["curbs"] = [replace(cb, points=by_id[cb.curb_id].dense_xyz) if cb.curb_id in by_id else cb for cb in pave.get("curbs", ())]
+    from samcloud.environment.curbs import transfer_curb_section  # keeps foot height, road side and gutter data on the fitted axis
+    pave["curbs"] = [transfer_curb_section(cb, by_id[cb.curb_id].dense_xyz) if cb.curb_id in by_id else cb for cb in pave.get("curbs", ())]
     return fit
 
 
@@ -259,7 +324,7 @@ def _step_tin(project, out, cfg, cache):
     from samcloud.terrain.clean import smooth_pavement_surfaces, tin_deviation
     from samcloud.terrain.tin import build_labeled_tin
     _ps, _frame = _working_pointset(cache), _load(cache / "load.pkl")[1]; terrain = _load(cache / "terrain.pkl"); pave = _load(cache / "pavement.pkl")
-    topo = pavement_topology(pave["polygons"], pave["lawns"], pave["curbs"], config=cfg)
+    topo = pavement_topology(pave["polygons"], [], pave["curbs"], config=cfg)  # no lawn regions (older caches may still hold some)
     fit = None
     if bool(cfg.get("edges", {}).get("enabled", False)):
         fit = _apply_edge_fit(topo, pave, cfg)
@@ -282,9 +347,19 @@ def _step_tin(project, out, cfg, cache):
     ground = _dtm_support(terrain, tin_cfg.get("support_spacing_m"))
     tol_terrain = float(tin_cfg.get("tolerance_terrain_m", tin_cfg.get("tolerance_m", .04)))
     tol_pavement = float(tin_cfg.get("tolerance_pavement_m", tol_terrain))
-    by_label = {"road": tol_pavement, "sidewalk": tol_pavement, "path": tol_pavement, "lawn": tol_terrain, "terrain": tol_terrain}
+    by_label = {"road": tol_pavement, "sidewalk": tol_pavement, "path": tol_pavement, "terrain": tol_terrain}
+    # manholes are TIN constraints (the terrain lies 1 mm below the cover) and vertical steps get a top and a bottom edge
+    from samcloud.outdoor_model.civil import manhole_detections
+    from samcloud.terrain import steps as terrain_steps
+    terrain_cfg = cfg.get("terrain", {})
+    manholes = [(float(m.center[0]), float(m.center[1]), float(m.center[2]), float(m.diameter)) for m in manhole_detections(_ps) if m.status == "ok"]
+    step_runs = terrain_steps.detect_steps(regions, sample, curbs=pave.get("curbs", ()), dtm=terrain["dtm"], dtm_bounds=terrain["bounds"], dtm_resolution=terrain["resolution"], config=cfg)
+    from samcloud.terrain.flush import plan_flush
+    flush_plan = plan_flush(regions, sample, step_runs, config=cfg)   # pavement edges are flush with the terrain (no lip)
     started = time.perf_counter()
     tin = build_labeled_tin(ground, regions=regions, dtm_sampler=sample,
+        manholes=manholes, manhole_ring_segments=int(terrain_cfg.get("manhole_ring_segments", 16)),
+        manhole_below_m=float(terrain_cfg.get("manhole_below_m", .001)), steps=step_runs, step_config=terrain_cfg.get("step"), flush=flush_plan,
         buffer=float(tin_cfg.get("constraint_buffer_m", .05)), min_angle_deg=float(tin_cfg.get("min_angle_deg", 20)),
         max_steiner_per_edge=int(tin_cfg.get("max_steiner_per_edge", 50)),
         thin_spacing=tin_cfg.get("thin_spacing_m"), tolerance=tol_terrain, tolerance_by_label=by_label,
@@ -297,12 +372,15 @@ def _step_tin(project, out, cfg, cache):
         limit = float(dev_cfg.get("max_rms_pavement_m", .04)) if name in c.PAVEMENT_KINDS else float(dev_cfg.get("max_rms_terrain_m", .06))
         row["limit_rms_m"] = limit; row["ok"] = bool(row["rms_m"] <= limit)
     report = {"clean": terrain.get("clean_report"), "smooth": smooth_report, "deviation": deviation, "labels": _label_stats(tin),
-              "edges": getattr(fit, "report", None), "topology_worst_cm2": topo.worst_cm2()}
+              "edges": getattr(fit, "report", None), "topology_worst_cm2": topo.worst_cm2(),
+              "lawn": terrain.get("lawn_report"), "steps": getattr(tin, "step_report", None), "flush": getattr(tin, "flush_report", None),
+              "step_sources": {src: sum(1 for r in step_runs if r.source == src) for src in ("curb", "pavement", "wall")}, "manholes": len(manholes)}
     (out / "terrain_clean_report.json").write_text(json.dumps(report, indent=2, default=float), encoding="utf-8")
     return {"triangles": len(tin.triangles), "vertices": len(tin.vertices),
             "simplify_report": getattr(tin, "simplify_report", None), "seconds": round(time.perf_counter() - started, 3),
             "support_cells": int(len(ground)), "constraint_report": getattr(tin, "constraint_report", None),
-            "deviation": deviation, "labels": report["labels"], "edges": report["edges"], "smooth": smooth_report}
+            "deviation": deviation, "labels": report["labels"], "edges": report["edges"], "smooth": smooth_report,
+            "steps": report["steps"], "flush": report["flush"], "step_sources": report["step_sources"], "manholes": len(manholes), "lawn": report["lawn"]}
 
 
 def _building_lod1_fallback(inst, points: PointSet, building_id: int, sampler, reason: str):
@@ -335,6 +413,8 @@ def _step_buildings(project, out, cfg, cache):
     ps, _frame = _working_pointset(cache), _load(cache / "load.pkl")[1]; terrain = _load(cache / "terrain.pkl"); sample = _sampler(terrain)
     semantic = _load(cache / "semantics.pkl", {})
     instances = semantic.get("instances", semantic.get("buildings", [])) if isinstance(semantic, dict) else []
+    from samcloud.buildings.base import make_tin_sampler
+    base_sampler = make_tin_sampler(_load(cache / "tin.pkl", None), fallback=sample)  # wall bottoms follow the final TIN (DTM when absent)
     dsm_points = np.empty((0, 3), dtype=float)
     dsm_resolution = float(cfg.get("terrain", {}).get("dsm_resolution_m", 0.10))
     try:
@@ -377,6 +457,7 @@ def _step_buildings(project, out, cfg, cache):
                 building_points,
                 bid,
                 dtm_sampler=sample,
+                base_sampler=base_sampler,
                 config=cfg,
                 dsm_roof_points=building_dsm,
                 dsm_cell_area_m2=dsm_resolution * dsm_resolution,
@@ -446,8 +527,24 @@ def _step_site(project, out, cfg, cache):
     from samcloud.outdoor_model.site_walls import build_site_elements, fence_features, site_wall_features
     from samcloud.outdoor_model.civil import build_civil_elements, manhole_detections, marking_features
     ps, _frame = _working_pointset(cache), _load(cache / "load.pkl")[1]; sample = _sampler(_load(cache / "terrain.pkl")); pave = _load(cache / "pavement.pkl")
-    site, qa = build_site_elements(site_wall_features(ps, sample), fence_features(ps, sample), config=cfg)
-    civil, civil_qa = build_civil_elements(pave["curbs"], marking_features(ps), manhole_detections(ps), config=cfg)
+    from copy import deepcopy
+    from shapely.ops import unary_union
+    from samcloud.terrain.tin import tin_sampler
+    tin = _load(cache / "tin.pkl", None)
+    surface = tin_sampler(tin) if tin is not None and len(getattr(tin, "triangles", ())) else None  # the final TIN: fences, walls and curbs sit flush on it
+    ground, site_cfg = sample, cfg
+    if surface is not None:
+        def ground(xy, _surface=surface, _dtm=sample):
+            z = np.asarray(_surface(xy), float); gap = ~np.isfinite(z)
+            if gap.any(): z[gap] = np.asarray(_dtm(np.asarray(xy, float).reshape(-1, 2)[gap]), float)
+            return z
+        site_cfg = deepcopy(cfg)
+        for group in ("fence", "wall"): site_cfg.setdefault("site", {}).setdefault(group, {})["terrain_radius_m"] = 0.0  # TIN sampled directly, no disc median
+    paved = [p.polygon for p in pave.get("polygons", ()) if getattr(p, "kind", "") in ("road", "sidewalk")]
+    outline = unary_union([p.polygon.boundary for p in pave.get("polygons", ())]) if pave.get("polygons") else None  # where terrain.step puts curb steps
+    site, qa = build_site_elements(site_wall_features(ps, ground, config=site_cfg), fence_features(ps, ground, config=site_cfg), config=site_cfg)
+    civil, civil_qa = build_civil_elements(pave["curbs"], marking_features(ps), manhole_detections(ps), config=cfg, surface=surface,
+                                           pavement=unary_union(paved) if paved else None, outline=outline)
     _dump(cache / "site.pkl", {"elements": site + civil, "qa": qa + civil_qa}); return {"elements": len(site) + len(civil)}
 
 
@@ -468,24 +565,27 @@ def _step_scene(project, out, cfg, cache):
     from samcloud.outdoor_model import buildings, site_walls, vegetation, pavement, civil, terrain as terrain_builder
     ps, frame = _working_pointset(cache), _load(cache / "load.pkl")[1]; veg = _load(cache / "vegetation.pkl"); pave = _load(cache / "pavement.pkl"); tin = _load(cache / "tin.pkl"); bld = _load(cache / "buildings.pkl"); site = _load(cache / "site.pkl"); terrain_data = _load(cache / "terrain.pkl")
     pavement_elements, pavement_qa = pavement.build_pavement_elements(
-        pave["polygons"], pave["lawns"], pave["curbs"], tin, config=cfg, topology_ready=True,
+        pave["polygons"], [], pave["curbs"], tin, config=cfg, topology_ready=True,
     )
     terrain_elements, terrain_qa = terrain_builder.build_terrain_elements(tin, dtm=terrain_data["dtm"], validity=terrain_data["validity"], resolution=terrain_data["resolution"], config=cfg)
-    lawn_qa = []
-    lawn_areas = vegetation.build_lawn_areas(pave["lawns"], _sampler(terrain_data), qa=lawn_qa)
-    lawn_elements = vegetation.lawn_elements(lawn_areas)
-    groups=[veg.elements, lawn_elements, pavement_elements, terrain_elements, bld["elements"], site["elements"]]
+    if tin is not None: veg.elements = vegetation.rebase_trees_on_tin(veg.elements, tin)  # trunk base flush with the final TIN
+    groups=[veg.elements, pavement_elements, terrain_elements, bld["elements"], site["elements"]]
     scene=assemble_scene(*groups, frame=frame)
     manholes = [tuple(item.params.center[:2]) for item in site["elements"] if hasattr(item.params, "center")]
     terrain_dxf, _terrain_info = terrain_builder.terrain_dxf_entities(terrain_elements, frame,
         dtm=terrain_data["dtm"], validity=terrain_data["validity"], dtm_bounds=tuple(terrain_data["bounds"]),
-        resolution=terrain_data["resolution"], curbs=pave["curbs"], manholes=manholes, config=cfg)
-    entities={"vegetation": vegetation.to_dxf_entities(veg.elements, frame, lawn_areas=lawn_areas), "pavement": pavement.to_dxf_entities(pavement_elements, frame, config=cfg, edge_fit=pave.get("edge_fit")), "terrain": terrain_dxf, "buildings": buildings.to_dxf_entities(bld["elements"], frame), "site": site_walls.to_dxf_entities(site["elements"], frame), "civil": civil.to_dxf_entities(site["elements"], frame, config=cfg)}
+        resolution=terrain_data["resolution"], curbs=pave["curbs"], manholes=manholes, footprints=terrain_builder.building_footprints(bld["elements"]), config=cfg)
+    entities={"vegetation": vegetation.to_dxf_entities(veg.elements, frame, config=cfg), "pavement": pavement.to_dxf_entities(pavement_elements, frame, config=cfg, edge_fit=pave.get("edge_fit")), "terrain": terrain_dxf, "buildings": buildings.to_dxf_entities(bld["elements"], frame), "site": site_walls.to_dxf_entities(site["elements"], frame), "civil": civil.to_dxf_entities(site["elements"], frame, config=cfg)}
     fitted_curbs = getattr(pave.get("edge_fit"), "curbs", None)  # curbs as lines/arcs (bulges), fitted with the outlines
-    if fitted_curbs: entities["civil"] = {**entities["civil"], **pavement.curb_dxf_entities(fitted_curbs, frame, config=cfg)}
+    if fitted_curbs:
+        fitted_curbs = civil.apply_curb_heights(fitted_curbs, site["elements"])  # DXF z = the surface-snapped curb top of the IFC body
+        skip, clipped = civil.curbs_off_the_fit(site["elements"], fitted_curbs, cfg)  # clipped / unfitted curbs keep their element axis
+        fitted_dxf = pavement.curb_dxf_entities(fitted_curbs, frame, config=cfg, exclude_ids=skip)
+        element_dxf = civil.to_dxf_entities(clipped, frame, config=cfg).get("S-CURB", [])
+        if fitted_dxf or element_dxf: entities["civil"] = {**entities["civil"], "S-CURB": fitted_dxf.get("S-CURB", []) + element_dxf}
     boundary_dxf = _boundary_dxf_entities(_load(cache / "boundary.pkl"), frame)
     if boundary_dxf: entities["boundary"] = boundary_dxf
-    dxf=assemble_dxf(entities, frame, cfg); _dump(cache / "scene.pkl", {"scene": scene, "dxf": dxf, "qa": pave.get("topology_qa", []) + pavement_qa + lawn_qa + terrain_qa + bld["qa"] + site["qa"]}); return {"elements": len(scene.elements)}
+    dxf=assemble_dxf(entities, frame, cfg); _dump(cache / "scene.pkl", {"scene": scene, "dxf": dxf, "qa": pave.get("topology_qa", []) + pavement_qa + terrain_qa + bld["qa"] + site["qa"]}); return {"elements": len(scene.elements)}
 
 
 def _element_category(element) -> str:
@@ -698,6 +798,20 @@ def _clip_polyline(points, poly, min_len: float = _MIN_CLIPPED_LINE_M):
     return parts
 
 
+def _clipped_vertex_data(params, line_attr, new_pts) -> dict:
+    """Per-vertex lists (foot_z, bottom_z, top_z_axis, base_z_axis) re-sampled onto a clipped axis."""
+    from shapely.geometry import LineString, Point
+    old = np.asarray(getattr(params, line_attr), float)[:, :2]
+    if len(old) < 2: return {}
+    line = LineString(old); cum = np.r_[0.0, np.cumsum(np.hypot(*np.diff(old, axis=0).T))]
+    along = np.array([line.project(Point(float(q[0]), float(q[1]))) for q in new_pts])
+    data = {a: [float(v) for v in np.interp(along, cum, getattr(params, a))]
+            for a in ("foot_z", "bottom_z", "top_z_axis", "base_z_axis")
+            if getattr(params, a, None) is not None and len(getattr(params, a)) == len(old)}
+    if getattr(params, "gutter_axis", None) is not None: data["gutter_axis"] = None  # dense stations of the whole curb: the clipped part falls back to axis + foot_z
+    return data
+
+
 def _is_unchanged(parts, pts) -> bool:
     return len(parts) == 1 and len(parts[0]) == len(pts) and np.allclose(parts[0], pts)
 
@@ -711,7 +825,7 @@ def _clip_elements(elements, poly, counts):
     for el in elements:
         p = el.params; kind = type(el).__name__.replace("Element", "").lower()
         def renamed(k, pts, attr, _el=el):
-            new = _el.model_copy(update={"params": _el.params.model_copy(update={attr: [tuple(map(float, q)) for q in pts]})})
+            new = _el.model_copy(update={"params": _el.params.model_copy(update={attr: [tuple(map(float, q)) for q in pts], **_clipped_vertex_data(_el.params, attr, pts)})})
             return new.model_copy(update={"id": f"{_el.id}-p{k}"}) if k else new
         if getattr(p, "trunk_xy", None) is not None or getattr(p, "center", None) is not None:
             xy = p.trunk_xy if getattr(p, "trunk_xy", None) is not None else p.center
@@ -784,7 +898,8 @@ def _apply_boundary(name: str, out: Path, cache: Path) -> dict | None:
                 for k, part in enumerate(parts):
                     cid = c.curb_id if k == 0 else next_id
                     if k: next_id += 1
-                    curbs.append(replace(c, curb_id=cid, points=part))
+                    from samcloud.environment.curbs import transfer_curb_section  # keeps foot height / road side / gutter on the clipped part
+                    curbs.append(replace(transfer_curb_section(c, part), curb_id=cid))
             pave["curbs"] = curbs
         _dump(cache / "pavement.pkl", pave)
     elif name == "vegetation":

@@ -273,16 +273,17 @@
     "layers": "DXF-Layer",
     "all": "Alle",
     "none": "Keine",
-    "hint": "Mausrad zoomt, Ziehen verschiebt.",
-    "open_png": "PNG öffnen"
+    "hint": "Mausrad zoomt (Text bleibt scharf), Ziehen verschiebt, Doppelklick passt ein.",
+    "open_png": "PNG öffnen",
+    "rendering_svg": "Vektor-Vorschau wird erstellt ..."
   },
   "ifc_outdoor": {
-    "lawns": "Rasen",
     "paths": "Wege",
     "terrain": "Gelände",
     "pavements": "Beläge",
     "sidewalks": "Trottoirs",
     "curbs": "Randsteine",
+    "gutters": "Wassersteine",
     "buildings": "Gebäude-Wände",
     "roofs": "Dächer",
     "site_walls": "Mauern",

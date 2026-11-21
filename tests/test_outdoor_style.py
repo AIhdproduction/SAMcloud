@@ -50,8 +50,7 @@ def _scene() -> Scene:
     scene.add(CurbElement(params=CurbParams(axis=[(0, 4, 0), (2, 4, 0)])))
     scene.add(MarkingElement(params=MarkingParams(points=[(0, 5), (2, 5)])))
     scene.add(ManholeElement(params=ManholeParams(center=(1, 6, 0), diameter=0.6)))
-    scene.add(VegetationAreaElement(params=VegetationAreaParams(outline=[(0, 7), (1, 7), (0, 8)], base_z=12)))
-    return scene
+    return scene  # no lawn / vegetation-area element: former lawn is plain terrain
 
 
 def test_style_file_covers_every_category() -> None:
@@ -96,7 +95,7 @@ def test_outdoor_ifc_every_product_styled_with_exactly_one_layer(tmp_path: Path)
                     )
                     got = tuple(round(value * 255) for value in (colour.Red, colour.Green, colour.Blue))
                     assert got == style["rgb"], (category, got)
-    assert {"terrain", "road", "sidewalk", "path", "lawn", "curb", "building_wall", "roof", "window", "site_wall",
+    assert {"terrain", "road", "sidewalk", "path", "curb", "building_wall", "roof", "window", "site_wall",
             "fence", "tree", "shrub", "manhole", "marking"} <= seen
     names = {layer.Name for layer in file.by_type("IfcPresentationLayerAssignment")}
     assert names <= {style["layer"] for style in styles.values()}
@@ -115,7 +114,6 @@ def _dxf_result() -> DxfPlanResult:
     square = [[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]]
     layers = {
         "S-PAVE": [{"type": "polyline", "points": square, "closed": True}],
-        "S-VEG": [{"type": "polyline", "points": square, "closed": True}],
         "S-CURB": [{"type": "line", "start": [0, 0, 0], "end": [3, 0, 0]}],
         "S-TREE": [outdoor_symbol_insert("TREE", (5.0, 5.0, 1.0), {"HEIGHT": 6.0}, crown_radius=2.0)],
         "S-SHRUB": [outdoor_symbol_insert("SHRUB", (7.0, 5.0, 1.0), {"HEIGHT": 1.0}, crown_radius=0.7)],
@@ -195,12 +193,21 @@ def test_lawn_surface_is_cut_out_of_terrain(tmp_path: Path) -> None:
         footprint = next(p for p in lawns if triangle_count(p) == 0)
         assert triangle_count(terrain) == 2 and triangle_count(surface) == 4  # no gap, no overlap
         assert footprint.Representation.Representations[0].RepresentationIdentifier == "FootPrint"
-        assert outdoor_category_of_product(surface) == "lawn"
-        layer_names = {layer.Name for layer in file.by_type("IfcPresentationLayerAssignment")}
-        assert category_style("lawn")["layer"] in layer_names
-        (styled,) = surface.Representation.Representations[0].Items[0].StyledByItem
-        colour = styled.Styles[0].Styles[0].SurfaceColour
-        assert tuple(round(v * 255) for v in (colour.Red, colour.Green, colour.Blue)) == category_style("lawn")["rgb"]
+        assert "lawn" not in load_outdoor_style()  # lawn is no output category any more
+
+
+def test_terrain_without_lawn_elements_is_one_complete_element(tmp_path: Path) -> None:
+    scene = _grid_scene(True)
+    for element_id in ("lawn-1", "lawn-2"):
+        scene.elements.pop(element_id)
+    path = tmp_path / "plain.ifc"
+    write_ifc(scene, path)
+    file = ifcopenshell.open(str(path))
+    products = file.by_type("IfcGeographicElement")
+    assert [p.PredefinedType for p in products] == ["TERRAIN"]
+    count = sum(len(item.CoordIndex) for rep in products[0].Representation.Representations for item in rep.Items
+                if item.is_a("IfcTriangulatedFaceSet"))
+    assert count == 6  # every non-pavement triangle stays in the terrain
 
 
 def test_terrain_builder_lists_lawn_triangles() -> None:
@@ -219,13 +226,14 @@ def test_viewer_has_path_and_lawn_categories() -> None:
         {"ifc_class": "IfcCivilElement", "name": "Pavement", "object_type": "Weg"},
         {"ifc_class": "IfcCivilElement", "name": "Pavement", "object_type": "Strasse"},
         {"ifc_class": "IfcGeographicElement", "name": "Rasen lawn-1", "object_type": "Vegetationsfläche", "predefined_type": "USERDEFINED"},
-    ]
+    ]  # an old IFC lawn counts as terrain
     _by_node, counts = ui_data.category_index({"elements": {f"g{i}": row for i, row in enumerate(rows)}}, True)
-    assert counts == {"lawns": 1, "pavements": 1, "paths": 1}
+    assert counts == {"terrain": 1, "pavements": 1, "paths": 1}
+    assert "lawns" not in ui_data.OUTDOOR_CATEGORY_ORDER
     styles = load_outdoor_style()
-    assert ui_data.OUTDOOR_COLORS["lawns"] == styles["lawn"]["hex"] and ui_data.OUTDOOR_COLORS["paths"] == styles["path"]["hex"]
+    assert ui_data.OUTDOOR_COLORS["paths"] == styles["path"]["hex"]
     import json
     root = Path(__file__).resolve().parents[1] / "samcloud" / "app" / "locales"
     for lang in ("de", "en"):
         labels = json.loads((root / lang / "dxf.json").read_text(encoding="utf-8"))["ifc_outdoor"]
-        assert {"lawns", "paths"} <= set(labels)
+        assert {"paths"} <= set(labels)

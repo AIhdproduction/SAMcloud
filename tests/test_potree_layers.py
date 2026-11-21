@@ -75,45 +75,29 @@ def test_node_group_prefers_extras_then_name() -> None:
     assert potree_viewer.node_group("xyz") == "other"
 
 
-def _page(layers: dict, matrix=None) -> tuple[str, str]:
-    config = {
-        "element_id": "sam-potree-dense", "kind": "dense", "title": "x",
-        "metadata_url": "/api/potree/dense/metadata.json", "class_colors": [[1, 2, 3]], "class_labels": ["Boden"],
-        "environment": potree_viewer._environment_config(layers, matrix),
-    }
-    html_text = potree_viewer._html("sam-potree-dense", layers=layers)
-    return html_text, potree_viewer._script(config)
+def _dense_page(tmp_path: Path) -> tuple[str, str, dict]:
+    config = potree_viewer._viewer_config("dense", "x", [[1, 2, 3]], ["Boden"])
+    html_text = potree_viewer._html("sam-potree-dense")
+    return html_text, potree_viewer._script(config), config
 
 
-def test_page_has_panel_and_glb_url_when_available(tmp_path: Path) -> None:
+def test_dense_viewer_shows_points_only_even_with_environment_meshes(tmp_path: Path, monkeypatch) -> None:
+    """environment.glb / model.glb next to the cloud must never be loaded into the dense point-cloud viewer."""
     _write_environment_glb(tmp_path)
-    layers = potree_viewer.environment_layers(tmp_path)
-    matrix = [1.0, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0, 20.0, 0.0, 0.0, 1.0, 30.0, 0.0, 0.0, 0.0, 1.0]
-    html_text, script = _page(layers, matrix)
-    assert 'data-layers-panel' in html_text
-    for label in ("RGB", "Klassen", "DGM", "DOM", "Gebäude", "Vegetation", "Strassen/Beläge", "Gesamtmodell"):
-        assert label in html_text, label
-    assert 'data-node="building_001"' in html_text and 'data-layer-opacity' in html_text
-    assert 'data-layer="dgm" checked' in html_text
-    assert 'data-layer="dom" disabled' in html_text and 'title="nicht berechnet"' in html_text
-    assert potree_viewer.ENVIRONMENT_GLB_URL in script
-    assert "GLTFLoader" in script
-    config_chunk = script[script.index("const config = ") + len("const config = "):]
-    config = json.loads(config_chunk[:config_chunk.index(";\n")])
-    assert config["environment"]["matrix"] == matrix
-    assert config["environment"]["origin_lv95"] == ORIGIN
+    site = tmp_path / "products" / "bim" / "site"
+    site.mkdir(parents=True)
+    (site / "model.glb").write_bytes((tmp_path / "products" / "environment" / "environment.glb").read_bytes())
+    from samcloud.app.state import state
 
-
-def test_page_without_glb_has_disabled_toggles_and_no_loader(tmp_path: Path) -> None:
-    layers = potree_viewer.environment_layers(tmp_path)
-    html_text, script = _page(layers)
-    assert 'data-layers-panel' in html_text
-    for key in ("dgm", "dom", "buildings", "vegetation", "streets", "model"):
-        assert f'data-layer="{key}" disabled' in html_text, key
-    assert html_text.count('title="nicht berechnet"') == 6
-    assert "GLTFLoader" not in script
-    assert potree_viewer.ENVIRONMENT_GLB_URL not in script
-    assert "__ENV_MESH_JS__" not in script and "__LAYERS_JS__" not in script
+    monkeypatch.setattr(state, "active_project_directory", tmp_path, raising=False)
+    html_text, script, config = _dense_page(tmp_path)
+    assert "environment" not in config
+    assert "data-layers-panel" not in html_text and 'data-action="layers"' not in html_text
+    for forbidden in ("GLTFLoader", "THREE.MeshLambertMaterial", ".glb", "environment.glb", "model.glb", "ENVIRONMENT"):
+        assert forbidden not in script, forbidden
+    assert "__LAYERS_JS__" not in script
+    # points are rendered as points (no surface/mesh reconstruction)
+    assert "Potree.PointShape.CIRCLE" in script
 
 
 def test_page_without_layers_is_unchanged() -> None:

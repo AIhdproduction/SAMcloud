@@ -9,6 +9,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import triangulate, unary_union
 
+from samcloud.buildings.base import densify_footprint
 from samcloud.buildings.partition import Partition
 from samcloud.drone.contracts import RoofPlane
 
@@ -357,8 +358,13 @@ def _extrude(partition: Partition, top, footprint: Polygon, ground_z) -> tuple[n
     return vertices_array, _orient_outward(vertices_array, faces_array), roles_array
 
 
-def _extrude_shared(partition: Partition, top, footprint: Polygon, ground_z) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build one closed shell from a shared, fully noded partition boundary graph."""
+def _extrude_shared(partition: Partition, top, footprint: Polygon, ground_z, max_edge_m: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build one closed shell from a shared, fully noded partition boundary graph.
+
+    With ``max_edge_m`` the outline is subdivided so a ``ground_z`` callable (terrain) is followed by the wall bottom.
+    """
+    if max_edge_m and callable(ground_z):
+        footprint = densify_footprint(footprint, max_edge_m, ground_z, float(getattr(ground_z, "follow_tol_m", 0.03)))
     original_rings = [np.asarray(cell.exterior.coords[:-1], dtype=float) for cell in partition.cells]
     all_points = list(np.asarray(footprint.exterior.coords[:-1], dtype=float))
     all_points.extend(point for ring in original_rings for point in ring)
@@ -475,7 +481,8 @@ def _extrude_shared(partition: Partition, top, footprint: Polygon, ground_z) -> 
 
 
 def extrude_lod22(
-    partition: Partition, labels: np.ndarray, roof_planes: list[RoofPlane], footprint: Polygon, ground_z: float | Callable
+    partition: Partition, labels: np.ndarray, roof_planes: list[RoofPlane], footprint: Polygon, ground_z: float | Callable,
+    max_edge_m: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extrude roof-labelled partition cells into an LoD2.2 triangular mesh."""
     labels = np.asarray(labels, dtype=int)
@@ -487,10 +494,10 @@ def extrude_lod22(
         plane = roof_planes[label - 1]
         return -float(plane.normal[0] * x + plane.normal[1] * y + plane.d) / float(plane.normal[2])
 
-    return _extrude_shared(partition, top, footprint, ground_z)
+    return _extrude_shared(partition, top, footprint, ground_z, max_edge_m)
 
 
-def extrude_lod13(partition: Partition, cell_heights: np.ndarray, ground_z: float | Callable) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extrude_lod13(partition: Partition, cell_heights: np.ndarray, ground_z: float | Callable, max_edge_m: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extrude partition cells as flat LoD1.3 roof slabs."""
     heights = np.asarray(cell_heights, dtype=float)
     footprint = partition.cells[0].union(partition.cells[0]) if len(partition.cells) == 1 else None
@@ -500,9 +507,9 @@ def extrude_lod13(partition: Partition, cell_heights: np.ndarray, ground_z: floa
         footprint = unary_union(partition.cells)
     if not isinstance(footprint, Polygon):
         footprint = max((item for item in footprint.geoms if isinstance(item, Polygon)), key=lambda item: item.area)
-    return _extrude_shared(partition, lambda index, _x, _y: float(heights[index]), footprint, ground_z)
+    return _extrude_shared(partition, lambda index, _x, _y: float(heights[index]), footprint, ground_z, max_edge_m)
 
 
-def extrude_lod1(footprint: Polygon, height: float, ground_z: float | Callable) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extrude_lod1(footprint: Polygon, height: float, ground_z: float | Callable, max_edge_m: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extrude a single flat footprint as an LoD1.2 mesh."""
-    return _extrude_shared(Partition([footprint], []), lambda _index, _x, _y: float(height), footprint, ground_z)
+    return _extrude_shared(Partition([footprint], []), lambda _index, _x, _y: float(height), footprint, ground_z, max_edge_m)

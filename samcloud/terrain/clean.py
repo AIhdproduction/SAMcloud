@@ -274,6 +274,109 @@ def smooth_pavement_surfaces(
     return z, report
 
 
+# ---------------------------------------------------------------------------------- former lawn areas
+
+
+def _cell_flat(xyz: np.ndarray, bounds, resolution: float, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    xmin, _ymin, _xmax, ymax = bounds
+    col = np.floor((xyz[:, 0] - xmin) / resolution).astype(np.int64)
+    row = np.floor((ymax - xyz[:, 1]) / resolution).astype(np.int64)
+    inside = (col >= 0) & (col < shape[1]) & (row >= 0) & (row < shape[0])
+    return row * shape[1] + col, inside
+
+
+def lawn_cell_mask(
+    lawn_xyz: np.ndarray, bounds, resolution: float, shape: tuple[int, int], *,
+    protect: np.ndarray | None = None, min_points: int = 3,
+) -> np.ndarray:
+    """Raster mask of the former lawn: cells with at least ``min_points`` low-vegetation points, closed by one cell."""
+    mask = np.zeros(shape, dtype=bool)
+    pts = np.asarray(lawn_xyz, dtype=float).reshape(-1, 3)
+    if len(pts):
+        flat, inside = _cell_flat(pts, bounds, float(resolution), shape)
+        counts = np.bincount(flat[inside], minlength=shape[0] * shape[1]).reshape(shape)
+        mask = counts >= int(min_points)
+        mask = ndimage.binary_closing(mask, structure=np.ones((3, 3), dtype=bool))
+    if protect is not None:
+        mask &= ~np.asarray(protect, dtype=bool)
+    return mask
+
+
+def points_in_mask(xyz: np.ndarray, mask: np.ndarray, bounds, resolution: float) -> np.ndarray:
+    """Boolean per point: lies in a ``True`` cell of the north-up raster ``mask``."""
+    pts = np.asarray(xyz, dtype=float).reshape(-1, 3)
+    flat, inside = _cell_flat(pts, bounds, float(resolution), mask.shape)
+    out = np.zeros(len(pts), dtype=bool)
+    out[inside] = np.asarray(mask, dtype=bool).ravel()[flat[inside]]
+    return out
+
+
+def lawn_ground_dtm(
+    dtm: np.ndarray,
+    bounds,
+    resolution: float,
+    lawn_xyz: np.ndarray,
+    support_xyz: np.ndarray,
+    *,
+    protect: np.ndarray | None = None,
+    config: Mapping | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Ground height of former lawn areas: grass tops are not ground.
+
+    Lawn points contain grass and shrub tops (several cm above the soil), so the per-cell median of the ground
+    points over-estimates the terrain.  In the lawn cells (see :func:`lawn_cell_mask`) the DTM becomes the
+    ``terrain.lawn_ground_percentile`` (default 20) of the ``support_xyz`` heights per cell (never higher than
+    before), cells with fewer than ``terrain.lawn_ground_min_points`` points are interpolated (a cell never drops more than ``terrain.lawn_ground_max_lowering_m``, default 0.25 m)
+     from the surrounding
+    ground (every non-lawn DTM cell, pavement edges included), and a 3x3 median removes single-cell noise.
+    Returns ``(dtm, lawn_mask, report)``.
+    """
+    from samcloud.terrain.rasters import _cell_percentile
+
+    tcfg = _cfg(config, "terrain")
+    percentile = float(tcfg.get("lawn_ground_percentile", 20.0))
+    min_points = int(tcfg.get("lawn_ground_min_points", 4))
+    max_lowering = float(tcfg.get("lawn_ground_max_lowering_m", 0.25))
+    z = np.asarray(dtm, dtype=np.float64).copy()
+    shape = z.shape
+    mask = lawn_cell_mask(lawn_xyz, bounds, resolution, shape, protect=protect)
+    report: dict = {"percentile": percentile, "cells": int(mask.sum()), "interpolated_cells": 0,
+                    "mean_lowering_m": 0.0, "max_lowering_m": 0.0}
+    if not mask.any():
+        return z, mask, report
+    before = z.copy()
+    pts = np.asarray(support_xyz, dtype=float).reshape(-1, 3)
+    flat, inside = _cell_flat(pts, bounds, float(resolution), shape)
+    sel = inside & mask.ravel()[np.where(inside, flat, 0)]
+    have = np.zeros(shape, dtype=bool)
+    if sel.any():
+        counts = np.bincount(flat[sel], minlength=shape[0] * shape[1])
+        cells, values = _cell_percentile(flat[sel], pts[sel, 2], percentile)
+        enough = counts[cells] >= min_points
+        cells, values = cells[enough], values[enough]
+        old = before.ravel()[cells]
+        new = np.where(np.isfinite(old), np.clip(values, old - max_lowering, old), values)  # never higher, never absurdly lower
+        z.ravel()[cells] = new
+        have.ravel()[cells] = True
+    holes = mask & ~have
+    if holes.any():
+        sources = np.isfinite(z) & ~holes
+        if sources.sum() >= 3:
+            z = _interpolate_removed(np.where(np.isfinite(z), z, 0.0), holes, sources)
+        report["interpolated_cells"] = int(holes.sum())
+    valid = np.isfinite(z)
+    smooth = ndimage.median_filter(np.where(valid, z, np.nanmean(z[valid]) if valid.any() else 0.0), size=3)
+    use = mask & valid
+    z[use] = smooth[use]
+    changed = mask & np.isfinite(before) & np.isfinite(z)
+    if changed.any():
+        delta = (before - z)[changed]
+        report["mean_lowering_m"] = round(float(delta.mean()), 4)
+        report["max_lowering_m"] = round(float(delta.max()), 4)
+    z[~np.isfinite(np.asarray(dtm, dtype=np.float64))] = np.nan  # the measured/clipped extent of the DTM stays
+    return z, mask, report
+
+
 # ---------------------------------------------------------------------------------- deviation
 
 
@@ -321,4 +424,4 @@ def tin_deviation(tin, ground_xyz: np.ndarray, *, max_points: int = 400_000, tri
     return out
 
 
-__all__ = ["clean_dtm", "protect_mask", "smooth_pavement_surfaces", "tin_deviation"]
+__all__ = ["clean_dtm", "lawn_cell_mask", "lawn_ground_dtm", "points_in_mask", "protect_mask", "smooth_pavement_surfaces", "tin_deviation"]

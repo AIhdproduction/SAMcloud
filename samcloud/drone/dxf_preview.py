@@ -10,6 +10,7 @@ re-rendered when the DXF is newer.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import re
 from collections import Counter
@@ -261,3 +262,242 @@ def _write_meta(out_path: Path, dxf_path: Path, extent: tuple[float, float, floa
     meta = {"version": META_VERSION, "dxf": dxf_path.name, "extent": list(extent), "width": size[0],
             "height": size[1], "background": background, "layers": legend}
     out_path.with_name(META_NAME).write_text(json.dumps(meta), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Vector (SVG) preview: stays sharp at any zoom level, text is real <text>
+# --------------------------------------------------------------------------------------------------------------
+
+SVG_NAME = "preview.svg"
+SVG_META_NAME = "preview_svg.json"
+SVG_META_VERSION = 1
+SVG_SIMPLIFY_M = 0.01  # polylines are simplified to 1 cm
+SVG_FLATTEN_M = 0.01
+SVG_TEXT_EM = 0.72  # DXF text height is the cap height, SVG font-size the em size
+SVG_STROKE_PX = 1.0
+_SVG_PATH_TYPES = {"LINE", "LWPOLYLINE", "POLYLINE", "SPLINE", "ARC", "ELLIPSE", "3DFACE"}
+_SVG_STYLE = (
+    ".samdxfp-svg path,.samdxfp-svg circle{fill:none;stroke-width:%s;vector-effect:non-scaling-stroke;"
+    "stroke-linecap:round;stroke-linejoin:round}"
+    ".samdxfp-svg text{stroke:none;font-family:Arial,Helvetica,sans-serif;white-space:pre}"
+) % SVG_STROKE_PX
+_ANCHOR = {0: "start", 1: "middle", 2: "end", 3: "middle", 4: "middle", 5: "middle"}
+_BASELINE = {0: "alphabetic", 1: "alphabetic", 2: "central", 3: "hanging"}
+_MTEXT_ALIGN = {1: (0, 3), 2: (1, 3), 3: (2, 3), 4: (0, 2), 5: (1, 2), 6: (2, 2), 7: (0, 1), 8: (1, 1), 9: (2, 1)}
+
+
+def svg_preview_path(png_path: Path | str) -> Path:
+    """``preview.svg`` next to the raster ``preview.png``."""
+    return Path(png_path).with_name(SVG_NAME)
+
+
+def svg_is_fresh(dxf_path: Path | str, svg_path: Path | str) -> bool:
+    """True when the SVG and its metadata exist and are not older than the DXF."""
+    dxf_path, svg_path = Path(dxf_path), Path(svg_path)
+    meta = svg_path.with_name(SVG_META_NAME)
+    try:
+        newest = dxf_path.stat().st_mtime_ns
+        return svg_path.stat().st_mtime_ns >= newest and meta.stat().st_mtime_ns >= newest
+    except OSError:
+        return False
+
+
+def load_svg_meta(svg_path: Path | str) -> dict[str, Any] | None:
+    """Metadata of the SVG preview (viewBox, origin, layers with colours/counts); None if absent."""
+    try:
+        data = json.loads(Path(svg_path).with_name(SVG_META_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("version") == SVG_META_VERSION else None
+
+
+def _esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _num(value: float) -> str:
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    return _background_rgb(color)
+
+
+def _entity_polylines(entity: Any) -> list[tuple[list[tuple[float, float]], bool]]:
+    """Flattened ``(points, closed)`` lists of a path-like entity in DXF coordinates."""
+    from ezdxf import path as ezpath
+
+    kind = entity.dxftype()
+    if kind == "LINE":
+        return [([(entity.dxf.start.x, entity.dxf.start.y), (entity.dxf.end.x, entity.dxf.end.y)], False)]
+    if kind == "3DFACE":
+        pts = [entity.dxf.get(f"vtx{i}") for i in range(4) if entity.dxf.hasattr(f"vtx{i}")]
+        return [([(p.x, p.y) for p in pts], True)] if len(pts) >= 3 else []
+    result = []
+    for sub in ezpath.make_path(entity).sub_paths():
+        points = [(v.x, v.y) for v in sub.flattening(SVG_FLATTEN_M)]
+        if len(points) >= 2:
+            result.append((points, bool(sub.is_closed)))
+    return result
+
+
+def _simplify(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if len(points) < 4:
+        return points
+    from shapely.geometry import LineString
+
+    simplified = list(LineString(points).simplify(SVG_SIMPLIFY_M, preserve_topology=False).coords)
+    return [(p[0], p[1]) for p in simplified] if len(simplified) >= 2 else points
+
+
+def _path_data(points: list[tuple[float, float]], closed: bool, origin: tuple[float, float]) -> str:
+    ox, oy = origin
+    local = [(x - ox, oy - y) for x, y in points]
+    if closed and len(local) > 2 and local[0] == local[-1]:
+        local = local[:-1]
+    parts: list[str] = []
+    last: tuple[str, str] | None = None
+    for x, y in local:
+        pair = (_num(x), _num(y))
+        if pair == last:
+            continue
+        parts.append(("M" if not parts else "L") + f"{pair[0]} {pair[1]}")
+        last = pair
+    if len(parts) < 2:
+        return ""
+    return "".join(parts) + ("Z" if closed else "")
+
+
+def _text_lines(entity: Any) -> list[str]:
+    try:
+        text = entity.plain_text()
+    except Exception:
+        text = str(entity.dxf.get("text", ""))
+    text = str(text).replace("\r", "")
+    return text.split("\n") if text.strip() else []
+
+
+def _text_element(entity: Any, origin: tuple[float, float], color: str) -> str:
+    """One SVG ``<text>`` for TEXT / ATTRIB / MTEXT; empty string when there is nothing to show."""
+    lines = _text_lines(entity)
+    if not lines:
+        return ""
+    dxf = entity.dxf
+    if entity.dxftype() == "MTEXT":
+        insert = dxf.insert
+        height = float(dxf.get("char_height", 1.0))
+        if dxf.hasattr("text_direction"):
+            rotation = math.degrees(math.atan2(dxf.text_direction.y, dxf.text_direction.x))
+        else:
+            rotation = float(dxf.get("rotation", 0.0))
+        halign, valign = _MTEXT_ALIGN.get(int(dxf.get("attachment_point", 1)), (0, 3))
+    else:
+        halign, valign = int(dxf.get("halign", 0)), int(dxf.get("valign", 0))
+        insert = dxf.align_point if (halign or valign) and dxf.hasattr("align_point") else dxf.insert
+        height = float(dxf.get("height", 1.0))
+        rotation = float(dxf.get("rotation", 0.0))
+    if height <= 0:
+        return ""
+    x, y = insert.x - origin[0], origin[1] - insert.y
+    size = height / SVG_TEXT_EM
+    attrs = (f'x="{_num(x)}" y="{_num(y)}" font-size="{size:.3f}" fill="{color}" '
+             f'text-anchor="{_ANCHOR.get(halign, "start")}" dominant-baseline="{_BASELINE.get(valign, "alphabetic")}"')
+    if abs(rotation) > 1e-6:
+        attrs += f' transform="rotate({-rotation:.2f} {_num(x)} {_num(y)})"'
+    if len(lines) == 1:
+        return f"<text {attrs}>{_esc(lines[0])}</text>"
+    spans = "".join(f'<tspan x="{_num(x)}" dy="{"0" if i == 0 else _num(size * 1.2)}">{_esc(line)}</tspan>'
+                    for i, line in enumerate(lines))
+    return f"<text {attrs}>{spans}</text>"
+
+
+def _attrib_hidden(attrib: Any) -> bool:
+    return bool(int(attrib.dxf.get("flags", 0)) & 1) or bool(attrib.dxf.get("invisible", 0))
+
+
+def _entity_svg(entity: Any, origin: tuple[float, float], layer_rgb: tuple[int, int, int], dark: bool,
+                depth: int = 0) -> list[str]:
+    """SVG elements of one entity; INSERTs are exploded (block children take the INSERT's colour when BYBLOCK /
+    layer 0) and only visible attributes are written."""
+    kind = entity.dxftype()
+    rgb = _entity_color(entity, layer_rgb, dark)
+    stroke = "" if rgb == layer_rgb else f' stroke="{_hex(rgb)}"'
+    out: list[str] = []
+    if kind == "INSERT":
+        if depth > 4:
+            return out
+        try:
+            children = list(entity.virtual_entities())
+        except Exception:
+            children = []
+        for child in children:
+            if child.dxftype() not in ("ATTDEF", "ATTRIB"):
+                out.extend(_entity_svg(child, origin, rgb, dark, depth + 1))
+        for attrib in entity.attribs:
+            if _attrib_hidden(attrib):
+                continue
+            element = _text_element(attrib, origin, _hex(_entity_color(attrib, rgb, dark)))
+            if element:
+                out.append(element)
+        return out
+    if kind in ("TEXT", "MTEXT", "ATTRIB"):
+        element = _text_element(entity, origin, _hex(rgb))
+        return [element] if element else []
+    if kind == "CIRCLE":
+        cx, cy = entity.dxf.center.x - origin[0], origin[1] - entity.dxf.center.y
+        return [f'<circle cx="{_num(cx)}" cy="{_num(cy)}" r="{_num(entity.dxf.radius)}"{stroke}/>']
+    if kind in _SVG_PATH_TYPES:
+        try:
+            polylines = _entity_polylines(entity)
+        except Exception:
+            return out
+        for points, closed in polylines:
+            data = _path_data(_simplify(points), closed, origin)
+            if data:
+                out.append(f'<path d="{data}"{stroke}/>')
+    return out
+
+
+def render_dxf_svg(dxf_path: Path | str, out_path: Path | str, *, frozen_layers_hidden: bool = True,
+                   background: str = DEFAULT_BACKGROUND, force: bool = False) -> Path:
+    """Render ``dxf_path`` to a vector ``out_path`` (SVG, one ``<g data-layer>`` per layer) plus ``preview_svg.json``.
+
+    Coordinates are translated to a local origin (``origin`` in the metadata) so LV95 values do not hurt float
+    precision in the browser; y points down. Stroke widths do not scale (``vector-effect``), text is real
+    ``<text>``. Cached: nothing is rebuilt while the SVG is newer than the DXF."""
+    dxf_path, out_path = Path(dxf_path), Path(out_path)
+    if not force and svg_is_fresh(dxf_path, out_path) and load_svg_meta(out_path) is not None:
+        return out_path
+    doc = ezdxf.readfile(str(dxf_path))
+    dark = _is_dark(_background_rgb(background))
+    _lighten_black_in_doc(doc, dark)
+    legend = _legend_from_doc(doc, dark)
+    if not frozen_layers_hidden:
+        legend = _legend_with_frozen(doc, legend, dark)
+    names = {item["name"] for item in legend}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    extent = _extent(doc, names) or (0.0, 0.0, 1.0, 1.0)
+    origin = (float(math.floor(extent[0])), float(math.ceil(extent[3])))
+    layer_color = {item["name"]: _hex_to_rgb(item["color"]) for item in legend}
+    groups: dict[str, list[str]] = {name: [] for name in names}
+    for entity in doc.modelspace():
+        name = entity.dxf.layer
+        if name in groups:
+            groups[name].extend(_entity_svg(entity, origin, layer_color[name], dark))
+    pad = 0.02 * max(extent[2] - extent[0], extent[3] - extent[1], 1e-6)
+    viewbox = [extent[0] - origin[0] - pad, origin[1] - extent[3] - pad,
+               extent[2] - extent[0] + 2 * pad, extent[3] - extent[1] + 2 * pad]
+    body = "".join(
+        f'<g data-layer="{_esc(item["name"])}" stroke="{item["color"]}" fill="none">' + "".join(groups[item["name"]]) + "</g>"
+        for item in legend)
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" class="samdxfp-svg" '
+           f'viewBox="{" ".join(_num(v) for v in viewbox)}" preserveAspectRatio="xMidYMid meet" width="100%" height="100%">'
+           f"<style>{_SVG_STYLE}</style>{body}</svg>")
+    out_path.write_text(svg, encoding="utf-8")
+    for item in legend:
+        item["file"] = SVG_NAME
+    meta = {"version": SVG_META_VERSION, "dxf": dxf_path.name, "origin": list(origin),
+            "viewbox": viewbox, "background": background, "layers": legend}
+    out_path.with_name(SVG_META_NAME).write_text(json.dumps(meta), encoding="utf-8")
+    return out_path

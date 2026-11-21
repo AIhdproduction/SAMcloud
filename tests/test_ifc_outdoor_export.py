@@ -101,8 +101,7 @@ def test_stylised_tree_triangle_count_and_assumed_parameter(tmp_path: Path) -> N
     tree = TreeElement(params=TreeParams(trunk_xy=(1, 2), base_z=0, height=6, crown_diameter=4))
     scene.add(tree)
     file = _export(scene, tmp_path / "tree.ifc")
-    face_set = file.by_type("IfcTriangulatedFaceSet")[0]
-    assert 60 <= len(face_set.CoordIndex) <= 120
+    assert 60 <= sum(len(fs.CoordIndex) for fs in file.by_type("IfcTriangulatedFaceSet")) <= 120  # trunk + crown
     product = file.by_type("IfcGeographicElement")[0]
     pset = next(pset for pset in product.IsDefinedBy if pset.RelatingPropertyDefinition.Name == "SAMcloud_Tree")
     values = {item.Name: item.NominalValue.wrappedValue for item in pset.RelatingPropertyDefinition.HasProperties}
@@ -192,7 +191,7 @@ def test_outdoor_building_envelope_and_window_relations(tmp_path: Path) -> None:
     scene.add(WindowElement(params=WindowParams(opening_id=opening.id)))
     file = _export(scene, tmp_path / "building.ifc")
     assert any(wall.ObjectType == "EXTERIOR" for wall in file.by_type("IfcWall"))
-    assert file.by_type("IfcRoof") and any(slab.PredefinedType == "ROOF" for slab in file.by_type("IfcSlab"))
+    assert len(file.by_type("IfcRoof")) == 1 and not any(slab.PredefinedType == "ROOF" for slab in file.by_type("IfcSlab"))  # one IfcRoof with its own body
     assert file.by_type("IfcRelVoidsElement") and file.by_type("IfcRelFillsElement")
 
 

@@ -153,7 +153,9 @@ def test_dxf_tin_contours_spots_pass_qa_rules_3_4_6(scene, tmp_path) -> None:
         curbs=curbs, manholes=[(12.3, 4.2)], config=CFG)
     assert info["minor_interval_m"] == 0.2 and info["contour_count"] > 0
     assert len(entities["S-TOPO-TIN"]) == len(tin.triangles)
-    assert {"S-TOPO-MAJR", "S-TOPO-MINR", "S-ELEV"} <= set(entities)
+    assert {"S-TOPO-MAJR", "S-TOPO-MINR"} <= set(entities)
+    assert "S-ELEV" not in entities  # spot heights are off by default (dxf.spot_heights)
+    assert entities["S-TOPO-TEXT"] and all(e["type"] == "text" for e in entities["S-TOPO-TEXT"])
     assert all(e["type"] == "spline" for layer in ("S-TOPO-MAJR", "S-TOPO-MINR") for e in entities[layer])
     # contours only on the measured cells (x < 24 m)
     xs = [p[0] - E0 for layer in ("S-TOPO-MAJR", "S-TOPO-MINR") for e in entities[layer] for p in e["fit_points"]]
@@ -168,13 +170,14 @@ def test_dxf_tin_contours_spots_pass_qa_rules_3_4_6(scene, tmp_path) -> None:
     doc = ezdxf.readfile(str(path))
     assert doc.layers.get("S-TOPO-TIN").is_frozen() or not doc.layers.get("S-TOPO-TIN").is_on()
     assert len(doc.modelspace().query("3DFACE")) == len(tin.triangles)
-    texts = [e.dxf.text for e in doc.modelspace().query("TEXT") if e.dxf.layer == "S-ELEV"]
-    assert texts and all(t.startswith("+43") for t in texts)
+    texts = [e.dxf.text for e in doc.modelspace().query("TEXT") if e.dxf.layer == "S-TOPO-TEXT"]
+    assert texts and all(t == "431.0" for t in texts)
 
 
 def test_spot_heights_cover_manhole_curb_breakpoints_and_grid(scene) -> None:
     _p, _l, curbs, tin, _pave, terrain, _qa = scene
-    entities = tr.to_dxf_entities(terrain, FRAME, tin=tin, curbs=curbs, manholes=[(12.3, 4.2)], config=CFG)
+    cfg = {**CFG, "dxf": {**CFG["dxf"], "spot_heights": True}}
+    entities = tr.to_dxf_entities(terrain, FRAME, tin=tin, curbs=curbs, manholes=[(12.3, 4.2)], config=cfg)
     spots = entities["S-ELEV"]
     texts = [e for e in spots if e["type"] == "text"]
     lines = [e for e in spots if e["type"] == "line"]

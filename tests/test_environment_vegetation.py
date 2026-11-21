@@ -77,7 +77,7 @@ def test_tree_without_trunk_points():
     assert len(trees) == 1
     t = trees[0]
     assert t.trunk_diameter_m is None
-    assert t.evidence.notes["trunk_xy"] == "crown_peak"
+    assert t.evidence.notes["trunk_xy"] == "crown_center"
     assert np.hypot(t.trunk_xy[0], t.trunk_xy[1]) < 1.0
 
 
@@ -140,7 +140,7 @@ def test_nothing_invented_without_support():
     assert len(trees) == 2
     for t in trees:
         assert t.trunk_diameter_m is None
-        assert t.evidence.notes["trunk_xy"] == "crown_peak"
+        assert t.evidence.notes["trunk_xy"] == "crown_center"
         assert t.evidence.rmse is None
 
 

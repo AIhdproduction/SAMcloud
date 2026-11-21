@@ -59,12 +59,13 @@ def test_two_trees_elements_and_dxf_inserts(tmp_path: Path) -> None:
     assert [type(e) for e in elements] == [TreeElement, TreeElement] and qa == []
     assert elements[0].param_origin["trunk_diameter"] is ParamOrigin.MEASURED
     entities = veg.to_dxf_entities(elements, FRAME)
-    inserts = entities["S-TREE"]
-    assert len(inserts) == 2
+    all_inserts = entities["S-TREE"]
+    inserts = [e for e in all_inserts if e["name"] == "TREE"]
+    assert len(inserts) == 2 and len(all_inserts) == 4  # each measured trunk adds one to-scale TREE_STEM circle
     assert inserts[0]["name"] == "TREE" and inserts[0]["point"] == pytest.approx([2_683_003.0, 1_248_004.0, 431.03])
     assert inserts[0]["xscale"] == pytest.approx(2.5) and inserts[1]["xscale"] == pytest.approx(1.7)
     _, doc = _dxf(entities, tmp_path)
-    found = sorted((e for e in doc.modelspace() if e.dxftype() == "INSERT"), key=lambda e: e.dxf.insert.x)
+    found = sorted((e for e in doc.modelspace() if e.dxftype() == "INSERT" and e.dxf.name == "TREE"), key=lambda e: e.dxf.insert.x)
     first = _attrs(found[0])
     assert float(first["HEIGHT"]) == pytest.approx(8.4) and float(first["CROWN_DIA"]) == pytest.approx(5.0)
     assert float(first["TRUNK_DIA"]) == pytest.approx(0.35)
@@ -78,8 +79,8 @@ def test_tree_without_trunk_diameter_is_assumed_and_na(tmp_path: Path) -> None:
     assert element.params.trunk_diameter == pytest.approx(0.30)
     entities = veg.to_dxf_entities([element], FRAME)
     _, doc = _dxf(entities, tmp_path)
-    (insert,) = [e for e in doc.modelspace() if e.dxftype() == "INSERT"]
-    assert _attrs(insert)["TRUNK_DIA"] == "n/a"
+    (insert,) = [e for e in doc.modelspace() if e.dxftype() == "INSERT"]  # no TREE_STEM: trunk not measured
+    assert _attrs(insert)["TRUNK_DIA"] == "n/a" and _attrs(insert)["STAMM"] == "STAMM=nicht gemessen"
     assert _attrs(insert)["CROWN_DIA"] != "n/a"
 
 
@@ -88,7 +89,7 @@ def test_rejected_tree_only_in_qa(tmp_path: Path) -> None:
     elements, qa = veg.build_vegetation_elements(trees, [])
     assert len(elements) == 1 and sorted(q.element_id for q in qa) == ["tree-2", "tree-3"]
     assert all(q.category == "tree" and q.reason for q in qa)
-    assert len(veg.to_dxf_entities(elements, FRAME)["S-TREE"]) == 1
+    assert len([e for e in veg.to_dxf_entities(elements, FRAME)["S-TREE"] if e["name"] == "TREE"]) == 1
     scene = Scene()
     for element in elements:
         scene.add(element)
@@ -149,8 +150,9 @@ def test_ifc_crown_triangles_and_qa_cad_dxf_rules(tmp_path: Path) -> None:
     assert set(entities) == {"S-TREE", "S-SHRUB", "S-VEG"}
     path, _ = _dxf(entities, tmp_path)
     by_rule = {r["rule"]: r for r in qa_cad.check_dxf(path)}
-    for name in ("1_block_inserts", "2_area_layers_closed_polylines"):
-        assert by_rule[name]["ok"], by_rule[name]
+    # qa_cad rule 1 still flags the (new) TREE_STEM trunk circles; every other insert must pass.
+    assert by_rule["1_block_inserts"]["ok"], by_rule["1_block_inserts"]  # qa_cad accepts the TREE_STEM trunk circles
+    assert by_rule["2_area_layers_closed_polylines"]["ok"]
 
 
 def test_category_counts() -> None:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 import shapely
@@ -549,6 +549,12 @@ def build_labeled_tin(
     max_vertices: int | None = None,
     max_refinement_rounds: int = 4,
     tolerance_by_label: dict[str, float] | None = None,
+    manholes: Iterable = (),
+    manhole_ring_segments: int = 16,
+    manhole_below_m: float = 0.001,
+    steps: Iterable | None = None,
+    step_config: dict | None = None,
+    flush=None,
 ) -> LabeledTin:
     """Build a common terrain/pavement TIN with recovered polygon and curb edges.
 
@@ -556,7 +562,22 @@ def build_labeled_tin(
     recovered by midpoint Steiner insertion and global retriangulation; this is
     predictable and robust for the modest number of pavement boundaries typical
     of one drone survey.
+
+    ``manholes`` is a sequence of ``(x, y, cover_z, diameter)``: every manhole becomes a polygon ring constraint
+    (``manhole_ring_segments`` corners, circumscribed around the cover) and each TIN vertex on or inside the ring is
+    set to ``cover_z - manhole_below_m`` (all labels), so the terrain never covers a manhole.  ``steps`` are
+    :class:`samcloud.terrain.steps.StepRun` objects: their top edge is added as breakline and the finished TIN is split
+    along them (top edge at the upper height, bottom edge ``offset_m`` outside at the lower height).  ``flush`` is a
+    :class:`samcloud.terrain.flush.FlushPlan`: its edge lines (finite z = pavement surface at the edge) are breaklines and the
+    terrain-only vertices within its blend band are moved towards the edge height, so terrain and pavement meet flush.
     """
+    breaklines = list(breaklines or ())
+    steps = list(steps or ())
+    manhole_rings = _manhole_rings(manholes, int(manhole_ring_segments), float(manhole_below_m))
+    breaklines.extend(ring for ring, _centre, _radius in manhole_rings)
+    breaklines.extend(run.top_line() for run in steps)
+    if flush is not None:
+        breaklines.extend(flush.lines)
     ground = np.asarray(ground_xy_z, dtype=float)
     if ground.ndim != 2 or ground.shape[1] != 3 or len(ground) < 3:
         raise ValueError("ground_xy_z must be an (N, 3) array with at least three points")
@@ -665,6 +686,18 @@ def build_labeled_tin(
     constrained_edges = {tuple(sorted((i, j))) for i, j, _ in indexed}
     triangles = _filter_triangles(vertices, triangles, constrained_edges)
     labels = _label_triangles(vertices, triangles, regions)
+    flush_report = None
+    if flush is not None and len(flush.edge_z):
+        from samcloud.terrain.flush import blend_terrain
+
+        blended = LabeledTin(vertices=vertices, triangles=triangles, labels=labels)
+        flush_report = blend_terrain(blended, flush)
+        vertices = blended.vertices
+    if manhole_rings:
+        vertices = vertices.copy()
+        for ring, centre, radius in manhole_rings:
+            inside = np.hypot(vertices[:, 0] - centre[0], vertices[:, 1] - centre[1]) <= radius + 1e-6
+            vertices[inside, 2] = ring[0, 2]
     tin = LabeledTin(vertices=vertices, triangles=triangles, labels=labels)
     # Kept as non-contract metadata so QA can inspect the exact densified edges.
     tin.constraint_segments = [np.vstack((start, end)) for start, end, _ in segments]
@@ -672,7 +705,62 @@ def build_labeled_tin(
     tin.min_angle_deg = float(min_angle_deg)
     if simplify_report is not None:
         tin.simplify_report = simplify_report
+    tin.manhole_count = len(manhole_rings)
+    if flush is not None:
+        tin.flush_report = {**flush.report, **(flush_report or {})}
+    if steps:
+        from samcloud.terrain.steps import apply_steps
+
+        apply_steps(tin, steps, {"terrain": {"step": step_config or {}}})
     return tin
+
+
+def tin_sampler(tin) -> Callable:
+    """Surface height sampler ``f(xy (N,2)) -> z (N,)`` of a (labelled) TIN, NaN outside.
+
+    Where several triangles cover a point (the 1 cm step faces of :mod:`samcloud.terrain.steps` overlap their upper and
+    lower neighbours in plan at the shared edge) the highest surface wins, so the sampler returns the UPPER side at a
+    step.  Curbs, gutters, fences, walls and trees sample this one surface.
+    """
+    vertices = np.asarray(tin.vertices, dtype=np.float64)
+    triangles = np.asarray(tin.triangles, dtype=np.int64)
+    tree = shapely.STRtree(shapely.polygons(vertices[triangles][:, :, :2])) if len(triangles) else None
+
+    def sample(xy) -> np.ndarray:
+        xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+        result = np.full(len(xy), -np.inf)
+        if tree is None or not len(xy):
+            return np.full(len(xy), np.nan)
+        pidx, tidx = tree.query(shapely.points(xy), predicate="intersects")
+        tri = vertices[triangles[tidx]]
+        p = xy[pidx]
+        v0, v1, v2 = tri[:, 0, :2], tri[:, 1, :2], tri[:, 2, :2]
+        den = (v1[:, 1] - v2[:, 1]) * (v0[:, 0] - v2[:, 0]) + (v2[:, 0] - v1[:, 0]) * (v0[:, 1] - v2[:, 1])
+        ok = np.abs(den) > 1e-18
+        den = np.where(ok, den, 1.0)
+        w0 = ((v1[:, 1] - v2[:, 1]) * (p[:, 0] - v2[:, 0]) + (v2[:, 0] - v1[:, 0]) * (p[:, 1] - v2[:, 1])) / den
+        w1 = ((v2[:, 1] - v0[:, 1]) * (p[:, 0] - v2[:, 0]) + (v0[:, 0] - v2[:, 0]) * (p[:, 1] - v2[:, 1])) / den
+        z = w0 * tri[:, 0, 2] + w1 * tri[:, 1, 2] + (1.0 - w0 - w1) * tri[:, 2, 2]
+        np.maximum.at(result, pidx[ok], z[ok])
+        result[~np.isfinite(result)] = np.nan
+        return result
+
+    return sample
+
+
+def _manhole_rings(manholes, segments: int, below: float) -> list[tuple[np.ndarray, tuple[float, float], float]]:
+    """``(ring_xyz, centre, ring_radius)`` per manhole; the ring is circumscribed around the cover circle."""
+    rings = []
+    segments = max(int(segments), 6)
+    for item in manholes or ():
+        x, y, z, diameter = (float(v) for v in item[:4])
+        if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z)) or diameter <= 0:
+            continue
+        radius = 0.5 * diameter / math.cos(math.pi / segments)
+        angle = np.linspace(0.0, 2.0 * math.pi, segments, endpoint=False)
+        ring = np.column_stack((x + radius * np.cos(angle), y + radius * np.sin(angle), np.full(segments, z - below)))
+        rings.append((np.vstack((ring, ring[:1])), (x, y), radius))
+    return rings
 
 
 def missing_constraint_edges(tin: LabeledTin, constraints=None) -> list:
@@ -751,4 +839,4 @@ def label_boundary_consistent(tin: LabeledTin, regions: dict[str, list[Polygon]]
     return maximum
 
 
-__all__ = ["select_tin_support", "build_labeled_tin", "missing_constraint_edges", "tin_quality", "label_boundary_consistent"]
+__all__ = ["select_tin_support", "build_labeled_tin", "tin_sampler", "missing_constraint_edges", "tin_quality", "label_boundary_consistent"]

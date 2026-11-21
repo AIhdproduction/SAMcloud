@@ -124,17 +124,17 @@ def category_of(ifc_class: str, predefined_type: str | None = None) -> str:
 
 
 OUTDOOR_CATEGORY_ORDER: tuple[str, ...] = (
-    "terrain", "lawns", "pavements", "paths", "sidewalks", "curbs", "buildings", "roofs", "site_walls", "fences",
+    "terrain", "pavements", "paths", "sidewalks", "curbs", "gutters", "buildings", "roofs", "site_walls", "fences",
     "trees", "shrubs", "manholes", "markings", "other",
 )
 _OUTDOOR_COLORS_FALLBACK: dict[str, str] = {
-    "lawns": "#78b848", "paths": "#a89f91", "terrain": "#b5b57a", "pavements": "#7d8590", "sidewalks": "#c3c8cf", "curbs": "#4a4f57",
+    "paths": "#a89f91", "terrain": "#b5b57a", "pavements": "#7d8590", "sidewalks": "#c3c8cf", "curbs": "#4a4f57", "gutters": "#a0a5ac",
     "buildings": "#e3cfa8", "roofs": "#c8643c", "site_walls": "#8a6244", "fences": "#a8794a",
     "trees": "#2f8f4e", "shrubs": "#8fcf7a", "manholes": "#3b82c4", "markings": "#ffffff", "other": "#9aa5b1",
 }
 # Viewer category -> category of config/outdoor_style.yaml (single source of truth for viewer, IFC and DXF).
 _VIEWER_STYLE_CATEGORY: dict[str, str] = {
-    "terrain": "terrain", "lawns": "lawn", "paths": "path", "pavements": "road", "sidewalks": "sidewalk", "curbs": "curb", "buildings": "building_wall",
+    "terrain": "terrain", "paths": "path", "pavements": "road", "sidewalks": "sidewalk", "curbs": "curb", "gutters": "gutter", "buildings": "building_wall",
     "roofs": "roof", "site_walls": "site_wall", "fences": "fence", "trees": "tree", "shrubs": "shrub",
     "manholes": "manhole", "markings": "marking",
 }
@@ -188,9 +188,11 @@ def outdoor_category_of(info: dict[str, Any]) -> str:
         if "busch" in text or "strauch" in text or "shrub" in text or "bush" in text:
             return "shrubs"
         if "rasen" in text or "vegetationsfl" in text or "vegetation area" in text or "lawn" in text:
-            return "lawns"
+            return "terrain"  # former lawn is plain terrain (no lawn category any more)
         return "other"
     if ifc_class == "IfcCivilElement":
+        if "wasserstein" in text or "gutter" in text:
+            return "gutters"
         if "randstein" in text or "curb" in text:
             return "curbs"
         if "trottoir" in text or "sidewalk" in text:

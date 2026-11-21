@@ -1,4 +1,4 @@
-"""IFC building walls: one IfcWall per facade plane, exactly the LoD2 wall faces, no duplicate wall mesh."""
+"""IFC building walls: one IfcWall per building, exactly the LoD2 wall faces, no duplicate wall mesh."""
 import numpy as np
 import ifcopenshell
 import ifcopenshell.geom
@@ -47,7 +47,7 @@ def _world_vertices(product) -> np.ndarray:
     return np.asarray(shape.geometry.verts, float).reshape(-1, 3)
 
 
-def test_building_walls_are_exact_lod2_faces_per_facade_plane(tmp_path):
+def test_building_walls_are_exact_lod2_faces_in_one_wall_per_building(tmp_path):
     model = _gable_house_with_step()
     elements, qa = build_building_elements([model], {}, {})
     assert not qa
@@ -57,19 +57,18 @@ def test_building_walls_are_exact_lod2_faces_per_facade_plane(tmp_path):
     ifc = ifcopenshell.open(str(path))
 
     walls = ifc.by_type("IfcWall")
-    # planes: front, back A, back B (the riser merges into one of them), west gable, east gable
-    assert len(walls) == 5
+    # all five facade planes (front, back A/B, riser, gables) are merged into one wall
+    assert len(walls) == 1
+    assert walls[0].Name == "Fassade 1"
     assert not any("exterior wall" in (w.Name or "") for w in walls)
-    back = [w for w in walls if abs(np.mean(_world_vertices(w)[:, 1]) - 6.0) < 0.5]
-    assert 1 <= len(back) <= 2
+    assert len(ifc.by_type("IfcRoof")) == 1
 
     wall_ids = np.unique(model.faces[model.face_roles == 1].ravel())
     lod2 = model.vertices[wall_ids]
     bottom = float(model.vertices[:, 2].min())
     roof_edge = float(model.vertices[np.unique(model.faces[model.face_roles == 2].ravel())][:, 2].max())
-    for wall in walls:
-        verts = _world_vertices(wall)
-        assert verts[:, 2].min() >= bottom - 1e-6
-        assert verts[:, 2].max() <= roof_edge + 0.01
-        for v in verts:  # every wall vertex is an LoD2 wall vertex (no extrusion beyond the mesh)
-            assert np.min(np.linalg.norm(lod2 - v, axis=1)) < 1e-3
+    verts = _world_vertices(walls[0])
+    assert verts[:, 2].min() >= bottom - 1e-6
+    assert verts[:, 2].max() <= roof_edge + 0.01
+    for v in verts:  # every wall vertex is an LoD2 wall vertex (no extrusion beyond the mesh)
+        assert np.min(np.linalg.norm(lod2 - v, axis=1)) < 1e-3

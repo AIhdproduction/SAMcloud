@@ -191,7 +191,7 @@ def test_below_threshold_and_rejected_instances_become_qa_entries() -> None:
 
 def test_category_counts(built) -> None:
     *_, elements, _qa = built
-    assert civil.category_counts(elements) == {"curb": 2, "marking": 2, "manhole": 1}
+    assert civil.category_counts(elements) == {"curb": 2, "gutter": 0, "marking": 2, "manhole": 1, "fence": 0, "site_wall": 0}
     assert sum(isinstance(e, MarkingElement) for e in elements) == 2
     origins = next(e for e in elements if isinstance(e, ManholeElement)).param_origin
     assert origins["type"].value == "assumed" and origins["center"].value == "measured"

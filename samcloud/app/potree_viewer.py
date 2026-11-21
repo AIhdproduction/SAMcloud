@@ -67,15 +67,6 @@ _HEAD = f"""
 .sam-potree-point-card {{ position:absolute; z-index:26; min-width:150px; max-width:260px; padding:9px 10px; border:1px solid #47718a; border-radius:7px; background:rgba(9,19,29,.96); color:#eaf2f8; font-size:12px; display:none; pointer-events:none; }}
 .sam-potree-point-card.is-open {{ display:block; }}
 .sam-potree-point-card strong {{ display:block; margin-bottom:3px; font-size:14px; }}
-.sam-potree-layers {{ position:absolute; z-index:21; top:64px; left:12px; max-height:calc(100% - 90px); overflow:auto; width:min(280px,34vw); padding:10px; border:1px solid #365c74; border-radius:8px; background:rgba(9,19,29,.94); color:#eaf2f8; font-size:12px; display:none; }}
-.sam-potree-layers.is-open {{ display:block; }}
-.sam-potree-layers h4 {{ margin:8px 0 4px; font-size:12px; color:#8fb3c9; text-transform:uppercase; letter-spacing:.04em; }}
-.sam-potree-layers h4:first-child {{ margin-top:0; }}
-.sam-potree-layers label {{ display:flex; align-items:center; gap:7px; padding:2px 0; cursor:pointer; }}
-.sam-potree-layers label.is-disabled {{ opacity:.45; cursor:not-allowed; }}
-.sam-potree-layers details {{ margin:2px 0 2px 18px; }}
-.sam-potree-layers summary {{ cursor:pointer; color:#8fb3c9; }}
-.sam-potree-layers details label {{ padding-left:4px; word-break:break-all; }}
 </style>
 """
 
@@ -458,124 +449,6 @@ def register_control_point_routes() -> None:
     _CONTROL_POINT_ROUTES_REGISTERED = True
 
 
-def _environment_config(layers: dict | None, matrix: list[float] | None = None) -> dict:
-    """Browser-side description of the mesh layers (``glb_url`` is ``None`` when nothing was computed)."""
-    if not layers or not layers.get("available"):
-        return {"glb_url": None, "groups": {}, "matrix": None}
-    glb = layers["glb"]
-    return {"glb_url": glb["url"], "groups": layers["groups"], "origin_lv95": glb["origin_lv95"], "matrix": matrix}
-
-
-def _layers_panel_html(layers: dict) -> str:
-    """HTML of the layer panel; unavailable products are disabled with the tooltip "nicht berechnet"."""
-    def esc(value: object) -> str:
-        return html.escape(str(value), quote=True)
-
-    def toggle(key: str) -> str:
-        info = layers["layers"][key]
-        label = esc(info["label"])
-        if info["available"]:
-            return f'<label><input type="checkbox" data-layer="{key}" checked>{label}</label>'
-        return (f'<label class="is-disabled" title="{esc(info["reason"] or _NOT_COMPUTED)}">'
-                f'<input type="checkbox" data-layer="{key}" disabled>{label}</label>')
-
-    parts = ['<h4>Punktwolke</h4>',
-             '<label><input type="radio" name="sam-layer-cloud" data-cloud-mode="rgba" checked>RGB</label>',
-             '<label><input type="radio" name="sam-layer-cloud" data-cloud-mode="classification">Klassen</label>',
-             '<h4>Modelle</h4>']
-    parts += [toggle(key) for key in ("model", "dgm", "dom", "buildings", "vegetation", "streets")]
-    groups = layers.get("groups", {})
-    if groups:
-        parts.append("<h4>Einzelobjekte</h4>")
-        for group in ("building", "vegetation", "pavement", "terrain", "dsm", "other"):
-            names = groups.get(group)
-            if not names:
-                continue
-            items = "".join(f'<label><input type="checkbox" data-node="{esc(name)}" data-group="{group}" checked>{esc(name)}</label>'
-                            for name in names)
-            parts.append(f'<details><summary>{esc(GROUP_LABELS[group])} ({len(names)})</summary>{items}</details>')
-    disabled = "" if layers["available"] else " disabled"
-    parts.append('<h4>Deckkraft Modelle</h4>')
-    parts.append(f'<input type="range" data-layer-opacity min="0.1" max="1" step="0.05" value="1" style="width:100%"{disabled}>')
-    return f'<aside class="sam-potree-layers" data-layers-panel>{"".join(parts)}</aside>'
-
-
-_LAYERS_JS = """
-  /* Ebenen-Panel: Punktwolken-Attribut, Mesh-Ebenen aus environment.glb (Potree-Szene = COLMAP-ENU-Rahmen). */
-  const layersPanel = root.querySelector("[data-layers-panel]");
-  if (layersPanel) {
-    root.querySelector('[data-action="layers"]').addEventListener("click", () => layersPanel.classList.toggle("is-open"));
-    layersPanel.addEventListener("change", event => {
-      const mode = event.target.dataset && event.target.dataset.cloudMode;
-      if (mode && cloud) { cloud.material.activeAttributeName = mode; select(["rgb", "classification"], mode === "rgba" ? "rgb" : "classification"); }
-    });
-    const env = config.environment || {};
-    __ENV_MESH_JS__
-  }
-"""
-
-_ENV_MESH_JS = """
-    if (env.glb_url) {
-      const group = new THREE.Group();
-      group.matrixAutoUpdate = false;
-      /* lokal (LV95 - origin_lv95) -> Potree-Szene (ENU); env.matrix ist zeilenweise, ohne Georeferenz Identitaet. */
-      if (Array.isArray(env.matrix) && env.matrix.length === 16) group.matrix.set(...env.matrix);
-      group.matrixWorldNeedsUpdate = true;
-      group.add(new THREE.AmbientLight(0xffffff, 0.75));
-      const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(0.4, -0.3, 1); group.add(sun);
-      viewer.scene.scene.add(group);
-      const palette = { terrain: 0x9b8b6e, dsm: 0x8a9aa6, building: 0xd9d2c5, vegetation: 0x4f9a52, pavement: 0x6e7479, other: 0xb0b0b0 };
-      const groupOfNode = {};
-      for (const [name, names] of Object.entries(env.groups || {})) names.forEach(node => { groupOfNode[node] = name; });
-      const meshes = [];
-      let opacity = 1;
-      const layerOn = {};
-      const nodeOn = {};
-      const sync = () => {
-        for (const mesh of meshes) {
-          const g = mesh.userData.group;
-          mesh.visible = layerOn.model !== false && layerOn[g] !== false && nodeOn[mesh.name] !== false;
-          mesh.material.opacity = opacity; mesh.material.transparent = opacity < 1; mesh.material.depthWrite = opacity >= 1;
-        }
-      };
-      const layerGroups = { dgm: "terrain", dom: "dsm", buildings: "building", vegetation: "vegetation", streets: "pavement" };
-      layersPanel.addEventListener("change", event => {
-        const t = event.target; if (!t.dataset) return;
-        if (t.dataset.layer === "model") layerOn.model = t.checked;
-        else if (t.dataset.layer && layerGroups[t.dataset.layer]) layerOn[layerGroups[t.dataset.layer]] = t.checked;
-        else if (t.dataset.node !== undefined) nodeOn[t.dataset.node] = t.checked;
-        sync();
-      });
-      layersPanel.addEventListener("input", event => {
-        if (event.target.dataset && event.target.dataset.layerOpacity !== undefined) { opacity = Number(event.target.value); sync(); }
-      });
-      import("/assets-static/potree/libs/three.js/loaders/GLTFLoader.js").then(module => {
-        new module.GLTFLoader().load(env.glb_url, gltf => {
-          gltf.scene.traverse(object => {
-            if (!object.isMesh) return;
-            const g = groupOfNode[object.name] || "other";
-            if (!object.geometry.getAttribute("normal")) object.geometry.computeVertexNormals();
-            object.material = new THREE.MeshLambertMaterial({ color: palette[g] || palette.other, side: THREE.DoubleSide });
-            object.userData.group = g;
-            meshes.push(object);
-          });
-          group.add(gltf.scene);
-          sync();
-        }, undefined, error => console.warn("environment.glb konnte nicht geladen werden", error));
-      }).catch(error => console.warn("GLTFLoader nicht verfuegbar", error));
-    }
-"""
-
-
-def _layers_script(config: dict) -> str:
-    """JS block of the layer panel; the GLB loader call is only emitted when a GLB URL is configured."""
-    environment = config.get("environment")
-    if environment is None:
-        return ""
-    mesh_js = _ENV_MESH_JS if environment.get("glb_url") else ""
-    return _LAYERS_JS.replace("__ENV_MESH_JS__", mesh_js)
-
-
 def render_potree_viewer(
     kind: str,
     *,
@@ -594,7 +467,6 @@ def render_potree_viewer(
         marker_endpoint, markers_disabled = _dense_marker_setup()
     config = _viewer_config(kind, title, class_colors, class_labels, class_names_de, instance_labels_de, marker_endpoint, camera_endpoint, fine_term_names_de)
     element_id = config["element_id"]
-    layers = _active_project_layers(config, kind)
     ui.add_head_html(_HEAD)
     ui.html(
         _html(
@@ -604,7 +476,6 @@ def render_potree_viewer(
             show_cameras=config["show_cameras"],
             markers_label=t("nav.control_points"),
             markers_disabled=markers_disabled,
-            layers=layers,
         ),
         sanitize=False,
     ).classes("w-full")
@@ -621,30 +492,6 @@ def _dense_marker_setup() -> tuple[str, bool]:
     except Exception as error:  # the markers are optional and must never break the viewer
         LOGGER.warning("control point markers unavailable: %s", error)
         return CONTROL_POINT_MARKERS_URL, True
-
-
-def _active_project_layers(config: dict, kind: str) -> dict | None:
-    """Layer panel data of the active project (dense cloud only); adds ``config["environment"]``."""
-    if kind != "dense":
-        return None
-    try:
-        from samcloud.app.state import state
-
-        project = state.active_project_directory
-        if project is None:
-            return None
-        layers = environment_layers(project)
-        matrix = None
-        origin = layers["glb"]["origin_lv95"]
-        if layers["available"]:
-            register_environment_routes()
-            matrix = local_to_viewer_matrix(project, origin) if origin else None
-        config["environment"] = _environment_config(layers, matrix)
-        return layers
-    except Exception as error:  # the panel is optional and must never break the viewer
-        LOGGER.warning("environment layers unavailable: %s", error)
-        config.pop("environment", None)
-        return None
 
 
 def _viewer_config(
@@ -793,7 +640,6 @@ def _html(
     show_markers: bool = False,
     show_cameras: bool = False,
     markers_label: str | None = None,
-    layers: dict | None = None,
     markers_disabled: bool = False,
 ) -> str:
     def esc(value: str) -> str:
@@ -825,14 +671,12 @@ def _html(
         if show_cameras
         else ""
     )
-    layers_btn = (f'    <button data-action="layers">{esc("Ebenen")}</button>' + chr(10)) if layers else ""
-    layers_panel = _layers_panel_html(layers) if layers else ""
     return f"""
 <div id="{element_id}" class="sam-potree">
   <div class="sam-potree-area"></div>
   <div class="sam-potree-toolbar">
     <button data-action="fit">{esc(t("viewer.toolbar.fit"))}</button>
-{markers_btn}{cameras_btns}{classes_btns}{layers_btn}    <button data-action="earth" class="is-selected">{esc(t("viewer.toolbar.terrain"))}</button>
+{markers_btn}{cameras_btns}{classes_btns}    <button data-action="earth" class="is-selected">{esc(t("viewer.toolbar.terrain"))}</button>
     <button data-action="orbit">{esc(t("viewer.toolbar.orbit"))}</button>
     <button data-action="edl" class="is-selected">{esc(t("viewer.toolbar.shading"))}</button>
     <button data-action="fullscreen">{esc(t("viewer.toolbar.fullscreen"))}</button>
@@ -841,7 +685,6 @@ def _html(
 {camera_sliders}
   </div>
   <div class="sam-potree-classes"></div>
-  {layers_panel}
   <aside class="sam-potree-camera-card"></aside>
   <aside class="sam-potree-point-card"></aside>
   <div class="sam-potree-status">{esc(t("viewer.status.preparing"))}</div>
@@ -1021,7 +864,6 @@ const start = () => {
        syncCameraBillboards();
      });
    });
-__LAYERS_JS__
   const pageStarted = Date.now();
   let loadAttempts = 0;
   const formatElapsed = seconds => {
@@ -1517,4 +1359,4 @@ __LAYERS_JS__
 };
 start();
 </script>
-""".replace("__LAYERS_JS__", _layers_script(config)).replace("__STRINGS__", json.dumps(_viewer_strings()).replace("</", "<\\/")).replace("__CONFIG__", json.dumps(config))
+""".replace("__STRINGS__", json.dumps(_viewer_strings()).replace("</", "<\\/")).replace("__CONFIG__", json.dumps(config))

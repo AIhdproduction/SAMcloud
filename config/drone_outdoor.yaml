@@ -55,6 +55,29 @@ terrain:
     support_spacing_m: 0.50      # DTM cell spacing used for robust TIN support selection
     max_vertices: 60000          # hard cap
     max_refinement_rounds: 2     # bounded batched error-refinement iterations
+  lawn_ground_percentile: 20.0   # former lawn cells: this percentile of the ground/low-vegetation heights per cell is the ground
+  lawn_ground_min_points: 4      # fewer points in a lawn cell -> interpolated from the surrounding ground
+  lawn_ground_max_lowering_m: 0.25   # a lawn cell never drops further than this below the cleaned DTM
+  manhole_ring_segments: 16      # polygon ring that makes a manhole a TIN constraint
+  manhole_below_m: 0.001         # the terrain lies this far below the manhole cover
+  step:                          # vertical steps (curb faces, path edges, retaining walls) as top + bottom edge (samcloud/terrain/steps.py)
+    enabled: true
+    min_slope_deg: 60.0          # steep DTM features from this gradient on are step candidates
+    min_length_m: 1.0            # steep DTM features must be at least this long
+    probe_m: 0.15                # height probes this far to both sides of the line
+    min_jump_m: 0.04             # smaller height jumps stay a single breakline
+    offset_m: 0.01               # the bottom edge lies this far (horizontally) outside the top edge
+    min_run_m: 0.5               # shorter runs of a jump are ignored
+    sample_m: 0.25               # spacing of the probes along a line
+    dtm_features: true           # steep DTM lines count as walls ...
+    wall_min_jump_m: 0.25        # ... when the jump is at least this at probe_m and at twice probe_m
+  flush:                         # pavement edges without a curb are flush with the terrain (samcloud/terrain/flush.py)
+    enabled: true
+    blend_m: 1.0                 # terrain vertices within this band outside the edge are blended to the edge height
+    probe_m: 0.15                # the edge height is the pavement surface this far inside the pavement
+    sample_m: 0.25               # spacing of the edge samples
+    step_clear_m: 0.05           # no flush edge within this distance of a step run
+    qa_tol_m: 0.01               # QA 18: terrain vs pavement edge tolerance
 buildings:
   ransac_distance_m: 0.05    # RANSAC inlier distance for planes
   region_growing:            # plane region growing
@@ -77,6 +100,13 @@ buildings:
     min_step_m: 0.35         # height differences below this are not roof steps
     merge_normal_deg: 4.0    # roof planes with normals closer than this may be merged
     merge_offset_m: 0.15     # ... when their plane offset is below this
+  dxf:
+    coplanar_deg: 2.0        # roof edges between faces closer than this are not drawn in the DXF
+  base:                      # wall bottoms follow the terrain
+    mode: terrain            # terrain: bottom = terrain at each outline vertex; flat_min: lowest terrain under the footprint
+    embed_m: 0.02            # walls end this far below the terrain (no visible gap)
+    max_edge_m: 2.0          # outline edges are checked against the terrain at this spacing (and split where it bends)
+    follow_tol_m: 0.03       # terrain deviation from the straight wall bottom that adds a vertex
   plausibility:
     min_width_m: 2.5         # narrow strips are walls or hedges, not buildings
     min_area_m2: 10.0        # minimum plausible building footprint
@@ -103,6 +133,25 @@ vegetation:
   tree_min_points: 200       # min points per tree
   crown_triangles: {min: 60, max: 120}   # crown mesh triangle budget
   default_trunk_diameter_m: 0.30     # used only with ParamOrigin.ASSUMED
+  crown:                     # crown shape fit (sphere/ellipsoid/cone/umbrella/cylinder)
+    min_crown_points: 150    # fewer crown points -> ellipsoid, status assumed
+    slices: 12               # height slices of the upper-envelope profile
+    min_slice_points: 15     # slices with fewer points are ignored
+    envelope_percentile: 90.0  # per-slice radius = this percentile of the radial distance from the crown axis
+    base_radius_fraction: 0.2  # crown base = lowest height where the radius reaches this fraction of the max
+    sphere_aspect_tol: 0.15  # |height / diameter - 1| below this -> sphere instead of ellipsoid
+    margin: 0.15             # a shape must have a residual >= this fraction lower than the ellipsoid's
+    cone_rho: -0.6           # cone: Spearman(z, r) over the upper 70 % must be <= this
+    cylinder_aspect: 1.8     # cylinder: height / diameter at least this
+    umbrella_aspect: 0.6     # ellipsoid with height / diameter below this is an umbrella (flattened dome)
+    cylinder_cv: 0.15        # cylinder: coefficient of variation of r over the middle 80 % at most this
+  trunk:                     # trunk circle fit; measured only when every gate passes
+    max_rms_m: 0.03          # circle fit RMS
+    min_points: 20           # min trunk points in the band
+    min_diameter_m: 0.05
+    max_diameter_m: 2.0
+    band_m: [0.5, 1.6]       # height band above the terrain used for the circle fit
+    search_radius_m: 1.0     # tree points below the crown must lie this close to the trunk position
 pavement:
   min_thickness_m: 0.10      # min pavement layer thickness
   snap_tolerance_m: 0.01     # vertex snapping tolerance
@@ -124,6 +173,59 @@ curb:
   arc_fit_max_residual_m: 0.01   # max residual for arc fitting
   arc_max_radius_m: 50.0     # larger radii are treated as straight
   arc_min_points: 4          # min points for an arc
+  dedupe_offset_m: 0.5       # parallel curb axes closer than this are one curb (the one at the height jump stays)
+  dedupe_angle_deg: 10.0     # axes within this angle count as parallel
+  dedupe_overlap: 0.5        # share of the shorter axis that must run alongside the other
+  gutter_width_m: 0.30       # gutter stone (Wasserstein) width when it cannot be measured (ASSUMED)
+  gutter_thickness_m: 0.12   # gutter stone thickness
+  gutter_min_band_m: 0.15    # a flat curb-class band at foot level at least this wide is a measured gutter
+  gutter_z_tol_m: 0.03       # band points within this height of the foot level belong to the gutter
+  embed_m: 0.15              # curb body extends this far below the road-side foot level
+  flush_max_m: 0.03          # reveal below this is a flush curb (nothing may stick out of the surface)
+  flush_min_run: 3           # a flush run needs this many consecutive stations
+  default_reveal_m: 0.12     # reveal when no surface points exist beside the curb (ASSUMED)
+  max_reveal_m: 0.35         # a higher step beside the curb (stairs, retaining wall) is not trusted as the road surface
+  section_halfwidth_m: 0.6   # cross-section analysis reaches this far to each side of the curb
+  section_step_m: 0.25       # station spacing of the cross-section analysis
+  gutter_station_m: 0.5      # the gutter strip follows the surface at this station spacing
+  surface_probe_m: 0.06      # distance beyond the curb face where the TIN is sampled for the curb top / road side
+  gutter_pavement_reach_m: 0.3   # a gutter stone needs a road/sidewalk polygon this close on its side
+  dxf_flat_tol_m: 0.003      # only curbs with a smaller Z range are written as flat LWPOLYLINE (at the median z)
+site:
+  fence:
+    eps_m: 0.3               # XY neighbour distance of fence points (neighbouring fences stay separate)
+    step_m: 0.25             # station spacing along the fence
+    min_points: 4            # min points per fence
+    min_station_points: 2    # min points per station
+    branch_offset_m: 0.3     # points farther than this from the traced path start a branch
+    top_percentile: 95.0     # top edge = this percentile of the station z values
+    smooth_window: 5         # median filter of top and bottom edge (stations)
+    dp_m: 0.02               # Douglas-Peucker tolerance of the edges
+    thickness_m: 0.04        # IFC fence thickness
+    min_height_m: 0.2        # lower fences are rejected (the bottom edge is at most top - 0.2 m)
+    min_length_m: 0.5        # shorter fence fragments are rejected
+    bottom_percentile: 3.0   # lower envelope of the fence points per station
+    bottom_smooth_window: 9  # median filter of the bottom edge (stations)
+    bottom_dp_m: 0.03        # Douglas-Peucker tolerance of the bottom edge
+    ground_snap_m: 0.15      # envelope within this of the terrain: bottom = smooth terrain, else the envelope itself
+    terrain_radius_m: 0.5    # disc radius of the terrain median
+    merge_gap_m: 1.0         # collinear fragments with an end gap below this are one fence
+    merge_angle_deg: 15.0    # direction difference of mergeable fragment ends
+    merge_height_diff_m: 0.3 # height difference of mergeable fragments
+  wall:
+    eps_m: 0.75              # XY neighbour distance of site wall points
+    step_m: 0.4              # station spacing along the wall
+    min_points: 4
+    min_station_points: 3
+    branch_offset_m: 0.8
+    top_percentile: 95.0
+    smooth_window: 5
+    dp_m: 0.02
+    min_thickness_m: 0.1
+    top_variation_m: 0.10    # top or base varying more than this along the wall makes a triangulated solid
+    terrain_radius_m: 0.5    # disc radius of the terrain median (wall base)
+manhole:
+  thickness_m: 0.05          # IFC cover body thickness (top = cover height)
 dxf:
   local_origin: false        # false = real LV95 coordinates
   hatch: false               # write hatches
@@ -132,6 +234,12 @@ dxf:
   spline_contours: true      # smooth contours as splines
   tin_layer_frozen: true     # freeze TIN layer
   spot_spacing_m: 10.0       # spacing of the thinned S-ELEV spot-height grid
+  spot_heights: false        # write S-ELEV spot heights (off: contour labels are used instead)
+  contour_label_spacing_m: 10.0   # a height label on every major contour each this many metres along the line
+  contour_label_height_m: 0.25    # text height of the contour labels (layer S-TOPO-TEXT)
+  contour_building_gap_m: 0.10    # contours are cut this far outside the building footprints
+  block_text_height_m: 0.2   # text height of the visible TREE/MANHOLE block attributes
+  fence_bottom_line: false   # also write the fence bottom edge (S-FENC)
 ifc:
   curb_sweep: auto           # auto|extrude_only
   epsg: 2056                 # CRS code
@@ -185,3 +293,50 @@ edges:
     sagitta_m: 0.01          # arcs are densified to this sagitta for TIN/IFC and 3D polylines
     curb_match_m: 0.12       # curb axis is taken from a shared outline edge within this distance
   dxf_curb_flat_z_m: 0.05    # curbs with a smaller Z range are written as LWPOLYLINE with bulges
+  image:                     # boundaries road|sidewalk|path|terrain refined with the top-down colour image (samcloud/environment/image_edges.py)
+    enabled: true
+    cell_m: 0.03             # ortho cell size (coloured dense cloud, products/environment/ortho_rgb.tif)
+    z_percentile: 0.7        # colour of the points above this height percentile of a cell
+    hole_fill_cells: 3       # ortho holes up to this many cells are filled
+    search_m: 0.30           # perpendicular search distance around the class-raster edge
+    step_m: 0.02             # offset step of the search
+    window_m: 0.06           # half width of the before/after windows of the step detector
+    along_m: 0.6             # profiles are averaged over this length along the edge
+    sigma_m: 0.03            # Gaussian smoothing of the Lab image
+    weight_color: 1.0        # weight of the Lab colour step
+    weight_height: 1.0       # weight of the height step (1 cm = this many Lab units)
+    min_contrast: 5.0        # a sample is supported when its combined step is at least this
+    prior_per_m: 1.0         # cost per metre of shift (tie break towards the class-raster edge)
+    smooth_cost: 1.5         # cost per step of offset change between neighbouring samples
+    max_step: 3              # largest offset change (steps) between neighbouring samples
+    passes: 2                # search repeated along the refined line
+    pass2_search_m: 0.10     # search distance of the repeat
+    fit_tolerance_m: 0.03    # line/arc tolerance for image-derived samples
+    straight: true           # robust line segmentation (RANSAC) of the refined samples
+    min_segment_m: 1.5       # shortest straight segment
+    inlier_m: 0.04           # RANSAC inlier tolerance
+    merge_deg: 4.0           # consecutive segments with a smaller direction change are merged
+    snap_deg: 6.0            # segment directions snap to the site's dominant orientations within this
+    min_arc_radius_m: 2.0    # arcs only from this radius and only when clearly better than lines
+    ransac_trials: 150       # hypotheses per RANSAC search
+    hough: true              # strong straight image edges near the boundary are extra line hypotheses
+    hough_parallel_deg: 8.0  # ... when parallel to the class boundary within this
+    hough_min_len_m: 1.0
+    merge_gap_samples: 8     # segments this close (samples) may be merged
+    min_support: 0.60        # share of supported samples that must agree with the fitted line
+    agree_m: 0.04            # a sample agrees when it lies this close to the fitted line
+    max_area_change: 0.05    # per class; above this the class-raster outlines are kept
+    min_edge_m: 0.5          # straight zig-zag edges shorter than this are removed
+    zigzag_dev_m: 0.05       # ... when the line moves by less than this
+    node_shift_m: 0.45       # junction nodes move at most this far
+    min_chain_m: 1.0         # shorter edges stay as they are
+    side_offset_m: 0.15      # probe distance that tells which surface lies on each side
+  clean:                     # geometric clean-up of boundaries without image support (cars, shadows, trees)
+    enabled: true
+    spike_m: 0.25            # spikes narrower than this at their base ...
+    spike_protrude_m: 0.10   # ... and sticking out further than this are cut
+    line_tol_m: 0.08         # RANSAC inlier tolerance (looser than with image)
+    min_segment_m: 1.5       # shortest straight segment
+    merge_gap_samples: 40    # segments this close (0.1 m samples) may be merged into one line
+    max_shift_m: 0.25        # largest move from the class-raster edge
+    max_area_change: 0.05    # per polygon; cleaned edges that break it are reverted

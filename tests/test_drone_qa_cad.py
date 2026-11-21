@@ -29,9 +29,9 @@ def _ok(results, prefix):
 # ---------------------------------------------------------------------------------- DXF fixtures
 
 
-def _dxf(path, *, tree="insert", pave="lwpoly", contour="spline", curb="thin", frozen=True):
+def _dxf(path, *, tree="insert", pave="lwpoly", contour="spline", curb="thin", frozen=True, labelled=True):
     doc = ezdxf.new("R2018")
-    for name in ("S-TREE", "S-SHRUB", "S-MANH", "S-PAVE", "S-TOPO-TIN", "S-TOPO-MAJR", "S-CURB"):
+    for name in ("S-TREE", "S-SHRUB", "S-MANH", "S-PAVE", "S-TOPO-TIN", "S-TOPO-MAJR", "S-TOPO-TEXT", "S-CURB"):
         doc.layers.add(name)
     if frozen:
         doc.layers.get("S-TOPO-TIN").freeze()
@@ -60,6 +60,9 @@ def _dxf(path, *, tree="insert", pave="lwpoly", contour="spline", curb="thin", f
         msp.add_spline(fit_points=ctr, dxfattribs={"layer": "S-TOPO-MAJR"})
     else:
         msp.add_lwpolyline([(x, y) for x, y, _ in ctr], dxfattribs={"layer": "S-TOPO-MAJR"})
+    if labelled:
+        label = msp.add_text("432.0", height=0.25, dxfattribs={"layer": "S-TOPO-TEXT"})
+        label.set_placement((E0 + 4.3, N0 + 2.9), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
     if curb == "thin":
         msp.add_lwpolyline([(E0, N0), (E0 + 12.0, N0 + 0.1), (E0 + 14.0, N0 + 3.1), (E0 + 14.2, N0 + 9.4)], dxfattribs={"layer": "S-CURB"})
     else:
@@ -354,7 +357,7 @@ def test_count_consistency_detects_mismatch(tmp_path):
     _add_tree(f, body, 100)
     _add_terrain(f, body)
     ifc = _save(f, tmp_path, "a.ifc")
-    ok = qa_cad.count_consistency({"tree": 1}, dxf, ifc)
+    ok = [r for r in qa_cad.count_consistency({"tree": 1}, dxf, ifc) if r["rule"].startswith("15_")]  # the geometry rules 16-19 need matching scenes
     assert all(r["ok"] for r in ok), ok
     bad = qa_cad.count_consistency({"tree": 2, "shrub": 1}, dxf, ifc)
     by = {r["rule"]: r for r in bad}
@@ -452,3 +455,30 @@ def test_count_dxf_pavement_hole_not_counted(tmp_path):
     solo.modelspace().add_lwpolyline(outer, close=True, dxfattribs={"layer": "S-PAVE"})
     solo.modelspace().add_lwpolyline(hole, close=True, dxfattribs={"layer": "S-PAVE"})
     assert qa_cad._count_dxf(solo.modelspace(), "road") == 1
+
+
+def test_unlabelled_long_major_contour_fails_rule_15(tmp_path):
+    results = qa_cad.check_dxf(_dxf(tmp_path / "nolabel.dxf", labelled=False))
+    assert not _ok(results, "15_contours_labelled")
+    assert _ok(qa_cad.check_dxf(_dxf(tmp_path / "label.dxf")), "15_contours_labelled")
+
+
+def _add_tree_stem(path):
+    doc = ezdxf.readfile(path)
+    blk = doc.blocks.new("TREE_STEM")
+    blk.add_circle((0, 0), 0.5)
+    doc.modelspace().add_blockref("TREE_STEM", (E0 + 3.3, N0 + 2.7), dxfattribs={"layer": "S-TREE"})
+    doc.saveas(path)
+
+
+def test_tree_stem_insert_allowed_and_not_counted_as_tree(tmp_path):
+    dxf = _dxf(tmp_path / "stem.dxf")
+    _add_tree_stem(dxf)
+    assert _ok(qa_cad.check_dxf(dxf), "1_block_inserts")
+    f, body = _new_ifc()
+    _add_tree(f, body, 100)
+    _add_terrain(f, body)
+    ifc = _save(f, tmp_path, "stem.ifc")
+    result = [r for r in qa_cad.count_consistency({"tree": 1}, dxf, ifc) if r["rule"].startswith("15_")]
+    assert all(r["ok"] for r in result), result
+    assert result[0]["value"]["dxf"] == 1

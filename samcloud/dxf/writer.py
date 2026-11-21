@@ -26,13 +26,22 @@ LOGGER = logging.getLogger(__name__)
 TIN_LAYER = "S-TOPO-TIN"
 MISSING_VALUE = "n/a"
 OUTDOOR_BLOCK_ATTRIBUTES: dict[str, tuple[str, ...]] = {
-    "TREE": ("HEIGHT", "CROWN_DIA", "TRUNK_DIA"),
+    "TREE": ("HEIGHT", "CROWN_DIA", "TRUNK_DIA", "KRONE", "STAMM", "HOEHE"),
+    "TREE_STEM": (),
     "SHRUB": ("HEIGHT",),
     "MANHOLE": ("Z_DECKEL", "TYP"),
 }
+# Attributes written as visible text next to the symbol (all others stay invisible data).
+VISIBLE_BLOCK_ATTRIBUTES: dict[str, tuple[str, ...]] = {
+    "TREE": ("KRONE", "STAMM", "HOEHE"),
+    "MANHOLE": ("Z_DECKEL",),
+}
+DEFAULT_BLOCK_TEXT_HEIGHT_M = 0.2
+NOT_MEASURED = "nicht gemessen"
+_MANHOLE_BLOCK_RADIUS = 0.3
 # Block contents on layer 0 with BYBLOCK colour take the colour of the layer of their INSERT.
 _BYBLOCK = {"layer": "0", "color": 0}
-_SYMBOL_LAYERS = {"TREE": "S-TREE", "SHRUB": "S-SHRUB", "MANHOLE": "S-MANH"}
+_SYMBOL_LAYERS = {"TREE": "S-TREE", "TREE_STEM": "S-TREE", "SHRUB": "S-SHRUB", "MANHOLE": "S-MANH"}
 
 
 def frame_scale_and_yaw(frame: Frame, coordinates: str) -> tuple[float, float]:
@@ -218,22 +227,54 @@ def ensure_outdoor_blocks(document: ezdxf.document.Drawing, names: Iterable[str]
         block.add_circle((0.0, 0.0), 1.0, dxfattribs=_BYBLOCK)
         block.add_line((-0.1, 0.0), (0.1, 0.0), dxfattribs=_BYBLOCK)
         block.add_line((0.0, -0.1), (0.0, 0.1), dxfattribs=_BYBLOCK)
-        _add_invisible_attdefs(block, OUTDOOR_BLOCK_ATTRIBUTES["TREE"])
+        _add_attdefs(block, "TREE")
+    if "TREE_STEM" in wanted and "TREE_STEM" not in document.blocks:
+        # Unit circle scaled to the MEASURED trunk radius; only inserted when the trunk was measured.
+        block = document.blocks.new("TREE_STEM")
+        block.add_circle((0.0, 0.0), 1.0, dxfattribs=_BYBLOCK)
     if "SHRUB" in wanted and "SHRUB" not in document.blocks:
         block = document.blocks.new("SHRUB")
         block.add_circle((0.0, 0.0), 1.0, dxfattribs=_BYBLOCK)
-        _add_invisible_attdefs(block, OUTDOOR_BLOCK_ATTRIBUTES["SHRUB"])
+        _add_attdefs(block, "SHRUB")
     if "MANHOLE" in wanted and "MANHOLE" not in document.blocks:
         block = document.blocks.new("MANHOLE")
-        block.add_circle((0.0, 0.0), 0.3, dxfattribs=_BYBLOCK)
-        block.add_line((-0.3, 0.0), (0.3, 0.0), dxfattribs=_BYBLOCK)
-        block.add_line((0.0, -0.3), (0.0, 0.3), dxfattribs=_BYBLOCK)
-        _add_invisible_attdefs(block, OUTDOOR_BLOCK_ATTRIBUTES["MANHOLE"])
+        block.add_circle((0.0, 0.0), _MANHOLE_BLOCK_RADIUS, dxfattribs=_BYBLOCK)
+        block.add_line((-_MANHOLE_BLOCK_RADIUS, 0.0), (_MANHOLE_BLOCK_RADIUS, 0.0), dxfattribs=_BYBLOCK)
+        block.add_line((0.0, -_MANHOLE_BLOCK_RADIUS), (0.0, _MANHOLE_BLOCK_RADIUS), dxfattribs=_BYBLOCK)
+        _add_attdefs(block, "MANHOLE")
 
 
-def _add_invisible_attdefs(block: Any, tags: Iterable[str]) -> None:
-    for index, tag in enumerate(tags):
-        block.add_attdef(tag, (0.0, -0.1 * (index + 1)), MISSING_VALUE, height=0.05, dxfattribs={"flags": 1})
+def _add_attdefs(block: Any, kind: str) -> None:
+    """Attribute definitions of a block: tags in VISIBLE_BLOCK_ATTRIBUTES are visible text, the rest invisible data.
+
+    The visible text height and position are set per INSERT (see ``_layout_symbol_attribs``), because the
+    insert scale (crown radius) would otherwise scale the labels.
+    """
+    visible = VISIBLE_BLOCK_ATTRIBUTES.get(kind, ())
+    for index, tag in enumerate(OUTDOOR_BLOCK_ATTRIBUTES[kind]):
+        shown = tag in visible
+        block.add_attdef(tag, (1.2, -0.3 * (index + 1)) if shown else (0.0, -0.1 * (index + 1)), MISSING_VALUE,
+                         height=DEFAULT_BLOCK_TEXT_HEIGHT_M if shown else 0.05, dxfattribs={"flags": 0 if shown else 1})
+
+
+def _layout_symbol_attribs(reference: Any, entity: dict[str, Any], rotation: float, scale_div: float) -> None:
+    """Give the visible attributes of an INSERT a fixed text height and stack them right of the symbol."""
+    height = entity.get("text_height")
+    visible = set(entity.get("visible_tags", ()))
+    if not height or not visible:
+        return
+    h = float(height) / scale_div
+    shown = [attrib for attrib in reference.attribs if attrib.dxf.tag in visible]
+    line = 1.5 * h
+    offset_x = float(entity.get("label_offset", 0.0)) / scale_div + 0.5 * h
+    top = (len(shown) - 1) / 2.0 * line - 0.35 * h
+    cos, sin = math.cos(math.radians(rotation)), math.sin(math.radians(rotation))
+    base = reference.dxf.insert
+    for index, attrib in enumerate(shown):
+        dx, dy = offset_x, top - index * line
+        attrib.dxf.height = h
+        attrib.dxf.rotation = rotation
+        attrib.dxf.insert = (base.x + dx * cos - dy * sin, base.y + dx * sin + dy * cos, base.z)
 
 
 def _attribute_text(value: object) -> str:
@@ -245,17 +286,37 @@ def _attribute_text(value: object) -> str:
     return text or MISSING_VALUE
 
 
+def _default_text_height() -> float:
+    try:
+        from samcloud.drone.contracts import load_drone_config
+        return float(load_drone_config().get("dxf", {}).get("block_text_height_m", DEFAULT_BLOCK_TEXT_HEIGHT_M))
+    except Exception:  # noqa: BLE001 - config unavailable: use the built-in default
+        return DEFAULT_BLOCK_TEXT_HEIGHT_M
+
+
+def _measure_text(label: str, value: object) -> str:
+    """``LABEL=<d> m`` for a finite number, ``LABEL=n/a`` otherwise."""
+    if value is None or isinstance(value, str) or not math.isfinite(float(value)):
+        return f"{label}={MISSING_VALUE}"
+    return f"{label}={float(value):.2f} m"
+
+
 def outdoor_symbol_insert(
     kind: str,
     xyz: Iterable[float],
     attributes: dict[str, object] | None = None,
     crown_radius: float | None = None,
+    text_height: float | None = None,
 ) -> dict[str, Any]:
-    """Return the ``insert`` entity dict for a TREE, SHRUB or MANHOLE symbol.
+    """Return the ``insert`` entity dict for a TREE, TREE_STEM, SHRUB or MANHOLE symbol.
 
     Every attribute of the block is written; missing values become "n/a" (never estimated).
-    The block scale is the measured crown radius (TREE/SHRUB); without a radius the scale is 1.
+    The block scale is the measured radius (``crown_radius``: crown radius of TREE/SHRUB, trunk radius of
+    TREE_STEM, cover radius of MANHOLE); without a radius the scale is 1.
     A TREE without an explicit CROWN_DIA gets ``2 * crown_radius`` (a measured value).
+    TREE also gets the visible labels ``KRONE=<d> m``, ``STAMM=<d> m`` / ``STAMM=nicht gemessen`` and
+    ``HOEHE=<h> m`` (the crown shape is only in the IFC); MANHOLE shows ``Z_DECKEL``.
+    Visible labels are ``text_height`` (default ``dxf.block_text_height_m``) metres high.
     """
     name = str(kind).upper()
     if name not in OUTDOOR_BLOCK_ATTRIBUTES:
@@ -264,10 +325,21 @@ def outdoor_symbol_insert(
     radius = float(crown_radius) if crown_radius is not None and math.isfinite(float(crown_radius)) and float(crown_radius) > 0 else None
     if name == "TREE" and radius is not None and given.get("CROWN_DIA") is None:
         given["CROWN_DIA"] = 2.0 * radius
+    if name == "TREE":
+        trunk = given.get("TRUNK_DIA")
+        trunk_ok = trunk is not None and not isinstance(trunk, str) and math.isfinite(float(trunk))
+        given.setdefault("KRONE", _measure_text("KRONE", given.get("CROWN_DIA")))
+        given.setdefault("STAMM", _measure_text("STAMM", trunk) if trunk_ok else f"STAMM={NOT_MEASURED}")
+        given.setdefault("HOEHE", _measure_text("HOEHE", given.get("HEIGHT")))
     texts = {tag: _attribute_text(given.get(tag)) for tag in OUTDOOR_BLOCK_ATTRIBUTES[name]}
-    scale = radius if (radius is not None and name in {"TREE", "SHRUB"}) else 1.0
+    if name == "MANHOLE":
+        scale = radius / _MANHOLE_BLOCK_RADIUS if radius is not None else 1.0
+        symbol_radius = _MANHOLE_BLOCK_RADIUS * scale
+    else:
+        scale = radius if (radius is not None and name in {"TREE", "TREE_STEM", "SHRUB"}) else 1.0
+        symbol_radius = scale if name in {"TREE", "SHRUB"} else 0.0
     point = list(xyz)
-    return {
+    insert: dict[str, Any] = {
         "type": "insert",
         "name": name,
         "layer": _SYMBOL_LAYERS[name],
@@ -277,6 +349,11 @@ def outdoor_symbol_insert(
         "rotation": 0.0,
         "attributes": texts,
     }
+    if name in VISIBLE_BLOCK_ATTRIBUTES:
+        insert["visible_tags"] = list(VISIBLE_BLOCK_ATTRIBUTES[name])
+        insert["text_height"] = float(text_height) if text_height else _default_text_height()
+        insert["label_offset"] = float(symbol_radius)
+    return insert
 
 
 def contours_as_splines(entities: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -462,6 +539,7 @@ def _add_entity(
             dxfattribs={**attributes, "rotation": rotation, "xscale": xscale, "yscale": yscale},
         )
         reference.add_auto_attribs(entity.get("attributes", {}))
+        _layout_symbol_attribs(reference, entity, rotation, scale_div)
     elif entity_type == "arc":
         radius = float(entity["radius"]) / scale_div
         start_angle = float(entity["start_angle"]) + yaw
