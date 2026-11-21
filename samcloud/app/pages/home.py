@@ -7,6 +7,7 @@ from pathlib import Path
 from nicegui import ui
 
 from samcloud.app.i18n import current_language, t, translate_or
+from samcloud.app.dxf_time import dxf_ifc_created, dxf_ifc_seconds
 from samcloud.app.layout import render_page
 from samcloud.app.processing import (
     classification_engine,
@@ -158,7 +159,8 @@ def _processing_time_summary(project_directory: Path | None) -> dict | None:
     visible = {name: value for name, value in groups.items() if value >= 1.0}
     # The header and the Total line are the sum of exactly the lines shown, DXF/IFC included.
     total = photogrammetry_total + (dxf_seconds if dxf_seconds is not None and dxf_seconds >= 1.0 else 0.0)
-    return {"total_seconds": total, "groups": visible, "runs": len(chain)}
+    dxf_pending = dxf_seconds is None and not dxf_ifc_created(project_directory)
+    return {"total_seconds": total, "groups": visible, "runs": len(chain), "dxf_pending": dxf_pending}
 
 
 def _dxf_ifc_metrics(project_directory: Path | None) -> dict | None:
@@ -173,12 +175,8 @@ def _dxf_ifc_metrics(project_directory: Path | None) -> dict | None:
 
 
 def _dxf_ifc_seconds(project_directory: Path | None) -> float | None:
-    """Wall time of the latest completed DXF/IFC run, or None without a usable record."""
-    data = _dxf_ifc_metrics(project_directory)
-    if data is None or data.get("status") != "completed":
-        return None
-    seconds = data.get("total_seconds")
-    return float(seconds) if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0 else None
+    """Time spent creating the DXF/IFC (indoor job metrics or drone environment steps), or None."""
+    return dxf_ifc_seconds(project_directory)
 
 
 def _dxf_ifc_step(project_directory: Path | None) -> dict:
@@ -733,6 +731,10 @@ def _render_workflow(project: dict | None) -> None:
                         group_key = _TIME_GROUP_KEYS.get(name)
                         ui.label(translate_or(group_key, name) if group_key else name).classes("text-xs sam-muted")
                         ui.label(_format_elapsed(seconds)).classes("text-xs sam-muted")
+                if timing.get("dxf_pending"):
+                    with ui.row().classes("items-center justify-between w-full no-wrap"):
+                        ui.label(translate_or("home.time_group.dxf_ifc", "DXF/IFC")).classes("text-xs sam-muted")
+                        ui.label(t("home.workflow.not_created")).classes("text-xs sam-muted")
                 with ui.row().classes("items-center justify-between w-full no-wrap q-mt-xs"):
                     ui.label(t("home.workflow.total")).classes("text-xs").style("font-weight:600")
                     ui.label(_format_elapsed(timing["total_seconds"])).classes("text-xs").style("font-weight:600").mark("home-total-time")

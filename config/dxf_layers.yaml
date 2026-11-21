@@ -39,6 +39,7 @@ layers:
 # are repeated here so the writer has one complete style table. `frozen: true` = created frozen/off.
 outdoor_extra_layers:
   - {name: S-BLDG-ROOF, color: 23, linetype: CONTINUOUS, lineweight: 35}
+  - {name: S-BLDG-ROOF-EDGE, color: 151, linetype: CONTINUOUS, lineweight: 35}
   - {name: S-BLDG-WIND, color: 141, linetype: CONTINUOUS, lineweight: 18}
   - {name: S-BLDG-DOOR, color: 37, linetype: CONTINUOUS, lineweight: 18}
   - {name: S-SHRUB, color: 81, linetype: CONTINUOUS, lineweight: 18}

@@ -103,9 +103,9 @@ def test_stylised_tree_triangle_count_and_assumed_parameter(tmp_path: Path) -> N
     file = _export(scene, tmp_path / "tree.ifc")
     assert 60 <= sum(len(fs.CoordIndex) for fs in file.by_type("IfcTriangulatedFaceSet")) <= 120  # trunk + crown
     product = file.by_type("IfcGeographicElement")[0]
-    pset = next(pset for pset in product.IsDefinedBy if pset.RelatingPropertyDefinition.Name == "SAMcloud_Tree")
+    pset = next(pset for pset in product.IsDefinedBy if pset.RelatingPropertyDefinition.Name == "SAMcloud_Herkunft")
     values = {item.Name: item.NominalValue.wrappedValue for item in pset.RelatingPropertyDefinition.HasProperties}
-    assert values["Origin_trunk_diameter"] == "assumed"
+    assert values["Herkunft_trunk_diameter"] == "assumed"
 
 
 def test_outdoor_categories_have_expected_classes_and_psets(tmp_path: Path) -> None:

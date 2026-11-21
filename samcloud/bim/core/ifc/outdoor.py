@@ -16,7 +16,7 @@ import numpy as np
 import shapely
 from shapely.geometry import Polygon
 
-from samcloud.bim.core.ifc import shapes
+from samcloud.bim.core.ifc import outdoor_props, shapes
 from samcloud.bim.core.ifc.context import ExportContext
 from samcloud.bim.core.ifc.elements import element_name
 from samcloud.bim.core.ifc.ids import set_guid
@@ -88,7 +88,6 @@ def _prism_mesh(outline: Sequence[tuple[float, float]], base: float, height: flo
     return vertices, triangles
 
 
-_PSET_SKIP_EVIDENCE = frozenset({"lawn_triangle_indices"})  # bulk triangle index list, not a property
 
 
 def _submesh(
@@ -146,29 +145,25 @@ def _split_lawn_surfaces(
     return lawn_meshes, {terrain.id: _submesh(vertices, triangles[keep])}
 
 
-def _pset(ctx: ExportContext, product: Entity, category: str, element: object, values: dict[str, object]) -> None:
-    """Write measured values plus origin, status and evidence in one category Pset."""
-    props: dict[str, object] = dict(values)
-    for name, origin in element.param_origin.items():
-        props[f"Origin_{name}"] = origin.value
-    props["Status"] = element.status.value
-    if element.source_instance_ids:
-        props["EvidenceViews"] = ", ".join(element.source_instance_ids)
-    if element.metrics.point_count is not None:
-        props["EvidencePoints"] = element.metrics.point_count
-    if element.metrics.deviation_rms is not None:
-        props["EvidenceRmse"] = element.metrics.deviation_rms
-    for name, value in element.evidence.items():
-        if name in _PSET_SKIP_EVIDENCE:
-            continue
-        if isinstance(value, (str, int, float, bool)):
-            props[f"Evidence_{name}"] = value
-        elif isinstance(value, (list, tuple)):
-            props[f"Evidence_{name}"] = ", ".join(str(item) for item in value)
-        else:
-            props[f"Evidence_{name}"] = str(value)
+def _pset(
+    ctx: ExportContext, product: Entity, category: str, element: object, values: dict[str, object],
+    quantities: dict[str, float] | None = None,
+) -> None:
+    """Write the semantic values in ``SAMcloud_<category>`` and the provenance in ``SAMcloud_Herkunft``.
+
+    ``values`` are typed (IfcLengthMeasure/IfcAreaMeasure/IfcBoolean/...) by :func:`outdoor_props.typed_value`;
+    Source, Points and RMSE_m move to the provenance set (see :func:`outdoor_props.provenance_props`);
+    ``quantities`` become the element quantity set ``Qto_SAMcloud_<category>``.
+    """
+    main = dict(values)
+    carried = {key: main.pop(key) for key in outdoor_props.PROVENANCE_KEYS if key in main}
+    typed = lambda items: {name: outdoor_props.typed_value(ctx.file, name, value) for name, value in items.items()}  # noqa: E731
     pset = ifcopenshell.api.pset.add_pset(ctx.file, product=product, name=f"SAMcloud_{category}")
-    ifcopenshell.api.pset.edit_pset(ctx.file, pset=pset, properties=props)
+    ifcopenshell.api.pset.edit_pset(ctx.file, pset=pset, properties=typed(main))
+    origin = ifcopenshell.api.pset.add_pset(ctx.file, product=product, name=outdoor_props.PROVENANCE_PSET)
+    ifcopenshell.api.pset.edit_pset(ctx.file, pset=origin, properties=typed({**carried, **outdoor_props.provenance_props(element)}))
+    if quantities:
+        outdoor_props.add_quantities(ctx.file, product, f"Qto_SAMcloud_{category}", quantities)
 
 
 def _axis_footprint(axis: Sequence[tuple[float, float]], thickness: float) -> list[tuple[float, float]]:
@@ -421,6 +416,7 @@ def _write_facade_walls(ctx: ExportContext, building: BuildingElement) -> int:
 def write_outdoor(ctx: ExportContext) -> None:
     """Write site-contained outdoor survey products and LoD2 building envelopes."""
     lawn_meshes, terrain_meshes = _split_lawn_surfaces(ctx)
+    offset = tuple(float(v) for v in ctx.scene.settings.origin_offset)  # local -> LV95 / LN02 for the Pset values
     for element in ctx.scene.elements.values():
         if isinstance(element, BuildingElement):
             building = ctx.buildings.get(element.id)
@@ -430,6 +426,10 @@ def write_outdoor(ctx: ExportContext) -> None:
             walls = [triangle for triangle, role in zip(element.params.triangles, element.params.face_roles, strict=True) if role == 1]
             roofs = [triangle for triangle, role in zip(element.params.triangles, element.params.face_roles, strict=True) if role == 2]
             facade_walls = _write_facade_walls(ctx, element)
+            roof = wall = None
+            if facade_walls:
+                wall = next((ctx.entities[e.id] for e in ctx.scene.elements.values() if isinstance(e, WallElement) and e.building_id == element.id
+                             and not e.evidence.get("host_only") and e.id in ctx.entities and e.evidence.get("face_indices")), None)
             if walls and not facade_walls:
                 wall = ifcopenshell.api.root.create_entity(ctx.file, ifc_class="IfcWall", name=f"{element_name(element, 'Building')} exterior wall")
                 wall.ObjectType = "EXTERIOR"
@@ -443,14 +443,20 @@ def write_outdoor(ctx: ExportContext) -> None:
                 ifcopenshell.api.spatial.assign_container(ctx.file, products=[roof], relating_structure=building)
                 shapes.place(ctx, roof, (0.0, 0.0, 0.0))
                 _assign_mesh(ctx, roof, element.params.vertices, roofs)  # one IfcRoof, one body with every roof face
-            _pset(ctx, building, "Building", element, {"TriangleCount": len(element.params.triangles)})
+            (b_props, b_qto), (r_props, r_qto), (w_props, w_qto) = outdoor_props.building_props(element, offset)
+            _pset(ctx, building, "Building", element, b_props, b_qto)
+            if roof is not None:
+                _pset(ctx, roof, "Roof", element, r_props, r_qto)
+            if wall is not None:
+                _pset(ctx, wall, "BuildingWall", element, w_props, w_qto)
         elif isinstance(element, TerrainElement):
             product = _product(ctx, element, "IfcGeographicElement", "Terrain")
             product.PredefinedType = "TERRAIN"
             terrain_vertices, terrain_triangles = terrain_meshes.get(element.id, (element.params.vertices, element.params.triangles))
             if terrain_triangles:
                 _assign_mesh(ctx, product, terrain_vertices, terrain_triangles)
-            _pset(ctx, product, "Terrain", element, {"TriangleCount": len(terrain_triangles)})
+            t_props, t_qto = outdoor_props.terrain_props(element, offset, (terrain_vertices, terrain_triangles) if terrain_triangles else None)
+            _pset(ctx, product, "Terrain", element, t_props, t_qto)
         elif isinstance(element, TreeElement):
             product = _product(ctx, element, "IfcGeographicElement", "Tree")
             product.PredefinedType, product.ObjectType = "USERDEFINED", "Baum"
@@ -459,10 +465,8 @@ def write_outdoor(ctx: ExportContext) -> None:
             trunk, crown = shapes.stylised_tree(ctx.file, tp.trunk_xy, tp.base_z, tp.height, tp.crown_diameter, tp.trunk_diameter,
                                                 tp.crown_shape or "ellipsoid", tp.crown_base_z, tp.crown_offset or (0.0, 0.0))
             shapes.assign_representations(ctx, product, [shapes.tessellation_representation(ctx, [trunk, crown])])  # ONE Body: viewers use only the first
-            _pset(ctx, product, "Tree", element, {
-                "Height": tp.height, "CrownDiameter": tp.crown_diameter, "CrownShape": tp.crown_shape or "ellipsoid",
-                "TrunkDiameter": tp.trunk_diameter if trunk_measured else "nicht gemessen",
-                "TrunkDiameterMeasured": bool(trunk_measured)})
+            tree_pset, tree_qto = outdoor_props.tree_props(element, offset)
+            _pset(ctx, product, "Tree", element, tree_pset, tree_qto)
         elif isinstance(element, ShrubElement):
             category, label, object_type = "Shrub", "Shrub", "Busch"
             product = _product(ctx, element, "IfcGeographicElement", label)
@@ -471,12 +475,14 @@ def write_outdoor(ctx: ExportContext) -> None:
                 element.params.outline, element.params.base_z, element.params.height
             )
             _assign_mesh(ctx, product, vertices, triangles)
+            shrub_pset, shrub_qto = outdoor_props.shrub_props(element, offset)
             _pset(
                 ctx,
                 product,
                 category,
                 element,
-                {"BaseZ": element.params.base_z, "Height": element.params.height},
+                shrub_pset,
+                shrub_qto,
             )
         elif isinstance(element, VegetationAreaElement):
             product = _product(ctx, element, "IfcGeographicElement", "Rasen")
@@ -490,7 +496,8 @@ def write_outdoor(ctx: ExportContext) -> None:
                     product,
                     [_footprint_representation(ctx, element.params.outline, element.params.base_z)],
                 )
-            _pset(ctx, product, "VegetationArea", element, {"BaseZ": element.params.base_z, "TriangleCount": len(surface[1]) if surface else 0})
+            lawn_pset, lawn_qto = outdoor_props.vegetation_area_props(element, offset, surface)
+            _pset(ctx, product, "VegetationArea", element, lawn_pset, lawn_qto)
         elif isinstance(element, SiteWallElement):
             product = _product(ctx, element, "IfcWall", "Site wall")
             product.ObjectType, product.PredefinedType = "Mauer", "STANDARD"
@@ -501,7 +508,8 @@ def write_outdoor(ctx: ExportContext) -> None:
                 profile = shapes.polygon_profile(ctx.file, outline)
                 solid = shapes.extrusion(ctx.file, profile, element.params.top_z - element.params.base_z, origin=(0.0, 0.0, element.params.base_z))
                 shapes.assign_representations(ctx, product, [shapes.swept_solid_representation(ctx, [solid])])
-            _pset(ctx, product, "SiteWall", element, {"BaseZ": element.params.base_z, "TopZ": element.params.top_z, "Thickness": element.params.thickness or 0.0})
+            wall_pset, wall_qto = outdoor_props.site_wall_props(element, offset)
+            _pset(ctx, product, "SiteWall", element, wall_pset, wall_qto)
         elif isinstance(element, FenceElement):
             product = _product(ctx, element, "IfcRailing", "Fence")
             product.ObjectType = "Zaun"
@@ -509,13 +517,15 @@ def write_outdoor(ctx: ExportContext) -> None:
             bottom = np.asarray(element.params.bottom_z, dtype=float) if element.params.bottom_z is not None and len(element.params.bottom_z) == len(fence_axis) else fence_axis[:, 2] - element.params.height
             half = element.params.thickness / 2.0
             _assign_mesh(ctx, product, *_ribbon_mesh(fence_axis[:, :2], half, -half, np.maximum(fence_axis[:, 2], bottom), bottom))
-            _pset(ctx, product, "Fence", element, {"Height": element.params.height, "Thickness": element.params.thickness})
+            fence_pset, fence_qto = outdoor_props.fence_props(element, offset)
+            _pset(ctx, product, "Fence", element, fence_pset, fence_qto)
         elif isinstance(element, PavementElement):
             product = _product(ctx, element, "IfcCivilElement", "Pavement")
             product.ObjectType = {"road": "Strasse", "sidewalk": "Trottoir", "path": "Weg"}[element.params.kind]
             vertices, triangles = _pavement_mesh(element)
             _assign_mesh(ctx, product, vertices, triangles)
-            _pset(ctx, product, "Pavement", element, {"Thickness": element.params.thickness, "Kind": element.params.kind})
+            pave_pset, pave_qto = outdoor_props.pavement_props(element, offset)
+            _pset(ctx, product, "Pavement", element, pave_pset, pave_qto)
         elif isinstance(element, CurbElement):
             product = _product(ctx, element, "IfcCivilElement", "Curb")
             product.ObjectType = "Randstein"
@@ -524,14 +534,16 @@ def write_outdoor(ctx: ExportContext) -> None:
                 shapes.assign_representations(ctx, product, [shapes.swept_solid_representation(ctx, [solid])])
             else:
                 shapes.assign_representations(ctx, product, [shapes.swept_solid_representation(ctx, _curb_extrusions(ctx, element))])
-            _pset(ctx, product, "Curb", element, {"Width": element.params.width, "Height": float(np.median(_curb_body_heights(element))), "Sweep": element.params.curb_sweep, "RoadSide": element.params.road_side})
+            curb_pset, curb_qto = outdoor_props.curb_props(element, offset)
+            _pset(ctx, product, "Curb", element, curb_pset, curb_qto)
             gutter = _gutter_mesh(element)
             if gutter is not None:  # gutter stone (Wasserstein) as its own product beside the curb
                 gutter_element = element.model_copy(update={"id": f"{element.id}-gutter", "name": f"Wasserstein {element.tag or element.id[:8]}"})
                 gutter_product = _product(ctx, gutter_element, "IfcCivilElement", "Gutter")
                 gutter_product.ObjectType = "Wasserstein"
                 _assign_mesh(ctx, gutter_product, *gutter)
-                _pset(ctx, gutter_product, "Gutter", gutter_element, {"Width": element.params.gutter_width, "Thickness": element.params.gutter_thickness})
+                gutter_pset, gutter_qto = outdoor_props.gutter_props(element, offset)
+                _pset(ctx, gutter_product, "Gutter", gutter_element, gutter_pset, gutter_qto)
         elif isinstance(element, MarkingElement):
             product = _product(ctx, element, "IfcAnnotation", "Marking")
             product.ObjectType = "Markierung"
@@ -539,7 +551,8 @@ def write_outdoor(ctx: ExportContext) -> None:
             curve = ctx.file.createIfcPolyline([ctx.file.createIfcCartesianPoint(point) for point in points + ([points[0]] if element.params.closed else [])])
             representation = ctx.file.createIfcShapeRepresentation(ctx.body, "Body", "GeometricCurveSet", [ctx.file.createIfcGeometricCurveSet([curve])])
             shapes.assign_representations(ctx, product, [representation])
-            _pset(ctx, product, "Marking", element, {"Closed": element.params.closed})
+            mark_pset, mark_qto = outdoor_props.marking_props(element, offset)
+            _pset(ctx, product, "Marking", element, mark_pset, mark_qto)
         elif isinstance(element, ManholeElement):
             product = _product(ctx, element, "IfcDistributionChamberElement", "Manhole")
             product.PredefinedType, product.ObjectType = "MANHOLE", element.params.type
@@ -547,7 +560,8 @@ def write_outdoor(ctx: ExportContext) -> None:
             cover_z = element.params.center[2]  # body top = cover height, so terrain never covers it
             solid = shapes.extrusion(ctx.file, profile, element.params.thickness, origin=(element.params.center[0], element.params.center[1], cover_z - element.params.thickness))
             shapes.assign_representations(ctx, product, [shapes.swept_solid_representation(ctx, [solid])])
-            _pset(ctx, product, "Manhole", element, {"Diameter": element.params.diameter, "Z_DECKEL": element.params.center[2], "Type": element.params.type})
+            hole_pset, hole_qto = outdoor_props.manhole_props(element, offset)
+            _pset(ctx, product, "Manhole", element, hole_pset, hole_qto)
     apply_outdoor_styles(ctx)
 
 

@@ -67,10 +67,13 @@ class ManholeDetection:
 
     manhole_id: int
     center: np.ndarray                # (3,) local; z = median Z of the cluster (Z_DECKEL)
-    diameter: float
+    diameter: float                   # snapped to the nearest standard size when ``snapped``, else the measured value
     evidence: c.Evidence = field(default_factory=c.Evidence)
     status: c.Status = "ok"
     reason: str = ""
+    diameter_measured: float | None = None   # raw measured diameter
+    standard: str = ""                       # label of the standard size ("" when not snapped)
+    snapped: bool = False
 
 
 def _components(points: np.ndarray, eps: float) -> list[np.ndarray]:
@@ -93,20 +96,44 @@ def _pca_axes(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return major, np.array([-major[1], major[0]])
 
 
+def snap_manhole_diameter(diameter: float, config: dict | None = None) -> tuple[float, str, bool]:
+    """Snap a measured manhole diameter to the nearest Swiss standard size; returns ``(diameter, label, snapped)``.
+
+    ``manhole.standard_diameters_m`` / ``standard_labels``: the nearest size is taken only if it lies within
+    ``snap_tol_m`` (``snap_tol_small_m`` below 0.5 m) AND is closer than half the distance to the second-nearest size;
+    otherwise the measured value stays (``snapped=False``).
+    """
+    cfg = (config if config is not None else c.load_drone_config()).get("manhole", {})
+    sizes = np.asarray(cfg.get("standard_diameters_m", ()), dtype=np.float64)
+    labels = list(cfg.get("standard_labels", ()))
+    if len(sizes) == 0:
+        return float(diameter), "", False
+    dist = np.abs(sizes - diameter)
+    order = np.argsort(dist)
+    tol = float(cfg.get("snap_tol_m", 0.08)) if diameter >= 0.5 else float(cfg.get("snap_tol_small_m", 0.04))
+    nearest = int(order[0])
+    second = float(dist[order[1]]) if len(sizes) > 1 else np.inf
+    if dist[nearest] <= tol and dist[nearest] < 0.5 * second:
+        return float(sizes[nearest]), str(labels[nearest]) if nearest < len(labels) else "", True
+    return float(diameter), "", False
+
+
 def manhole_detections(
     ps: c.PointSet,
     *,
     eps: float = 0.15,
     min_points: int = 30,
-    diameter_range: tuple[float, float] = (0.4, 1.2),
+    diameter_range: tuple[float, float] = (0.25, 1.2),
     min_roundness: float = 0.7,
+    config: dict | None = None,
 ) -> list[ManholeDetection]:
     """Manhole covers from MANHOLE (75) points.
 
     Points are clustered (eps-neighbour components). A cluster is a manhole when its PCA extents
-    give a diameter ``(major + minor) / 2`` inside ``diameter_range`` (0.4-1.2 m) and a roundness
+    give a diameter ``(major + minor) / 2`` inside ``diameter_range`` (0.25-1.2 m: valve caps to concrete bases) and a roundness
     ``minor / major`` >= ``min_roundness``. The centre is the middle of the extents, ``Z_DECKEL`` is the
-    median Z of the cluster. Other clusters are returned with ``status="rejected"`` and a reason.
+    median Z of the cluster. The diameter is snapped to the nearest standard size (:func:`snap_manhole_diameter`), the
+    measured one stays in ``diameter_measured``. Other clusters are returned with ``status="rejected"`` and a reason.
     """
     xyz = np.asarray(ps.xyz, dtype=np.float64)[ps.classes == c.MANHOLE]
     out: list[ManholeDetection] = []
@@ -126,9 +153,10 @@ def manhole_detections(
             status, reason = "rejected", f"diameter {diameter:.2f} m outside {diameter_range[0]}-{diameter_range[1]} m"
         elif roundness < min_roundness:
             status, reason = "rejected", f"not round (minor/major {roundness:.2f} < {min_roundness})"
+        snapped_d, standard, snapped = (snap_manhole_diameter(float(diameter), config) if status == "ok" else (float(diameter), "", False))
         out.append(ManholeDetection(
             manhole_id=len(out), center=np.array([centre_xy[0], centre_xy[1], float(np.median(pts[:, 2]))]),
-            diameter=float(diameter),
+            diameter=snapped_d, diameter_measured=float(diameter), standard=standard, snapped=snapped,
             evidence=c.Evidence(points=int(len(idx)), notes={"roundness": round(roundness, 3)}),
             status=status, reason=reason,
         ))
@@ -318,7 +346,7 @@ def build_civil_elements(
             gutter_w = (gutter_w if gutter_w > 0 else float(cc.get("gutter_width_m", 0.30))) if snapped["gutter"] else 0.0
             notes_in = {**notes_in, "reveal_m": round(snapped["reveal"], 3), "foot": "measured",
                         "gutter": ("measured" if axis.gutter_measured else "assumed") if gutter_w > 0 else
-                                  ("flush" if snapped["flush"] else ("no pavement" if not snapped["on_pavement"] else ("no step" if not snapped["step_built"] else "none")))}
+                                  ("flush" if snapped["flush"] else ("no pavement" if not snapped["on_pavement"] else ("no step" if not snapped["step_built"] else "no calm surface")))}
         section = {}
         if foot is not None:
             section = {"road_side": road_side, "flush": bool(axis.flush) if snapped is None else bool(snapped["flush"]),
@@ -369,9 +397,12 @@ def build_civil_elements(
         el = ManholeElement(
             id=eid, tag=str(mh.manhole_id),
             params=ManholeParams(center=tuple(map(float, mh.center)), diameter=float(mh.diameter), type=MANHOLE_TYPE),
-            param_origin={"center": ParamOrigin.MEASURED, "diameter": ParamOrigin.FITTED, "type": ParamOrigin.ASSUMED},
+            param_origin={"center": ParamOrigin.MEASURED, "diameter": ParamOrigin.SNAPPED if mh.snapped else ParamOrigin.FITTED,
+                          "type": ParamOrigin.ASSUMED},
             source_instance_ids=[str(mh.manhole_id)],
-            evidence={"z_deckel_local": round(float(mh.center[2]), 3), **mh.evidence.notes},
+            evidence={"z_deckel_local": round(float(mh.center[2]), 3), **mh.evidence.notes,
+                      "diameter_measured_m": round(float(mh.diameter_measured if mh.diameter_measured is not None else mh.diameter), 3),
+                      "snapped": bool(mh.snapped), "standard": mh.standard},
             status=_status(mh.status), notes=[mh.reason] if mh.reason else [],
         )
         el.metrics.point_count = int(mh.evidence.points) or None
@@ -557,8 +588,9 @@ def snap_curb_to_surface(
     # curb-side edge of the gutter: beyond the curb face AND beyond the step line (which may lie up to snap off the axis)
     shift = np.einsum("ij,ij->i", line_xy - sxy, side * snrm)
     inner_off = np.maximum(hw, shift + 0.03)
-    z_in = surface(sxy + side * snrm * inner_off[:, None])
-    z_out = surface(sxy + side * snrm * (hw + gw))
+    raw_in = surface(sxy + side * snrm * inner_off[:, None])
+    raw_out = surface(sxy + side * snrm * (hw + gw))
+    z_in, z_out = raw_in, raw_out
     fill = lambda z, alt: np.where(np.isfinite(z), z, alt)  # noqa: E731
     z_low = surface(sxy + side * snrm * (hw + probe))
     base_low = np.where(np.isfinite(z_low), z_low, top_d - float(cc.get("default_reveal_m", 0.12)))
@@ -576,10 +608,56 @@ def snap_curb_to_surface(
         on_pavement = float(np.mean(hit)) >= 0.5
     plausible = float(np.median(reveal_d)) <= float(cc.get("max_reveal_m", 0.35))
     at_vertices = lambda z: np.interp(cum, stations, z)  # noqa: E731
+    # a gutter stone is only built on a calm road surface: where the TIN across / along the strip is not (nearly) planar
+    # (ramps, stair-like steps, manhole rings) no flat-topped draped slab can lie on it, so those stretches get none
+    run = None
+    if on_pavement and plausible and not flush and step_built:
+        run = _calm_gutter_run(surface, sxy, snrm, stations, line_xy, top_d, raw_in, raw_out, inner_off, side, hw, gw, base, cc)
+    gutter_axis = None if run is None else np.column_stack([sxy[run[0]:run[1] + 1], z_in[run[0]:run[1] + 1]])
     return {"top": at_vertices(top_d), "foot": at_vertices(z_in), "side": side, "flush": flush,
-            "gutter": bool(on_pavement and plausible and not flush and step_built), "on_pavement": bool(on_pavement),
-            "step_built": step_built, "reveal": float(np.median(reveal_d)),
-            "gutter_axis": np.column_stack([sxy, z_in]), "gutter_z_outer": z_out}
+            "gutter": run is not None, "on_pavement": bool(on_pavement), "step_built": step_built,
+            "calm": run is not None, "reveal": float(np.median(reveal_d)),
+            "gutter_axis": gutter_axis, "gutter_z_outer": None if run is None else z_out[run[0]:run[1] + 1]}
+
+
+def _calm_gutter_run(surface, sxy, snrm, stations, line_xy, top_d, raw_in, raw_out, inner_off, side, hw, gw, base, cc):
+    """Station index range ``(first, last)`` of the longest stretch where a draped gutter lies flush on the TIN, else ``None``.
+
+    A station is calm when the surface exists at the curb-side edge, the middle and the outer edge of the strip, is
+    planar across it (middle within ``gutter_flat_tol_m`` of the edge mean), falls by at most ``gutter_max_cross_m``
+    across it and does not rise above the curb top. A segment is calm when both its stations are and the surface at
+    its midpoint agrees with the linear interpolation at both edges. The stretch must be ``gutter_min_run_m`` long.
+    """
+    tol = float(cc.get("gutter_flat_tol_m", 0.01))
+    max_cross = float(cc.get("gutter_max_cross_m", 0.05))
+    mid_z = surface(sxy + side * snrm * (hw + gw / 2.0))
+    with np.errstate(invalid="ignore"):
+        st_ok = (np.isfinite(raw_in) & np.isfinite(raw_out) & np.isfinite(mid_z) & (np.abs(mid_z - (raw_in + raw_out) / 2.0) <= tol)
+                 & (np.abs(raw_in - raw_out) <= max_cross) & (raw_in <= top_d + 0.005) & (raw_out <= top_d + 0.005))
+    if len(stations) < 2 or not st_ok.any():
+        return None
+    mids = (stations[:-1] + stations[1:]) / 2.0
+    mxy = shapely.get_coordinates(shapely.line_interpolate_point(base, mids))
+    mnrm = _station_normals(mxy)
+    m_inner = (inner_off[:-1] + inner_off[1:]) / 2.0
+    mi = surface(mxy + side * mnrm * m_inner[:, None])
+    mo = surface(mxy + side * mnrm * (hw + gw))
+    with np.errstate(invalid="ignore"):
+        seg_ok = (st_ok[:-1] & st_ok[1:] & np.isfinite(mi) & np.isfinite(mo)
+                  & (np.abs(mi - (raw_in[:-1] + raw_in[1:]) / 2.0) <= tol) & (np.abs(mo - (raw_out[:-1] + raw_out[1:]) / 2.0) <= tol))
+    best, best_len, i = None, 0.0, 0
+    while i < len(seg_ok):
+        if not seg_ok[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(seg_ok) and seg_ok[j + 1]:
+            j += 1
+        length = float(stations[j + 1] - stations[i])
+        if length > best_len:
+            best, best_len = (i, j + 1), length
+        i = j + 1
+    return best if best is not None and best_len >= float(cc.get("gutter_min_run_m", 0.5)) else None
 
 
 def apply_curb_heights(fitted: Iterable, elements: Iterable) -> list:

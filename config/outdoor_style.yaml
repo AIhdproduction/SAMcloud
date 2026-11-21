@@ -21,6 +21,7 @@ categories:
   gutter:         {label: Wasserstein,    layer: S-GUTR,       rgb: [160, 165, 172], aci: 251, transparency: 0.0}
   building_wall:  {label: Gebäude-Wand,   layer: S-BLDG,       rgb: [227, 207, 168], aci: 41,  transparency: 0.0}
   roof:           {label: Dach,           layer: S-BLDG-ROOF,  rgb: [200, 100, 60],  aci: 23,  transparency: 0.0}
+  roof_edge:      {label: Dachkante,      layer: S-BLDG-ROOF-EDGE, rgb: [127, 191, 255], aci: 151, transparency: 0.0, ifc: false}
   window:         {label: Fenster,        layer: S-BLDG-WIND,  rgb: [159, 211, 240], aci: 141, transparency: 0.4}
   door:           {label: Tür,            layer: S-BLDG-DOOR,  rgb: [90, 58, 34],    aci: 37,  transparency: 0.0}
   site_wall:      {label: Mauer,          layer: S-WALL,       rgb: [138, 98, 68],   aci: 35,  transparency: 0.0}

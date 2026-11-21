@@ -69,6 +69,7 @@
     "title": "Projektablauf",
     "open_dxf": "DXF/IFC öffnen",
     "total": "Total",
+    "not_created": "noch nicht erstellt",
     "total_time": "Rechenzeit gesamt: {time}",
     "storage": "Speicher: {size} GB"
   },
@@ -81,7 +82,7 @@
     "refinement": "Verbessern & filtern",
     "export": "Export",
     "other": "Übrige Schritte",
-    "dxf_ifc": "DXF/IFC-Export"
+    "dxf_ifc": "DXF/IFC"
   },
   "recent": {
     "title": "Zuletzt verwendete Projekte",

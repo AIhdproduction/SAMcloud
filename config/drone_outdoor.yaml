@@ -187,7 +187,10 @@ curb:
   max_reveal_m: 0.35         # a higher step beside the curb (stairs, retaining wall) is not trusted as the road surface
   section_halfwidth_m: 0.6   # cross-section analysis reaches this far to each side of the curb
   section_step_m: 0.25       # station spacing of the cross-section analysis
-  gutter_station_m: 0.5      # the gutter strip follows the surface at this station spacing
+  gutter_station_m: 0.25     # the gutter strip follows the surface at this station spacing
+  gutter_flat_tol_m: 0.01    # a gutter needs a planar surface: middle / midpoint of the strip within this of the linear interpolation
+  gutter_max_cross_m: 0.05   # ... and a fall across the strip of at most this (ramps and stair-like steps get no gutter)
+  gutter_min_run_m: 0.5      # shortest gutter stretch
   surface_probe_m: 0.06      # distance beyond the curb face where the TIN is sampled for the curb top / road side
   gutter_pavement_reach_m: 0.3   # a gutter stone needs a road/sidewalk polygon this close on its side
   dxf_flat_tol_m: 0.003      # only curbs with a smaller Z range are written as flat LWPOLYLINE (at the median z)
@@ -226,6 +229,10 @@ site:
     terrain_radius_m: 0.5    # disc radius of the terrain median (wall base)
 manhole:
   thickness_m: 0.05          # IFC cover body thickness (top = cover height)
+  standard_diameters_m: [0.27, 0.42, 0.62, 0.745, 0.785, 0.85, 0.92, 1.05]   # visible outer diameter of Swiss covers/frames from above
+  standard_labels: [Schieberkappe, Hydrantenkappe, Deckel LW600-625, Rahmen LW625 / Trottoirdeckel, Rahmen LW600 (Typ Viatop), Rahmen LW600 (Typ Pamrex), Rahmen LW800, Betonuntersatz]
+  snap_tol_m: 0.08           # snap to the nearest standard size within this (diameters >= 0.5 m) ...
+  snap_tol_small_m: 0.04     # ... or this (smaller ones), and only if closer than half the distance to the second-nearest size
 dxf:
   local_origin: false        # false = real LV95 coordinates
   hatch: false               # write hatches

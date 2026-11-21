@@ -15,6 +15,7 @@ from samcloud.drone.contracts import BuildingModel, LocalFrame, Opening, QAEntry
 
 LAYER_BUILDING = "S-BLDG"
 LAYER_ROOF = "S-BLDG-ROOF"
+LAYER_ROOF_EDGE = "S-BLDG-ROOF-EDGE"
 LAYER_WINDOW = "S-BLDG-WIND"
 LAYER_DOOR = "S-BLDG-DOOR"
 
@@ -233,8 +234,10 @@ def _simplify(points: np.ndarray, tolerance: float) -> np.ndarray:
     return np.vstack([_simplify(points[: index + 1], tolerance)[:-1], _simplify(points[index:], tolerance)])
 
 
-def roof_lines(vertices: np.ndarray, roof_faces: np.ndarray, *, coplanar_deg: float = 2.0, tolerance: float = DXF_SIMPLIFY_M) -> list[np.ndarray]:
-    """Real roof lines of a triangulated roof: outline, ridges, hips, valleys and steps.
+def roof_line_sets(vertices: np.ndarray, roof_faces: np.ndarray, *, coplanar_deg: float = 2.0, tolerance: float = DXF_SIMPLIFY_M) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Real roof lines of a triangulated roof as ``(outline chains, inner chains)``.
+
+    Outline = edges bordering one roof face only (eave and steps to walls); inner = ridges, hips, valleys.
 
     An edge is kept when it borders only one roof face (outline) or when its two roof faces differ in
     normal by more than ``coplanar_deg``; coplanar triangle seams give nothing.  Edges are chained through
@@ -243,7 +246,7 @@ def roof_lines(vertices: np.ndarray, roof_faces: np.ndarray, *, coplanar_deg: fl
     vertices = np.asarray(vertices, float)
     faces = np.asarray(roof_faces, int)
     if len(faces) == 0:
-        return []
+        return [], []
     normals = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]], vertices[faces[:, 2]] - vertices[faces[:, 0]])
     lengths = np.linalg.norm(normals, axis=1)
     normals = normals / np.where(lengths > 1e-12, lengths, 1.0)[:, None]
@@ -257,8 +260,20 @@ def roof_lines(vertices: np.ndarray, roof_faces: np.ndarray, *, coplanar_deg: fl
     for edge, faces_at in owners.items():
         if len(faces_at) != 2 or lengths[faces_at[0]] < 1e-12 or lengths[faces_at[1]] < 1e-12 or float(normals[faces_at[0]] @ normals[faces_at[1]]) < cosine:
             kept.add(edge)
+    outline = {edge for edge in kept if len(owners[edge]) == 1}
+    return _chains(vertices, outline, tolerance), _chains(vertices, kept - outline, tolerance)
+
+
+def roof_lines(vertices: np.ndarray, roof_faces: np.ndarray, *, coplanar_deg: float = 2.0, tolerance: float = DXF_SIMPLIFY_M) -> list[np.ndarray]:
+    """All real roof lines (outline first, then ridges, hips, valleys and steps)."""
+    outline, inner = roof_line_sets(vertices, roof_faces, coplanar_deg=coplanar_deg, tolerance=tolerance)
+    return outline + inner
+
+
+def _chains(vertices: np.ndarray, edges: set[tuple[int, int]], tolerance: float) -> list[np.ndarray]:
+    """Chain edges through degree-two vertices and simplify; a chain that returns to its start is closed (first == last)."""
     adjacency: dict[int, set[int]] = {}
-    for a, b in kept:
+    for a, b in edges:
         adjacency.setdefault(a, set()).add(b)
         adjacency.setdefault(b, set()).add(a)
     used: set[tuple[int, int]] = set()
@@ -303,8 +318,12 @@ def to_dxf_entities(elements: Sequence[object], frame: LocalFrame, *, coplanar_d
             ring = frame.to_lv95(_ring_from_mesh(el))
             out.setdefault(LAYER_BUILDING, []).append({"type": "lwpolyline", "points": ring.tolist(), "closed": True, "elevation": float(np.min(ring[:, 2]))})
             v, f, r = np.asarray(el.params.vertices, float), np.asarray(el.params.triangles, int), np.asarray(el.params.face_roles)
-            for chain in roof_lines(v, f[r == 2], coplanar_deg=coplanar_deg):
+            outline, inner = roof_line_sets(v, f[r == 2], coplanar_deg=coplanar_deg)
+            for chain in inner:  # ridges, hips, valleys: nothing is drawn twice
                 out.setdefault(LAYER_ROOF, []).append({"type": "polyline3d", "points": frame.to_lv95(chain).tolist(), "closed": False})
+            for chain in outline:  # Dachkanten: the roof boundary, closed where it loops
+                closed = len(chain) > 3 and bool(np.allclose(chain[0], chain[-1]))
+                out.setdefault(LAYER_ROOF_EDGE, []).append({"type": "polyline3d", "points": frame.to_lv95(chain[:-1] if closed else chain).tolist(), "closed": closed})
         elif isinstance(el, WallElement) and el.id.startswith("building-"):
             building_axes[el.id] = (np.asarray(el.params.start, float), np.asarray(el.params.end, float), float(el.params.thickness))
         elif isinstance(el, OpeningElement):

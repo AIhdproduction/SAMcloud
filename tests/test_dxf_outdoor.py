@@ -18,7 +18,7 @@ from samcloud.dxf.writer import (
     outdoor_symbol_insert,
 )
 
-NEW_LAYERS = ("S-BLDG-ROOF", "S-BLDG-WIND", "S-BLDG-DOOR", "S-SHRUB", "S-PATH", "S-TOPO-TIN", "S-TOPO-MAJR", "S-TOPO-MINR", "S-TOPO-TEXT", "S-ELEV", "S-ANNO-GRENZE", "S-GUTR")
+NEW_LAYERS = ("S-BLDG-ROOF", "S-BLDG-ROOF-EDGE", "S-BLDG-WIND", "S-BLDG-DOOR", "S-SHRUB", "S-PATH", "S-TOPO-TIN", "S-TOPO-MAJR", "S-TOPO-MINR", "S-TOPO-TEXT", "S-ELEV", "S-ANNO-GRENZE", "S-GUTR")
 
 
 def _result(layers: dict[str, list[dict]], bounds=(0.0, 0.0, 10.0, 10.0)) -> DxfPlanResult:

@@ -1112,12 +1112,105 @@ def _rule_gutter_curb_flush(msp, ifc) -> dict[str, Any] | None:
                    f"median |top - surface| <= {SURFACE_FLUSH_TOLERANCE_M} m", offenders[:MAX_OFFENDERS])
 
 
+# Pset / quantity set suffix per outdoor category (``SAMcloud_<suffix>`` and ``Qto_SAMcloud_<suffix>``).
+ATTRIBUTE_SET_SUFFIX: dict[str, str] = {
+    "terrain": "Terrain", "tree": "Tree", "shrub": "Shrub", "lawn": "VegetationArea", "site_wall": "SiteWall", "fence": "Fence",
+    "road": "Pavement", "sidewalk": "Pavement", "path": "Pavement", "curb": "Curb", "gutter": "Gutter", "marking": "Marking",
+    "manhole": "Manhole", "roof": "Roof",
+}
+ATTRIBUTE_TOLERANCE_M = 0.01
+ATTRIBUTE_MATCH_REACH_M = 1.0
+
+
+def _rule_ifc_attribute_sets(ifc) -> dict[str, Any] | None:
+    """Rule 20: every outdoor product (and building) carries its ``SAMcloud_<Category>`` Pset, ``Qto_SAMcloud_<Category>`` quantity set and ``SAMcloud_Herkunft``."""
+    import ifcopenshell.util.element as element_util
+    from samcloud.bim.core.ifc.outdoor import outdoor_category_of_product
+    checked, offenders = 0, []
+    for product in ifc.by_type("IfcProduct"):
+        category = "building" if product.is_a("IfcBuilding") else outdoor_category_of_product(product)
+        suffix = "Building" if category == "building" else ATTRIBUTE_SET_SUFFIX.get(category or "")
+        if suffix is None:
+            continue
+        checked += 1
+        sets = element_util.get_psets(product)
+        missing = [name for name in (f"SAMcloud_{suffix}", f"Qto_SAMcloud_{suffix}", "SAMcloud_Herkunft") if name not in sets]
+        if missing:
+            offenders.append(f"{_label_ifc(product)}: missing {', '.join(missing)}")
+    if checked == 0:
+        return None
+    return _result("20_ifc_attribute_sets", not offenders, {"products": checked, "missing": len(offenders)},
+                   "every outdoor product has SAMcloud_<Category>, Qto_SAMcloud_<Category> and SAMcloud_Herkunft", offenders[:MAX_OFFENDERS])
+
+
+def _dxf_attribute_number(insert, *tags: str) -> float | None:
+    """First number found in the attributes ``tags`` of an INSERT (``"903.39"`` or ``"KRONE=1.99 m"``)."""
+    import re
+    values = {a.dxf.tag.upper(): a.dxf.text for a in insert.attribs}
+    for tag in tags:
+        match = re.search(r"-?\d+(?:\.\d+)?", values.get(tag, ""))
+        if match:
+            return float(match.group(0))
+    return None
+
+
+def _rule_ifc_attributes_vs_dxf(msp, ifc) -> dict[str, Any] | None:
+    """Rule 21: IFC manhole ``Deckelhoehe_LN02`` == DXF ``Z_DECKEL`` and tree ``Kronendurchmesser_m`` == DXF ``KRONE`` (within 1 cm)."""
+    import ifcopenshell.util.element as element_util
+    from scipy.spatial import cKDTree
+    from samcloud.bim.core.ifc.outdoor import outdoor_category_of_product
+
+    def dxf_values(layer: str, block: str, *tags: str) -> tuple[np.ndarray, list[float | None]]:
+        inserts = [e for e in msp.query(f'INSERT[layer=="{layer}"]') if e.dxf.name == block]
+        xy = np.asarray([(e.dxf.insert.x, e.dxf.insert.y) for e in inserts], dtype=float).reshape(-1, 2)
+        return xy, [_dxf_attribute_number(e, *tags) for e in inserts]
+
+    compared = {"manhole": 0, "tree": 0}
+    offenders: list[str] = []
+    worst = 0.0
+    for category, layer, block, tags, keys, prop in (
+        ("manhole", "S-MANH", "MANHOLE", ("Z_DECKEL",), (("LV95_E", "LV95_N"),), "Deckelhoehe_LN02"),
+        ("tree", "S-TREE", "TREE", ("CROWN_DIA", "KRONE"), (("Kronenmitte_LV95_E", "Kronenmitte_LV95_N"), ("Stamm_LV95_E", "Stamm_LV95_N")), "Kronendurchmesser_m"),
+    ):
+        xy, values = dxf_values(layer, block, *tags)
+        tree = cKDTree(xy) if len(xy) else None
+        pset_name = f"SAMcloud_{ATTRIBUTE_SET_SUFFIX[category]}"
+        for product in ifc.by_type("IfcProduct"):
+            if outdoor_category_of_product(product) != category:
+                continue
+            props = element_util.get_psets(product).get(pset_name, {})
+            if prop not in props:
+                continue  # missing attribute sets are reported by rule 20
+            if tree is None:
+                continue  # the DXF has no such block at all: the counts (rule 15) and block rule 1 report that
+            best = None
+            for east, north in keys:
+                if east in props and north in props:
+                    distance, index = tree.query([props[east], props[north]])
+                    if best is None or distance < best[0]:
+                        best = (float(distance), int(index))
+            if best is None or best[0] > ATTRIBUTE_MATCH_REACH_M or values[best[1]] is None:
+                offenders.append(f"{_label_ifc(product)}: no matching DXF {block} insert within {ATTRIBUTE_MATCH_REACH_M} m")
+                continue
+            compared[category] += 1
+            deviation = abs(float(props[prop]) - float(values[best[1]]))
+            worst = max(worst, deviation)
+            if deviation > ATTRIBUTE_TOLERANCE_M:
+                offenders.append(f"{_label_ifc(product)}: {prop} {props[prop]} vs DXF {values[best[1]]} (deviation {deviation:.3f} m)")
+    if not any(compared.values()) and not offenders:
+        return None
+    return _result("21_ifc_attributes_vs_dxf", not offenders, {**compared, "max_deviation_m": round(worst, 4)},
+                   f"manhole Deckelhoehe_LN02 == DXF Z_DECKEL, tree Kronendurchmesser_m == DXF KRONE within {ATTRIBUTE_TOLERANCE_M} m", offenders[:MAX_OFFENDERS])
+
+
 def check_geometry_consistency(dxf_path, ifc_path) -> list[dict[str, Any]]:
-    """Rules 16-17 and 19: fence top edge IFC == DXF (3 cm), curb bodies never above their DXF axis (5 mm), gutter / curb tops flush with the surface (1 cm)."""
+    """Rules 16-17 and 19-21: fence top edge IFC == DXF (3 cm), curb bodies never above their DXF axis (5 mm), gutter / curb tops flush with the surface (1 cm), attribute sets present, IFC manhole cover height / tree crown == DXF (1 cm)."""
     import ifcopenshell
     msp = ezdxf.readfile(str(dxf_path)).modelspace()
     ifc = ifcopenshell.open(str(ifc_path))
-    return [r for r in (_rule_fence_heights(msp, ifc), _rule_curb_body_height(msp, ifc), _rule_gutter_curb_flush(msp, ifc)) if r is not None]
+    rules = (_rule_fence_heights(msp, ifc), _rule_curb_body_height(msp, ifc), _rule_gutter_curb_flush(msp, ifc),
+             _rule_ifc_attribute_sets(ifc), _rule_ifc_attributes_vs_dxf(msp, ifc))
+    return [r for r in rules if r is not None]
 
 
 # ============================================================================== report

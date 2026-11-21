@@ -176,11 +176,34 @@ def test_hip_roof_dxf_has_only_outline_ridge_and_hips_no_diagonals():
     vertices, faces = _fine_hip_roof()
     assert len(faces) > 90
     chains = roof_lines(vertices, faces, coplanar_deg=2.0)
-    assert len(chains) == 9  # 4 eave edges + 1 ridge + 4 hips
-    for chain in chains:
-        assert len(chain) == 2  # merged collinear chains, DP 1 cm
-    ends = {tuple(np.round(c[0], 1)) + tuple(np.round(c[-1], 1)) for c in chains}
-    ridge = [c for c in chains if abs(c[0][2] - 5.0) < 0.01 and abs(c[-1][2] - 5.0) < 0.01]
+    assert len(chains) == 6  # one closed eave loop (4 corners) + 1 ridge + 4 hips
+    loops = [c for c in chains if len(c) > 2]
+    assert len(loops) == 1 and len(loops[0]) == 5 and np.allclose(loops[0][0], loops[0][-1])
+    straight = [c for c in chains if len(c) == 2]  # merged collinear chains, DP 1 cm
+    assert len(straight) == 5
+    ridge = [c for c in straight if abs(c[0][2] - 5.0) < 0.01 and abs(c[1][2] - 5.0) < 0.01]
     assert len(ridge) == 1 and abs(np.linalg.norm(ridge[0][0] - ridge[0][1]) - 4.0) < 0.02
-    assert sum(abs(c[0][2] - 3.0) < 0.01 and abs(c[-1][2] - 3.0) < 0.01 for c in chains) == 4
-    assert len(ends) == 9
+
+
+def test_roof_edge_is_its_own_closed_light_blue_layer_and_not_drawn_twice():
+    from samcloud.bim.core.model import BuildingElement, BuildingParams
+    from samcloud.outdoor_model.buildings import to_dxf_entities
+    from samcloud.outdoor_model.style import load_outdoor_style
+
+    vertices, faces = _fine_hip_roof()
+    floor = [(0, 0, 0), (8, 0, 0), (8, 6, 0), (0, 6, 0)]
+    start = len(vertices)
+    all_vertices = np.vstack([vertices, np.asarray(floor, float)])
+    all_faces = np.vstack([faces, [[start, start + 2, start + 1], [start, start + 3, start + 2]]])
+    roles = [2] * len(faces) + [0, 0]
+    element = BuildingElement(id="building-1", tag="1", name="Building 1", params=BuildingParams(
+        vertices=[tuple(map(float, v)) for v in all_vertices], triangles=[tuple(map(int, f)) for f in all_faces], face_roles=roles))
+    dxf = to_dxf_entities([element], LocalFrame((2600000, 1200000, 500)))
+    edge = dxf["S-BLDG-ROOF-EDGE"]
+    assert len(edge) == 1 and edge[0]["closed"] and len(edge[0]["points"]) == 4  # one closed polyline, 4 corners
+    inner = dxf["S-BLDG-ROOF"]
+    assert len(inner) == 5 and all(len(e["points"]) == 2 for e in inner)  # ridge + 4 hips, no eave duplicated
+    style = load_outdoor_style()["roof_edge"]
+    assert style["layer"] == "S-BLDG-ROOF-EDGE" and not style["ifc"]
+    r, g, b = style["rgb"]
+    assert b >= 240 and g >= 170 and r <= 140 and style["aci"] == 151

@@ -346,7 +346,7 @@ _DEFAULT_CONFIG: dict = {
         "dedupe_offset_m": 0.5, "dedupe_angle_deg": 10.0, "dedupe_overlap": 0.5,
         "gutter_width_m": 0.30, "gutter_thickness_m": 0.12, "gutter_min_band_m": 0.15, "gutter_z_tol_m": 0.03,
         "embed_m": 0.15, "flush_max_m": 0.03, "flush_min_run": 3, "default_reveal_m": 0.12, "max_reveal_m": 0.35,
-        "section_halfwidth_m": 0.6, "section_step_m": 0.25, "dxf_flat_tol_m": 0.003, "surface_probe_m": 0.06, "gutter_station_m": 0.5, "gutter_pavement_reach_m": 0.3,
+        "section_halfwidth_m": 0.6, "section_step_m": 0.25, "dxf_flat_tol_m": 0.003, "surface_probe_m": 0.06, "gutter_station_m": 0.25, "gutter_flat_tol_m": 0.01, "gutter_max_cross_m": 0.05, "gutter_min_run_m": 0.5, "gutter_pavement_reach_m": 0.3,
     },
     "site": {
         "fence": {"eps_m": 0.3, "step_m": 0.25, "min_points": 4, "min_station_points": 2, "branch_offset_m": 0.3,
@@ -357,7 +357,13 @@ _DEFAULT_CONFIG: dict = {
                  "top_percentile": 95.0, "smooth_window": 5, "dp_m": 0.02, "min_thickness_m": 0.1,
                  "top_variation_m": 0.10, "terrain_radius_m": 0.5},
     },
-    "manhole": {"thickness_m": 0.05},
+    "manhole": {
+        "thickness_m": 0.05,
+        "standard_diameters_m": [0.27, 0.42, 0.62, 0.745, 0.785, 0.85, 0.92, 1.05],
+        "standard_labels": ["Schieberkappe", "Hydrantenkappe", "Deckel LW600-625", "Rahmen LW625 / Trottoirdeckel",
+                            "Rahmen LW600 (Typ Viatop)", "Rahmen LW600 (Typ Pamrex)", "Rahmen LW800", "Betonuntersatz"],
+        "snap_tol_m": 0.08, "snap_tol_small_m": 0.04,
+    },
     "dxf": {
         "local_origin": False, "hatch": False, "contour_major_m": 1.0,
         "contour_minor_m": "auto", "spline_contours": True, "tin_layer_frozen": True,

@@ -153,3 +153,43 @@ def test_curb_axis_within_snap_distance_lies_on_the_outline():
     (curb,), _ = civil.build_civil_elements([_axis(rng, y=0.10)], config=CFG, surface=tin_sampler(tin), pavement=box(-1, -6, 21, 0), outline=OUTLINE)
     assert np.abs(np.asarray(curb.params.axis)[:, 1]).max() < 1e-9              # snapped onto the step line
     assert np.abs(np.asarray(curb.params.axis)[:, 2] - TOP).max() < 1e-6        # so its top is the upper side of the step
+
+
+def _ramp_tin():
+    """Road with a calm part (x < 12) and a ramp part (x > 12) whose surface falls 0.3 m within 0.4 m of the curb (across the gutter strip)."""
+    v = np.array([[-1, -6, 0], [12, -6, 0], [12, 0, 0], [-1, 0, 0],                                   # calm road, z = 0
+                  [12, -0.4, 0], [21, -0.4, -0.3], [21, 0, 0], [12, 0, 0],                             # ramp strip beside the curb
+                  [12, -6, 0], [21, -6, -0.3], [21, -0.4, -0.3], [12, -0.4, 0],                        # road below the ramp
+                  [-1, 0, TOP], [21, 0, TOP], [21, 6, TOP], [-1, 6, TOP]], float)
+    t = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [8, 9, 10], [8, 10, 11], [12, 13, 14], [12, 14, 15]])
+    return SimpleNamespace(vertices=v, triangles=t, labels=np.zeros(len(t), dtype=np.uint8))
+
+
+def test_gutter_is_dropped_where_the_surface_is_a_ramp_not_a_road(tmp_path):
+    """Regression (Wasserstein 5): on a ramp / stair-like surface no draped slab can match the TIN, so only the calm stretch gets a gutter."""
+    rng = np.random.default_rng(47)
+    tin = _ramp_tin()
+    surface = tin_sampler(tin)
+    (curb,), _ = civil.build_civil_elements([_axis(rng)], config=CFG, surface=surface, pavement=box(-1, -6, 21, 0), outline=OUTLINE)
+    p = curb.params
+    assert p.gutter_width > 0 and p.gutter_axis is not None
+    ga = np.asarray(p.gutter_axis)
+    assert 11.0 < ga[:, 0].max() <= 14.5 and ga[:, 0].min() < 0.5      # the calm stretch only (the strip falls > 5 cm across from about x = 14), not the whole curb
+    # IFC + QA: every gutter face centre lies on the surface the QA samples
+    scene = Scene()
+    scene.settings.origin_offset = (E0, N0, H0)
+    scene.add(TerrainElement(params=TerrainParams(vertices=[tuple(a) for a in tin.vertices.tolist()], triangles=[tuple(a) for a in tin.triangles.tolist()])))
+    scene.add(curb)
+    path = tmp_path / "ramp.ifc"
+    write_ifc(scene, path)
+    entities = civil.to_dxf_entities([curb], FRAME, config=CFG)
+    result = DxfPlanResult("t", "site", "outdoor", None, 1.0, Frame(np.zeros(3)), "t", entities, {}, dict.fromkeys(entities, 7),
+                           BackgroundImage(None, None, (E0, N0, E0 + 20, N0 + 20)))
+    dxf = tmp_path / "ramp.dxf"
+    build_dxf_document(result).saveas(dxf)
+    rule = {r["rule"]: r for r in qa_cad.count_consistency(civil.category_counts([curb]), dxf, path)}["19_gutter_curb_flush_with_surface"]
+    assert rule["ok"] and rule["value"]["max_median_gutter_m"] < 0.005, rule
+    # a curb that runs only along the ramp gets no gutter at all
+    ramp_axis = c.CurbAxis(1, np.array([[16.0, 0.0, TOP], [20.0, 0.0, TOP]]), c.Evidence(points=100), foot_z=np.array([0.0, -0.3]), road_side=1, gutter_width=0.30)
+    (bare,), _ = civil.build_civil_elements([ramp_axis], config=CFG, surface=surface, pavement=box(-1, -6, 21, 0), outline=OUTLINE)
+    assert bare.params.gutter_width == 0.0 and bare.evidence["gutter"] == "no calm surface"

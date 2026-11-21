@@ -294,14 +294,15 @@ def _pset(ifc, name="SAMcloud_Tree") -> dict:
 
 def test_ifc_pset_measured_and_not_measured_trunk(tmp_path: Path) -> None:
     measured = _pset(_ifc(tmp_path, [_tree_instance(shape="cone")]))
-    assert measured["CrownShape"] == "cone" and measured["TrunkDiameter"] == pytest.approx(0.35)
-    assert measured["TrunkDiameterMeasured"] is True
-    assert measured["Height"] == pytest.approx(8.4) and measured["CrownDiameter"] == pytest.approx(5.0)
+    assert "CrownShape" not in measured and measured["Stammdurchmesser_m"] == pytest.approx(0.35)
+    assert measured["StammGemessen"] is True
+    assert measured["Hoehe_m"] == pytest.approx(8.4) and measured["Kronendurchmesser_m"] == pytest.approx(5.0)
+    assert not {"Height", "CrownDiameter", "TrunkDiameter"} & set(measured)
     sub = tmp_path / "b"
     sub.mkdir()
     unmeasured = _pset(_ifc(sub, [_tree_instance(shape="cylinder", trunk=None)]))
-    assert unmeasured["TrunkDiameter"] == "nicht gemessen" and unmeasured["TrunkDiameterMeasured"] is False
-    assert unmeasured["Origin_trunk_diameter"] == "assumed"
+    assert unmeasured["Stammdurchmesser_m"] == "nicht gemessen" and unmeasured["StammGemessen"] is False
+    assert _pset(_ifc(sub, [_tree_instance(shape="cylinder", trunk=None)]), "SAMcloud_Herkunft")["Herkunft_trunk_diameter"] == "assumed"
 
 
 def test_tree_element_params_carry_the_fit() -> None:
