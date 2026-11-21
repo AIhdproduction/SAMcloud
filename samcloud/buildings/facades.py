@@ -12,6 +12,10 @@ from shapely.ops import unary_union
 from samcloud.drone.contracts import BuildingModel, FacadePlane
 
 
+GROUP_ANGLE_DEG = 3.0  # coplanar wall faces: normals within this angle
+GROUP_OFFSET_M = 0.10  # ... and plane offsets within this distance
+
+
 @dataclass(frozen=True)
 class FacadeSurface:
     """One coplanar exterior wall in a mesh-aligned ``(u, z)`` frame."""
@@ -38,7 +42,10 @@ def _unit(vector: np.ndarray) -> np.ndarray:
 
 def _canonical_plane(vertices: np.ndarray) -> tuple[np.ndarray, float]:
     """Return a stable vertical plane normal and offset for a wall triangle."""
-    normal = np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])[:2]
+    cross = np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])
+    if float(np.linalg.norm(cross)) <= 1e-10 or float(np.linalg.norm(cross[:2])) <= 1e-10:
+        raise ValueError("degenerate wall triangle")
+    normal = cross[:2]
     normal = _unit(normal)
     if normal[0] < -1e-10 or (abs(normal[0]) <= 1e-10 and normal[1] < 0.0):
         normal = -normal
@@ -80,7 +87,7 @@ def _direction(normal: np.ndarray, plane: FacadePlane | None) -> np.ndarray:
     return direction
 
 
-def _group_wall_faces(model: BuildingModel) -> list[dict]:
+def _group_wall_faces(model: BuildingModel, report: dict | None = None) -> list[dict]:
     vertices = np.asarray(model.vertices, dtype=float)
     faces = np.asarray(model.faces, dtype=int)
     roles = np.asarray(model.face_roles)
@@ -90,12 +97,14 @@ def _group_wall_faces(model: BuildingModel) -> list[dict]:
         try:
             normal, offset = _canonical_plane(triangle)
         except ValueError:
+            if report is not None:
+                report["degenerate_wall_triangles"] = int(report.get("degenerate_wall_triangles", 0)) + 1
             continue
         for group in groups:
-            if degrees(acos(float(np.clip(abs(group["normal"] @ normal), -1.0, 1.0)))) >= 1.0:
+            if degrees(acos(float(np.clip(abs(group["normal"] @ normal), -1.0, 1.0)))) >= GROUP_ANGLE_DEG:
                 continue
             aligned_offset = offset if float(group["normal"] @ normal) >= 0 else -offset
-            if abs(group["offset"] - aligned_offset) < 0.01:
+            if abs(group["offset"] - aligned_offset) < GROUP_OFFSET_M:
                 group["faces"].append(int(index))
                 group["vertices"].append(triangle)
                 raw = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])[:2]
@@ -108,10 +117,12 @@ def _group_wall_faces(model: BuildingModel) -> list[dict]:
     return groups
 
 
-def facade_surfaces(model: BuildingModel, facades: list[FacadePlane]) -> list[FacadeSurface]:
+def facade_surfaces(model: BuildingModel, facades: list[FacadePlane], *, report: dict | None = None) -> list[FacadeSurface]:
     """Return one mesh-exact surface for each coplanar LoD2 wall face group."""
     surfaces: list[FacadeSurface] = []
-    for group in _group_wall_faces(model):
+    if report is not None:
+        report.setdefault("degenerate_wall_triangles", 0)
+    for group in _group_wall_faces(model, report):
         vertices = np.concatenate(group["vertices"], axis=0)
         plane = _match_plane(group["normal"], group["offset"], facades)
         direction = _direction(group["normal"], plane)
@@ -127,7 +138,9 @@ def facade_surfaces(model: BuildingModel, facades: list[FacadePlane]) -> list[Fa
             if not polygons:
                 continue
             merged = max(polygons, key=lambda item: item.area)
-        outward = _unit(np.mean(group["outward"], axis=0))
+        mean_outward = np.mean(group["outward"], axis=0)
+        # Opposite-facing coplanar roof-step walls can cancel; keep the first normal then.
+        outward = _unit(mean_outward if float(np.linalg.norm(mean_outward)) > 1e-6 else group["outward"][0])
         surfaces.append(FacadeSurface(
             building_id=model.building_id,
             facade_index=len(surfaces),

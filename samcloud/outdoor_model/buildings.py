@@ -10,6 +10,7 @@ from samcloud.bim.core.model import (
     ParamOrigin, Status, WallElement, WallFunction, WallJustification, WallParams,
     WindowElement, WindowParams,
 )
+from samcloud.buildings.facades import facade_surfaces
 from samcloud.drone.contracts import BuildingModel, LocalFrame, Opening, QAEntry
 
 LAYER_BUILDING = "S-BLDG"
@@ -22,46 +23,78 @@ def _status(value: str) -> Status:
     return {"ok": Status.OK, "lod1_fallback": Status.WARNING}.get(value, Status.FAIL)
 
 
-def _facade_axes(model: BuildingModel, facades) -> list[tuple[np.ndarray, np.ndarray, float]]:
-    """Return stable facade segments, favouring supplied fitted facade surfaces."""
-    result: list[tuple[np.ndarray, np.ndarray, float]] = []
-    for facade in facades or ():
-        segment = getattr(facade, "segment", None)
-        if segment is not None and len(segment.coords) >= 2:
-            a, b = np.asarray(segment.coords[0], float), np.asarray(segment.coords[-1], float)
-            if np.linalg.norm(b - a) > 1e-6:
-                result.append((a, b, float(getattr(facade, "z_min", np.min(model.vertices[:, 2])))))
-    if result:
-        return result
-    vertices, faces, roles = np.asarray(model.vertices, float), np.asarray(model.faces, int), np.asarray(model.face_roles)
-    edges: dict[tuple[int, int], int] = {}
-    for face, role in zip(faces, roles, strict=True):
-        if role != 1:
+MIN_FACADE_LENGTH = 0.5  # shorter wall pieces (stair-step risers) are merged into their neighbour
+
+
+def _facade_surface_list(model: BuildingModel, facades) -> list:
+    """Return mesh-exact facade surfaces (one per coplanar LoD2 wall face group)."""
+    given = [f for f in (facades or ()) if hasattr(f, "direction_xy") and hasattr(f, "face_indices")]
+    if given:
+        return given
+    try:
+        return facade_surfaces(model, [])
+    except Exception:  # noqa: BLE001 - a bad wall mesh must not drop the building
+        return []
+
+
+def _merge_small_surfaces(model: BuildingModel, surfaces: list, protected: set[int]) -> list[tuple[object, list[int], int]]:
+    """Group surfaces into walls: ``(primary surface, face indices, member surface positions)``.
+
+    Pieces shorter than ``MIN_FACADE_LENGTH`` that host no opening join the longest touching surface.
+    """
+    faces = np.asarray(model.faces, int)
+    verts = [set(int(v) for i in s.face_indices for v in faces[i]) for s in surfaces]
+    target = list(range(len(surfaces)))
+    for pos, surface in enumerate(surfaces):
+        if pos in protected or float(surface.length) >= MIN_FACADE_LENGTH:
             continue
-        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-            key = tuple(sorted((int(a), int(b))))
-            edges[key] = edges.get(key, 0) + 1
-    for (i, j), count in edges.items():
-        a, b = vertices[i], vertices[j]
-        if count == 1 and abs(a[2] - b[2]) < 0.15 and np.linalg.norm(a[:2] - b[:2]) > 0.1:
-            result.append((a[:2], b[:2], float(min(a[2], b[2]))))
+        best = None
+        for other, osurf in enumerate(surfaces):
+            if other == pos or float(osurf.length) < MIN_FACADE_LENGTH or not (verts[pos] & verts[other]):
+                continue
+            if best is None or osurf.length > surfaces[best].length:
+                best = other
+        if best is not None:
+            target[pos] = best
+    groups: dict[int, list[int]] = {}
+    for pos, primary in enumerate(target):
+        groups.setdefault(primary, []).append(pos)
+    result = []
+    for primary, members in groups.items():
+        indices = sorted({int(i) for m in members for i in surfaces[m].face_indices})
+        result.append((surfaces[primary], indices, members))
     return result
 
 
-def _wall_elements(model: BuildingModel, facades) -> tuple[list[WallElement], list[tuple[np.ndarray, np.ndarray, float]]]:
-    axes = _facade_axes(model, facades)
-    height = max(float(np.ptp(model.vertices[:, 2])), 0.1)
+def _wall_elements(model: BuildingModel, facades, protected: set[int] | None = None) -> tuple[list[WallElement], dict[int, int]]:
+    """One WallElement per facade plane; returns the walls and a surface-position -> wall-index map."""
+    surfaces = _facade_surface_list(model, facades)
+    vertices = np.asarray(model.vertices, float)
+    faces = np.asarray(model.faces, int)
     walls: list[WallElement] = []
-    for index, (a, b, base) in enumerate(axes):
+    index_map: dict[int, int] = {}
+    for primary, indices, members in _merge_small_surfaces(model, surfaces, protected or set()):
+        pts = vertices[faces[indices].ravel()]
+        z_min, z_max = float(pts[:, 2].min()), float(pts[:, 2].max())
+        direction = np.asarray(primary.direction_xy, float)
+        origin = np.asarray(primary.origin_xy, float)
+        length = max(float(primary.length), float(((pts[:, :2] - origin) @ direction).max()))
+        if length <= 1e-6:
+            continue
+        index = len(walls)
+        for member in members:
+            index_map[member] = index
         walls.append(WallElement(
             id=f"building-{model.building_id}-facade-{index}", name=f"Building {model.building_id} facade {index}",
             building_id=f"building-{model.building_id}", params=WallParams(
-                start=tuple(a), end=tuple(b), thickness=0.20, height=height, base_offset=base,
+                start=tuple(float(v) for v in origin), end=tuple(float(v) for v in origin + direction * length),
+                thickness=0.20, height=max(z_max - z_min, 0.1), base_offset=z_min,
                 justification=WallJustification.CENTER, function=WallFunction.EXTERIOR,
             ), param_origin={"start": ParamOrigin.FITTED, "end": ParamOrigin.FITTED, "thickness": ParamOrigin.ASSUMED,
-                           "height": ParamOrigin.FITTED, "base_offset": ParamOrigin.FITTED}, status=_status(model.status),
+                           "height": ParamOrigin.FITTED, "base_offset": ParamOrigin.FITTED},
+            evidence={"face_indices": indices}, status=_status(model.status),
         ))
-    return walls, axes
+    return walls, index_map
 
 
 def build_building_elements(
@@ -96,22 +129,23 @@ def build_building_elements(
         building.metrics.deviation_rms = model.rmse
         building.metrics.coverage = model.coverage
         elements.append(building)
-        walls, axes = _wall_elements(model, (facades_by_building or {}).get(bid, ()))
+        hosting = {int(o.facade_index) for o in (openings_by_building or {}).get(bid, ()) if o.facade_index >= 0}
+        walls, index_map = _wall_elements(model, (facades_by_building or {}).get(bid, ()), hosting)
         elements.extend(walls)
         for ordinal, opening in enumerate((openings_by_building or {}).get(bid, ())):
             oid = f"building-{bid}-opening-{ordinal}"
             if opening.status not in ("ok", "warning") or opening.u1 <= opening.u0 or opening.z1 <= opening.z0:
                 qa.append(QAEntry("opening", oid, opening.reason or "rejected opening"))
                 continue
-            if opening.facade_index < 0 or opening.facade_index >= len(walls):
+            if opening.facade_index not in index_map:
                 qa.append(QAEntry("opening", oid, "facade index has no host wall"))
                 continue
             width, height = float(opening.u1 - opening.u0), float(opening.z1 - opening.z0)
-            host = walls[opening.facade_index]
+            host = walls[index_map[opening.facade_index]]
             opening_el = OpeningElement(
                 id=oid, name=f"{opening.kind} opening", building_id=host.building_id,
                 params=OpeningParams(host_wall_id=host.id, position_along_axis=max(0.0, float(opening.u0)), width=width,
-                                     height=height, sill_height=max(0.0, float(opening.z0 - axes[opening.facade_index][2])),
+                                     height=height, sill_height=max(0.0, float(opening.z0 - host.params.base_offset)),
                                      reveal_depth=host.params.thickness),
                 param_origin={"host_wall_id": ParamOrigin.FITTED, "position_along_axis": ParamOrigin.FITTED,
                               "width": ParamOrigin.FITTED, "height": ParamOrigin.FITTED, "sill_height": ParamOrigin.FITTED,

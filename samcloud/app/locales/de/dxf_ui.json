@@ -1,7 +1,8 @@
 {
   "unavailable": {
     "no_project": "Zuerst ein Projekt öffnen",
-    "not_classified": "Zuerst die Punktwolke klassifizieren"
+    "not_classified": "Zuerst die Punktwolke klassifizieren",
+    "flurseg": "DXF/IFC nur mit SAM3"
   },
   "source": {
     "none": "keine Punktwolke gefunden",
@@ -48,7 +49,8 @@
     "unknown_layer": "Unbekannter Layer '{layer}'",
     "z_band_order": "Beim Höhenband muss der untere Wert kleiner als der obere sein",
     "no_cached_plan": "Für dieses Ziel gibt es keinen gespeicherten DXF-Plan. Zuerst berechnen.",
-    "png_encoding_failed": "PNG-Kodierung des Schnappschusses ist fehlgeschlagen"
+    "png_encoding_failed": "PNG-Kodierung des Schnappschusses ist fehlgeschlagen",
+    "environment_running": "Die Umgebungsberechnung läuft bereits."
   },
   "review_canvas": {
     "hint": "Mausrad: Zoom · Ziehen: Verschieben · H halten: DXF ausblenden",

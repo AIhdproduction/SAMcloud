@@ -166,11 +166,31 @@ def prepare_points(project_dir: Path, max_points: int, progress: ProgressFn, che
     progress(0.0, "Punktwolke laden")
     points = load_classified_pointset(project_dir / "products", class_set=class_set)
     check()
+    points = _clip_to_boundary(project_dir, points)
     original = len(points)
     progress(0.5, f"{original:,} Punkte, Ausdünnen".replace(",", "'"))
     points = thin_points(points, max_points, check=check)
     progress(1.0, f"{len(points):,} Punkte".replace(",", "'"))
     return points, original
+
+
+def _clip_to_boundary(project_dir: Path, points: PointSet) -> PointSet:
+    """Outdoor/drone projects with a processing boundary: keep only points inside it (raw cloud unchanged on any problem).
+
+    Clips in memory instead of reading ``classified_clipped.ply`` so confidence/margin/view_count, which are matched to
+    the full PLY by length, are kept.
+    """
+    try:
+        from samcloud.drone import frames, perimeter
+
+        polygon = perimeter.clip_polygon_lv95(project_dir)
+        if polygon is None:
+            return points
+        mask = perimeter.inside_mask_enu(points.xyz, frames.project_georeference(project_dir), polygon)
+    except Exception as error:
+        logging.getLogger(__name__).warning("share: boundary clip skipped: %s", error)
+        return points
+    return points.subset(mask) if mask.any() else points
 
 
 def _class_set(project_dir: Path) -> str:

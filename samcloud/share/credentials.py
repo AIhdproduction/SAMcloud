@@ -68,10 +68,29 @@ def _restrict(path: Path) -> None:
         user = os.environ.get("USERNAME")
         if user:
             try:
-                subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
+                subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(F)"],
                                capture_output=True, check=False, timeout=15, creationflags=0x08000000)
             except (OSError, subprocess.SubprocessError):
                 LOGGER.info("could not restrict permissions of the credentials file")
+
+
+def _regrant(path: Path) -> None:
+    """Restore full owner rights on a file written with an older, too narrow ACL."""
+    if os.name == "nt":
+        import subprocess
+
+        user = os.environ.get("USERNAME")
+        if user:
+            try:
+                subprocess.run(["icacls", str(path), "/grant:r", f"{user}:(F)"],
+                               capture_output=True, check=False, timeout=15, creationflags=0x08000000)
+            except (OSError, subprocess.SubprocessError):
+                LOGGER.info("could not regrant permissions of the credentials file")
+    else:
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
 
 
 def save_credentials(values: dict[str, Any]) -> Path:
@@ -81,7 +100,12 @@ def save_credentials(values: dict[str, Any]) -> Path:
         raise ValueError("incomplete credentials")
     path = credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    text = yaml.safe_dump(data, sort_keys=False)
+    try:
+        path.write_text(text, encoding="utf-8")
+    except PermissionError:
+        _regrant(path)
+        path.write_text(text, encoding="utf-8")
     _restrict(path)
     return path
 
@@ -90,7 +114,11 @@ def delete_credentials() -> bool:
     """Remove the credentials file; False when none existed."""
     path = credentials_path()
     if path.is_file():
-        path.unlink()
+        try:
+            path.unlink()
+        except PermissionError:
+            _regrant(path)
+            path.unlink()
         return True
     return False
 

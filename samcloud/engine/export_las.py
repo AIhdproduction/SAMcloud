@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from samcloud.pointcloud.georeference import (
 from samcloud.classification.profiles import NEVER_CLASSIFIED_ID, profile_for_engine, write_profile_sidecar
 from samcloud.classification.custom import migrate_classes_config
 
+LOGGER = logging.getLogger(__name__)
 
 PLY_DTYPE = np.dtype(
     [
@@ -133,11 +135,14 @@ def export_las(
     engine: str = "sam3",
     *,
     extra_dims: dict[str, np.ndarray] | None = None,
+    clip_polygon_lv95=None,
 ) -> int:
     """Write a classified PLY as LAS 1.4 (LAZ when ``output_path`` ends with ``.laz``).
 
     ``extra_dims`` maps names to per-point arrays (PLY order) written as extra bytes
     (float -> float32, ints -> uint16/uint32, bool -> uint8).
+    ``clip_polygon_lv95`` (shapely geometry in LV95 E/N) keeps only points inside it; the source PLY is never modified.
+    Returns the number of points written.
     """
     payload_offset, vertex_count = read_ply_header(input_path)
     extra_arrays = _prepare_extra_dims(extra_dims, vertex_count)
@@ -185,11 +190,26 @@ def export_las(
     if str(output_path).lower().endswith(".laz"):
         open_kwargs = {"do_compress": True, "laz_backend": laspy.LazBackend.Lazrs}
     written = 0
+    consumed = 0
+    clip_warned = False
     with input_path.open("rb") as source, laspy.open(output_path, mode="w", header=header, **open_kwargs) as destination:
         for points in _ply_chunks(source, payload_offset, vertex_count, chunk_size):
+            raw_xyz = np.column_stack((points["x"], points["y"], points["z"]))
+            xyz = _transform_xyz(raw_xyz, transformer, georeference, target_crs)
+            keep = None
+            if clip_polygon_lv95 is not None:
+                keep = _clip_keep_mask(raw_xyz, xyz, georeference, source_crs, target_crs, clip_polygon_lv95)
+                if keep is None and not clip_warned:
+                    LOGGER.warning("no LV95 position available for the clip boundary; %s stays unclipped", output_path)
+                    clip_warned = True
+            chunk_extras = {name: array[consumed:consumed + len(points)] for name, array in extra_arrays.items()}
+            consumed += len(points)
+            if keep is not None:
+                points, xyz = points[keep], xyz[keep]
+                chunk_extras = {name: array[keep] for name, array in chunk_extras.items()}
             count = len(points)
-            xyz = np.column_stack((points["x"], points["y"], points["z"]))
-            xyz = _transform_xyz(xyz, transformer, georeference, target_crs)
+            if count == 0:
+                continue
 
             las_points = laspy.ScaleAwarePointRecord.zeros(count, header=header)
             las_points.x = xyz[:, 0]
@@ -211,8 +231,8 @@ def export_las(
                 las_points.fine_term = points["fine_term"]
             if has_instance_id:
                 las_points.instance_id = points["instance_id"]
-            for name, array in extra_arrays.items():
-                setattr(las_points, name, array[written:written + count])
+            for name, array in chunk_extras.items():
+                setattr(las_points, name, array)
             written += count
             destination.write_points(las_points)
 
@@ -222,7 +242,50 @@ def export_las(
         print(f"Georeference residuals: {format_residuals(georeference)}")
     print(f"Export height system: {export_height_system(target_crs)}")
 
-    return vertex_count
+    if clip_polygon_lv95 is not None:
+        print(f"Clipped to processing boundary: {written:,} of {vertex_count:,} points kept")
+    return written
+
+
+def _clip_keep_mask(raw_xyz, transformed, georeference, source_crs: str, target_crs: str, polygon) -> np.ndarray | None:
+    """Mask of chunk points inside the LV95 ``polygon``; ``None`` when no LV95 position can be derived."""
+    from shapely import contains_xy
+
+    if target_crs.upper().startswith("EPSG:2056"):
+        xy = transformed[:, :2]
+    elif source_crs.upper().startswith("EPSG:2056") and georeference is None:
+        xy = raw_xyz[:, :2]
+    elif georeference is not None:
+        xy = enu_to_target(raw_xyz, georeference, "EPSG:2056")[:, :2]
+    else:
+        return None
+    return np.asarray(contains_xy(polygon, xy[:, 0].astype(np.float64), xy[:, 1].astype(np.float64)), bool)
+
+
+def clip_ply(input_path: Path, output_path: Path, keep_fn, chunk_size: int = 1_000_000) -> tuple[int, int]:
+    """Stream a binary PLY into ``output_path`` keeping the vertices for which ``keep_fn(xyz_float64) -> bool mask`` is true.
+
+    The vertex layout (all properties, e.g. ``instance_id``/``fine_term``) is preserved byte for byte; the source is
+    only read. Returns ``(points_before, points_after)``.
+    """
+    payload_offset, vertex_count = read_ply_header(input_path)
+    with input_path.open("rb") as probe:
+        header = probe.read(payload_offset).decode("ascii")
+    if "property list" in header:
+        raise ValueError("PLY with list properties cannot be clipped")
+    masks: list[np.ndarray] = []
+    with input_path.open("rb") as source:
+        for points in _ply_chunks(source, payload_offset, vertex_count, chunk_size):
+            xyz = np.column_stack((points["x"], points["y"], points["z"])).astype(np.float64)
+            masks.append(np.asarray(keep_fn(xyz), bool))
+    kept = int(sum(int(mask.sum()) for mask in masks))
+    lines = [f"element vertex {kept}" if line.split()[:2] == ["element", "vertex"] else line for line in header.split("\n")]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with input_path.open("rb") as source, output_path.open("wb") as destination:
+        destination.write("\n".join(lines).encode("ascii"))
+        for points, mask in zip(_ply_chunks(source, payload_offset, vertex_count, chunk_size), masks):
+            destination.write(points[mask].tobytes())
+    return vertex_count, kept
 
 
 def _prepare_extra_dims(extra_dims: dict[str, np.ndarray] | None, count: int) -> dict[str, np.ndarray]:
@@ -380,6 +443,17 @@ def _las_scales(target_crs: str) -> np.ndarray:
     return np.array([0.001, 0.001, 0.001])
 
 
+def _load_clip_geojson(path: Path | None):
+    """Union of all geometries of a GeoJSON file, or ``None`` without a path."""
+    if path is None:
+        return None
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    return unary_union([shape(feature["geometry"]) for feature in document.get("features", []) if feature.get("geometry")])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export a classified PLY as LAS 1.4")
     parser.add_argument("--input", required=True, type=Path, help="classified PLY with scalar_class")
@@ -393,6 +467,8 @@ def main() -> None:
     parser.add_argument("--georeference", type=Path, default=None,
                         help="ENU-to-ECEF georeference JSON for LOCAL GPS-aligned projects")
     parser.add_argument("--chunk-size", type=int, default=1_000_000, help="points written per batch")
+    parser.add_argument("--clip-geojson", type=Path, default=None,
+                        help="LV95 boundary GeoJSON; only points inside it are written (outdoor/drone projects)")
     args = parser.parse_args()
 
     if args.chunk_size < 1:
@@ -407,6 +483,7 @@ def main() -> None:
         args.class_set,
         args.georeference,
         args.engine,
+        clip_polygon_lv95=_load_clip_geojson(args.clip_geojson),
     )
     print(f"Wrote {count:,} classified points to {args.output}")
 

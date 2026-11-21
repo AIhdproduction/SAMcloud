@@ -294,3 +294,50 @@ def lv95_sample_check(ps_local: PointSet | np.ndarray, laz_path: Path | str, fra
     ok = err < tol_m
     return {"ok": bool(ok), "reason": "ok" if ok else f"max deviation {err:.4f} m >= {tol_m} m",
             "n": int(len(pick)), "max_err_m": err}
+
+
+# ----------------------------------------------------------------------------------------
+# clipped copy of the classified cloud for the viewer (raw classified.ply stays untouched)
+# ----------------------------------------------------------------------------------------
+
+CLIPPED_PLY_NAME = "classified_clipped.ply"
+
+
+def ensure_clipped_classified_ply(project_dir: Path | str, config: dict | None = None) -> Path | None:
+    """Boundary-clipped copy ``products/classified/classified_clipped.ply`` for outdoor/drone projects.
+
+    ``classified.ply`` (COLMAP ENU frame) is the raw pipeline output and is only read. The copy keeps all vertex
+    properties; the boundary (LV95, ``products/environment/boundary.geojson``) is applied through the project
+    georeference, so the ENU/LV95 rotation is honoured. Rebuilt when the source, the boundary or the georeference
+    changes. Returns ``None`` when no clipping applies (indoor, switch off, no boundary/georeference, errors).
+    """
+    import hashlib
+
+    from samcloud.drone import frames, perimeter
+    from samcloud.engine.export_las import clip_ply
+
+    project = Path(project_dir)
+    polygon = perimeter.clip_polygon_lv95(project, config)
+    source = project / "products" / "classified" / "classified.ply"
+    if polygon is None or not source.is_file() or source.stat().st_size == 0:
+        return None
+    target = source.with_name(CLIPPED_PLY_NAME)
+    sidecar = target.with_suffix(".json")
+    boundary_file = project / perimeter.BOUNDARY_GEOJSON
+    georef_file = project / "products" / "georeference.json"
+    signature = {
+        "source_size": source.stat().st_size, "source_mtime_ns": source.stat().st_mtime_ns,
+        "boundary": hashlib.sha1(boundary_file.read_bytes()).hexdigest(),
+        "georeference": hashlib.sha1(georef_file.read_bytes()).hexdigest() if georef_file.is_file() else None,
+    }
+    try:
+        if target.is_file() and sidecar.is_file() and json.loads(sidecar.read_text(encoding="utf-8")).get("signature") == signature:
+            return target
+        georef = frames.project_georeference(project)
+        before, after = clip_ply(source, target, lambda xyz: perimeter.inside_mask_enu(xyz, georef, polygon))
+    except Exception as error:  # the viewer then shows the unclipped cloud rather than failing
+        logger.warning("could not clip %s to the processing boundary: %s", source, error)
+        return None
+    sidecar.write_text(json.dumps({"signature": signature, "points_before": before, "points_after": after}), encoding="utf-8")
+    logger.info("clipped classified cloud for the viewer: %d -> %d points", before, after)
+    return target

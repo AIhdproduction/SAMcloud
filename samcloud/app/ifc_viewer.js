@@ -14,6 +14,7 @@ export default {
     src: String,
     hiddenClasses: Array,
     classByNode: Object,
+    categoryColors: Object,
     clipHeight: Number,
     background: Array,
     selected: String,
@@ -54,6 +55,9 @@ export default {
     classByNode() {
       this.indexElements();
       this.applyVisibility();
+    },
+    categoryColors() {
+      this.applyColors();
     },
     clipHeight() {
       this.applyClip();
@@ -102,6 +106,10 @@ export default {
       this.controls = new this.OrbitControls(this.camera, this.renderer.domElement);
       this.controls.enableDamping = false;
       this.controls.addEventListener("change", () => this.requestDraw());
+      this.userMoved = false;
+      this.controls.addEventListener("start", () => {
+        this.userMoved = true;
+      });
       this.raycaster = new THREE.Raycaster();
       this.pointerDown = null;
       const dom = this.renderer.domElement;
@@ -175,6 +183,8 @@ export default {
       this.renderer.domElement.style.height = height + "px";
       this.camera.aspect = width / height;
       this.camera.updateProjectionMatrix();
+      // Until the user has moved the camera, keep the model framed when the canvas size settles or changes.
+      if (this.ready && !this.userMoved) this.fit(true);
       this.requestDraw();
     },
     requestDraw() {
@@ -231,6 +241,8 @@ export default {
       this.applyVisibility();
       this.applyClip();
       this.message = "";
+      this.userMoved = false;
+      this.resize();
       this.fit();
       this.ready = true;
       const box = this.visibleBox();
@@ -292,6 +304,31 @@ export default {
       if (this.modelRoot) for (const child of this.modelRoot.children) walk(child, null);
       for (const element of found) this.applyGlass(element);
       this.elements = found;
+      this.applyColors();
+    },
+    applyColors() {
+      // Outdoor view: one flat colour per category instead of the GLB material colours.
+      const colors = this.categoryColors || {};
+      if (!this.elements || Object.keys(colors).length === 0) return;
+      for (const element of this.elements) {
+        const hex = colors[element.category];
+        if (!hex) continue;
+        for (const mesh of element.meshes) {
+          if (mesh.geometry && mesh.geometry.attributes.color) mesh.geometry.deleteAttribute("color");
+          const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          for (const material of materials) {
+            material.vertexColors = false;
+            material.color.set(hex);
+            if (material.metalness !== undefined) material.metalness = 0;
+            if (material.roughness !== undefined) material.roughness = 0.9;
+            material.side = this.THREE.DoubleSide;
+            material.userData.baseColor = material.color.getHex();
+            material.userData.baseSide = this.THREE.DoubleSide;
+            material.needsUpdate = true;
+          }
+        }
+      }
+      this.requestDraw();
     },
     applyGlass(element) {
       const cls = element.ifcClass || element.category;
@@ -351,7 +388,9 @@ export default {
       }
       return box;
     },
-    fit() {
+    fit(keepAngle) {
+      // Frame the bounding box of the visible elements: project its 8 corners and iteratively re-centre the
+      // projected extent and scale the distance, so wide, narrow or tall canvases all end up centred.
       if (!this.camera || !this.modelRoot) return;
       const THREE = this.THREE;
       const box = this.visibleBox();
@@ -359,13 +398,55 @@ export default {
       const center = box.getCenter(new THREE.Vector3());
       const size = box.getSize(new THREE.Vector3());
       const radius = Math.max(size.length() / 2, 0.5);
-      const distance = radius / Math.sin((this.camera.fov * Math.PI) / 360);
-      const direction = new THREE.Vector3(1, 0.8, 1).normalize();
-      this.camera.position.copy(center).addScaledVector(direction, distance);
-      this.camera.near = Math.max(distance / 500, 0.01);
-      this.camera.far = distance * 20;
-      this.camera.updateProjectionMatrix();
-      this.controls.target.copy(center);
+      const camera = this.camera;
+      let direction = new THREE.Vector3(1, 0.75, 1.15).normalize();
+      if (keepAngle && this.controls) {
+        const current = camera.position.clone().sub(this.controls.target);
+        if (current.lengthSq() > 1e-9) direction = current.normalize();
+      }
+      const corners = [];
+      for (const x of [box.min.x, box.max.x]) {
+        for (const y of [box.min.y, box.max.y]) {
+          for (const z of [box.min.z, box.max.z]) corners.push(new THREE.Vector3(x, y, z));
+        }
+      }
+      const margin = 0.88;
+      const target = center.clone();
+      let distance = radius / Math.sin((camera.fov * Math.PI) / 360);
+      camera.far = Math.max(distance * 40, 100);
+      for (let step = 0; step < 6; step += 1) {
+        camera.position.copy(target).addScaledVector(direction, distance);
+        camera.near = Math.max(distance / 500, 0.01);
+        camera.lookAt(target);
+        camera.updateProjectionMatrix();
+        camera.updateMatrixWorld(true);
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (const corner of corners) {
+          const ndc = corner.clone().project(camera);
+          minX = Math.min(minX, ndc.x);
+          maxX = Math.max(maxX, ndc.x);
+          minY = Math.min(minY, ndc.y);
+          maxY = Math.max(maxY, ndc.y);
+        }
+        const midX = (minX + maxX) / 2;
+        const midY = (minY + maxY) / 2;
+        const extent = Math.max((maxX - minX) / 2, (maxY - minY) / 2, 1e-6);
+        const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+        const up = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+        const halfHeight = Math.tan((camera.fov * Math.PI) / 360) * distance;
+        target.addScaledVector(right, midX * halfHeight * camera.aspect);
+        target.addScaledVector(up, midY * halfHeight);
+        distance = Math.max(distance * (extent / margin), 0.05);
+      }
+      camera.position.copy(target).addScaledVector(direction, distance);
+      camera.near = Math.max(distance / 500, 0.01);
+      camera.far = Math.max(distance * 40, 100);
+      camera.lookAt(target);
+      camera.updateProjectionMatrix();
+      this.controls.target.copy(target);
       this.controls.update();
       this.requestDraw();
     },

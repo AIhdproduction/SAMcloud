@@ -1,0 +1,35 @@
+# Single source of truth for outdoor/drone category styling.
+# One layer + one colour per category, shared by the outdoor IFC (IfcPresentationLayerAssignment +
+# IfcSurfaceStyle), the outdoor DXF (layer true colour, entities BYLAYER) and the app's IFC viewer
+# (samcloud/bim/ui_data.py OUTDOOR_COLORS). Loader: samcloud/outdoor_model/style.py.
+#
+# Fields per category:
+#   label         German display name
+#   layer         layer name, identical in IFC and DXF
+#   rgb           true colour [r, g, b]
+#   aci           AutoCAD colour index used as DXF fallback
+#   transparency  0 = opaque .. 1 = invisible (IFC surface style)
+#   ifc           false = DXF-only category (never written to IFC)
+#
+# Palette: calm and distinguishable, based on the outdoor viewer colours (Okabe-Ito inspired).
+categories:
+  terrain:        {label: Gelände,        layer: S-TOPO-TIN,   rgb: [181, 181, 122], aci: 53,  transparency: 0.0}
+  road:           {label: Strasse,        layer: S-PAVE,       rgb: [125, 133, 144], aci: 8,   transparency: 0.0}
+  path:           {label: Weg,            layer: S-PATH,       rgb: [168, 159, 145], aci: 252, transparency: 0.0}
+  sidewalk:       {label: Trottoir,       layer: S-WALK,       rgb: [195, 200, 207], aci: 9,   transparency: 0.0}
+  lawn:           {label: Rasen,          layer: S-VEG,        rgb: [120, 184, 72],  aci: 73,  transparency: 0.0}
+  curb:           {label: Randstein,      layer: S-CURB,       rgb: [74, 79, 87],    aci: 137, transparency: 0.0}
+  building_wall:  {label: Gebäude-Wand,   layer: S-BLDG,       rgb: [227, 207, 168], aci: 41,  transparency: 0.0}
+  roof:           {label: Dach,           layer: S-BLDG-ROOF,  rgb: [200, 100, 60],  aci: 23,  transparency: 0.0}
+  window:         {label: Fenster,        layer: S-BLDG-WIND,  rgb: [159, 211, 240], aci: 141, transparency: 0.4}
+  door:           {label: Tür,            layer: S-BLDG-DOOR,  rgb: [90, 58, 34],    aci: 37,  transparency: 0.0}
+  site_wall:      {label: Mauer,          layer: S-WALL,       rgb: [138, 98, 68],   aci: 35,  transparency: 0.0}
+  fence:          {label: Zaun,           layer: S-FENC,       rgb: [168, 121, 74],  aci: 33,  transparency: 0.0}
+  tree:           {label: Baum,           layer: S-TREE,       rgb: [47, 143, 78],   aci: 105, transparency: 0.0}
+  shrub:          {label: Busch,          layer: S-SHRUB,      rgb: [143, 207, 122], aci: 81,  transparency: 0.0}
+  manhole:        {label: Schacht,        layer: S-MANH,       rgb: [59, 130, 196],  aci: 153, transparency: 0.0}
+  marking:        {label: Markierung,     layer: S-MARK,       rgb: [255, 255, 255], aci: 7,   transparency: 0.0}
+  contour_major:  {label: Höhenlinie Haupt, layer: S-TOPO-MAJR, rgb: [150, 60, 40],  aci: 34,  transparency: 0.0, ifc: false}
+  contour_minor:  {label: Höhenlinie Neben, layer: S-TOPO-MINR, rgb: [190, 140, 100], aci: 43, transparency: 0.0, ifc: false}
+  spot_elevation: {label: Kote,           layer: S-ELEV,       rgb: [0, 0, 0],       aci: 7,   transparency: 0.0, ifc: false}
+  boundary:       {label: Grenze,         layer: S-ANNO-GRENZE, rgb: [220, 30, 30],  aci: 1,   transparency: 0.0, ifc: false}

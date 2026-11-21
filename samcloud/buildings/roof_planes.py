@@ -119,6 +119,118 @@ def detect_roof_planes(
     return result
 
 
+def merge_coplanar_planes(planes: list[RoofPlane], samples: np.ndarray, *, normal_deg: float = 4.0, offset_m: float = 0.15) -> list[RoofPlane]:
+    """Merge planes whose normals differ < ``normal_deg`` and whose heights differ < ``offset_m``.
+
+    One roof face split by noise or by an occluding feature becomes one plane again,
+    refitted on the union of both supports.
+    """
+    planes = list(planes)
+    cosine = math.cos(math.radians(normal_deg))
+    changed = True
+    while changed and len(planes) > 1:
+        changed = False
+        for first in range(len(planes)):
+            for second in range(first + 1, len(planes)):
+                a, b = planes[first], planes[second]
+                if float(np.asarray(a.normal) @ np.asarray(b.normal)) < cosine:
+                    continue
+                union = np.unique(np.concatenate((np.asarray(a.inliers, dtype=int), np.asarray(b.inliers, dtype=int))))
+                points = samples[union]
+                height_a = -(points[:, :2] @ np.asarray(a.normal[:2]) + a.d) / a.normal[2]
+                height_b = -(points[:, :2] @ np.asarray(b.normal[:2]) + b.d) / b.normal[2]
+                if float(np.mean(np.abs(height_a - height_b))) >= offset_m:
+                    continue
+                normal, d, residual = _fit_plane(points)
+                outline = _outline(points)
+                planes[first] = RoofPlane(
+                    normal=normal, d=d, inliers=union, rmse=float(np.sqrt(np.mean(residual ** 2))), outline=outline,
+                    slope_deg=math.degrees(math.acos(float(np.clip(normal[2], -1.0, 1.0)))),
+                )
+                planes.pop(second)
+                changed = True
+                break
+            if changed:
+                break
+    return planes
+
+
+def detect_raster_roof_planes(
+    xyz: np.ndarray,
+    *,
+    min_plane_area_m2: float = 4.0,
+    inlier_tolerance_m: float = 0.08,
+    cell_area_m2: float = 0.01,
+    max_planes: int = 12,
+    merge_normal_deg: float = 4.0,
+    merge_offset_m: float = 0.15,
+) -> list[RoofPlane]:
+    """Fit the dominant roof faces from measured DSM cells.
+
+    The DSM is a regular 2.5D observation, so sequential RANSAC is both more
+    stable than point-cloud normal growing and naturally rejects sparse facade
+    returns.  ``inliers`` deliberately index ``xyz``; callers can pass the
+    same raster support directly to partition labelling and validation.
+    """
+    samples = np.asarray(xyz, dtype=float)
+    samples = samples[np.isfinite(samples).all(axis=1)]
+    if len(samples) < 12 or cell_area_m2 <= 0:
+        return []
+    minimum = max(12, int(math.ceil(float(min_plane_area_m2) / float(cell_area_m2))))
+    if len(samples) < minimum:
+        return []
+    rng = np.random.default_rng(20261121)
+    remaining = np.arange(len(samples), dtype=int)
+    result: list[RoofPlane] = []
+    for _plane_index in range(max_planes):
+        if len(remaining) < minimum:
+            break
+        active = samples[remaining]
+        best: np.ndarray | None = None
+        trials = min(640, max(128, len(active) // 8))
+        for _trial in range(trials):
+            choice = rng.choice(len(active), size=3, replace=False)
+            seed = active[choice]
+            normal = np.cross(seed[1] - seed[0], seed[2] - seed[0])
+            norm = float(np.linalg.norm(normal))
+            if norm <= 1e-10:
+                continue
+            normal /= norm
+            if abs(float(normal[2])) < 0.25:
+                continue
+            d = -float(normal @ seed[0])
+            inliers = np.flatnonzero(np.abs(active @ normal + d) <= inlier_tolerance_m)
+            if best is None or len(inliers) > len(best):
+                best = inliers
+        if best is None or len(best) < minimum:
+            break
+        normal, d, _residual = _fit_plane(active[best])
+        refined = np.flatnonzero(np.abs(active @ normal + d) <= inlier_tolerance_m)
+        if len(refined) < minimum:
+            break
+        normal, d, residual = _fit_plane(active[refined])
+        refined = np.flatnonzero(np.abs(active @ normal + d) <= inlier_tolerance_m)
+        if len(refined) < minimum:
+            break
+        indices = remaining[refined]
+        support = samples[indices]
+        outline = _outline(support)
+        if outline.is_empty or outline.area < min_plane_area_m2 * 0.5:
+            remaining = np.delete(remaining, refined)
+            continue
+        slope = math.degrees(math.acos(float(np.clip(normal[2], -1.0, 1.0))))
+        result.append(RoofPlane(
+            normal=normal,
+            d=d,
+            inliers=indices,
+            rmse=float(np.sqrt(np.mean(residual ** 2))),
+            outline=outline,
+            slope_deg=slope,
+        ))
+        remaining = np.delete(remaining, refined)
+    return merge_coplanar_planes(result, samples, normal_deg=merge_normal_deg, offset_m=merge_offset_m)
+
+
 def plane_ids(ps: PointSet, roof_planes: list[RoofPlane], *, distance: float = 0.08) -> np.ndarray:
     """Assign each point the nearest accepted roof-plane index, or -1."""
     xyz = np.asarray(ps.xyz, dtype=float)

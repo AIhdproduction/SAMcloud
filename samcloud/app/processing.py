@@ -225,6 +225,11 @@ class ProcessingManager:
         ]
         if georeference is not None:
             command.extend(["--georeference", str(georeference)])
+        # outdoor/drone projects with a processing boundary: the LAS product is clipped to it (classified.ply stays raw)
+        from samcloud.drone.perimeter import BOUNDARY_GEOJSON, clip_polygon_lv95
+
+        if clip_polygon_lv95(project_directory) is not None:
+            command.extend(["--clip-geojson", str(project_directory / BOUNDARY_GEOJSON)])
 
         project.setdefault("workflow", {})["export"] = "running"
         project.setdefault("processing", {}).update({
@@ -426,7 +431,7 @@ class ProcessingManager:
             "--progress-file",
             str(project_directory / "reports" / "progress.json"),
             "--auto-dxf",
-            "1" if auto_dxf_enabled(settings) else "0",
+            "1" if auto_dxf_requested(settings) else "0",
         ]
         threshold_sweep = classification.get("threshold_sweep", [])
         if threshold_sweep:
@@ -579,6 +584,36 @@ def classification_engine(classification: dict) -> str:
     if engine not in CLASSIFICATION_ENGINES or classification.get("class_set", "outdoor") != "outdoor":
         return "sam3"
     return engine
+
+
+def settings_use_flurseg(settings: dict | None) -> bool:
+    """True when the project settings select the FlurSeg engine (point clouds only, no DXF/IFC)."""
+    classification = (settings or {}).get("classification", {}) if isinstance(settings, dict) else {}
+    return isinstance(classification, dict) and classification_engine(classification) == "flurseg"
+
+
+def dxf_ifc_allowed(settings: dict | None) -> bool:
+    """DXF/IFC exist only for SAM3 projects; FlurSeg projects deliver point clouds only."""
+    return not settings_use_flurseg(settings)
+
+
+def auto_dxf_requested(settings: dict | None) -> bool:
+    """Whether ``--auto-dxf 1`` is passed: the project setting AND a SAM3 engine."""
+    return dxf_ifc_allowed(settings) and auto_dxf_enabled(settings)
+
+
+def project_uses_flurseg(project_directory: Path | str | None) -> bool:
+    """Read the project file of a directory and tell whether it classifies with FlurSeg (False when unreadable)."""
+    if project_directory is None:
+        return False
+    from samcloud.core.configuration import load_yaml
+    from samcloud.core.project_manager import PROJECT_FILENAME
+
+    try:
+        project = load_yaml(Path(project_directory) / PROJECT_FILENAME)
+    except Exception:  # noqa: BLE001 - missing/corrupt project file: do not hide pages because of it
+        return False
+    return settings_use_flurseg(project.get("settings") if isinstance(project, dict) else None)
 
 
 def reclassification_available(project_directory: Path) -> bool:

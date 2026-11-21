@@ -178,3 +178,80 @@ def mask_geotiff_outside(path, poly_lv95) -> None:
             data = src.read(band)
             data[outside] = src.nodata
             src.write(data, band)
+
+
+# ----------------------------------------------------------------------------------------
+# point cloud product clipping (frame-aware, shared by LAZ/LAS export and the viewer)
+# ----------------------------------------------------------------------------------------
+
+BOUNDARY_GEOJSON = Path("products") / "environment" / "boundary.geojson"
+
+
+def project_is_outdoor(project_dir) -> bool:
+    """True for outdoor/drone projects (class set ``outdoor`` or capture type ``drone_gps``); indoor projects never clip."""
+    import yaml
+
+    path = Path(project_dir) / "project.samcloud.yml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, yaml.YAMLError):
+        return True  # class set default of a new project is outdoor
+    settings = data.get("settings") or {}
+    class_set = str(((settings.get("classification") or {}).get("class_set")) or "outdoor")
+    capture = str(((data.get("acquisition") or {}).get("type")) or "")
+    if class_set == "indoor":
+        return False
+    return class_set == "outdoor" or capture == "drone_gps"
+
+
+def clip_point_cloud_enabled(config: dict | None = None) -> bool:
+    """Value of ``environment.clip_point_cloud`` (default true)."""
+    if config is None:
+        from samcloud.drone.contracts import load_drone_config
+
+        config = load_drone_config()
+    return bool(((config or {}).get("environment") or {}).get("clip_point_cloud", True))
+
+
+def load_boundary_lv95(project_dir):
+    """Processing boundary in LV95 (``products/environment/boundary.geojson``) or ``None``."""
+    from shapely.geometry import shape
+
+    path = Path(project_dir) / BOUNDARY_GEOJSON
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        geoms = [shape(f["geometry"]) for f in doc.get("features", []) if f.get("geometry")]
+    except (OSError, ValueError, KeyError):
+        logger.warning("boundary %s is unreadable; point cloud stays unclipped", path)
+        return None
+    geoms = [g for g in geoms if not g.is_empty]
+    if not geoms:
+        return None
+    return geoms[0] if len(geoms) == 1 else unary_union(geoms)
+
+
+def clip_polygon_lv95(project_dir, config: dict | None = None):
+    """LV95 clip polygon for the user-facing point cloud products, or ``None`` (indoor, switch off, no boundary)."""
+    if not project_is_outdoor(project_dir) or not clip_point_cloud_enabled(config):
+        return None
+    return load_boundary_lv95(project_dir)
+
+
+def inside_mask_lv95(xy_lv95: np.ndarray, poly_lv95) -> np.ndarray:
+    """Boolean mask of LV95 (E, N) points inside the polygon."""
+    xy = np.asarray(xy_lv95, dtype=np.float64)
+    return np.asarray(contains_xy(poly_lv95, xy[:, 0], xy[:, 1]), bool)
+
+
+def inside_mask_enu(xyz_enu: np.ndarray, georef: dict, poly_lv95, chunk: int = 2_000_000) -> np.ndarray:
+    """Mask of COLMAP-ENU points whose LV95 position lies inside ``poly_lv95`` (exact georeference, rotation included)."""
+    from samcloud.drone import frames
+
+    xyz = np.asarray(xyz_enu, dtype=np.float64).reshape(-1, 3)
+    mask = np.empty(len(xyz), bool)
+    for start in range(0, len(xyz), chunk):
+        lv95 = frames.enu_to_lv95(xyz[start:start + chunk], georef)
+        mask[start:start + chunk] = inside_mask_lv95(lv95[:, :2], poly_lv95)
+    return mask

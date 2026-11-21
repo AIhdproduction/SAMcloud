@@ -26,9 +26,18 @@ _PROJECT_PAGES = {"/sparse", "/control-points", "/dense", "/dxf"}
 _TECHNOLOGIES = ("COLMAP", "SAM3", "FlurSeg", "Depth Anything")
 
 
-def _visible_navigation(project_open: bool) -> list[tuple[str, str, str]]:
-    """Hide project-specific pages until a project is open; returns (translated label, path, icon)."""
-    return [(t(key), path, icon) for key, path, icon in _NAVIGATION if project_open or path not in _PROJECT_PAGES]
+def _visible_navigation(project_open: bool, project_directory: Path | str | None = None) -> list[tuple[str, str, str]]:
+    """Hide project-specific pages until a project is open; returns (translated label, path, icon).
+
+    FlurSeg projects deliver point clouds only, so their navigation has no DXF/IFC entry at all."""
+    from samcloud.app.processing import project_uses_flurseg
+
+    hide_dxf = project_open and project_uses_flurseg(project_directory)
+    return [
+        (t(key), path, icon)
+        for key, path, icon in _NAVIGATION
+        if (project_open or path not in _PROJECT_PAGES) and not (hide_dxf and path == "/dxf")
+    ]
 
 
 def _tech_footer_html() -> str:
@@ -91,7 +100,7 @@ def render_page(
         with ui.element("aside").classes("sam-sidebar column"):
             ui.html('<div class="sam-wordmark"><img class="sam-wordmark-logo" src="/assets-static/samcloud-logo-96.png" alt="SAMcloud logo"><span class="sam-wordmark-text"><strong>SAM</strong>cloud</span></div>')
             project_directory = state.active_project_directory if project_open else None
-            for label, path, icon in _visible_navigation(project_open):
+            for label, path, icon in _visible_navigation(project_open, project_directory):
                 classes = "sam-nav sam-nav-active" if path == current_path else "sam-nav"
                 marker = f"nav-{path.strip('/') or 'overview'}"
                 reason = _navigation_disabled_reason(path, project_directory)

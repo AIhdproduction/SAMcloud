@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,10 +24,22 @@ from samcloud.engine.colmap_model import load_model, qvec2rotmat
 HEIGHT_REFERENCE = "GPS altitude as recorded in the image EXIF (treated as ellipsoidal height)"
 def camera_centres(model_dir: Path) -> dict[str, np.ndarray]:
     """Return COLMAP camera centres in the model's world coordinate frame."""
-    _, images = load_model(Path(model_dir))
+    model = Path(model_dir)
+    if (model / "images.txt").is_file():
+        _, images = load_model(model)
+        return {
+            image.name: -(qvec2rotmat(image.qvec).T @ image.tvec)
+            for image in images.values()
+        }
+    try:
+        import pycolmap
+
+        reconstruction = pycolmap.Reconstruction(str(model))
+    except Exception as error:  # noqa: BLE001 - add the model location to COLMAP's opaque error
+        raise ValueError(f"Could not read COLMAP model for camera centres: {model}") from error
     return {
-        image.name: -(qvec2rotmat(image.qvec).T @ image.tvec)
-        for image in images.values()
+        image.name: np.asarray(image.projection_center(), dtype=float)
+        for image in reconstruction.images.values()
     }
 
 
@@ -120,6 +135,118 @@ def save_georeference(path: Path, georeference: dict[str, Any]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(georeference, indent=2) + "\n", encoding="utf-8")
+
+
+def georeference_is_control_point_based(path: Path) -> bool:
+    """Return whether an existing georeference was produced from control points."""
+    source = Path(path)
+    if not source.is_file():
+        return False
+    try:
+        georeference = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        georeference.get("source_frame") == "gcp_local_enu"
+        or georeference.get("method") in {"gcp_bundle_adjustment", "similarity_from_control_points"}
+    )
+
+
+def fit_model_frame_transform(
+    source_model: Path,
+    destination_model: Path,
+) -> tuple[float, np.ndarray, np.ndarray, dict[str, float], int]:
+    """Fit the similarity that maps camera centres from one COLMAP model frame to another."""
+    source_centres = camera_centres(source_model)
+    destination_centres = camera_centres(destination_model)
+    names = sorted(set(source_centres).intersection(destination_centres))
+    if len(names) < 3:
+        raise ValueError(
+            "At least three matching camera centres are required to relate the cloud and GCP frames"
+        )
+    scale, rotation, translation, residual_m = fit_similarity(
+        np.asarray([source_centres[name] for name in names], dtype=float),
+        np.asarray([destination_centres[name] for name in names], dtype=float),
+    )
+    return scale, rotation, translation, residual_m, len(names)
+
+
+def gcp_georeference_for_cloud_frame(
+    gcp_georeference: dict[str, Any],
+    cloud_model: Path,
+    gcp_model: Path,
+) -> dict[str, Any]:
+    """Compose a GCP-local georeference with the actual dense-cloud model frame.
+
+    The dense cloud is expressed in ``cloud_model``'s frame, while the passed GCP
+    solution is expressed in ``gcp_model``'s local ENU frame. Matching camera
+    centres provide the similarity between both frames without using GPS priors.
+    """
+    scale, rotation, translation, residual_m, pairs = fit_model_frame_transform(cloud_model, gcp_model)
+    stored_local = gcp_georeference.get("gcp_local_georeference")
+    local_georeference = stored_local if isinstance(stored_local, dict) else gcp_georeference
+    gcp_scale = float(local_georeference["scale"])
+    gcp_rotation = np.asarray(local_georeference["rotation"], dtype=float)
+    gcp_translation = np.asarray(local_georeference["translation"], dtype=float)
+    if gcp_rotation.shape != (3, 3) or gcp_translation.shape != (3,):
+        raise ValueError("GCP georeference has an invalid similarity transform")
+
+    result = copy.deepcopy(local_georeference)
+    result["source_frame"] = "colmap_enu"
+    result["scale"] = gcp_scale * scale
+    result["rotation"] = (gcp_rotation @ rotation).tolist()
+    result["translation"] = (gcp_scale * (gcp_rotation @ translation) + gcp_translation).tolist()
+    result["cloud_frame_transform"] = {
+        "method": "similarity_from_camera_centres",
+        "scale": scale,
+        "rotation": rotation.tolist(),
+        "translation": translation.tolist(),
+        "pairs": pairs,
+        "residual_m": residual_m,
+    }
+    result["gcp_local_georeference"] = copy.deepcopy(local_georeference)
+    return result
+
+
+def restore_gcp_georeference(
+    products_dir: Path,
+    control_points_csv: Path,
+    control_points_crs: str = "EPSG:2056+5728",
+    out: Path | None = None,
+) -> dict[str, Any]:
+    """Restore a completed GCP project's dense-cloud georeference.
+
+    Run with ``python -m samcloud.pointcloud.georeference restore-gcp --products <dir>
+    --control-points <csv> [--crs ...] [--out <path>]``. Without ``--out``, the
+    camera-centre metadata is copied to ``georeference.camera_fit_backup.json``
+    before the repaired metadata is written. With ``--out``, only that output file
+    is written, so an existing completed project remains untouched.
+    """
+    from samcloud.control_points.georeference import coordinates_to_ecef, gcp_georeference_from_ecef
+    from samcloud.control_points.repository import read_control_points
+
+    products = Path(products_dir)
+    sparse = products / "sparse"
+    gcp_model = sparse / "gcp_adjusted"
+    cloud_model = products / "dense" / "sparse"
+    if not gcp_model.is_dir():
+        raise ValueError("GCP-adjusted sparse model is missing; refusing to restore georeference")
+    if not cloud_model.is_dir():
+        raise ValueError("Dense sparse model is missing; cannot determine the cloud coordinate frame")
+
+    points = read_control_points(Path(control_points_csv))
+    enabled = points.loc[points["role"] == "pass", ["x", "y", "z"]]
+    if enabled.empty:
+        raise ValueError("No enabled pass control points with coordinates were found")
+    ecef = coordinates_to_ecef(enabled.to_numpy(dtype=float), control_points_crs)
+    residual_m = {"mean": 0.0, "p95": 0.0, "max": 0.0}
+    gcp_georeference = gcp_georeference_from_ecef(ecef, control_points_crs, residual_m)
+    georeference = gcp_georeference_for_cloud_frame(gcp_georeference, cloud_model, gcp_model)
+    destination = Path(out) if out is not None else products / "georeference.json"
+    if out is None and destination.is_file():
+        shutil.copy2(destination, products / "georeference.camera_fit_backup.json")
+    save_georeference(destination, georeference)
+    return georeference
 
 
 def ensure_project_georeference(project_directory: Path) -> Path | None:
@@ -325,6 +452,18 @@ def _require_non_collinear(source: np.ndarray, destination: np.ndarray) -> None:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "restore-gcp":
+        parser = argparse.ArgumentParser(description="Restore GCP georeferencing for a completed project")
+        parser.add_argument("restore-gcp")
+        parser.add_argument("--products", required=True, type=Path, help="project products directory")
+        parser.add_argument("--control-points", required=True, type=Path, help="surveyed control-point CSV")
+        parser.add_argument("--crs", default="EPSG:2056+5728", help="control-point CRS")
+        parser.add_argument("--out", type=Path, help="write repaired metadata here without changing products")
+        args = parser.parse_args()
+        restore_gcp_georeference(args.products, args.control_points, args.crs, args.out)
+        print(f"Restored GCP georeference in {args.out if args.out else args.products}")
+        return
+
     parser = argparse.ArgumentParser(description="Estimate COLMAP ENU georeferencing from GPS camera centres")
     parser.add_argument("--model-dir", required=True, type=Path, help="COLMAP TXT model directory")
     parser.add_argument("--gps-ref", required=True, type=Path, help="GPS reference file used by model_aligner")

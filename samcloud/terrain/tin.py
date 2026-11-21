@@ -12,7 +12,7 @@ from collections.abc import Iterable
 
 import numpy as np
 import shapely
-from scipy.spatial import Delaunay, cKDTree
+from scipy.spatial import ConvexHull, Delaunay, cKDTree
 from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
@@ -22,7 +22,8 @@ from samcloud.drone.contracts import LabeledTin, TIN_LABELS
 
 LOGGER = logging.getLogger(__name__)
 _EPS = 1e-9
-_CONSTRAINT_MERGE_TOLERANCE = 2.5e-3
+_CONSTRAINT_MERGE_TOLERANCE = 1.0e-2
+_RECOVERY_ROUNDS = 8  # bounded midpoint-split rounds for constraints that Delaunay does not contain
 
 
 def _polygon_parts(value) -> list[Polygon]:
@@ -124,7 +125,28 @@ def _node_constraint_lines(lines: list[np.ndarray]) -> list[np.ndarray]:
     """
     if not lines:
         return []
-    linework = unary_union([LineString(line[:, :2]) for line in lines])
+    # Near-coincident constraints (mm offsets between a curb line and a polygon edge) cannot coexist in a
+    # Delaunay mesh: every line is snapped onto earlier lines that run within the merge tolerance.
+    raw = [LineString(line[:, :2]) for line in lines]
+    tree = shapely.STRtree(raw)
+    snapped = list(raw)
+    for index, geometry in enumerate(raw):
+        near = [int(j) for j in tree.query(geometry, predicate="dwithin", distance=_CONSTRAINT_MERGE_TOLERANCE) if j < index]
+        if near:
+            reference = unary_union([snapped[j] for j in near])
+            candidate = shapely.snap(geometry, reference, _CONSTRAINT_MERGE_TOLERANCE)
+            if candidate.geom_type == "LineString" and not candidate.is_empty:
+                snapped[index] = candidate
+    # Vertices that now lie on a neighbouring segment must split it, or the noding below misses the contact.
+    tree2 = shapely.STRtree(snapped)
+    for index, geometry in enumerate(snapped):
+        near = [int(j) for j in tree2.query(geometry, predicate="dwithin", distance=1e-5) if j != index]
+        if near:
+            points = shapely.multipoints(np.vstack([np.asarray(snapped[j].coords) for j in near]))
+            candidate = shapely.snap(geometry, points, 1e-5)
+            if candidate.geom_type == "LineString" and not candidate.is_empty:
+                snapped[index] = candidate
+    linework = unary_union(snapped)
     geometries = [linework] if linework.geom_type == "LineString" else list(getattr(linework, "geoms", ()))
 
     def elevation(xy: np.ndarray) -> float:
@@ -166,8 +188,165 @@ def _nearest_spacing(xy: np.ndarray) -> tuple[cKDTree, float]:
     return tree, float(np.median(valid)) if len(valid) else 1.0
 
 
+def _barycentric_elevation(triangulation: Delaunay, z: np.ndarray, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate elevations and return the containing simplex for each XY point."""
+    simplex = triangulation.find_simplex(xy)
+    values = np.full(len(xy), np.nan, dtype=float)
+    valid = simplex >= 0
+    if valid.any():
+        transform = triangulation.transform[simplex[valid], :2]
+        delta = xy[valid] - triangulation.transform[simplex[valid], 2]
+        weights = np.einsum("nij,nj->ni", transform, delta)
+        barycentric = np.column_stack((weights, 1.0 - weights.sum(axis=1)))
+        values[valid] = np.einsum("ni,ni->n", barycentric, z[triangulation.simplices[simplex[valid]]])
+    return values, simplex
+
+
+def _grid_reference(ground: np.ndarray, cell: float) -> np.ndarray:
+    """Reduce ground points to one median-elevation point per regular grid cell."""
+    xy = ground[:, :2]
+    origin = xy.min(axis=0)
+    bins = np.floor((xy - origin) / cell).astype(np.int64)
+    unique_bins, inverse = np.unique(bins, axis=0, return_inverse=True)
+    # Sorting by cell then elevation permits a fully vectorised grouped median.
+    order = np.lexsort((ground[:, 2], inverse))
+    counts = np.bincount(inverse, minlength=len(unique_bins))
+    starts = np.r_[0, np.cumsum(counts[:-1])]
+    lower = ground[order[starts + (counts - 1) // 2], 2]
+    upper = ground[order[starts + counts // 2], 2]
+    centres = origin + (unique_bins.astype(float) + 0.5) * cell
+    return np.column_stack((centres, (lower + upper) * 0.5))
+
+
+def _initial_support(reference: np.ndarray, spacing: float, max_vertices: int) -> np.ndarray:
+    """Select one nearby reference point per coarse grid cell plus hull corners."""
+    xy = reference[:, :2]
+    origin = xy.min(axis=0)
+    bins = np.floor((xy - origin) / spacing).astype(np.int64)
+    unique_bins, inverse = np.unique(bins, axis=0, return_inverse=True)
+    centres = origin + (unique_bins.astype(float) + 0.5) * spacing
+    distances = np.einsum("ij,ij->i", xy - centres[inverse], xy - centres[inverse])
+    order = np.lexsort((distances, inverse))
+    first = np.r_[True, inverse[order][1:] != inverse[order][:-1]]
+    coarse = order[first]
+    try:
+        hull = ConvexHull(xy).vertices
+    except Exception:
+        hull = np.empty(0, dtype=np.int64)
+    # Hull vertices establish coverage; the coarse representatives fill the cap.
+    selected = np.r_[hull, coarse]
+    _, first_positions = np.unique(selected, return_index=True)
+    selected = selected[np.sort(first_positions)]
+    return selected[:max_vertices]
+
+
+def select_tin_support(
+    ground,
+    *,
+    dtm_sampler=None,
+    tolerance: float,
+    initial_spacing: float,
+    max_vertices: int,
+    constraints_xy=None,
+    max_rounds: int = 4,
+    tolerance_fn=None,
+) -> tuple[np.ndarray, dict]:
+    """Select bounded TIN support points with batched vertical-error refinement.
+
+    A median grid forms a noise-resistant reference surface.  Each refinement
+    round adds the largest violating reference point in every TIN triangle.  ``tolerance_fn``
+    (XY array -> tolerance array) makes the tolerance position dependent, e.g. tighter on pavements.
+    """
+    points = np.asarray(ground, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("ground must be an (N, 3) array")
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) < 3:
+        raise ValueError("ground must contain at least three finite points")
+    if tolerance <= 0 or initial_spacing <= 0 or max_vertices < 3:
+        raise ValueError("tolerance, initial_spacing, and max_vertices must be positive")
+
+    _, median_spacing = _nearest_spacing(points[:, :2])
+    reference = _grid_reference(points, max(float(median_spacing), 0.1))
+    initial = _initial_support(reference, float(initial_spacing), int(max_vertices))
+    selected = reference[initial]
+    ref_tol = np.full(len(reference), float(tolerance)) if tolerance_fn is None else np.asarray(tolerance_fn(reference[:, :2]), dtype=float)
+
+    if constraints_xy is not None and len(selected) < max_vertices:
+        constraint_xy = np.asarray(constraints_xy, dtype=float)
+        if constraint_xy.ndim == 2 and constraint_xy.shape[1] >= 2 and len(constraint_xy):
+            constraint_xy = constraint_xy[:, :2]
+            z = _interpolate_z(constraint_xy, points, dtm_sampler)
+            extra = np.column_stack((constraint_xy, z))
+            # Constraints are non-negotiable topology; retain them before
+            # optional coarse support when applying the vertex budget.
+            combined = np.vstack((extra, selected))
+            keys = np.rint(combined[:, :2] * 1e9).astype(np.int64)
+            _, first = np.unique(keys, axis=0, return_index=True)
+            selected = combined[np.sort(first)[:max_vertices]]
+
+    rounds = 0
+    round_additions: list[int] = []
+    round_triangle_counts: list[int] = []
+    errors = np.empty(0, dtype=float)
+    stop_reason = "max_rounds"
+    for _ in range(max(1, int(max_rounds))):
+        triangulation = Delaunay(selected[:, :2])
+        interpolated, simplex = _barycentric_elevation(triangulation, selected[:, 2], reference[:, :2])
+        valid = np.isfinite(interpolated)
+        errors = np.abs(reference[valid, 2] - interpolated[valid])
+        limit = ref_tol[valid]
+        if not len(errors):
+            stop_reason = "no_interpolable_candidates"
+            break
+        if bool((errors <= limit).all()):
+            stop_reason = "tolerance_reached"
+            break
+        if len(selected) >= max_vertices:
+            stop_reason = "max_vertices"
+            break
+
+        valid_indices = np.flatnonzero(valid)
+        valid_simplex = simplex[valid]
+        # Lexicographic sort yields the largest error at the start of each simplex group.
+        excess = errors - limit
+        order = np.lexsort((-excess, valid_simplex))
+        ordered_simplex = valid_simplex[order]
+        first = np.r_[True, ordered_simplex[1:] != ordered_simplex[:-1]]
+        candidates = valid_indices[order[first][excess[order[first]] > 0]]
+        if not len(candidates):
+            stop_reason = "no_violating_candidates"
+            break
+        remaining = int(max_vertices) - len(selected)
+        if len(candidates) > remaining:
+            candidates = candidates[np.argsort(excess[order[first]][excess[order[first]] > 0])[::-1][:remaining]]
+        round_triangle_counts.append(int(len(triangulation.simplices)))
+        selected = np.vstack((selected, reference[candidates]))
+        rounds += 1
+        round_additions.append(int(len(candidates)))
+
+    triangulation = Delaunay(selected[:, :2])
+    interpolated, _ = _barycentric_elevation(triangulation, selected[:, 2], reference[:, :2])
+    errors = np.abs(reference[np.isfinite(interpolated), 2] - interpolated[np.isfinite(interpolated)])
+    final_limit = ref_tol[np.isfinite(interpolated)]
+    report = {
+        "rounds": int(rounds),
+        "vertices": int(len(selected)),
+        "max_error_m": float(errors.max()) if len(errors) else 0.0,
+        "p95_error_m": float(np.percentile(errors, 95)) if len(errors) else 0.0,
+        "rms_error_m": float(np.sqrt(np.mean(errors ** 2))) if len(errors) else 0.0,
+        "candidate_cells": int(len(reference)),
+        "round_additions": round_additions,
+        "round_triangle_counts": round_triangle_counts,
+        "max_added_per_triangle_per_round": 1,
+        "stop_reason": stop_reason,
+        "violations": int((errors > final_limit).sum()),
+    }
+    return selected, report
+
+
 def _densify_lines(lines: list[np.ndarray], point_tree: cKDTree, fallback_spacing: float) -> list[np.ndarray]:
-    """Densify lines to half their local DTM spacing, preserving breakline Z values."""
+    """Densify constraints once at a bounded DTM-scale spacing."""
     output: list[np.ndarray] = []
     for line in lines:
         dense: list[np.ndarray] = [line[0]]
@@ -175,15 +354,11 @@ def _densify_lines(lines: list[np.ndarray], point_tree: cKDTree, fallback_spacin
             length = float(np.linalg.norm(end[:2] - start[:2]))
             if length <= _EPS:
                 continue
-            midpoint = (start[:2] + end[:2]) * 0.5
-            if point_tree.n:
-                distances = np.atleast_1d(point_tree.query(midpoint, k=min(2, point_tree.n))[0])
-                positive = distances[distances > _EPS]
-                local = float(positive[0]) if len(positive) else fallback_spacing
-            else:
-                local = fallback_spacing
-            local = max(local, fallback_spacing * 0.1, _EPS)
-            pieces = max(1, int(math.ceil(length / (0.5 * local))))
+            # A fixed spacing avoids a nearest-neighbour query and a Python
+            # loop for every dense DTM cell.  It also bounds line vertices on
+            # long surveyed boundaries while retaining curb breaks.
+            spacing = float(np.clip(2.0 * float(fallback_spacing), 0.2, 1.0))
+            pieces = max(1, int(math.ceil(length / spacing)))
             fractions = np.linspace(0.0, 1.0, pieces + 1)[1:]
             for frac in fractions:
                 p = start * (1.0 - frac) + end * frac
@@ -217,27 +392,18 @@ def _segments_from_value(constraints) -> list[tuple[np.ndarray, np.ndarray, int]
 
 def _interpolate_z(points_xy: np.ndarray, ground: np.ndarray, sampler) -> np.ndarray:
     if sampler is not None:
-        return np.asarray([float(sampler(float(x), float(y))) for x, y in points_xy], dtype=float)
+        values = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+        sampled = np.asarray(sampler(values), dtype=float).reshape(-1)
+        if len(sampled) != len(values):
+            raise ValueError("DTM sampler returned an unexpected number of elevations")
+        return sampled
     if len(ground) < 3:
         return np.full(len(points_xy), float(ground[0, 2]) if len(ground) else 0.0)
-    try:
-        tri = Delaunay(ground[:, :2])
-        simplex = tri.find_simplex(points_xy)
-        z = np.empty(len(points_xy), dtype=float)
-        valid = simplex >= 0
-        transform = tri.transform[simplex[valid], :2]
-        delta = points_xy[valid] - tri.transform[simplex[valid], 2]
-        weights = np.einsum("nij,nj->ni", transform, delta)
-        barycentric = np.column_stack((weights, 1.0 - weights.sum(axis=1)))
-        z[valid] = np.einsum("ni,ni->n", barycentric, ground[tri.simplices[simplex[valid]], 2])
-        if (~valid).any():
-            tree = cKDTree(ground[:, :2])
-            nearest = tree.query(points_xy[~valid])[1]
-            z[~valid] = ground[nearest, 2]
-        return z
-    except Exception:
-        tree = cKDTree(ground[:, :2])
-        return ground[tree.query(points_xy)[1], 2]
+    # Constraint elevation is sampled once.  A tree lookup is substantially
+    # cheaper than constructing a second full Delaunay triangulation merely to
+    # obtain these values, and is robust at raster boundaries.
+    tree = cKDTree(ground[:, :2])
+    return ground[tree.query(points_xy)[1], 2]
 
 
 def _remove_near_constraints(ground: np.ndarray, lines: list[np.ndarray], buffer: float) -> np.ndarray:
@@ -253,36 +419,35 @@ def _remove_near_constraints(ground: np.ndarray, lines: list[np.ndarray], buffer
 
 def _unique_vertices(ground: np.ndarray, segments, sampler) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
     """Merge all input sources by XY, giving explicit breakline Z precedence."""
-    records: list[np.ndarray] = []
-    lookup: dict[tuple[int, int], int] = {}
     scale = 1e9
+    segment_count = len(segments)
+    segment_points = np.empty((segment_count * 2, 3), dtype=float)
+    if segment_count:
+        segment_points[0::2] = np.asarray([start for start, _, _ in segments], dtype=float)
+        segment_points[1::2] = np.asarray([end for _, end, _ in segments], dtype=float)
+    records = np.vstack((segment_points, ground))
+    keys = np.rint(records[:, :2] * scale).astype(np.int64)
+    _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    record_order = np.argsort(first, kind="stable")
+    output_index = np.empty(len(first), dtype=np.int64)
+    output_index[record_order] = np.arange(len(first))
+    vertices = records[first[record_order]].copy()
 
-    def add(point: np.ndarray, prefer: bool = False) -> int:
-        key = tuple(np.rint(point[:2] * scale).astype(np.int64))
-        idx = lookup.get(key)
-        if idx is None:
-            lookup[key] = len(records)
-            records.append(point.copy())
-            return len(records) - 1
-        if prefer and np.isfinite(point[2]):
-            records[idx][2] = point[2]
-        return idx
-
-    for start, end, _ in segments:
-        add(start, prefer=True)
-        add(end, prefer=True)
-    for point in ground:
-        add(point, prefer=False)
-    vertices = np.asarray(records, dtype=float)
+    # The old insertion order means the last finite constraint elevation wins.
+    if segment_count:
+        segment_inverse = inverse[:len(segment_points)]
+        finite = np.isfinite(segment_points[:, 2])
+        last_preferred = np.full(len(first), -1, dtype=np.int64)
+        np.maximum.at(last_preferred, segment_inverse[finite], np.flatnonzero(finite))
+        preferred_groups = np.flatnonzero(last_preferred >= 0)
+        vertices[output_index[preferred_groups], 2] = segment_points[last_preferred[preferred_groups], 2]
     missing_z = ~np.isfinite(vertices[:, 2])
     if missing_z.any():
         vertices[missing_z, 2] = _interpolate_z(vertices[missing_z, :2], ground, sampler)
     indexed = []
-    for start, end, root in segments:
-        i = add(start, prefer=True)
-        j = add(end, prefer=True)
-        if i != j:
-            indexed.append((i, j, root))
+    if segment_count:
+        endpoint_indices = output_index[inverse[:len(segment_points)]].reshape(-1, 2)
+        indexed = [(int(i), int(j), root) for (i, j), (_, _, root) in zip(endpoint_indices, segments) if i != j]
     return vertices, indexed
 
 
@@ -321,9 +486,11 @@ def _filter_triangles(vertices: np.ndarray, triangles: np.ndarray, protected_edg
     if protected_edges:
         tri_edges = np.stack((triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]), axis=1)
         tri_edges.sort(axis=2)
-        touches_constraint = np.array(
-            [any(tuple(edge) in protected_edges for edge in tri_edges[index]) for index in range(len(triangles))], dtype=bool
-        )
+        protected = np.asarray(sorted(protected_edges), dtype=triangles.dtype)
+        edge_dtype = np.dtype([("first", triangles.dtype), ("second", triangles.dtype)])
+        tri_keys = np.ascontiguousarray(tri_edges.reshape(-1, 2)).view(edge_dtype).reshape(-1)
+        protected_keys = np.ascontiguousarray(protected).view(edge_dtype).reshape(-1)
+        touches_constraint = np.isin(tri_keys, protected_keys).reshape(-1, 3).any(axis=1)
         keep |= touches_constraint
     return triangles[keep]
 
@@ -344,6 +511,29 @@ def _label_triangles(vertices: np.ndarray, triangles: np.ndarray, regions: dict[
     return labels
 
 
+def _label_tolerance(regions: dict[str, list[Polygon]], default: float, by_label: dict[str, float]):
+    """Position dependent tolerance: the tolerance of the region label containing a point (default elsewhere)."""
+    areas: list[tuple[float, object]] = []
+    for name in ("road", "sidewalk", "path", "lawn"):
+        if name not in by_label:
+            continue
+        parts = [part for poly in regions.get(name, []) for part in _polygon_parts(poly)]
+        if parts:
+            merged = unary_union(parts)
+            shapely.prepare(merged)
+            areas.append((float(by_label[name]), merged))
+    base = float(by_label.get("terrain", default))
+
+    def tolerance_at(xy: np.ndarray) -> np.ndarray:
+        out = np.full(len(xy), base, dtype=float)
+        # earlier regions win, matching the labelling priority; applied in reverse so they overwrite
+        for value, geom in reversed(areas):
+            out[np.asarray(shapely.contains_xy(geom, xy[:, 0], xy[:, 1]), dtype=bool)] = value
+        return out
+
+    return tolerance_at
+
+
 def build_labeled_tin(
     ground_xy_z,
     *,
@@ -354,6 +544,11 @@ def build_labeled_tin(
     min_angle_deg: float = 20,
     max_steiner_per_edge: int = 50,
     thin_spacing: float | None = None,
+    tolerance: float | None = None,
+    initial_spacing: float | None = None,
+    max_vertices: int | None = None,
+    max_refinement_rounds: int = 4,
+    tolerance_by_label: dict[str, float] | None = None,
 ) -> LabeledTin:
     """Build a common terrain/pavement TIN with recovered polygon and curb edges.
 
@@ -366,32 +561,73 @@ def build_labeled_tin(
     if ground.ndim != 2 or ground.shape[1] != 3 or len(ground) < 3:
         raise ValueError("ground_xy_z must be an (N, 3) array with at least three points")
     ground = ground[np.isfinite(ground).all(axis=1)]
+    # Constraint spacing must be measured against the unsimplified survey.  Measuring it
+    # after error-driven support selection turns dense, nearby curb/pavement lines into
+    # sparse parallel constraints that Delaunay cannot represent reliably.
+    raw_lines = _iter_raw_lines(regions, breaklines)
+    source_tree, source_spacing = _nearest_spacing(ground[:, :2])
+    prepared_lines = _prepare_constraint_lines(raw_lines, source_tree, source_spacing)
+    constraint_xy = np.vstack([line[:, :2] for line in prepared_lines]) if prepared_lines else None
+    # The candidate surface is strictly the DTM cells.  A clearance comparable
+    # to the cell spacing prevents ordinary support vertices from cutting
+    # across a densified curb or polygon boundary.
+    # Every constraint segment must be a Gabriel edge (no support vertex inside its diametral
+    # circle), otherwise Delaunay does not contain it: clear half of the longest segment.
+    longest = max((float(np.linalg.norm(b[:2] - a[:2])) for line in prepared_lines for a, b in zip(line[:-1], line[1:])), default=0.0)
+    clearance = max(float(buffer), float(source_spacing) * 1.01, 0.505 * longest)
+    candidate_ground = _remove_near_constraints(ground, prepared_lines, clearance)
+    if len(candidate_ground) < 3:
+        candidate_ground = ground
+    simplify_report = None
+    tolerance_fn = None
+    if tolerance is not None and tolerance_by_label:
+        tolerance_fn = _label_tolerance(regions, float(tolerance), tolerance_by_label)
+    if tolerance is not None:
+        ground, simplify_report = select_tin_support(
+            candidate_ground,
+            dtm_sampler=dtm_sampler,
+            tolerance=float(tolerance),
+            initial_spacing=float(initial_spacing if initial_spacing is not None else 2.0),
+            max_vertices=int(max_vertices if max_vertices is not None else 200000),
+            constraints_xy=constraint_xy,
+            max_rounds=max_refinement_rounds,
+            tolerance_fn=tolerance_fn,
+        )
+    else:
+        ground = candidate_ground
     if thin_spacing is not None and thin_spacing > 0:
         bins = np.floor(ground[:, :2] / float(thin_spacing)).astype(np.int64)
         _, first = np.unique(bins, axis=0, return_index=True)
         ground = ground[np.sort(first)]
-    point_tree, median_spacing = _nearest_spacing(ground[:, :2])
-    raw_lines = _iter_raw_lines(regions, breaklines)
-    lines = _prepare_constraint_lines(raw_lines, point_tree, median_spacing)
+    # ``prepared_lines`` deliberately keeps the original survey-driven spacing even
+    # when the terrain support is sparse; exact line vertices are merged below.
+    lines = prepared_lines
     segments = _segments(lines)
-    retained_ground = _remove_near_constraints(ground, lines, float(buffer))
-    if len(retained_ground) < 3:
-        retained_ground = ground
+    retained_ground = ground
 
     # Each refinement adds at most the requested number of points per original
     # densified edge.  Most valid input needs no recovery iterations at all.
     steiner_counts: dict[int, int] = {}
     unresolved: list[tuple[np.ndarray, np.ndarray, int]] = []
-    for _ in range(max(0, int(max_steiner_per_edge)) + 1):
+    # Recovery is bounded: midpoint splitting continues only while it reduces the number of missing
+    # edges, and the best state is kept (splitting can make mm-scale tangles worse).
+    best: tuple[int, list] | None = None
+    previous: int | None = None
+    for _ in range(min(_RECOVERY_ROUNDS, max(0, int(max_steiner_per_edge))) + 1):
         vertices, indexed = _unique_vertices(retained_ground, segments, dtm_sampler)
         triangles = _triangulate(vertices)
         edges = _edge_set(triangles)
         missing = [(start, end, root) for (start, end, root), (i, j, _) in zip(segments, indexed)
                    if tuple(sorted((i, j))) not in edges]
+        if best is None or len(missing) < best[0]:
+            best = (len(missing), segments)
         if not missing:
             unresolved = []
             break
         unresolved = missing
+        if previous is not None and len(missing) >= previous:
+            break
+        previous = len(missing)
         replacement: list[tuple[np.ndarray, np.ndarray, int]] = []
         split_keys = {
             (tuple(np.rint(item[0][:2] * 1e9).astype(np.int64)), tuple(np.rint(item[1][:2] * 1e9).astype(np.int64)), item[2])
@@ -412,6 +648,8 @@ def build_labeled_tin(
         if len(replacement) == len(segments):
             break
         segments = replacement
+    if best is not None:
+        segments = best[1]
     if unresolved:
         # The final refinement can have replaced a segment after the last
         # iteration.  Triangulate it once more so warning state and metadata
@@ -430,7 +668,10 @@ def build_labeled_tin(
     tin = LabeledTin(vertices=vertices, triangles=triangles, labels=labels)
     # Kept as non-contract metadata so QA can inspect the exact densified edges.
     tin.constraint_segments = [np.vstack((start, end)) for start, end, _ in segments]
+    tin.constraint_report = {"unrecovered_edges": int(len(unresolved)), "recovery_round_limit": _RECOVERY_ROUNDS}
     tin.min_angle_deg = float(min_angle_deg)
+    if simplify_report is not None:
+        tin.simplify_report = simplify_report
     return tin
 
 
@@ -510,4 +751,4 @@ def label_boundary_consistent(tin: LabeledTin, regions: dict[str, list[Polygon]]
     return maximum
 
 
-__all__ = ["build_labeled_tin", "missing_constraint_edges", "tin_quality", "label_boundary_consistent"]
+__all__ = ["select_tin_support", "build_labeled_tin", "missing_constraint_edges", "tin_quality", "label_boundary_consistent"]

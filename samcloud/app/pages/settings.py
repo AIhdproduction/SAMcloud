@@ -20,7 +20,13 @@ from samcloud.app.i18n import (
     user_language,
 )
 from samcloud.app.layout import render_page
-from samcloud.app.pages.projects import CAPTURE_TYPE_OPTIONS, CLASS_SET_OPTIONS, ENGINE_OPTIONS, TranslatedOptions
+from samcloud.app.pages.projects import (
+    CAPTURE_TYPE_OPTIONS,
+    CLASS_SET_OPTIONS,
+    ENGINE_OPTIONS,
+    TranslatedOptions,
+    creation_engine_and_auto_dxf,
+)
 from samcloud.app.state import state
 from samcloud.share.ui import render_settings_card as render_share_settings_card
 from samcloud.core.configuration import load_export_crs_presets
@@ -276,8 +282,12 @@ def render() -> None:
                 outdoor = class_set.value == "outdoor"
                 engine.set_visibility(outdoor)
                 engine_hint.set_visibility(not outdoor)
+                # DXF/IFC need SAM3: hide the automatic-export switch while FlurSeg is the effective engine.
+                effective_engine, _ = creation_engine_and_auto_dxf(class_set.value, engine.value, True)
+                auto_dxf.set_visibility(effective_engine != "flurseg")
 
             class_set.on_value_change(lambda _event: update_engine_visibility())
+            engine.on_value_change(lambda _event: update_engine_visibility())
             update_engine_visibility()
             classification_mode = ui.select(
                 dict(CLASSIFICATION_MODE_OPTIONS),
@@ -384,7 +394,7 @@ def render() -> None:
                 coordinates["working_crs"] = working_crs.value
                 coordinates["export_crs"] = export_crs.value
                 workflow["use_gpu"] = use_gpu.value
-                workflow["auto_dxf"] = bool(auto_dxf.value)
+                workflow["auto_dxf"] = creation_engine_and_auto_dxf(class_set.value, engine.value, bool(auto_dxf.value))[1]
                 workflow["control_points_enabled"] = control_points.value in {"after_alignment", "automatic", "auto"}
                 project.setdefault("workflow", {})["control_points_mode"] = control_points.value
                 classification["class_set"] = class_set.value

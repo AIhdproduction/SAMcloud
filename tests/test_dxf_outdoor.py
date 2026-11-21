@@ -47,7 +47,7 @@ def test_new_layers_exist_and_tin_is_frozen() -> None:
     assert document.layers.get("S-TOPO-TIN").is_frozen()
     assert not document.layers.get("S-TOPO-TIN").is_on()
     assert not document.layers.get("S-PATH").is_frozen()
-    assert document.layers.get("S-SHRUB").dxf.color == 94
+    assert document.layers.get("S-SHRUB").dxf.color == 81
     other = ezdxf.new("R2018")
     ensure_outdoor_layers(other, tin_frozen=False)
     assert not other.layers.get("S-TOPO-TIN").is_frozen()
@@ -56,7 +56,7 @@ def test_new_layers_exist_and_tin_is_frozen() -> None:
 def test_topo_and_elev_layers_get_yaml_style() -> None:
     document = ezdxf.new("R2018")
     ensure_outdoor_layers(document, {"S-TOPO-MAJR", "S-TOPO-MINR", "S-ELEV"})
-    expected = {"S-TOPO-MAJR": (30, 25), "S-TOPO-MINR": (74, 13), "S-ELEV": (3, 18)}
+    expected = {"S-TOPO-MAJR": (34, 25), "S-TOPO-MINR": (43, 13), "S-ELEV": (7, 18)}
     for name, (color, weight) in expected.items():
         layer = document.layers.get(name)
         assert layer.dxf.color == color and layer.dxf.lineweight == weight

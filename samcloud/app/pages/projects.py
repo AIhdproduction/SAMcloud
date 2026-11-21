@@ -150,6 +150,15 @@ class _ClassEditor:
         return {"prompts": prompts, "added": added} if prompts or added else None
 
 
+def creation_engine_and_auto_dxf(class_set: str | None, engine: str | None, auto_dxf: bool = True) -> tuple[str, bool]:
+    """Effective (engine, auto_dxf) for a new project from the dialog values.
+
+    FlurSeg applies to the outdoor class set only; it delivers point clouds, so auto DXF/IFC is forced off.
+    With SAM3 the user's choice of the switch counts (default ON)."""
+    effective_engine = (engine or "sam3") if class_set == "outdoor" else "sam3"
+    return effective_engine, bool(auto_dxf) and effective_engine != "flurseg"
+
+
 def render() -> None:
     """Render the persistent project manager."""
     def content() -> None:
@@ -213,6 +222,15 @@ def render() -> None:
                 value="auto",
             )
             auto_dxf = ui.switch(t("projects.create.auto_dxf"), value=True).mark("auto-dxf-switch")
+
+            def update_auto_dxf_visibility() -> None:
+                """DXF/IFC need SAM3: hide the switch while FlurSeg is the effective engine."""
+                engine_value, _ = creation_engine_and_auto_dxf(class_set.value, classification_engine.value, True)
+                auto_dxf.set_visibility(engine_value != "flurseg")
+
+            class_set.on_value_change(lambda _: update_auto_dxf_visibility())
+            classification_engine.on_value_change(lambda _: update_auto_dxf_visibility())
+            update_auto_dxf_visibility()
             with ui.card().classes("w-full"):
                 ui.label(t("projects.create.storage")).classes("text-base font-medium")
                 storage_switches = {
@@ -289,13 +307,15 @@ def render() -> None:
                         raise ValueError(t("projects.create.select_capture_type"))
                     if class_set.value is None:
                         raise ValueError(t("projects.create.select_class_set"))
+                    engine_value, auto_dxf_value = creation_engine_and_auto_dxf(
+                        class_set.value, classification_engine.value, bool(auto_dxf.value)
+                    )
                     project_directory = state.projects.create_project(
                         name.value,
                         image_directory.value or "",
                         capture_type=capture_type.value,
                         class_set=class_set.value,
-                        classification_engine=(classification_engine.value or "sam3")
-                        if class_set.value == "outdoor" else "sam3",
+                        classification_engine=engine_value,
                         custom_classes=class_editor.customization(),
                         panorama_image_directory=panorama_image_directory.value or "",
                         panorama_video_path=panorama_video_path.value or "",
@@ -303,7 +323,7 @@ def render() -> None:
                         rtk_enabled=rtk_enabled.value,
                         control_points_mode=control_points_mode.value,
                         storage={key: bool(control.value) for key, control in storage_switches.items()},
-                        auto_dxf=bool(auto_dxf.value),
+                        auto_dxf=auto_dxf_value,
                         apriltags_enabled=bool(apriltag_switch.value),
                         apriltag_coordinates_csv=tag_upload["path"] if apriltag_switch.value else None,
                         apriltag_crs=tag_crs.value if tag_upload["path"] else None,

@@ -13,15 +13,18 @@ import ifcopenshell.api.pset
 import ifcopenshell.api.root
 import ifcopenshell.api.spatial
 import numpy as np
+import shapely
+from shapely.geometry import Polygon
 
 from samcloud.bim.core.ifc import shapes
 from samcloud.bim.core.ifc.context import ExportContext
 from samcloud.bim.core.ifc.elements import element_name
 from samcloud.bim.core.ifc.ids import set_guid
+from samcloud.outdoor_model.style import load_outdoor_style
 from samcloud.bim.core.model import (
     BuildingElement, CurbElement, FenceElement, ManholeElement, MarkingElement,
     PavementElement, ShrubElement, SiteWallElement, TerrainElement, TreeElement,
-    VegetationAreaElement,
+    VegetationAreaElement, WallElement,
 )
 
 Entity = ifcopenshell.entity_instance
@@ -85,6 +88,64 @@ def _prism_mesh(outline: Sequence[tuple[float, float]], base: float, height: flo
     return vertices, triangles
 
 
+_PSET_SKIP_EVIDENCE = frozenset({"lawn_triangle_indices"})  # bulk triangle index list, not a property
+
+
+def _submesh(
+    vertices: np.ndarray, triangles: np.ndarray
+) -> tuple[list[Vec3], list[tuple[int, int, int]]]:
+    """Mesh of ``triangles`` with the used vertices only (re-indexed)."""
+    used, inverse = np.unique(triangles.ravel(), return_inverse=True)
+    return (
+        [tuple(float(v) for v in vertices[i]) for i in used],
+        [tuple(int(i) for i in row) for row in inverse.reshape(triangles.shape)],
+    )
+
+
+def _split_lawn_surfaces(
+    ctx: ExportContext,
+) -> tuple[dict[str, tuple[list[Vec3], list[tuple[int, int, int]]]], dict[str, tuple[list[Vec3], list[tuple[int, int, int]]]]]:
+    """Hand the lawn-labelled terrain triangles over to the lawn elements.
+
+    Returns ``(lawn_meshes, terrain_meshes)`` keyed by element id. The lawn triangles are the ones listed in
+    the terrain evidence ``lawn_triangle_indices`` (all triangles when absent) whose centroid lies inside the
+    outline of a vegetation area (smallest outline wins); they are removed from the terrain mesh, so terrain,
+    lawn and pavements together cover the TIN without gap or overlap. Lawn-labelled triangles outside every
+    outline and lawns without triangles stay as they are (terrain keeps them, the lawn keeps its footprint).
+    """
+    terrains = [e for e in ctx.scene.elements.values() if isinstance(e, TerrainElement)]
+    lawns = [e for e in ctx.scene.elements.values() if isinstance(e, VegetationAreaElement)]
+    if len(terrains) != 1 or not lawns or not terrains[0].params.triangles:
+        return {}, {}
+    terrain = terrains[0]
+    vertices = np.asarray(terrain.params.vertices, dtype=float)
+    triangles = np.asarray(terrain.params.triangles, dtype=np.int64)
+    listed = terrain.evidence.get("lawn_triangle_indices")
+    candidates = np.arange(len(triangles)) if listed is None else np.asarray(listed, dtype=np.int64).reshape(-1)
+    candidates = candidates[(candidates >= 0) & (candidates < len(triangles))]
+    if len(candidates) == 0:
+        return {}, {}
+    centroids = vertices[triangles[candidates]][:, :, :2].mean(axis=1)
+    owner = np.full(len(candidates), -1, dtype=np.int64)
+    polygons = []
+    for index, lawn in enumerate(lawns):
+        polygon = Polygon(lawn.params.outline)
+        polygons.append(polygon if polygon.is_valid else polygon.buffer(0))
+    for index in sorted(range(len(lawns)), key=lambda i: -polygons[i].area):  # larger first, smaller outlines overwrite
+        owner[shapely.contains_xy(polygons[index], centroids[:, 0], centroids[:, 1])] = index
+    taken = owner >= 0
+    if not taken.any() or int(taken.sum()) >= len(triangles):
+        return {}, {}
+    lawn_meshes = {
+        lawns[index].id: _submesh(vertices, triangles[candidates[owner == index]])
+        for index in range(len(lawns))
+        if (owner == index).any()
+    }
+    keep = np.ones(len(triangles), dtype=bool)
+    keep[candidates[taken]] = False
+    return lawn_meshes, {terrain.id: _submesh(vertices, triangles[keep])}
+
+
 def _pset(ctx: ExportContext, product: Entity, category: str, element: object, values: dict[str, object]) -> None:
     """Write measured values plus origin, status and evidence in one category Pset."""
     props: dict[str, object] = dict(values)
@@ -98,6 +159,8 @@ def _pset(ctx: ExportContext, product: Entity, category: str, element: object, v
     if element.metrics.deviation_rms is not None:
         props["EvidenceRmse"] = element.metrics.deviation_rms
     for name, value in element.evidence.items():
+        if name in _PSET_SKIP_EVIDENCE:
+            continue
         if isinstance(value, (str, int, float, bool)):
             props[f"Evidence_{name}"] = value
         elif isinstance(value, (list, tuple)):
@@ -174,8 +237,39 @@ def _pavement_mesh(element: PavementElement) -> tuple[list[Vec3], list[tuple[int
     return top + bottom, triangles
 
 
+def _write_facade_walls(ctx: ExportContext, building: BuildingElement) -> int:
+    """Give each facade IfcWall of ``building`` the exact LoD2 wall faces of its facade plane.
+
+    The generic wall writer extrudes a flat prism; here its body is replaced by the mesh faces listed in
+    the wall's ``face_indices`` evidence, so walls end exactly at the LoD2 roof edge and terrain bottom.
+    Returns the number of walls written.
+    """
+    count = 0
+    triangles = list(building.params.triangles)
+    for element in ctx.scene.elements.values():
+        if not isinstance(element, WallElement) or element.building_id != building.id:
+            continue
+        indices = element.evidence.get("face_indices")
+        wall = ctx.entities.get(element.id)
+        if not indices or wall is None:
+            continue
+        used = sorted({int(v) for i in indices for v in triangles[int(i)]})
+        remap = {old: new for new, old in enumerate(used)}
+        sub_vertices = [building.params.vertices[old] for old in used]
+        sub_triangles = [tuple(remap[int(v)] for v in triangles[int(i)]) for i in indices]
+        if wall.Representation is not None:
+            for representation in list(wall.Representation.Representations):
+                ifcopenshell.api.geometry.unassign_representation(ctx.file, product=wall, representation=representation)
+                ifcopenshell.api.geometry.remove_representation(ctx.file, representation=representation)
+        shapes.place(ctx, wall, (0.0, 0.0, 0.0))
+        _assign_mesh(ctx, wall, sub_vertices, sub_triangles)
+        count += 1
+    return count
+
+
 def write_outdoor(ctx: ExportContext) -> None:
     """Write site-contained outdoor survey products and LoD2 building envelopes."""
+    lawn_meshes, terrain_meshes = _split_lawn_surfaces(ctx)
     for element in ctx.scene.elements.values():
         if isinstance(element, BuildingElement):
             building = ctx.buildings.get(element.id)
@@ -184,7 +278,8 @@ def write_outdoor(ctx: ExportContext) -> None:
             ctx.entities[element.id] = building
             walls = [triangle for triangle, role in zip(element.params.triangles, element.params.face_roles, strict=True) if role == 1]
             roofs = [triangle for triangle, role in zip(element.params.triangles, element.params.face_roles, strict=True) if role == 2]
-            if walls:
+            facade_walls = _write_facade_walls(ctx, element)
+            if walls and not facade_walls:
                 wall = ifcopenshell.api.root.create_entity(ctx.file, ifc_class="IfcWall", name=f"{element_name(element, 'Building')} exterior wall")
                 wall.ObjectType = "EXTERIOR"
                 wall.PredefinedType = "STANDARD"
@@ -205,9 +300,10 @@ def write_outdoor(ctx: ExportContext) -> None:
         elif isinstance(element, TerrainElement):
             product = _product(ctx, element, "IfcGeographicElement", "Terrain")
             product.PredefinedType = "TERRAIN"
-            if element.params.triangles:
-                _assign_mesh(ctx, product, element.params.vertices, element.params.triangles)
-            _pset(ctx, product, "Terrain", element, {"TriangleCount": len(element.params.triangles)})
+            terrain_vertices, terrain_triangles = terrain_meshes.get(element.id, (element.params.vertices, element.params.triangles))
+            if terrain_triangles:
+                _assign_mesh(ctx, product, terrain_vertices, terrain_triangles)
+            _pset(ctx, product, "Terrain", element, {"TriangleCount": len(terrain_triangles)})
         elif isinstance(element, TreeElement):
             product = _product(ctx, element, "IfcGeographicElement", "Tree")
             product.PredefinedType, product.ObjectType = "USERDEFINED", "Baum"
@@ -230,14 +326,18 @@ def write_outdoor(ctx: ExportContext) -> None:
                 {"BaseZ": element.params.base_z, "Height": element.params.height},
             )
         elif isinstance(element, VegetationAreaElement):
-            product = _product(ctx, element, "IfcGeographicElement", "Vegetation area")
+            product = _product(ctx, element, "IfcGeographicElement", "Rasen")
             product.PredefinedType, product.ObjectType = "USERDEFINED", "Vegetationsfläche"
-            shapes.assign_representations(
-                ctx,
-                product,
-                [_footprint_representation(ctx, element.params.outline, element.params.base_z)],
-            )
-            _pset(ctx, product, "VegetationArea", element, {"BaseZ": element.params.base_z})
+            surface = lawn_meshes.get(element.id)
+            if surface is not None:  # lawn surface: the lawn-labelled TIN triangles inside the outline
+                _assign_mesh(ctx, product, *surface)
+            else:
+                shapes.assign_representations(
+                    ctx,
+                    product,
+                    [_footprint_representation(ctx, element.params.outline, element.params.base_z)],
+                )
+            _pset(ctx, product, "VegetationArea", element, {"BaseZ": element.params.base_z, "TriangleCount": len(surface[1]) if surface else 0})
         elif isinstance(element, SiteWallElement):
             product = _product(ctx, element, "IfcWall", "Site wall")
             product.ObjectType, product.PredefinedType = "Mauer", "STANDARD"
@@ -282,3 +382,85 @@ def write_outdoor(ctx: ExportContext) -> None:
             solid = shapes.extrusion(ctx.file, profile, 0.05, origin=element.params.center)
             shapes.assign_representations(ctx, product, [shapes.swept_solid_representation(ctx, [solid])])
             _pset(ctx, product, "Manhole", element, {"Diameter": element.params.diameter, "Z_DECKEL": element.params.center[2], "Type": element.params.type})
+    apply_outdoor_styles(ctx)
+
+
+_OUTDOOR_ELEMENT_TYPES = (
+    BuildingElement, CurbElement, FenceElement, ManholeElement, MarkingElement, PavementElement, ShrubElement,
+    SiteWallElement, TerrainElement, TreeElement, VegetationAreaElement,
+)
+_PAVEMENT_CATEGORY = {"Strasse": "road", "Trottoir": "sidewalk", "Weg": "path", "Randstein": "curb"}
+_GEOGRAPHIC_CATEGORY = {"Baum": "tree", "Busch": "shrub", "Vegetationsfläche": "lawn"}
+
+
+def outdoor_category_of_product(product: Entity) -> str | None:
+    """Outdoor style category of an IFC product (None when the product is not an outdoor element)."""
+    kind = str(getattr(product, "PredefinedType", None) or "").upper()
+    object_type = str(getattr(product, "ObjectType", None) or "")
+    if product.is_a("IfcGeographicElement"):
+        return "terrain" if kind == "TERRAIN" else _GEOGRAPHIC_CATEGORY.get(object_type)
+    if product.is_a("IfcCivilElement"):
+        return _PAVEMENT_CATEGORY.get(object_type)
+    if product.is_a("IfcRailing"):
+        return "fence"
+    if product.is_a("IfcDistributionChamberElement"):
+        return "manhole"
+    if product.is_a("IfcAnnotation"):
+        return "marking"
+    if product.is_a("IfcWall"):
+        return "site_wall" if object_type == "Mauer" else "building_wall"
+    if product.is_a("IfcRoof") or (product.is_a("IfcSlab") and kind == "ROOF"):
+        return "roof"
+    if product.is_a("IfcWindow"):
+        return "window"
+    if product.is_a("IfcDoor"):
+        return "door"
+    if product.is_a("IfcOpeningElement"):
+        for relation in getattr(product, "HasFillings", None) or ():
+            filling = relation.RelatedBuildingElement
+            if filling.is_a("IfcDoor"):
+                return "door"
+        return "window"
+    return None
+
+
+def apply_outdoor_styles(ctx: ExportContext) -> int:
+    """Colour and layer every outdoor product by category (``config/outdoor_style.yaml``).
+
+    Each representation item gets an IfcStyledItem (IfcSurfaceStyle with rendering, IfcCurveStyle for
+    curves) and each shape representation joins exactly one IfcPresentationLayerAssignment named like
+    the DXF layer of its category. Scenes without outdoor elements (indoor export) are left untouched.
+    Returns the number of styled products.
+    """
+    if not any(isinstance(element, _OUTDOOR_ELEMENT_TYPES) for element in ctx.scene.elements.values()):
+        return 0
+    f = ctx.file
+    styles = load_outdoor_style()
+    surface: dict[str, Entity] = {}
+    curve: dict[str, Entity] = {}
+    layers: dict[str, Entity] = {}
+    count = 0
+    for product in f.by_type("IfcProduct"):
+        representation = getattr(product, "Representation", None)
+        if representation is None:
+            continue
+        category = outdoor_category_of_product(product)
+        style = styles.get(category) if category else None
+        if style is None or not style["ifc"]:
+            continue
+        if category not in surface:
+            surface[category] = shapes.surface_style(f, style["label"], style["rgb"], style["transparency"])
+            curve[category] = shapes.curve_style(f, style["label"], style["rgb"])
+        layer = shapes.presentation_layer(f, layers, style["layer"])
+        for shape in representation.Representations:
+            for item in shape.Items:
+                if item.is_a("IfcGeometricCurveSet"):
+                    for element in item.Elements:
+                        shapes.style_item(f, element, curve[category])
+                elif item.is_a("IfcCurve"):
+                    shapes.style_item(f, item, curve[category])
+                else:
+                    shapes.style_item(f, item, surface[category])
+            shapes.add_to_layer(layer, shape)
+        count += 1
+    return count

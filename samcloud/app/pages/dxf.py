@@ -11,7 +11,8 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
-from nicegui import run, ui
+from nicegui import app, run, ui
+from starlette.responses import FileResponse, JSONResponse
 
 from samcloud.app.dxf_controller import LAYER_MODES, MODEL_PROFILES, DxfPageController, dxf_unavailable_reason
 from samcloud.app.dxf_review_canvas import DxfReviewCanvas, background_url, level_key, ortho_preview_url, payload_url
@@ -22,6 +23,7 @@ from samcloud.app.ifc_viewer import IfcViewer, model_url
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
 from samcloud.bim import ui_data as bim_ui_data
+from samcloud.drone import dxf_preview
 from samcloud.dxf.job_runner import DxfJobRunner
 
 ACTION_LABELS: dict[str, str] = {
@@ -116,26 +118,10 @@ def _cache_status_label(status: str) -> str:
     return translate_or(f"dxf.cache_status.{status}", status)
 
 
-def _ifc_cache_status(controller: DxfPageController, level_id: str | None) -> str:
-    """Freshness of the IFC export of a level in the cache-status vocabulary (missing / ok / stale)."""
-    status = bim_ui_data.ifc_status(controller.project_dir, level_key(level_id))
-    return "ok" if status == "fresh" else status
-
-
-def _refine_cache_status(controller: DxfPageController, level_id: str | None) -> str:
-    """Freshness of the opening refinement of a level in the cache-status vocabulary (missing / ok / stale)."""
-    from samcloud.dxf.jobs import refine_openings_status
-
-    try:
-        status = refine_openings_status(controller.project_dir, level_id)
-    except Exception:  # noqa: BLE001 - an unreadable cache counts as stale in the checklist
-        return "stale"
-    return "ok" if status == "fresh" else status
-
-
 def _mode_label(mode: str) -> str:
     """Translated project mode value (indoor / outdoor)."""
     return translate_or(f"dxf.mode_value.{mode}", mode)
+
 
 _RUNNERS: dict[Path, DxfJobRunner] = {}
 
@@ -151,9 +137,63 @@ _STYLE = """
 .sam-result-fullscreen .sam-result-side { overflow-y:auto; overflow-x:hidden; min-width:0; max-height:100%; flex:none; }
 .sam-result-side .q-checkbox__label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
 .q-slider.q-slider--disabled, .q-slider.disabled { opacity:.38!important; cursor:not-allowed!important; filter:grayscale(1); }
+.sam-dxfp { position:relative; overflow:hidden; cursor:grab; touch-action:none; border-radius:6px; }
+.sam-dxfp.is-dragging { cursor:grabbing; }
+.sam-dxfp-stage { position:absolute; left:0; top:0; width:100%; height:100%; transform-origin:0 0; }
+.sam-dxfp-stage img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; pointer-events:none; user-select:none; }
 .sam-dxf-log { max-height:220px; overflow:auto; white-space:pre-wrap; font-family:monospace; font-size:11px; color:#c9d8e4; background:#050b12; border:1px solid #20394b; border-radius:6px; padding:8px; }
 </style>
 """
+
+
+_PREVIEW_SCRIPT = """
+<script>
+(function () {
+  function view(vp) { if (!vp._v) vp._v = {k: 1, x: 0, y: 0}; return vp._v; }
+  function apply(vp) { var v = view(vp); vp.firstElementChild.style.transform = 'translate(' + v.x + 'px,' + v.y + 'px) scale(' + v.k + ')'; }
+  window.samDxfpFit = function (id) { var vp = document.getElementById(id); if (!vp) return; vp._v = {k: 1, x: 0, y: 0}; apply(vp); };
+  document.addEventListener('wheel', function (e) {
+    var vp = e.target.closest && e.target.closest('.sam-dxfp'); if (!vp) return;
+    e.preventDefault();
+    var v = view(vp), r = vp.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+    var k = Math.max(0.5, Math.min(200, v.k * Math.exp(-e.deltaY * 0.0015)));
+    v.x = px - (px - v.x) * k / v.k; v.y = py - (py - v.y) * k / v.k; v.k = k; apply(vp);
+  }, {passive: false});
+  var drag = null;
+  document.addEventListener('pointerdown', function (e) {
+    var vp = e.target.closest && e.target.closest('.sam-dxfp'); if (!vp || e.button !== 0) return;
+    var v = view(vp); drag = {vp: vp, sx: e.clientX, sy: e.clientY, ox: v.x, oy: v.y}; vp.classList.add('is-dragging');
+  });
+  document.addEventListener('pointermove', function (e) {
+    if (!drag) return; var v = view(drag.vp); v.x = drag.ox + e.clientX - drag.sx; v.y = drag.oy + e.clientY - drag.sy; apply(drag.vp);
+  });
+  document.addEventListener('pointerup', function () { if (drag) { drag.vp.classList.remove('is-dragging'); drag = null; } });
+  document.addEventListener('dblclick', function (e) { var vp = e.target.closest && e.target.closest('.sam-dxfp'); if (vp) window.samDxfpFit(vp.id); });
+})();
+</script>
+"""
+
+PREVIEW_ROUTE = "/api/dxf-preview"
+_PREVIEW_RENDERING: set[Path] = set()
+"""Preview PNGs currently being rendered (one render per file at a time)."""
+
+
+@app.get(PREVIEW_ROUTE + "/{name}")
+def dxf_preview_file(name: str, v: str | None = None):
+    """Serve ``preview.png`` or a layer image of the active outdoor project's DXF preview; never renders."""
+    project_directory = state.active_project_directory
+    if project_directory is None:
+        return JSONResponse({"error": "no project"}, status_code=404)
+    export_dir = (Path(project_directory) / "products" / "dxf" / "export").resolve()
+    path = export_dir / name if name == dxf_preview.PREVIEW_NAME else export_dir / dxf_preview.LAYER_DIR / name
+    try:
+        path = path.resolve()
+        path.relative_to(export_dir)
+    except (OSError, ValueError):
+        return JSONResponse({"error": "invalid"}, status_code=400)
+    if path.suffix != ".png" or not path.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-cache"})
 
 
 def runner_for(project_directory: Path) -> DxfJobRunner:
@@ -164,6 +204,18 @@ def runner_for(project_directory: Path) -> DxfJobRunner:
     return _RUNNERS[key]
 
 
+def page_blocked_text(project_directory: Path | str) -> str | None:
+    """Text shown instead of the DXF page, or None when the page can be built.
+
+    FlurSeg projects get the engine reason ("DXF/IFC nur mit SAM3"); otherwise the not-classified hint."""
+    from samcloud.app.processing import project_uses_flurseg
+
+    reason = dxf_unavailable_reason(project_directory)
+    if reason is None:
+        return None
+    return reason if project_uses_flurseg(project_directory) else t("dxf.page.not_ready")
+
+
 def render() -> None:
     """Render the /dxf page for the active project."""
 
@@ -172,8 +224,9 @@ def render() -> None:
         if project_directory is None or state.active_project() is None:
             ui.label(t("dxf.page.no_project")).classes("sam-muted")
             return
-        if dxf_unavailable_reason(project_directory) is not None:
-            ui.label(t("dxf.page.not_ready")).classes("sam-muted").mark("dxf-not-ready")
+        blocked = page_blocked_text(project_directory)
+        if blocked is not None:
+            ui.label(blocked).classes("sam-muted").mark("dxf-not-ready")
             return
         controller = DxfPageController(project_directory, runner=runner_for(project_directory))
         DxfPage(controller).build()
@@ -183,6 +236,13 @@ def render() -> None:
 
 def _banner(text: str, kind: str = "warning") -> ui.label:
     return ui.label(text).classes(f"sam-dxf-banner is-{kind} w-full")
+
+
+def ifc_category_label(name: str, outdoor: bool) -> str:
+    """Checkbox label of an IFC viewer category: outdoor names live in ``dxf.ifc_outdoor``, 'other' is shared."""
+    if outdoor and name != "other":
+        return t(f"dxf.ifc_outdoor.{name}")
+    return t(f"ifc.category.{name}")
 
 
 class DxfPage:
@@ -205,6 +265,12 @@ class DxfPage:
         self.result_row: ui.row | None = None
         self.result_opacity_slider: ui.slider | None = None
         self.run_all_button: ui.button | None = None
+        self.env_rows: ui.column | None = None
+        self.env_stage: ui.label | None = None
+        self.env_progress: ui.linear_progress | None = None
+        self.env_signature: str = ""
+        self.env_was_running = controller.uses_environment_chain and controller.environment_running()
+        self.env_ticks = 0
         self.hidden_layers: set[str] = set()
         self.measurement: dict[str, Any] | None = None
         self.job_stage: ui.label | None = None
@@ -217,6 +283,7 @@ class DxfPage:
 
     def build(self) -> None:
         ui.add_head_html(_STYLE)
+        ui.add_head_html(_PREVIEW_SCRIPT)
         with ui.column().classes("w-full gap-4"):
             self.body()
         ui.timer(1.0, self.poll)
@@ -233,7 +300,12 @@ class DxfPage:
         self.ifc_viewer = None
         self.ifc_row = None
         self.ifc_fullscreen = False
+        self.dxfp_body = None
+        self.dxfp_row = None
+        self.dxfp_fullscreen = False
         self.run_all_button = None
+        self.env_rows = self.env_stage = self.env_progress = None
+        self.env_signature = ""
         self.job_stage = self.job_progress = self.cancel_button = self.job_log = None
         self.build_header()
         if self.controller.profile_required:
@@ -245,14 +317,18 @@ class DxfPage:
             return
         self.build_compute_card()
         self.build_result_card()
+        if self.controller.uses_environment_chain:
+            self.build_dxf_preview_card()
         self.build_ifc_card()
-        with ui.expansion(t("dxf.page.advanced"), icon="tune", value=False).classes("w-full").mark("advanced"):
-            self.stale_banner()
-            self.build_preparation()
-            if self.controller.mode == "indoor":
-                self.build_side_view()
-            self.build_review_section()
-        self.apply_busy(self.controller.is_running())
+        if not self.controller.uses_environment_chain:
+            # The ortho/clean-plan settings and review have no effect on the outdoor environment chain.
+            with ui.expansion(t("dxf.page.advanced"), icon="tune", value=False).classes("w-full").mark("advanced"):
+                self.stale_banner()
+                self.build_preparation()
+                if self.controller.mode == "indoor":
+                    self.build_side_view()
+                self.build_review_section()
+        self.apply_busy(self.controller.is_running() or self.env_running())
 
     def job_button(self, label: str, icon: str, on_click: Callable[[], Any], enabled: bool = True) -> ui.button:
         button = ui.button(label, icon=icon, on_click=on_click).props("no-caps unelevated").classes("sam-button-secondary")
@@ -279,12 +355,14 @@ class DxfPage:
             ui.label(t("dxf.header.point_source", source=controller.source_label)).classes("sam-muted text-sm").mark("point-source")
             with ui.row().classes("items-end w-full gap-3"):
                 current = controller.las_path
-                # The classified PLY is used automatically; the field is only for choosing another LAS file.
-                shown = "" if current is None or controller.source_is_ply else str(current)
-                las_input = ui.input(t("dxf.header.las_file"), value=shown, placeholder=t("dxf.header.las_placeholder")).classes("flex-1").props("outlined dense").mark("las-path")
-                ui.button(t("dxf.header.use_las"), icon="check", on_click=lambda: self.choose_las(las_input.value)).props("flat no-caps")
-                if controller.las_is_custom:
-                    ui.button(t("dxf.header.project_cloud"), icon="restart_alt", on_click=lambda: self.choose_las(None)).props("flat no-caps")
+                if not controller.uses_environment_chain:
+                    # The classified PLY is used automatically; the field is only for choosing another LAS file
+                    # (the environment chain always reads the project's own classified cloud, so it has no selector).
+                    shown = "" if current is None or controller.source_is_ply else str(current)
+                    las_input = ui.input(t("dxf.header.las_file"), value=shown, placeholder=t("dxf.header.las_placeholder")).classes("flex-1").props("outlined dense").mark("las-path")
+                    ui.button(t("dxf.header.use_las"), icon="check", on_click=lambda: self.choose_las(las_input.value)).props("flat no-caps")
+                    if controller.las_is_custom:
+                        ui.button(t("dxf.header.project_cloud"), icon="restart_alt", on_click=lambda: self.choose_las(None)).props("flat no-caps")
                 mode_options = {"auto": t("dxf.header.mode_auto"), "indoor": t("dxf.header.mode_indoor"), "outdoor": t("dxf.header.mode_outdoor")}
                 ui.select(mode_options, label=t("dxf.header.mode_label"), value=controller.state.mode_override or "auto",
                           on_change=lambda event: self.set_mode(event.value)).classes("w-40").props("outlined dense").mark("mode-select")
@@ -370,6 +448,9 @@ class DxfPage:
         self.poll()
 
     def poll(self) -> None:
+        if self.controller.uses_environment_chain:
+            self.poll_environment()
+            return
         running = self.controller.is_running()
         status = self.controller.job_status()
         if self.was_running and not running:
@@ -405,7 +486,13 @@ class DxfPage:
         with ui.card().classes("w-full gap-3"):
             ui.label(t("dxf.compute.title")).classes("sam-section-title")
             force = ui.checkbox(t("dxf.compute.force"), value=False).classes("text-sm")
-            if controller.mode == "outdoor":
+            if controller.uses_environment_chain:
+                self.run_all_button = self.primary_job_button(
+                    t("dxf.compute.run_all"), "play_arrow", lambda: self.start_environment(bool(force.value)),
+                )
+                self.run_all_button.mark("run-all")
+                self.build_environment_status()
+            elif controller.mode == "outdoor":
                 self.run_all_button = self.primary_job_button(
                     t("dxf.compute.run_all"), "play_arrow", lambda: self.start("run_all", force=bool(force.value)),
                 )
@@ -433,7 +520,8 @@ class DxfPage:
                     self.run_all_button.mark("run-all")
                     self.job_button(t("dxf.compute.detect_again"), "refresh", lambda: self.start("prepare_levels", force=bool(force.value))).props("flat")
                     self.build_step_checklist(self.compute_level)
-            self.build_job_bar()
+            if not controller.uses_environment_chain:
+                self.build_job_bar()
 
     def select_compute_level(self, level_id: str | None) -> None:
         self.compute_level = level_id
@@ -456,17 +544,84 @@ class DxfPage:
         if controller.mode == "indoor" and level_id is None:
             ui.label(t("dxf.compute.select_storey")).classes("sam-muted text-sm")
             return
-        rows = [
-            (t("dxf.compute.step_ortho"), controller.ortho_status(level_id)),
-            (t("dxf.compute.step_segmentation"), controller.segment_status(level_id)),
-            (t("dxf.compute.step_clean_plan"), controller.plan_status(level_id, "ortho")),
-            *([(t("dxf.compute.step_refine"), _refine_cache_status(controller, level_id))] if controller.mode == "indoor" else []),
-            (t("dxf.compute.step_export"), controller.plan_status(level_id, "ortho")),
-            (t("dxf.compute.step_ifc"), _ifc_cache_status(controller, level_id)),
-        ]
+        rows = controller.compute_card_rows(level_id)["rows"]
         with ui.column().classes("gap-1"):
-            for name, current in rows:
-                ui.label(t("dxf.compute.step_row", name=name, status=_cache_status_label(current))).classes("sam-muted text-sm")
+            for key, current in rows:
+                ui.label(t("dxf.compute.step_row", name=t(f"dxf.compute.step_{key}"), status=_cache_status_label(current))).classes("sam-muted text-sm")
+
+    # ------------------------------------------------------------------ outdoor environment chain
+
+    def env_running(self) -> bool:
+        return self.controller.uses_environment_chain and self.controller.environment_running()
+
+    def build_environment_status(self) -> None:
+        """Step lines + QA summary of the environment chain, refreshed by ``poll_environment``."""
+        self.env_stage = ui.label("").classes("text-sm").mark("env-stage")
+        self.env_progress = ui.linear_progress(value=0.0, show_value=False).classes("w-full")
+        self.env_rows = ui.column().classes("gap-1").mark("env-steps")
+        self.env_signature = ""
+        self.update_environment_status()
+
+    def update_environment_status(self) -> None:
+        if self.env_rows is None or self.env_stage is None or self.env_progress is None:
+            return
+        card = self.controller.compute_card_rows(None)
+        status = card["status"]
+        signature = repr((card["rows"], card["qa"], status["state"]))
+        if signature == self.env_signature:
+            return
+        self.env_signature = signature
+        steps = status["steps"]
+        if status["running"]:
+            done = sum(1 for item in steps if item["status"] in ("done", "failed", "skipped"))
+            self.env_stage.set_text(t("dxf.compute.env_progress", done=done, total=len(steps)))
+        elif status["state"] == "finished":
+            self.env_stage.set_text(t("dxf.compute.env_finished"))
+        elif status["state"] == "failed":
+            self.env_stage.set_text(t("dxf.compute.env_failed", detail=f": {status['error']}" if status.get("error") else ""))
+        else:
+            self.env_stage.set_text(t("dxf.compute.env_idle"))
+        self.env_progress.set_value(float(status["progress"]) if status["running"] or status["state"] == "finished" else 0.0)
+        self.env_rows.clear()
+        with self.env_rows:
+            for name, current, detail in card["rows"]:
+                ui.label(t("dxf.compute.env_step_row", name=t(f"dxf.compute.env_steps.{name}"),
+                           status=t(f"dxf.compute.env_status.{current}"), detail=detail)).classes("sam-muted text-sm")
+            qa = card["qa"]
+            if qa is None:
+                ui.label(t("dxf.compute.env_qa_missing")).classes("sam-muted text-sm").mark("env-qa")
+            else:
+                ui.label(t("dxf.compute.env_qa", passed=qa["passed"], total=qa["total"])).classes("sam-muted text-sm").mark("env-qa")
+                if qa["failed"]:
+                    ui.label(t("dxf.compute.env_qa_failed", rules=", ".join(qa["failed"]))).classes("sam-muted text-sm")
+
+    def start_environment(self, rerun_all: bool) -> None:
+        try:
+            self.controller.start_environment_job(rerun_all)
+        except (ValueError, RuntimeError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self.env_was_running = True
+        self.apply_busy(True)
+        self.update_environment_status()
+        ui.notify(t("dxf.compute.env_started"))
+
+    def poll_environment(self) -> None:
+        """Every 2 s: re-read job_status/state.json; on completion refresh the downloads and IFC viewer."""
+        self.env_ticks += 1
+        if self.env_ticks % 2:
+            return
+        running = self.controller.environment_running()
+        if self.env_was_running and not running:
+            self.env_was_running = False
+            status = self.controller.environment_status()
+            kind = "positive" if status["state"] == "finished" else "negative"
+            ui.notify(t("dxf.compute.env_finished") if kind == "positive" else t("dxf.compute.env_failed", detail=""), type=kind)
+            self.body.refresh()
+            return
+        self.env_was_running = running
+        self.update_environment_status()
+        self.apply_busy(running)
 
     # ------------------------------------------------------------------ stale + preparation
 
@@ -675,7 +830,16 @@ class DxfPage:
         with ui.card().classes("w-full gap-3"):
             ui.label(t("dxf.result.title")).classes("sam-section-title")
             if result is None:
-                ui.label(t("dxf.result.placeholder")).classes("sam-muted").mark("result-placeholder")
+                published = controller.outdoor_export_files()
+                if not published:
+                    ui.label(t("dxf.result.placeholder")).classes("sam-muted").mark("result-placeholder")
+                    return
+                with ui.row().classes("items-center gap-2").mark("outdoor-downloads"):
+                    ui.button(t("dxf.result.open_dxf_folder"), icon="folder_open", on_click=self.open_dxf_folder).props("flat no-caps")
+                    dxf_button = ui.button(t("dxf.result.download_dxf"), icon="download", on_click=lambda: self.download_dxf(None)).props("flat no-caps")
+                    dxf_button.set_enabled("dxf" in published)
+                    ifc_button = ui.button(t("ifc.card.download"), icon="download", on_click=lambda: self.download_ifc(None)).props("flat no-caps").mark("download-ifc")
+                    ifc_button.set_enabled("ifc" in published)
                 return
             self.build_result_canvas(result, level)
             with ui.row().classes("items-center gap-2"):
@@ -823,6 +987,115 @@ class DxfPage:
 
     # ------------------------------------------------------------------ IFC viewer
 
+    # ------------------------------------------------------------------ DXF preview (outdoor)
+
+    def build_dxf_preview_card(self) -> None:
+        """Zoomable raster preview of the published DXF with a layer legend (re-rendered when the DXF is newer)."""
+        self.dxfp_images: dict[str, ui.element] = {}
+        self.dxfp_checks: dict[str, ui.checkbox] = {}
+        with ui.card().classes("w-full gap-3").mark("dxf-preview-card"):
+            ui.label(t("dxf.dxf_preview.title")).classes("sam-section-title")
+            self.dxfp_body = ui.column().classes("w-full gap-2")
+            target = self.controller.dxf_preview_path()
+            if target is None:
+                with self.dxfp_body:
+                    ui.label(t("dxf.dxf_preview.empty")).classes("sam-muted").mark("dxf-preview-empty")
+                return
+            dxf = self.controller.outdoor_export_files()["dxf"]
+            if dxf_preview.preview_is_fresh(dxf, target) and dxf_preview.load_preview_meta(target) is not None:
+                self.fill_dxf_preview(target)
+            else:
+                with self.dxfp_body:
+                    with ui.row().classes("items-center gap-2").mark("dxf-preview-spinner"):
+                        ui.spinner(size="md")
+                        ui.label(t("dxf.dxf_preview.rendering")).classes("sam-muted")
+                ui.timer(0.2, lambda: self.render_dxf_preview(dxf, target), once=True)
+
+    async def render_dxf_preview(self, dxf: Path, target: Path) -> None:
+        """Render in a worker thread so the UI stays responsive, then swap the spinner for the viewer."""
+        if target in _PREVIEW_RENDERING:
+            return
+        _PREVIEW_RENDERING.add(target)
+        try:
+            await run.io_bound(dxf_preview.render_dxf_preview, dxf, target)
+        except Exception as error:  # a broken DXF must not break the page
+            if self.dxfp_body is not None and not self.dxfp_body.is_deleted:
+                self.dxfp_body.clear()
+                with self.dxfp_body:
+                    _banner(t("dxf.dxf_preview.failed", error=error), "error")
+            return
+        finally:
+            _PREVIEW_RENDERING.discard(target)
+        if self.dxfp_body is not None and not self.dxfp_body.is_deleted:
+            self.dxfp_body.clear()
+            self.fill_dxf_preview(target)
+
+    def fill_dxf_preview(self, target: Path) -> None:
+        meta = dxf_preview.load_preview_meta(target) or {}
+        layers = [item for item in meta.get("layers", []) if item.get("file")]
+        version = target.stat().st_mtime_ns
+        self.dxfp_images = {}
+        self.dxfp_checks = {}
+        self.dxfp_fullscreen = False
+        view_id = f"samdxfp-{id(self)}"
+        with self.dxfp_body:
+            with ui.row().classes("w-full gap-4 no-wrap items-stretch") as row:
+                self.dxfp_row = row
+                with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:1040px;min-width:0"):
+                    viewport = ui.element("div").classes("sam-dxfp w-full h-full").props(f"id={view_id}").style(
+                        f"background:{meta.get('background', dxf_preview.DEFAULT_BACKGROUND)}").mark("dxf-preview-view")
+                    with viewport:
+                        with ui.element("div").classes("sam-dxfp-stage"):
+                            for item in layers:
+                                image = ui.element("img").props(f'src="{PREVIEW_ROUTE}/{item["file"]}?v={version}" draggable=false')
+                                self.dxfp_images[item["name"]] = image
+                    self.dxfp_fullscreen_button = ui.button(icon="fullscreen", on_click=self.toggle_dxfp_fullscreen).props(
+                        "flat round dense color=white").classes("absolute").style(
+                        "top:8px;left:8px;z-index:10;background:rgba(9,19,29,.65)").mark("dxf-preview-fullscreen")
+                    with self.dxfp_fullscreen_button:
+                        self.dxfp_fullscreen_tooltip = ui.tooltip(t("dxf.result.fullscreen"))
+                    ui.keyboard(on_key=self.on_dxfp_key, ignore=["input", "select", "textarea"])
+                with ui.column().classes("w-80 gap-2 sam-result-side"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.button(t("dxf.dxf_preview.fit"), on_click=lambda: ui.run_javascript(f"samDxfpFit('{view_id}')")).props("flat no-caps")
+                        ui.button(t("dxf.dxf_preview.all"), on_click=lambda: self.set_all_dxfp_layers(True)).props("flat no-caps").mark("dxf-preview-all")
+                        ui.button(t("dxf.dxf_preview.none"), on_click=lambda: self.set_all_dxfp_layers(False)).props("flat no-caps").mark("dxf-preview-none")
+                    ui.label(t("dxf.dxf_preview.hint")).classes("sam-muted text-xs")
+                    ui.label(t("dxf.dxf_preview.layers")).classes("text-sm")
+                    for item in layers:
+                        name = item["name"]
+                        with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                            ui.element("div").classes("sam-dxf-swatch").style(f"background:{item['color']}")
+                            self.dxfp_checks[name] = ui.checkbox(
+                                name, value=True, on_change=lambda event, layer=name: self.toggle_dxfp_layer(layer, bool(event.value)),
+                            ).mark(f"dxf-preview-layer-{name}")
+                            ui.label(str(item["count"])).classes("sam-muted text-xs")
+
+    def toggle_dxfp_layer(self, layer: str, visible: bool) -> None:
+        image = self.dxfp_images.get(layer)
+        if image is not None:
+            image.set_visibility(visible)
+
+    def set_all_dxfp_layers(self, visible: bool) -> None:
+        for box in self.dxfp_checks.values():
+            box.value = visible  # the checkbox handler toggles the image
+
+    def toggle_dxfp_fullscreen(self) -> None:
+        row = self.dxfp_row
+        if row is None:
+            return
+        self.dxfp_fullscreen = not self.dxfp_fullscreen
+        if self.dxfp_fullscreen:
+            row.classes(add="sam-result-fullscreen")
+        else:
+            row.classes(remove="sam-result-fullscreen")
+        self.dxfp_fullscreen_button.props(f"icon={'fullscreen_exit' if self.dxfp_fullscreen else 'fullscreen'}")
+        self.dxfp_fullscreen_tooltip.set_text(t("dxf.result.exit_fullscreen") if self.dxfp_fullscreen else t("dxf.result.fullscreen"))
+
+    def on_dxfp_key(self, event: Any) -> None:
+        if self.dxfp_fullscreen and event.action.keydown and event.key.escape:
+            self.toggle_dxfp_fullscreen()
+
     def build_ifc_card(self) -> None:
         controller = self.controller
         level = self.compute_level if controller.mode == "indoor" else None
@@ -837,8 +1110,9 @@ class DxfPage:
             if glb is None or not data:
                 ui.label(t("ifc.card.empty")).classes("sam-muted").mark("ifc-empty")
                 return
-            by_node, counts = bim_ui_data.category_index(data)
-            self.ifc_hidden = {name for name in bim_ui_data.HIDDEN_BY_DEFAULT if name in counts}
+            config = bim_ui_data.viewer_config(key, data)
+            by_node, counts, outdoor = config["by_node"], config["counts"], config["outdoor"]
+            self.ifc_hidden = set(config["hidden"])
             self.ifc_checks: dict[str, ui.checkbox] = {}
             if bim_ui_data.ifc_status(controller.project_dir, key) == "stale":
                 _banner(t("ifc.card.stale"), "warning").mark("ifc-stale")
@@ -851,6 +1125,7 @@ class DxfPage:
                 with ui.element("div").classes("flex-1 relative sam-result-canvas-box").style("height:1040px;min-width:0"):
                     self.ifc_viewer = IfcViewer().classes("w-full h-full").mark("ifc-viewer")
                     self.ifc_viewer.show(model_url(key, glb.stat().st_mtime_ns), by_node)
+                    self.ifc_viewer.set_category_colors(config["colors"])
                     self.ifc_viewer.set_hidden_classes(self.ifc_hidden)
                     self.ifc_viewer.on("pick", lambda event: self.on_ifc_pick(event.args, key))
                     self.ifc_viewer.on("ready", lambda event: self.on_ifc_ready(event.args))
@@ -867,8 +1142,10 @@ class DxfPage:
                     ui.label(t("ifc.panel.types")).classes("text-sm")
                     for name, count in counts.items():
                         with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                            if outdoor:
+                                ui.element("div").classes("sam-dxf-swatch").style(f"background:{config['colors'][name]}")
                             self.ifc_checks[name] = ui.checkbox(
-                                t(f"ifc.category.{name}"), value=name not in self.ifc_hidden,
+                                ifc_category_label(name, outdoor), value=name not in self.ifc_hidden,
                                 on_change=lambda event, category=name: self.toggle_ifc_category(category, bool(event.value)),
                             ).mark(f"ifc-class-{name}")
                             ui.label(str(count)).classes("sam-muted text-xs")

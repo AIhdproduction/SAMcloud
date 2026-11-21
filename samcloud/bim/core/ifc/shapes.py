@@ -114,9 +114,13 @@ def swept_curb(
     height: float = 0.25,
 ) -> Entity:
     """Create an IfcFixedReferenceSweptAreaSolid along a three-dimensional polyline."""
-    profile = rectangle_profile(ifc, (0.0, height / 2.0), width, height)
+    profile = rectangle_profile(ifc, (0.0, -height / 2.0), width, height)
     directrix = ifc.createIfcPolyline([_point3(ifc, point) for point in axis])
-    position = ifc.createIfcAxis2Placement3D(_point3(ifc, axis[0]), None, None)
+    # Directrix uses absolute coordinates, so the solid position stays at the origin
+    # (an axis[0] offset here would be applied a second time). IfcOpenShell maps the
+    # profile +Y to -Z for FixedReference (0, 0, 1), so the profile hangs at -height/2
+    # to make the curb stand up from the axis.
+    position = ifc.createIfcAxis2Placement3D(_point3(ifc, (0.0, 0.0, 0.0)), None, None)
     return ifc.createIfcFixedReferenceSweptAreaSolid(
         profile, position, directrix, None, None, _direction(ifc, (0.0, 0.0, 1.0))
     )
@@ -225,3 +229,49 @@ def place(
     ifcopenshell.api.geometry.edit_object_placement(
         ctx.file, product=product, matrix=frame_matrix(origin, x_axis, z_axis)
     )
+
+
+# --------------------------------------------------------------------------------------
+# presentation styles and layers (outdoor category styling)
+# --------------------------------------------------------------------------------------
+
+def _colour(f: ifcopenshell.file, rgb: Sequence[int]) -> Entity:
+    return f.createIfcColourRgb(None, *(float(value) / 255.0 for value in rgb))
+
+
+def surface_style(f: ifcopenshell.file, name: str, rgb: Sequence[int], transparency: float = 0.0) -> Entity:
+    """IfcSurfaceStyle with one IfcSurfaceStyleRendering in the given 0..255 colour."""
+    rendering = f.createIfcSurfaceStyleRendering(
+        _colour(f, rgb), float(transparency), None, None, None, None, None, None, "NOTDEFINED"
+    )
+    return f.createIfcSurfaceStyle(name, "BOTH", [rendering])
+
+
+def curve_style(f: ifcopenshell.file, name: str, rgb: Sequence[int]) -> Entity:
+    """IfcCurveStyle (solid line, colour only) for curve items such as markings and footprints."""
+    return f.createIfcCurveStyle(name, None, None, _colour(f, rgb), None)
+
+
+def style_item(f: ifcopenshell.file, item: Entity, style: Entity) -> None:
+    """Attach ``style`` to a representation item; an existing IfcStyledItem is re-pointed, never doubled."""
+    existing = list(getattr(item, "StyledByItem", None) or [])
+    if existing:
+        existing[0].Styles = [style]
+        return
+    f.createIfcStyledItem(item, [style], None)
+
+
+def presentation_layer(f: ifcopenshell.file, layers: dict[str, Entity], name: str) -> Entity:
+    """Return the IfcPresentationLayerAssignment called ``name``, creating it on first use (cached in ``layers``)."""
+    layer = layers.get(name)
+    if layer is None:
+        layer = f.createIfcPresentationLayerAssignment(name, None, [], None)
+        layers[name] = layer
+    return layer
+
+
+def add_to_layer(layer: Entity, representation: Entity) -> None:
+    """Add a shape representation to a presentation layer once."""
+    assigned = list(layer.AssignedItems)
+    if representation not in assigned:
+        layer.AssignedItems = assigned + [representation]

@@ -123,8 +123,109 @@ def category_of(ifc_class: str, predefined_type: str | None = None) -> str:
     return _CLASS_CATEGORY.get(ifc_class, "other")
 
 
-def category_index(data: dict[str, Any]) -> tuple[dict[str, str], dict[str, int]]:
-    """(GlobalId -> category, category -> element count) from a parsed props.json."""
+OUTDOOR_CATEGORY_ORDER: tuple[str, ...] = (
+    "terrain", "lawns", "pavements", "paths", "sidewalks", "curbs", "buildings", "roofs", "site_walls", "fences",
+    "trees", "shrubs", "manholes", "markings", "other",
+)
+_OUTDOOR_COLORS_FALLBACK: dict[str, str] = {
+    "lawns": "#78b848", "paths": "#a89f91", "terrain": "#b5b57a", "pavements": "#7d8590", "sidewalks": "#c3c8cf", "curbs": "#4a4f57",
+    "buildings": "#e3cfa8", "roofs": "#c8643c", "site_walls": "#8a6244", "fences": "#a8794a",
+    "trees": "#2f8f4e", "shrubs": "#8fcf7a", "manholes": "#3b82c4", "markings": "#ffffff", "other": "#9aa5b1",
+}
+# Viewer category -> category of config/outdoor_style.yaml (single source of truth for viewer, IFC and DXF).
+_VIEWER_STYLE_CATEGORY: dict[str, str] = {
+    "terrain": "terrain", "lawns": "lawn", "paths": "path", "pavements": "road", "sidewalks": "sidewalk", "curbs": "curb", "buildings": "building_wall",
+    "roofs": "roof", "site_walls": "site_wall", "fences": "fence", "trees": "tree", "shrubs": "shrub",
+    "manholes": "manhole", "markings": "marking",
+}
+
+
+def _outdoor_colors() -> dict[str, str]:
+    """Viewer colours from the shared style file; falls back to the built-in values when it cannot be read."""
+    colors = dict(_OUTDOOR_COLORS_FALLBACK)
+    try:
+        from samcloud.outdoor_model.style import load_outdoor_style
+        styles = load_outdoor_style()
+        for viewer_key, style_key in _VIEWER_STYLE_CATEGORY.items():
+            if style_key in styles:
+                colors[viewer_key] = styles[style_key]["hex"]
+    except Exception:  # noqa: BLE001 - the viewer must keep working without the style file
+        pass
+    return colors
+
+
+# Calm, colour-blind-safe (Okabe-Ito inspired, softened) category colours of the outdoor view.
+OUTDOOR_COLORS: dict[str, str] = _outdoor_colors()
+_OUTDOOR_CLASSES = frozenset({
+    "IfcGeographicElement", "IfcCivilElement", "IfcRailing", "IfcDistributionChamberElement", "IfcAnnotation", "IfcRoof",
+})
+
+
+_INDOOR_ONLY_CLASSES = frozenset({
+    "IfcSpace", "IfcDoor", "IfcWindow", "IfcOpeningElement", "IfcFurniture", "IfcSanitaryTerminal",
+    "IfcElectricAppliance", "IfcSystemFurnitureElement",
+})
+
+
+def _info_text(info: dict[str, Any]) -> str:
+    return " ".join(str(info.get(key) or "") for key in ("name", "object_type")).lower()
+
+
+def outdoor_category_of(info: dict[str, Any]) -> str:
+    """Outdoor viewer category of one props.json element from ifc_class, name, object_type and predefined_type."""
+    ifc_class = str(info.get("ifc_class") or "")
+    kind = str(info.get("predefined_type") or "").upper()
+    text = _info_text(info)
+    if ifc_class == "IfcRoof" or (ifc_class == "IfcSlab" and kind == "ROOF"):
+        return "roofs"
+    if ifc_class in {"IfcWall", "IfcWallStandardCase"}:
+        return "site_walls" if "mauer" in text or "site wall" in text else "buildings"
+    if ifc_class == "IfcGeographicElement":
+        if kind == "TERRAIN" or "terrain" in text or "gelände" in text:
+            return "terrain"
+        if "baum" in text or "tree" in text:
+            return "trees"
+        if "busch" in text or "strauch" in text or "shrub" in text or "bush" in text:
+            return "shrubs"
+        if "rasen" in text or "vegetationsfl" in text or "vegetation area" in text or "lawn" in text:
+            return "lawns"
+        return "other"
+    if ifc_class == "IfcCivilElement":
+        if "randstein" in text or "curb" in text:
+            return "curbs"
+        if "trottoir" in text or "sidewalk" in text:
+            return "sidewalks"
+        if str(info.get("object_type") or "").strip().lower() in {"weg", "path"}:
+            return "paths"
+        if "strasse" in text or "straße" in text or "weg" in text or "pavement" in text or "road" in text:
+            return "pavements"
+        return "other"
+    if ifc_class == "IfcRailing":
+        return "fences"
+    if ifc_class == "IfcDistributionChamberElement":
+        return "manholes"
+    if ifc_class == "IfcAnnotation":
+        return "markings"
+    return "other"
+
+
+def is_outdoor(level_key: str | None, data: dict[str, Any]) -> bool:
+    """True when props.json contains outdoor IFC classes, or for level "site" without indoor-only classes."""
+    elements = data.get("elements") if isinstance(data, dict) else None
+    classes = {info.get("ifc_class") for info in elements.values() if isinstance(info, dict)} if isinstance(elements, dict) else set()
+    if classes & _OUTDOOR_CLASSES:
+        return True
+    return str(level_key or "") == "site" and not classes & _INDOOR_ONLY_CLASSES
+
+
+def category_index(data: dict[str, Any], outdoor: bool | None = None) -> tuple[dict[str, str], dict[str, int]]:
+    """(GlobalId -> category, category -> element count) from a parsed props.json.
+
+    ``outdoor`` None detects outdoor props from their IFC classes; True/False forces the category set.
+    """
+    if outdoor is None:
+        outdoor = is_outdoor(None, data)
+    order = OUTDOOR_CATEGORY_ORDER if outdoor else CATEGORY_ORDER
     by_node: dict[str, str] = {}
     counts: dict[str, int] = {}
     elements = data.get("elements") if isinstance(data, dict) else None
@@ -132,10 +233,26 @@ def category_index(data: dict[str, Any]) -> tuple[dict[str, str], dict[str, int]
         for guid, info in elements.items():
             if not isinstance(info, dict):
                 continue
-            category = category_of(str(info.get("ifc_class") or ""), info.get("predefined_type"))
+            if outdoor:
+                category = outdoor_category_of(info)
+            else:
+                category = category_of(str(info.get("ifc_class") or ""), info.get("predefined_type"))
             by_node[str(guid)] = category
             counts[category] = counts.get(category, 0) + 1
-    return by_node, {key: counts[key] for key in CATEGORY_ORDER if key in counts}
+    return by_node, {key: counts[key] for key in order if key in counts}
+
+
+def viewer_config(level_key: str | None, data: dict[str, Any]) -> dict[str, Any]:
+    """Everything the IFC viewer card needs: outdoor flag, node->category, counts, hidden-by-default set, colours.
+
+    Outdoor: every category visible by default and a colour per category. Indoor: unchanged (no colours,
+    spaces/openings/ceilings hidden).
+    """
+    outdoor = is_outdoor(level_key, data)
+    by_node, counts = category_index(data, outdoor)
+    hidden = set() if outdoor else {name for name in HIDDEN_BY_DEFAULT if name in counts}
+    colors = {name: OUTDOOR_COLORS[name] for name in counts} if outdoor else {}
+    return {"outdoor": outdoor, "by_node": by_node, "counts": counts, "hidden": hidden, "colors": colors}
 
 
 # --------------------------------------------------------------------------------------

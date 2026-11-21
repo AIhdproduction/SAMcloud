@@ -6,7 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable
 
 import numpy as np
-from shapely.geometry import LineString, MultiLineString, Polygon
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import triangulate, unary_union
 
 from samcloud.buildings.partition import Partition
@@ -93,6 +93,16 @@ def _inside_triangle(point: np.ndarray, first: np.ndarray, second: np.ndarray, t
     return min(values) >= -1e-10 or max(values) <= 1e-10
 
 
+def _min_angle(first: np.ndarray, second: np.ndarray, third: np.ndarray) -> float:
+    """Smallest interior angle (radians) of a triangle, used to prefer well-shaped ears."""
+    angles = []
+    for a, b, c in ((first, second, third), (second, third, first), (third, first, second)):
+        u, v = b - a, c - a
+        denominator = float(np.linalg.norm(u) * np.linalg.norm(v))
+        angles.append(float(np.arccos(np.clip(np.dot(u, v) / denominator, -1.0, 1.0))) if denominator > 1e-14 else 0.0)
+    return min(angles)
+
+
 def _triangulate_ring(ring: list[np.ndarray]) -> list[tuple[int, int, int]]:
     """Ear-clip a simple polygon while preserving every supplied boundary vertex."""
     if len(ring) < 3:
@@ -103,6 +113,7 @@ def _triangulate_ring(ring: list[np.ndarray]) -> list[tuple[int, int, int]]:
     triangles: list[tuple[int, int, int]] = []
     while len(indices) > 3:
         found_ear = False
+        best: tuple[float, int] | None = None
         for position, middle in enumerate(indices):
             first, third = indices[position - 1], indices[(position + 1) % len(indices)]
             left, center, right = ring[first], ring[middle], ring[third]
@@ -110,10 +121,16 @@ def _triangulate_ring(ring: list[np.ndarray]) -> list[tuple[int, int, int]]:
                 continue
             if any(_inside_triangle(ring[other], left, center, right) for other in indices if other not in (first, middle, third)):
                 continue
+            quality = _min_angle(left, center, right)
+            if best is None or quality > best[0] + 1e-12:
+                best = (quality, position)
+        if best is not None:
+            position = best[1]
+            middle = indices[position]
+            first, third = indices[position - 1], indices[(position + 1) % len(indices)]
             triangles.append((first, middle, third))
             indices.pop(position)
             found_ear = True
-            break
         if not found_ear:
             for position, middle in enumerate(indices):
                 first, third = indices[position - 1], indices[(position + 1) % len(indices)]
@@ -371,16 +388,20 @@ def _extrude_shared(partition: Partition, top, footprint: Polygon, ground_z) -> 
     edge_owners: dict[tuple[tuple[int, int], tuple[int, int]], list[tuple[int, int, int]]] = defaultdict(list)
     for cell_index, ring in enumerate(rings):
         roof = [add(np.array((point[0], point[1], top(cell_index, *point)), dtype=float)) for point in ring]
-        ground = [add(np.array((point[0], point[1], _ground(ground_z, *point)), dtype=float)) for point in ring]
         roof_vertices.append(roof)
-        ground_vertices.append(ground)
         for first, second, third in _triangulate_ring(ring):
             face(roof[first], roof[second], roof[third], 2)
-            face(ground[first], ground[third], ground[second], 0)
         for position in range(len(ring)):
             next_position = (position + 1) % len(ring)
             edge_key = tuple(sorted((_xy_key(ring[position]), _xy_key(ring[next_position]))))
             edge_owners[edge_key].append((cell_index, position, next_position))
+
+    # The floor is one polygon over the whole outline (nodes included); interior
+    # roof seams need no ground vertices.
+    floor = list(np.asarray(footprint.exterior.coords[:-1], dtype=float))
+    floor_indices = [add(np.array((point[0], point[1], _ground(ground_z, *point)), dtype=float)) for point in floor]
+    for first, second, third in _triangulate_ring(floor):
+        face(floor_indices[first], floor_indices[third], floor_indices[second], 0)
 
     for owners in edge_owners.values():
         if len(owners) == 1:
@@ -412,7 +433,9 @@ def _extrude_shared(partition: Partition, top, footprint: Polygon, ground_z) -> 
             cell_index, first, second = owners[0]
             first_point, second_point = rings[cell_index][first], rings[cell_index][second]
             segment = LineString([first_point, second_point])
-            if edge.distance(segment) > _NODE_TOLERANCE:
+            # Collinear only: a segment that merely touches the edge at a vertex
+            # (a sharp notch) must not contribute a facade piece.
+            if edge.distance(segment) > _NODE_TOLERANCE or max(edge.distance(Point(first_point)), edge.distance(Point(second_point))) > _NODE_TOLERANCE:
                 continue
             first_t = float(np.dot(first_point - start, direction))
             second_t = float(np.dot(second_point - start, direction))
@@ -424,15 +447,26 @@ def _extrude_shared(partition: Partition, top, footprint: Polygon, ground_z) -> 
         pieces.sort(key=lambda item: item[0])
         if not pieces:
             continue
-        profile = [(0.0, _ground(ground_z, *start))]
-        for _first_t, second_t, _cell_index in pieces:
-            profile.append((second_t, _ground(ground_z, *(start + second_t * direction))))
+        # Ground side: only the two footprint corners (the floor polygon has no nodes).
+        profile = [(0.0, _ground(ground_z, *start)), (length, _ground(ground_z, *end))]
         for first_t, second_t, cell_index in reversed(pieces):
             profile.append((second_t, top(cell_index, *(start + second_t * direction))))
             profile.append((first_t, top(cell_index, *(start + first_t * direction))))
-        for triangle in _triangles(Polygon(profile)):
-            indices = [add(np.array((*((start + direction * value[0]).tolist()), value[1]), dtype=float)) for value in triangle]
-            face(*indices, 1)
+        # Ear clipping keeps every profile vertex (an unconstrained Delaunay
+        # triangulation can drop thin slivers between roof steps).
+        profile_ring = [np.asarray(value, dtype=float) for value in profile]
+        try:
+            triangle_indices = _triangulate_ring(profile_ring)
+        except ValueError:
+            triangle_indices = []
+        if triangle_indices:
+            for triangle in triangle_indices:
+                indices = [add(np.array((*((start + direction * profile_ring[item][0]).tolist()), profile_ring[item][1]), dtype=float)) for item in triangle]
+                face(*indices, 1)
+        else:
+            for triangle in _triangles(Polygon(profile)):
+                indices = [add(np.array((*((start + direction * value[0]).tolist()), value[1]), dtype=float)) for value in triangle]
+                face(*indices, 1)
 
     vertices_array, faces_array, roles_array = _weld(vertices, faces, roles)
     faces_array = _orient_outward(vertices_array, faces_array)

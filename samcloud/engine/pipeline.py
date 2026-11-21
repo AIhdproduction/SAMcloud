@@ -48,7 +48,7 @@ from samcloud.engine.run_summary import RunSummary
 from samcloud.engine.fine_terms import LABELS_NAME, SOURCE_NAME, attach_fine_terms, snapshot_fine_terms
 from samcloud.engine.instances import SOURCE_NAME as INSTANCES_SOURCE_NAME, attach_instances, snapshot_instances
 from samcloud.engine.extract_gps import is_dji_rtk_project
-from samcloud.control_points.georeference import coordinates_to_ecef, enu_rotation_at_ecef, georeference_from_control_points, save_control_point_report
+from samcloud.control_points.georeference import coordinates_to_ecef, enu_rotation_at_ecef, gcp_georeference_from_ecef, georeference_from_control_points, save_control_point_report
 from samcloud.control_points.model_transform import transform_text_model
 from samcloud.control_points.repository import APRILTAG_CSV_NAME, load_detections, load_observations, read_apriltag_coordinates, read_control_points, save_detections, save_observations
 from samcloud.control_points.apriltags import (
@@ -58,7 +58,10 @@ from samcloud.control_points.apriltags import (
 )
 from samcloud.control_points.auto_detect import _similarity, automatic_detection, populate_undistorted_coordinates, triangulate_observations
 from samcloud.control_points.adjustment import build_control_point_report, camera_intrinsics, leave_one_out_errors, populate_review_projections, pose_priors_in_model_frame, quality_gate, run_gcp_bundle_adjustment
-from samcloud.pointcloud.georeference import fit_enu_to_ecef, fit_similarity, format_residuals, save_georeference
+from samcloud.pointcloud.georeference import (
+    fit_enu_to_ecef, fit_similarity, format_residuals, gcp_georeference_for_cloud_frame,
+    georeference_is_control_point_based, load_georeference, save_georeference,
+)
 from samcloud.engine.eta import ProgressEstimator, RateStore, stage_units
 from samcloud.core.project_manager import LOCAL_CRS_GPS_MESSAGE
 
@@ -464,6 +467,32 @@ def _local_tag_georeferenced(outdir: Path) -> bool:
 
 def _is_georeferenced(outdir: Path) -> bool:
     return (outdir / "georeference.json").is_file() or _local_tag_georeferenced(outdir)
+
+
+def _write_camera_centre_georeference(
+    model_dir: Path,
+    gps_ref_path: Path,
+    georeference_path: Path,
+    *,
+    automatic_model_used: bool = False,
+) -> dict | None:
+    """Write a GPS fit, or express a retained GCP solution in the cloud frame."""
+    if georeference_is_control_point_based(georeference_path):
+        gcp_model = georeference_path.parent / "sparse" / "gcp_adjusted"
+        if gcp_model.is_dir():
+            georeference = gcp_georeference_for_cloud_frame(
+                load_georeference(georeference_path), model_dir, gcp_model,
+            )
+            save_georeference(georeference_path, georeference)
+            return georeference
+        print("keeping control-point georeference")
+        return None
+    if automatic_model_used:
+        print("keeping control-point georeference")
+        return None
+    georeference = fit_enu_to_ecef(model_dir, gps_ref_path, _configured_height_reference())
+    save_georeference(georeference_path, georeference)
+    return georeference
 
 
 class TagStepResult(NamedTuple):
@@ -1126,9 +1155,11 @@ def _resume_dense_stereo(
     georeferenced = (outdir / "gps_ref.txt").is_file()
     if georeferenced:
         try:
-            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt", _configured_height_reference())
-            save_georeference(outdir / "georeference.json", georeference)
-            summary.settings["georeference_residual_m"] = georeference["residual_m"]
+            georeference = _write_camera_centre_georeference(
+                sparse_txt, outdir / "gps_ref.txt", outdir / "georeference.json",
+            )
+            if georeference is not None:
+                summary.settings["georeference_residual_m"] = georeference["residual_m"]
         except Exception as error:
             print(f"WARNING: Could not create GPS georeference: {error}")
             georeferenced = False
@@ -1170,9 +1201,11 @@ def _resume_classification(
     georeferenced = (outdir / "gps_ref.txt").is_file()
     if georeferenced:
         try:
-            georeference = fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt", _configured_height_reference())
-            save_georeference(outdir / "georeference.json", georeference)
-            summary.settings["georeference_residual_m"] = georeference["residual_m"]
+            georeference = _write_camera_centre_georeference(
+                sparse_txt, outdir / "gps_ref.txt", outdir / "georeference.json",
+            )
+            if georeference is not None:
+                summary.settings["georeference_residual_m"] = georeference["residual_m"]
         except Exception as error:
             print(f"WARNING: Could not create GPS georeference: {error}")
             georeferenced = False
@@ -1523,16 +1556,19 @@ def _finish_control_point_adjustment(
                 summary.settings["quick_correction"] = quick_correction
         save_control_point_report(report_path, report)
         return None
-    names = list(ecef_by_name)
+    enabled_pass = [str(name) for name in pass_names if detections.get(str(name), {}).get("enabled")]
+    names = enabled_pass
     if local_frame:
         # Local survey coordinates are the target frame: no ECEF/ENU conversion and no centroid shift.
         target_enu = {name: np.asarray(ecef_by_name[name], dtype=float) for name in names}
     else:
         ecef = np.asarray([ecef_by_name[name] for name in names], dtype=float)
-        centroid = ecef.mean(axis=0)
-        enu_rotation = enu_rotation_at_ecef(centroid)
+        georeference = gcp_georeference_from_ecef(
+            ecef, control_points_crs, {"mean": 0.0, "p95": 0.0, "max": 0.0},
+        )
+        centroid = np.asarray(georeference["translation"], dtype=float)
+        enu_rotation = np.asarray(georeference["rotation"], dtype=float).T
         target_enu = dict(zip(names, (enu_rotation @ (ecef - centroid).T).T, strict=True))
-    enabled_pass = [str(name) for name in pass_names if detections.get(str(name), {}).get("enabled")]
     source = np.asarray([references[name] for name in enabled_pass], dtype=float)
     destination = np.asarray([target_enu[name] for name in enabled_pass], dtype=float)
     local_scale, local_rotation, local_translation, residuals = fit_similarity(source, destination)
@@ -1589,11 +1625,10 @@ def _finish_control_point_adjustment(
                 if path != local_model:
                     remove_generated(path, products)
         return local_model
-    save_georeference(model_path.parents[1] / "georeference.json", {
-        "source_frame": "gcp_local_enu", "method": "gcp_bundle_adjustment", "scale": 1.0,
-        "rotation": enu_rotation.T.tolist(), "translation": centroid.tolist(), "pairs": len(names),
-        "residual_m": residuals, "control_points": {"crs": control_points_crs, "origin_ecef": centroid.tolist()},
-    })
+    save_georeference(
+        model_path.parents[1] / "georeference.json",
+        gcp_georeference_from_ecef(ecef, control_points_crs, residuals),
+    )
     products = model_path.parents[1]
     if (products.parent / "project.samcloud.yml").is_file():
         for path in model_path.parent.glob("gcp_adjusted_raw*"):
@@ -2441,7 +2476,7 @@ def _reclassify_project(
     georeferenced = _is_georeferenced(outdir)
     if not georeferenced and (outdir / "gps_ref.txt").is_file():
         try:
-            save_georeference(outdir / "georeference.json", fit_enu_to_ecef(sparse_txt, outdir / "gps_ref.txt", _configured_height_reference()))
+            _write_camera_centre_georeference(sparse_txt, outdir / "gps_ref.txt", outdir / "georeference.json")
             georeferenced = True
         except Exception as error:  # noqa: BLE001
             print(f"WARNING: Could not create GPS georeference: {error}")
@@ -3189,8 +3224,10 @@ def main():
              "--output_type", "TXT"], summary=summary, stage="Preparing control points")
         if georeferenced and not tag_georeferenced:
             try:
-                georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path, _configured_height_reference())
-                save_georeference(outdir / "georeference.json", georeference)
+                _write_camera_centre_georeference(
+                    dense_sparse_txt, gps_ref_path, outdir / "georeference.json",
+                    automatic_model_used=automatic_model_used,
+                )
             except Exception as error:
                 print(f"WARNING: Could not create GPS georeference: {error}")
         if progress:
@@ -3236,14 +3273,17 @@ def main():
     if georeferenced and not tag_georeferenced:
         started_at = time.perf_counter()
         try:
-            georeference = fit_enu_to_ecef(dense_sparse_txt, gps_ref_path, _configured_height_reference())
-            save_georeference(georeference_path, georeference)
+            georeference = _write_camera_centre_georeference(
+                dense_sparse_txt, gps_ref_path, georeference_path,
+                automatic_model_used=automatic_model_used,
+            )
         except Exception as error:
             print(f"WARNING: Could not create GPS georeference: {error}")
         else:
-            summary.record_stage("Georeference", time.perf_counter() - started_at)
-            summary.settings["georeference_residual_m"] = georeference["residual_m"]
-            print(f"Georeference residuals: {format_residuals(georeference)}")
+            if georeference is not None:
+                summary.record_stage("Georeference", time.perf_counter() - started_at)
+                summary.settings["georeference_residual_m"] = georeference["residual_m"]
+                print(f"Georeference residuals: {format_residuals(georeference)}")
     if progress:
         progress.update(87, "Preparing classification")
 
@@ -3360,8 +3400,11 @@ _AUTO_DXF_REQUEST: dict | None = None
 def _request_auto_dxf(args) -> None:
     """Remember whether the final export stage was requested (``--auto-dxf 1``) for this process."""
     global _AUTO_DXF_REQUEST
+    requested = getattr(args, "auto_dxf", "0") == "1"
+    flurseg = (getattr(args, "classification_engine", "sam3") or "sam3") == "flurseg"
     _AUTO_DXF_REQUEST = {
-        "enabled": getattr(args, "auto_dxf", "0") == "1",
+        "enabled": requested and not flurseg,
+        "flurseg": requested and flurseg,
         "project_dir": Path(args.outdir).resolve().parent,
         "progress_file": args.progress_file,
         "started": time.time(),
@@ -3453,6 +3496,9 @@ def run_auto_dxf_stage() -> None:
     run_metrics*.json and run_summary.txt are final at this point, so the pipeline's total time never
     contains the DXF/IFC time (the home page adds dxf_run_metrics.json separately). Never raises."""
     request = _AUTO_DXF_REQUEST
+    if request and request.get("flurseg"):
+        print("DXF/IFC export skipped: FlurSeg projects deliver point clouds only (DXF/IFC need SAM3).", flush=True)
+        return
     if not request or not request["enabled"]:
         return
     if request.get("capture_type") == "drone_gps" or request.get("class_set") == "outdoor":

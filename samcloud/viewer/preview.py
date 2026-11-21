@@ -68,11 +68,24 @@ def ensure_preview(project_directory: Path, kind: str, *, max_points: int = 300_
     return output, point_count
 
 
+def _clipped_classified(project_directory: Path) -> Path | None:
+    """Boundary-clipped classified cloud of an outdoor project, or ``None`` when clipping does not apply."""
+    try:
+        from samcloud.drone.export import ensure_clipped_classified_ply
+
+        return ensure_clipped_classified_ply(project_directory)
+    except Exception:  # never block the viewer
+        return None
+
+
 def _source_path(project_directory: Path, kind: str) -> Path | None:
     products = project_directory / "products"
     if kind == "sparse":
         return sparse_points_path(products / "sparse")
     else:
+        clipped = _clipped_classified(project_directory)
+        if clipped is not None:  # outdoor/drone: boundary-clipped copy; the raw classified.ply stays untouched
+            return clipped
         candidates = (
             products / "classified" / "classified.ply",
             products / "dense" / "fused.ply",

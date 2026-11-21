@@ -110,12 +110,26 @@ def dxf_unavailable_reason(project_dir: Path | str | None) -> str | None:
     """
     if project_dir is None:
         return t("dxf_ui.unavailable.no_project")
+    from samcloud.app.processing import project_uses_flurseg
+
+    if project_uses_flurseg(project_dir):
+        return t("dxf_ui.unavailable.flurseg")
     chosen = chosen_las_path(project_dir)
     if chosen is not None and chosen.is_file():
         return None
     if project_point_source(project_dir) is not None:
         return None
     return t("dxf_ui.unavailable.not_classified")
+
+
+def _environment_detail(item: dict[str, Any]) -> str:
+    """Suffix of an environment step line: duration for finished steps, the shortened error for failed ones."""
+    parts: list[str] = []
+    if item.get("seconds") is not None and item["status"] in ("done", "failed"):
+        parts.append(t("dxf.compute.env_seconds", seconds=f"{float(item['seconds']):.1f}"))
+    if item.get("error"):
+        parts.append(f" - {item['error']}")
+    return "".join(parts)
 
 
 class DxfPageController:
@@ -306,6 +320,26 @@ class DxfPageController:
             except Exception:
                 pass
         return "outdoor"
+
+    @property
+    def uses_environment_chain(self) -> bool:
+        """True for outdoor drone projects, which run the environment chain instead of the ortho DXF job.
+
+        A drone project declares ``acquisition.type: drone_gps`` (or already has a chain ``state.json``); plain outdoor
+        projects keep the ortho/clean-plan workflow.
+        """
+        if self.mode != "outdoor":
+            return False
+        if (self.project_dir / "products" / "environment" / "state.json").is_file():
+            return True
+        project_file = self.project_dir / "project.samcloud.yml"
+        if not project_file.is_file():
+            return False
+        try:
+            data = load_yaml(project_file)
+        except Exception:  # noqa: BLE001 - an unreadable project file means "not a drone project"
+            return False
+        return str((data.get("acquisition") or {}).get("type", "")) == "drone_gps"
 
     @property
     def blocked_message(self) -> str | None:
@@ -837,8 +871,85 @@ class DxfPageController:
     def ifc_export_status(self, level_key: str | None) -> Literal["missing", "fresh", "stale"]:
         """Freshness of the level's IFC export (products/bim/<level>/export.json vs plan_model.json)."""
         if level_key is None:
+            level_key = "site" if self.mode == "outdoor" else None
+        if level_key is None:
             return "missing"
         return _ifc_export_status(self.project_dir, level_key)
+
+    def start_environment_job(self, rerun_all: bool = False) -> dict[str, Any]:
+        """Start the outdoor environment chain in a background subprocess (one per project)."""
+        from samcloud.drone.env_job import start_environment_job
+
+        if self.blocked_message is not None:
+            raise ValueError(self.blocked_message)
+        try:
+            return start_environment_job(self.project_dir, rerun_all)
+        except RuntimeError as error:
+            raise ValueError(t("dxf_ui.errors.environment_running")) from error
+
+    def environment_status(self) -> dict[str, Any]:
+        """Merged job + state.json status of the environment chain (files only, cheap)."""
+        from samcloud.drone.env_job import environment_job_status
+
+        return environment_job_status(self.project_dir)
+
+    def environment_running(self) -> bool:
+        """Whether the environment chain job of this project is running."""
+        from samcloud.drone.env_job import is_environment_job_running
+
+        return is_environment_job_running(self.project_dir)
+
+    def compute_card_rows(self, level_id: str | None) -> dict[str, Any]:
+        """Status lines of the compute card.
+
+        Outdoor drone projects: ``{"kind": "environment", "rows": [(step, status, detail)], "qa": {...} | None}``;
+        everything else: ``{"kind": "classic", "rows": [(step_key, cache_status)]}`` with the ortho/segmentation/clean
+        plan/(refine)/export/IFC lines the indoor workflow always showed.
+        """
+        if self.uses_environment_chain:
+            status = self.environment_status()
+            rows = [(item["name"], item["status"], _environment_detail(item)) for item in status["steps"]]
+            return {"kind": "environment", "rows": rows, "qa": status["qa"], "status": status}
+        from samcloud.bim import ui_data as bim_ui_data
+
+        ifc = bim_ui_data.ifc_status(self.project_dir, "site" if level_id is None else level_id)
+        rows = [
+            ("ortho", self.ortho_status(level_id)),
+            ("segmentation", self.segment_status(level_id)),
+            ("clean_plan", self.plan_status(level_id, "ortho")),
+        ]
+        if self.mode == "indoor":
+            from samcloud.dxf.jobs import refine_openings_status
+
+            try:
+                refine = refine_openings_status(self.project_dir, level_id)
+            except Exception:  # noqa: BLE001 - an unreadable cache counts as stale in the checklist
+                refine = "stale"
+            rows.append(("refine", "ok" if refine == "fresh" else refine))
+        rows.append(("export", self.plan_status(level_id, "ortho")))
+        rows.append(("ifc", "ok" if ifc == "fresh" else ifc))
+        return {"kind": "classic", "rows": rows}
+
+    def outdoor_export_files(self) -> dict[str, Path]:
+        """Published outdoor exports (keys ``dxf``, ``ifc``) of a drone project; empty for indoor projects."""
+        if self.mode != "outdoor":
+            return {}
+        found: dict[str, Path] = {}
+        export_dir = self.project_dir / "products" / "dxf" / "export"
+        dxf = sorted(export_dir.glob(f"*{self.level_label(None)}*clean.dxf")) if export_dir.is_dir() else []
+        if dxf:
+            found["dxf"] = dxf[-1]
+        from samcloud.bim import ui_data as _bim_ui_data
+
+        ifc = _bim_ui_data.find_ifc(self.project_dir, "site")
+        if ifc is not None:
+            found["ifc"] = ifc
+        return found
+
+    def dxf_preview_path(self) -> Path | None:
+        """Target ``preview.png`` next to the published outdoor DXF; None for indoor projects or without a DXF."""
+        dxf = self.outdoor_export_files().get("dxf")
+        return None if dxf is None else dxf.parent / "preview.png"
 
     def cancel_job(self) -> None:
         """Signal background job to cancel and terminate process if needed."""

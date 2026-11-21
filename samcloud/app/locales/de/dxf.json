@@ -83,7 +83,38 @@
     "step_export": "DXF-Export",
     "step_row": "{name}: {status}",
     "step_ifc": "IFC-Export",
-    "step_refine": "Öffnungen verfeinern"
+    "step_refine": "Öffnungen verfeinern",
+    "env_step_row": "{name}: {status}{detail}",
+    "env_seconds": " ({seconds} s)",
+    "env_progress": "Umgebungsberechnung: Schritt {done} von {total}",
+    "env_idle": "Umgebungsberechnung: noch nicht gestartet",
+    "env_finished": "Umgebungsberechnung abgeschlossen",
+    "env_failed": "Umgebungsberechnung fehlgeschlagen{detail}",
+    "env_started": "Umgebungsberechnung gestartet",
+    "env_qa": "QA: {passed}/{total} Regeln bestanden",
+    "env_qa_failed": "Nicht bestanden: {rules}",
+    "env_qa_missing": "QA: noch kein Bericht",
+    "env_status": {
+      "done": "fertig",
+      "failed": "fehlgeschlagen",
+      "pending": "ausstehend",
+      "running": "läuft",
+      "skipped": "übersprungen"
+    },
+    "env_steps": {
+      "load": "Laden",
+      "semantics": "Semantik",
+      "terrain": "Gelände",
+      "vegetation": "Vegetation",
+      "pavement": "Beläge",
+      "tin": "Geländemodell (TIN)",
+      "buildings": "Gebäude",
+      "site": "Grundstück",
+      "scene": "Szene",
+      "export": "DXF/IFC-Export",
+      "qa": "Qualitätsprüfung",
+      "report": "Bericht"
+    }
   },
   "prep": {
     "title": "Vorbereitung",
@@ -232,5 +263,33 @@
       "voting_photos": "Fotos stimmen ab {index}/{total}",
       "plan_has_openings": "Plan enthält die verfeinerten Öffnungen bereits"
     }
+  },
+  "dxf_preview": {
+    "title": "DXF-Vorschau",
+    "rendering": "DXF-Vorschau wird erstellt ...",
+    "empty": "Noch kein exportiertes DXF vorhanden.",
+    "failed": "DXF-Vorschau fehlgeschlagen: {error}",
+    "fit": "Einpassen",
+    "layers": "DXF-Layer",
+    "all": "Alle",
+    "none": "Keine",
+    "hint": "Mausrad zoomt, Ziehen verschiebt.",
+    "open_png": "PNG öffnen"
+  },
+  "ifc_outdoor": {
+    "lawns": "Rasen",
+    "paths": "Wege",
+    "terrain": "Gelände",
+    "pavements": "Beläge",
+    "sidewalks": "Trottoirs",
+    "curbs": "Randsteine",
+    "buildings": "Gebäude-Wände",
+    "roofs": "Dächer",
+    "site_walls": "Mauern",
+    "fences": "Zäune",
+    "trees": "Bäume",
+    "shrubs": "Büsche",
+    "manholes": "Schächte",
+    "markings": "Markierungen"
   }
 }

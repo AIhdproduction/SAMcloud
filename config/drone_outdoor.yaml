@@ -3,6 +3,14 @@ class_codes:                 # LAS class codes for outdoor classes
   road_marking: 82           # road marking class code
   path: 83                   # path class code
   custom_slots_start: 200    # first free code for user-defined classes
+environment:
+  working_voxel_m: auto      # float metres or auto
+  max_working_points: 8000000  # auto chooses the smallest voxel within this limit
+  min_working_voxel_m: 0.03
+  clip_point_cloud: true     # clip the user-facing point cloud products (LAZ/LAS, viewer) to the processing boundary
+semantics:
+  plane_k: 24                # maximum neighbours for local planar metrics
+  plane_chunk_size: 500000   # points processed per local-PCA batch
 terrain:
   dsm_resolution_m: 0.10     # DSM raster cell size
   dtm_resolution_m: 0.25     # DTM raster cell size
@@ -13,10 +21,40 @@ terrain:
     class_threshold_m: 0.15  # max distance cloth-to-point for ground
     iterations: 500          # simulation iterations
     time_step: 0.65          # simulation time step
+  clean:                     # DTM clean-up before the TIN (samcloud/terrain/clean.py)
+    enabled: true
+    window_m: 5.0            # window of the robust local surface (morphological opening)
+    max_bump_m: 0.15         # cells higher than the local surface by more than this are bump seeds
+    max_bump_area_m2: 25.0   # bumps with a larger area are real terrain and stay
+    tall_bump_m: 1.0         # bumps at least this high (objects, shrub groups) ...
+    tall_area_factor: 4.0    # ... may cover this many times max_bump_area_m2
+    grow_fraction: 0.25      # a bump is grown down to this share of max_bump_m ...
+    grow_margin_m: 1.0       # ... but never further than this from a seed
+    steep_slope: 1.0         # gradient above this marks a step/wall
+    wall_min_length_m: 2.0   # steep features longer than this are retaining walls and stay untouched
+    protect_dilate_m: 0.5    # cells near curbs/pavement points are never modified
+    median_cells: 3          # median filter size on measured terrain cells (0 = off)
+  smooth:                    # robust per-element smoothing of pavement surfaces
+    enabled: true
+    window_m: 2.0            # local plane window
+    iterations: 3            # robust reweighting rounds
+    robust_scale_m: 0.08     # Tukey scale of the residuals
+    max_change_m: 0.06       # a cell never moves further than this (larger jumps are real relief)
+  deviation:
+    max_rms_pavement_m: 0.04
+    max_rms_terrain_m: 0.06
+    max_points: 400000
   tin:                       # constrained TIN meshing
     constraint_buffer_m: 0.05    # buffer around breaklines
     min_angle_deg: 20            # minimum triangle angle
     max_steiner_per_edge: 50     # cap on Steiner points per edge
+    tolerance_m: 0.03            # max vertical deviation TIN vs. ground reference
+    tolerance_pavement_m: 0.02   # max vertical deviation on road/sidewalk/path
+    tolerance_terrain_m: 0.04    # max vertical deviation on terrain and lawn
+    initial_spacing_m: 2.0       # start grid before error-driven insertion
+    support_spacing_m: 0.50      # DTM cell spacing used for robust TIN support selection
+    max_vertices: 60000          # hard cap
+    max_refinement_rounds: 2     # bounded batched error-refinement iterations
 buildings:
   ransac_distance_m: 0.05    # RANSAC inlier distance for planes
   region_growing:            # plane region growing
@@ -27,6 +65,32 @@ buildings:
   label_pruning_buffer_m: 2.5    # buffer when pruning stray building labels
   complexity_factor: 0.7     # roof model complexity trade-off
   max_seconds_per_building: 60   # time budget per building
+  roof:
+    min_plane_area_m2: 4.0   # minimum measured DSM support for one roof plane
+    inlier_tolerance_m: 0.08 # DSM plane inlier distance
+    min_roof_height_m: 1.5   # DSM cells lower than this above the DTM are not roof
+    region_simplify_m: 0.35  # boundary tolerance between sloped planes (ridges/valleys are re-cut exactly)
+    step_simplify_m: 0.12    # boundary tolerance at height steps (errors scale with the step)
+    outline_simplify_m: 0.3  # tolerance of the outline after roofless parts are removed
+    min_region_area_m2: 1.0  # smaller roof regions are merged into their neighbour
+    min_feature_area_m2: 6.0 # roof features (dormers, annexes) below this area are merged
+    min_step_m: 0.35         # height differences below this are not roof steps
+    merge_normal_deg: 4.0    # roof planes with normals closer than this may be merged
+    merge_offset_m: 0.15     # ... when their plane offset is below this
+  plausibility:
+    min_width_m: 2.5         # narrow strips are walls or hedges, not buildings
+    min_area_m2: 10.0        # minimum plausible building footprint
+    min_height_m: 2.5        # minimum 95th percentile height above the DTM
+    min_plane_area_m2: 4.0   # minimum roof plane area for a plausible building
+  regularize:
+    angle_tol_deg: 12        # snap nearly axial footprint and roof edges
+    merge_offset_m: 0.3      # maximum offset when merging parallel footprint edges
+    min_edge_m: 0.5          # remove smaller footprint facets and jogs
+    ridge_tol_deg: 5         # symmetric slope tolerance for horizontal ridges
+    flat_slope_deg: 5        # slopes below this value become flat roofs
+    eave_tol_m: 0.15         # shared eave-height reconciliation tolerance
+    min_footprint_iou: 0.92  # retain only footprint changes close to the source
+    max_rmse_increase_m: 0.03  # retain only roof changes within fit tolerance
 openings:
   min_views: 3               # min camera views as evidence
   min_area_m2: 0.3           # smallest accepted opening
@@ -46,6 +110,12 @@ pavement:
   snap_search_m: 0.15        # search radius for snapping to curbs (residual target stays max_gap_overlap_cm2)
   gap_tolerance_m: 0.15      # gaps narrower than this between neighbouring pavements are closed
   min_area_m2: 2.0           # smaller pavement polygons become QA entries instead of elements
+  outline:
+    close_m: 0.25            # close narrow gaps between labelled TIN triangles
+    open_m: 0.10             # remove narrow spikes after closing
+    min_area_m2: 2.0         # discard small disconnected footprint parts
+    min_hole_m2: 1.0         # discard tiny footprint holes
+    simplify_m: 0.05         # topology-preserving Douglas-Peucker tolerance
 curb:
   min_length_m: 0.3          # shorter curb axes are not emitted
   dp_tolerance_m: 0.015      # Douglas-Peucker tolerance for axis thinning
@@ -95,3 +165,23 @@ boundary:                    # processing boundary (samcloud/drone/perimeter.py)
   buffer_m: 10.0             # outward buffer of the camera-position convex hull
   perimeter_path: null       # KML path (relative to project or absolute); null = inputs/survey/*.kml
   perimeter_buffer_m: 2.0    # margin around the KML polygon in mode "perimeter"
+surfaces:
+  clean:                     # cleaning of lawn / sidewalk / path polygons before the TIN
+    close_m: 0.4             # morphological close
+    open_m: 0.2              # morphological open
+    min_area_m2: {lawn: 4.0, sidewalk: 2.0, path: 2.0}   # smaller parts fall back to terrain
+    min_hole_m2: 2.0         # smaller holes are filled
+    simplify_m: 0.10         # topology-preserving Douglas-Peucker tolerance
+    min_width_m: 0.6         # narrower slivers are merged into the neighbour with the longest shared edge
+edges:
+  enabled: true
+  fit:                       # lines and circular arcs for outlines and curbs (samcloud/terrain/edges.py)
+    min_radius_m: 1.0        # smaller radii stay straight segments
+    max_radius_m: 200.0      # larger radii are straight
+    tolerance_m: 0.05        # max deviation fitted vs cleaned outline
+    sample_m: 0.10           # resampling step of the outline
+    tangent_deg: 10.0        # line/arc junctions closer than this are made tangent
+    merge_deg: 3.0           # near-collinear neighbouring lines are merged
+    sagitta_m: 0.01          # arcs are densified to this sagitta for TIN/IFC and 3D polylines
+    curb_match_m: 0.12       # curb axis is taken from a shared outline edge within this distance
+  dxf_curb_flat_z_m: 0.05    # curbs with a smaller Z range are written as LWPOLYLINE with bulges

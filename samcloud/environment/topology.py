@@ -20,6 +20,7 @@ LOGGER = logging.getLogger(__name__)
 #: Priority of surfaces when they overlap (highest first).
 PRIORITY_ORDER = ("curb", "sidewalk", "road", "path", "lawn")
 _MIN_AREA = 1e-9
+_EPS = 1e-12
 
 
 def _explode(geom) -> list[Polygon]:
@@ -36,19 +37,31 @@ def _explode(geom) -> list[Polygon]:
 
 
 def _as_polygon(item) -> Polygon:
-    return item.polygon if isinstance(item, c.PavementPolygon) else item
+    value = item.polygon if isinstance(item, c.PavementPolygon) else item
+    return value if value is not None else Polygon()
 
 
 def _as_line(item) -> LineString:
+    if item is None:
+        return LineString()
     if isinstance(item, c.CurbAxis):
-        return LineString(np.asarray(item.points)[:, :2])
+        points = np.asarray(item.points, dtype=float) if item.points is not None else np.empty((0, 2))
+        return LineString(points[:, :2]) if points.ndim == 2 and len(points) >= 2 else LineString()
     if isinstance(item, (LineString, MultiLineString)):
         return shapely.force_2d(item)
     return LineString(np.asarray(item)[:, :2])
 
 
 def _clean(geom) -> list[Polygon]:
+    if geom is None:
+        return []
     return [p for p in _explode(make_valid(geom)) if p.area > _MIN_AREA]
+
+
+def _polygonal_union(items: Iterable) -> Polygon:
+    """Return only valid polygonal area, never a GeometryCollection."""
+    parts = [part for item in items for part in _clean(_as_polygon(item))]
+    return unary_union(parts) if parts else Polygon()
 
 
 def _snap_ring(coords: np.ndarray, target, tolerance: float) -> np.ndarray:
@@ -63,6 +76,8 @@ def _snap_ring(coords: np.ndarray, target, tolerance: float) -> np.ndarray:
 
 
 def _snap_polygon(poly: Polygon, target, tolerance: float, max_segment: float) -> Polygon:
+    if poly is None or poly.is_empty or target is None or target.is_empty:
+        return Polygon()
     dense = shapely.segmentize(poly, max_segment)
     shell = _snap_ring(np.asarray(dense.exterior.coords), target, tolerance)
     holes = [_snap_ring(np.asarray(r.coords), target, tolerance) for r in dense.interiors]
@@ -78,7 +93,7 @@ def snap_to_breakline(polygons: Iterable, breaklines: Iterable, *, tolerance: fl
     that line, so neighbouring road/sidewalk polygons end up sharing the curb line. The result is
     repaired with make_valid. Same element type in and out; a polygon that splits yields several.
     """
-    lines = [_as_line(b) for b in breaklines]
+    lines = [line for b in breaklines if (line := _as_line(b)) is not None and not line.is_empty and line.length > _EPS]
     items = list(polygons)
     if not lines:
         return items
@@ -86,6 +101,8 @@ def snap_to_breakline(polygons: Iterable, breaklines: Iterable, *, tolerance: fl
     out: list = []
     for item in items:
         poly = _as_polygon(item)
+        if poly.is_empty:
+            continue
         snapped = _snap_polygon(poly, target, tolerance, max_segment)
         parts = _clean(snapped)
         if isinstance(item, c.PavementPolygon):
@@ -121,30 +138,69 @@ def resolve_overlaps(
     per input group, in the same order.
     """
     materialised = [list(g) for g in polygons_by_priority]
-    groups = [unary_union([_as_polygon(p) for p in g]) if g else Polygon() for g in materialised]
+    groups = [_polygonal_union(group) for group in materialised]
     resolved: list = []
     covered = Polygon()
     for geom in groups:
-        geom = make_valid(geom)
+        geom = _polygonal_union([geom])
         cut = geom.difference(covered) if not covered.is_empty else geom
+        cut = _polygonal_union([cut])
         resolved.append(cut)
-        covered = unary_union([covered, cut]) if not cut.is_empty else covered
+        covered = _polygonal_union([covered, cut]) if not cut.is_empty else covered
     if gap_tolerance > 0 and not covered.is_empty:
         for piece in _gap_pieces(covered, gap_tolerance):
             ring = piece.buffer(1e-6)
-            lengths = [
-                0.0 if g.is_empty else float(ring.intersection(g.boundary).length) for g in resolved
-            ]
+            lengths = [0.0 if g.is_empty or g.boundary is None else float(ring.intersection(g.boundary).length)
+                       for g in resolved]
             if sum(1 for ln in lengths if ln > 1e-4) < 2:
                 continue
             best = int(np.argmax(lengths))
-            resolved[best] = unary_union([resolved[best], piece])
+            resolved[best] = _polygonal_union([resolved[best], piece])
     return [_clean(g) for g in resolved]
 
 
+def absorb_slivers(
+    groups: Sequence[Iterable],
+    min_width: float,
+    *,
+    names: Sequence[str] | None = None,
+    min_piece_area: float = 0.05,
+) -> tuple[list[list[Polygon]], dict[str, int]]:
+    """Merge or drop parts narrower than ``min_width`` (measured with a negative buffer).
+
+    For every group the pieces removed by an opening of radius ``min_width / 2`` are slivers when they
+    are larger than ``min_piece_area`` (smaller ones are only rounded corners).  A sliver is given to
+    the other group with the longest shared edge (at least 0.1 m); without such a neighbour it is dropped
+    and the area falls back to terrain.  Returns the new groups and the sliver count per group name.
+    """
+    unions = [_polygonal_union(g) for g in groups]
+    label = list(names) if names is not None else [str(i) for i in range(len(unions))]
+    counts: dict[str, int] = {}
+    radius = float(min_width) / 2.0
+    for index, geom in enumerate(unions):
+        if geom.is_empty or radius <= 0:
+            continue
+        opened = geom.buffer(-radius).buffer(radius)
+        pieces = [p for p in _explode(make_valid(geom.difference(opened))) if p.area >= min_piece_area]
+        for piece in pieces:
+            if piece.area >= min_piece_area and piece.minimum_rotated_rectangle.area > 0:
+                ring = piece.buffer(1e-3)
+                best, length = -1, 0.1
+                for other, ogeom in enumerate(unions):
+                    if other == index or ogeom.is_empty:
+                        continue
+                    shared = float(ring.intersection(ogeom.boundary).length) / 2.0
+                    if shared >= length:
+                        best, length = other, shared
+                unions[index] = _polygonal_union([unions[index].difference(piece)])
+                if best >= 0:
+                    unions[best] = _polygonal_union([unions[best], piece])
+                counts[label[index]] = counts.get(label[index], 0) + 1
+    return [_clean(g) for g in unions], counts
+
+
 def _union(polys: Iterable) -> Polygon:
-    items = [make_valid(_as_polygon(p)) for p in polys]
-    return unary_union(items) if items else Polygon()
+    return _polygonal_union(polys)
 
 
 def gap_overlap_report(polys_a: Iterable, polys_b: Iterable, *, region=None, tolerance: float = 0.05,

@@ -19,6 +19,7 @@ import yaml
 from samcloud.core.paths import CONFIG_DIRECTORY
 from samcloud.dxf.las_source import Frame
 from samcloud.dxf.result import DxfPlanResult
+from samcloud.outdoor_model.style import layer_styles as outdoor_layer_styles
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ OUTDOOR_BLOCK_ATTRIBUTES: dict[str, tuple[str, ...]] = {
     "SHRUB": ("HEIGHT",),
     "MANHOLE": ("Z_DECKEL", "TYP"),
 }
+# Block contents on layer 0 with BYBLOCK colour take the colour of the layer of their INSERT.
+_BYBLOCK = {"layer": "0", "color": 0}
 _SYMBOL_LAYERS = {"TREE": "S-TREE", "SHRUB": "S-SHRUB", "MANHOLE": "S-MANH"}
 
 
@@ -92,6 +95,8 @@ def build_dxf_document(
             lineweight = style.get("lineweight")
             if lineweight is not None:
                 layer_entity.dxf.lineweight = int(lineweight)
+        if result.mode == "outdoor":
+            _apply_outdoor_style(layer_entity)
     if "X-NOTE" not in document.layers:
         document.layers.add("X-NOTE", color=8, linetype="CONTINUOUS")
     _ensure_furniture_block(document)
@@ -147,18 +152,23 @@ def ensure_outdoor_layers(
 ) -> list[str]:
     """Create the drone-pipeline outdoor layers (``outdoor_extra_layers`` in dxf_layers.yaml).
 
-    ``names=None`` creates all of them. Existing layers are left untouched. ``frozen: true``
+    ``names=None`` creates all of them. Existing layers are kept but every category layer of
+    ``config/outdoor_style.yaml`` gets its style colour (true colour + ACI). ``frozen: true``
     layers (S-TOPO-TIN) are created frozen and off; ``tin_frozen`` overrides that for S-TOPO-TIN.
     Returns the names of the layers that were newly created.
     """
     source = Path(config_path) if config_path else CONFIG_DIRECTORY / "dxf_layers.yaml"
     wanted = None if names is None else set(names)
     created: list[str] = []
-    for record in _load_extra_layers(str(source)):
+    records = list(_load_extra_layers(str(source)))
+    for record in records:
         name = str(record["name"])
-        if (wanted is not None and name not in wanted) or name in document.layers:
+        if wanted is not None and name not in wanted:
+            continue
+        if name in document.layers:
             continue
         layer = document.layers.add(name, color=int(record.get("color", 7)), linetype=str(record.get("linetype", "CONTINUOUS")))
+        _apply_outdoor_style(layer)
         if record.get("lineweight") is not None:
             layer.dxf.lineweight = int(record["lineweight"])
         frozen = bool(record.get("frozen", False))
@@ -168,12 +178,22 @@ def ensure_outdoor_layers(
             layer.freeze()
             layer.off()
         created.append(name)
+    for layer in document.layers:
+        _apply_outdoor_style(layer)
     return created
+
+
+def _apply_outdoor_style(layer: Any) -> None:
+    """Give a category layer its true colour and ACI fallback from ``config/outdoor_style.yaml``."""
+    style = outdoor_layer_styles().get(layer.dxf.name)
+    if style is not None:
+        layer.color = int(style["aci"])  # keeps the on/off state
+        layer.rgb = tuple(int(value) for value in style["rgb"])
 
 
 def _ensure_used_outdoor_items(document: ezdxf.document.Drawing, result: DxfPlanResult) -> None:
     """Create outdoor layers and symbol blocks only when the result references them (indoor output unchanged)."""
-    extra_names = {str(record["name"]) for record in _load_extra_layers(str(CONFIG_DIRECTORY / "dxf_layers.yaml"))}
+    extra_names = {str(record["name"]) for record in _load_extra_layers(str(CONFIG_DIRECTORY / "dxf_layers.yaml"))} | set(outdoor_layer_styles())
     used_layers = {name for name in result.layers if name in extra_names}
     used_blocks: set[str] = set()
     for entities in result.layers.values():
@@ -195,19 +215,19 @@ def ensure_outdoor_blocks(document: ezdxf.document.Drawing, names: Iterable[str]
     wanted = set(OUTDOOR_BLOCK_ATTRIBUTES) if names is None else set(names)
     if "TREE" in wanted and "TREE" not in document.blocks:
         block = document.blocks.new("TREE")
-        block.add_circle((0.0, 0.0), 1.0)
-        block.add_line((-0.1, 0.0), (0.1, 0.0))
-        block.add_line((0.0, -0.1), (0.0, 0.1))
+        block.add_circle((0.0, 0.0), 1.0, dxfattribs=_BYBLOCK)
+        block.add_line((-0.1, 0.0), (0.1, 0.0), dxfattribs=_BYBLOCK)
+        block.add_line((0.0, -0.1), (0.0, 0.1), dxfattribs=_BYBLOCK)
         _add_invisible_attdefs(block, OUTDOOR_BLOCK_ATTRIBUTES["TREE"])
     if "SHRUB" in wanted and "SHRUB" not in document.blocks:
         block = document.blocks.new("SHRUB")
-        block.add_circle((0.0, 0.0), 1.0)
+        block.add_circle((0.0, 0.0), 1.0, dxfattribs=_BYBLOCK)
         _add_invisible_attdefs(block, OUTDOOR_BLOCK_ATTRIBUTES["SHRUB"])
     if "MANHOLE" in wanted and "MANHOLE" not in document.blocks:
         block = document.blocks.new("MANHOLE")
-        block.add_circle((0.0, 0.0), 0.3)
-        block.add_line((-0.3, 0.0), (0.3, 0.0))
-        block.add_line((0.0, -0.3), (0.0, 0.3))
+        block.add_circle((0.0, 0.0), 0.3, dxfattribs=_BYBLOCK)
+        block.add_line((-0.3, 0.0), (0.3, 0.0), dxfattribs=_BYBLOCK)
+        block.add_line((0.0, -0.3), (0.0, 0.3), dxfattribs=_BYBLOCK)
         _add_invisible_attdefs(block, OUTDOOR_BLOCK_ATTRIBUTES["MANHOLE"])
 
 
@@ -367,12 +387,13 @@ def _add_entity(
             for hole in entity.get("holes", []):
                 modelspace.add_lwpolyline([_point(point, result, coordinates) for point in hole], close=True, dxfattribs=attributes)
         if result.layer_hatches.get(layer, False) and entity.get("closed", False):
-            hatch = modelspace.add_hatch(color=result.layer_colors.get(layer, 7), dxfattribs=attributes)
+            hatch_color = 256 if (result.mode == "outdoor" and layer in outdoor_layer_styles()) else result.layer_colors.get(layer, 7)
+            hatch = modelspace.add_hatch(color=hatch_color, dxfattribs=attributes)
             style = result.layer_styles.get(layer, {})
             hatch_pattern = style.get("hatch_pattern")
             if hatch_pattern:
                 scale = float(style.get("hatch_scale") or 1.0)
-                hatch.set_pattern_fill(hatch_pattern, color=result.layer_colors.get(layer, 7), scale=scale)
+                hatch.set_pattern_fill(hatch_pattern, color=hatch_color, scale=scale)
             hatch.paths.add_polyline_path(points, is_closed=True)
             for hole in entity.get("holes", []):
                 hatch.paths.add_polyline_path([_point(point, result, coordinates) for point in hole], is_closed=True)
@@ -401,11 +422,21 @@ def _add_entity(
             for p in raw
         ]
         z_value = points3[0][2] if points3 else 0.0
-        modelspace.add_lwpolyline([point[:2] for point in points3], close=bool(entity.get("closed", False)), dxfattribs={**attributes, "elevation": z_value})
+        bulges = entity.get("bulges")
+        if bulges is not None and len(points3) >= 2:
+            # Arc segments: the bulge of segment i belongs to vertex i (DXF LWPOLYLINE convention, tan(sweep / 4)).
+            values = [float(b) for b in bulges][: len(points3)]
+            values += [0.0] * (len(points3) - len(values))
+            modelspace.add_lwpolyline([(point[0], point[1], value) for point, value in zip(points3, values, strict=True)],
+                                      format="xyb", close=bool(entity.get("closed", False)),
+                                      dxfattribs={**attributes, "elevation": z_value})
+        else:
+            modelspace.add_lwpolyline([point[:2] for point in points3], close=bool(entity.get("closed", False)), dxfattribs={**attributes, "elevation": z_value})
         if entity.get("hatch", False) and entity.get("closed", False) and len(points3) >= 3:
             # Optional boundary hatch, off unless the entity asks for it.
             hatch = modelspace.add_hatch(color=256, dxfattribs={**attributes, "elevation": (0.0, 0.0, z_value)})
-            hatch.paths.add_polyline_path([point[:2] for point in points3], is_closed=True)
+            hatch_path = [(p[0], p[1], b) for p, b in zip(points3, [*(float(v) for v in bulges), *([0.0] * len(points3))], strict=False)] if bulges is not None else [point[:2] for point in points3]
+            hatch.paths.add_polyline_path(hatch_path, is_closed=True)
     elif entity_type == "3dface":
         corners = [_point(point, result, coordinates) for point in entity["points"]]
         if len(corners) == 3:

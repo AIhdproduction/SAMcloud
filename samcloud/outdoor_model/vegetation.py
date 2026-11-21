@@ -1,9 +1,10 @@
 """Vegetation scene elements (trees, shrubs) and lawn areas for the outdoor DXF/IFC chain.
 
-Lawn areas are a classification, not a second body on the terrain: no IFC element is produced for
-them. :func:`build_vegetation` returns them as :class:`LawnArea` records; the terrain builder labels
+:func:`build_vegetation` returns lawn areas as :class:`LawnArea` records; the terrain builder labels
 the TIN triangles inside ``LawnArea.polygon`` with ``"lawn"`` and the DXF gets closed boundary
-polylines on ``S-VEG``.
+polylines on ``S-VEG``. :func:`lawn_elements` creates one ``VegetationAreaElement`` per area (outline
+only); the IFC export gives each its own surface from the lawn-labelled terrain triangles inside its
+outline and removes those triangles from the terrain product.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from shapely.geometry import Polygon
 
-from samcloud.bim.core.model import ParamOrigin, ShrubElement, ShrubParams, Status, TreeElement, TreeParams
+from samcloud.bim.core.model import (ParamOrigin, ShrubElement, ShrubParams, Status, TreeElement, TreeParams,
+                                     VegetationAreaElement, VegetationAreaParams)
 from samcloud.drone.contracts import LocalFrame, QAEntry, ShrubInstance, TreeInstance, load_drone_config
 from samcloud.dxf.writer import outdoor_symbol_insert
 
@@ -148,7 +150,9 @@ def _build_shrub(shrub: ShrubInstance, dtm_sampler: DtmSampler | None) -> ShrubE
     )
 
 
-def build_lawn_areas(lawn_polygons: Sequence[Polygon], dtm_sampler: DtmSampler | None) -> list[LawnArea]:
+def build_lawn_areas(
+    lawn_polygons: Sequence[Polygon], dtm_sampler: DtmSampler | None, *, qa: list[QAEntry] | None = None,
+) -> list[LawnArea]:
     """Wrap lawn polygons with the DTM elevation (median) and height range of their boundary."""
     areas: list[LawnArea] = []
     for polygon in lawn_polygons:
@@ -162,7 +166,38 @@ def build_lawn_areas(lawn_polygons: Sequence[Polygon], dtm_sampler: DtmSampler |
             continue
         z = np.where(np.isfinite(z), z, float(np.median(finite)))
         areas.append(LawnArea(polygon, float(np.median(z)), float(z.max() - z.min()), [float(v) for v in z]))
-    return areas
+    kept: list[LawnArea] = []
+    for index, area in enumerate(areas, start=1):
+        # A closed DXF ring inside another lawn exterior is necessarily counted as that
+        # exterior's hole by the CAD QA. It is duplicate lawn geometry, not a second area.
+        nested = any(
+            other is not area and Polygon(other.polygon.exterior).contains(area.polygon)
+            and other.polygon.intersection(area.polygon).area < 1e-6  # an island inside a hole; overlapping lawns are not duplicates of a hole
+            for other in areas
+        )
+        if nested:
+            message = "dropped lawn nested in another lawn outline"
+            logger.warning("%s: lawn-%d", message, index)
+            if qa is not None:
+                qa.append(QAEntry("lawn", f"lawn-{index}", message, {"area_m2": round(float(area.polygon.area), 4)}))
+            continue
+        kept.append(area)
+    return kept
+
+
+def lawn_elements(lawn_areas: Sequence[LawnArea]) -> list[VegetationAreaElement]:
+    """Create BIM vegetation-area records that correspond one-to-one with DXF lawns."""
+    result: list[VegetationAreaElement] = []
+    for index, area in enumerate(lawn_areas, start=1):
+        outline = _ring(area.polygon)
+        if len(outline) < 3:
+            continue
+        result.append(VegetationAreaElement(
+            id=f"lawn-{index}", tag="lawn", params=VegetationAreaParams(outline=outline, base_z=area.elevation),
+            param_origin={"outline": ParamOrigin.MEASURED, "base_z": ParamOrigin.MEASURED},
+            evidence={"area_m2": round(float(area.polygon.area), 4)},
+        ))
+    return result
 
 
 def build_vegetation(
@@ -255,5 +290,5 @@ def category_counts(elements: Sequence[object], lawn_areas: Sequence[LawnArea] =
     return {
         "tree": sum(isinstance(e, TreeElement) for e in elements),
         "shrub": sum(isinstance(e, ShrubElement) for e in elements),
-        "vegetation_area": len(lawn_areas),
+        "vegetation_area": sum(isinstance(e, VegetationAreaElement) for e in elements) or len(lawn_areas),
     }

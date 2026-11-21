@@ -83,7 +83,38 @@
     "step_export": "DXF export",
     "step_row": "{name}: {status}",
     "step_ifc": "IFC export",
-    "step_refine": "Refine openings"
+    "step_refine": "Refine openings",
+    "env_step_row": "{name}: {status}{detail}",
+    "env_seconds": " ({seconds} s)",
+    "env_progress": "Environment run: step {done} of {total}",
+    "env_idle": "Environment run: not started yet",
+    "env_finished": "Environment run finished",
+    "env_failed": "Environment run failed{detail}",
+    "env_started": "Environment run started",
+    "env_qa": "QA: {passed}/{total} rules passed",
+    "env_qa_failed": "Failed: {rules}",
+    "env_qa_missing": "QA: no report yet",
+    "env_status": {
+      "done": "done",
+      "failed": "failed",
+      "pending": "pending",
+      "running": "running",
+      "skipped": "skipped"
+    },
+    "env_steps": {
+      "load": "Load",
+      "semantics": "Semantics",
+      "terrain": "Terrain",
+      "vegetation": "Vegetation",
+      "pavement": "Pavements",
+      "tin": "Terrain model (TIN)",
+      "buildings": "Buildings",
+      "site": "Site",
+      "scene": "Scene",
+      "export": "DXF/IFC export",
+      "qa": "Quality check",
+      "report": "Report"
+    }
   },
   "prep": {
     "title": "Preparation",
@@ -232,5 +263,33 @@
       "voting_photos": "Voting photographs {index}/{total}",
       "plan_has_openings": "Plan already contains the refined openings"
     }
+  },
+  "dxf_preview": {
+    "title": "DXF preview",
+    "rendering": "Rendering DXF preview...",
+    "empty": "No exported DXF yet.",
+    "failed": "DXF preview failed: {error}",
+    "fit": "Fit",
+    "layers": "DXF layers",
+    "all": "All",
+    "none": "None",
+    "hint": "Mouse wheel zooms, drag pans.",
+    "open_png": "Open PNG"
+  },
+  "ifc_outdoor": {
+    "lawns": "Lawns",
+    "paths": "Paths",
+    "terrain": "Terrain",
+    "pavements": "Pavements",
+    "sidewalks": "Sidewalks",
+    "curbs": "Curbs",
+    "buildings": "Building walls",
+    "roofs": "Roofs",
+    "site_walls": "Site walls",
+    "fences": "Fences",
+    "trees": "Trees",
+    "shrubs": "Shrubs",
+    "manholes": "Manholes",
+    "markings": "Markings"
   }
 }

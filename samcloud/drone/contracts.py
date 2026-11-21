@@ -167,7 +167,7 @@ class Opening:
 
 @dataclass
 class PavementPolygon:
-    pavement_id: int
+    pavement_id: int | str
     kind: Literal["road", "sidewalk", "path"]
     polygon: Polygon              # 2D local, valid
     evidence: Evidence = field(default_factory=Evidence)
@@ -256,7 +256,16 @@ _DEFAULT_CONFIG: dict = {
         "ground_filter": "auto",
         "csf": {"cloth_resolution_m": 0.5, "rigidness": 2, "class_threshold_m": 0.15,
                 "iterations": 500, "time_step": 0.65},
-        "tin": {"constraint_buffer_m": 0.05, "min_angle_deg": 20, "max_steiner_per_edge": 50},
+        "clean": {"enabled": True, "window_m": 5.0, "max_bump_m": 0.15, "max_bump_area_m2": 25.0, "tall_bump_m": 1.0, "tall_area_factor": 4.0,
+                  "grow_fraction": 0.25, "grow_margin_m": 1.0, "steep_slope": 1.0, "wall_min_length_m": 2.0,
+                  "protect_dilate_m": 0.5, "median_cells": 3},
+        "smooth": {"enabled": True, "window_m": 2.0, "iterations": 3, "robust_scale_m": 0.08, "max_change_m": 0.06},
+        "deviation": {"max_rms_pavement_m": 0.04, "max_rms_terrain_m": 0.06, "max_points": 400000},
+        "tin": {
+            "constraint_buffer_m": 0.05, "min_angle_deg": 20, "max_steiner_per_edge": 50,
+            "tolerance_m": 0.03, "tolerance_pavement_m": 0.02, "tolerance_terrain_m": 0.04, "initial_spacing_m": 2.0, "support_spacing_m": 0.50, "max_vertices": 60000,
+            "max_refinement_rounds": 2,
+        },
     },
     "buildings": {
         "ransac_distance_m": 0.05,
@@ -264,6 +273,14 @@ _DEFAULT_CONFIG: dict = {
         "label_pruning_buffer_m": 2.5,
         "complexity_factor": 0.7,
         "max_seconds_per_building": 60,
+        "roof": {"min_plane_area_m2": 4.0, "inlier_tolerance_m": 0.08, "min_roof_height_m": 1.5, "region_simplify_m": 0.35, "step_simplify_m": 0.12, "outline_simplify_m": 0.3, "min_region_area_m2": 1.0,
+                 "min_feature_area_m2": 6.0, "min_step_m": 0.35, "merge_normal_deg": 4.0, "merge_offset_m": 0.15},
+        "plausibility": {"min_width_m": 2.5, "min_area_m2": 10.0, "min_height_m": 2.5, "min_plane_area_m2": 4.0},
+        "regularize": {
+            "angle_tol_deg": 12, "merge_offset_m": 0.3, "min_edge_m": 0.5,
+            "ridge_tol_deg": 5, "flat_slope_deg": 5, "eave_tol_m": 0.15,
+            "min_footprint_iou": 0.92, "max_rmse_increase_m": 0.03,
+        },
     },
     "openings": {
         "min_views": 3, "min_area_m2": 0.3, "max_area_m2": 12.0,
@@ -277,7 +294,16 @@ _DEFAULT_CONFIG: dict = {
     "pavement": {
         "min_thickness_m": 0.10, "snap_tolerance_m": 0.01, "max_gap_overlap_cm2": 1.0,
         "snap_search_m": 0.15, "gap_tolerance_m": 0.15, "min_area_m2": 2.0,
+        "outline": {"close_m": 0.25, "open_m": 0.10, "min_area_m2": 2.0,
+                    "min_hole_m2": 1.0, "simplify_m": 0.05},
     },
+    "surfaces": {"clean": {"close_m": 0.4, "open_m": 0.2,
+                           "min_area_m2": {"lawn": 4.0, "sidewalk": 2.0, "path": 2.0},
+                           "min_hole_m2": 2.0, "simplify_m": 0.10, "min_width_m": 0.6}},
+    "edges": {"enabled": True,
+              "fit": {"min_radius_m": 1.0, "max_radius_m": 200.0, "tolerance_m": 0.05, "sample_m": 0.10,
+                      "tangent_deg": 10.0, "merge_deg": 3.0, "sagitta_m": 0.01, "curb_match_m": 0.12},
+              "dxf_curb_flat_z_m": 0.05},
     "curb": {
         "min_length_m": 0.3, "dp_tolerance_m": 0.015, "section_width_m": 0.12, "section_height_m": 0.25,
         "arc_fit_max_residual_m": 0.01, "arc_max_radius_m": 50.0, "arc_min_points": 4,
@@ -297,6 +323,9 @@ _DEFAULT_CONFIG: dict = {
                    "curb_clearance_m": 0.15, "curb_code": 74, "sigma_factor": 1.0,
                    "min_inlier_fraction": 0.95, "max_rms_m": 0.015},
     },
+    "environment": {"working_voxel_m": "auto", "max_working_points": 8000000, "min_working_voxel_m": 0.03,
+                    "clip_point_cloud": True},
+    "semantics": {"plane_k": 24, "plane_chunk_size": 500000},
 }
 
 

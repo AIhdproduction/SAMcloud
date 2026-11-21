@@ -60,6 +60,13 @@ def ifc_export_status(project_root: Path | str, level_key: str) -> IfcExportStat
         return "stale"
     if not all(path.is_file() for path in outputs):
         return "missing"
+    if manifest.get("source") == "environment":
+        # Outdoor exports published by samcloud.drone.publish: no plan model, the IFC hash decides.
+        try:
+            digest = hashlib.sha256((directory / str(manifest["ifc"])).read_bytes()).hexdigest()
+        except OSError:
+            return "stale"
+        return "fresh" if manifest.get("ifc_sha256") == digest else "stale"
     current = plan_model_sha256(project_root, level_key)
     if current is None or manifest.get("plan_model_sha256") != current:
         return "stale"

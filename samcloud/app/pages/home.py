@@ -8,7 +8,12 @@ from nicegui import ui
 
 from samcloud.app.i18n import current_language, t, translate_or
 from samcloud.app.layout import render_page
-from samcloud.app.processing import classification_engine, display_progress_text, reclassification_available
+from samcloud.app.processing import (
+    classification_engine,
+    display_progress_text,
+    reclassification_available,
+    settings_use_flurseg,
+)
 from samcloud.app.state import state
 
 
@@ -311,6 +316,13 @@ def _dxf_unavailable_reason(project: dict | None) -> str | None:
     from samcloud.app.dxf_controller import dxf_unavailable_reason
 
     return dxf_unavailable_reason(state.active_project_directory if project is not None else None)
+
+
+def _workflow_steps(project: dict | None) -> tuple[tuple[str, str], ...]:
+    """Workflow steps shown in the side panel; FlurSeg projects have no DXF/IFC step."""
+    if project is not None and settings_use_flurseg(project.get("settings", {})):
+        return tuple(step for step in _WORKFLOW if step[1] != "dxf")
+    return _WORKFLOW
 
 
 def _workflow_is_active(workflow: dict) -> bool:
@@ -654,7 +666,7 @@ def _render_workflow(project: dict | None) -> None:
     dxf_step = _dxf_ifc_step(state.active_project_directory) if project is not None else {"status": "ready", "percent": 0.0}
     dxf_bar = None
     dxf_status_label = None
-    for index, (label, key) in enumerate(_WORKFLOW, start=1):
+    for index, (label, key) in enumerate(_workflow_steps(project), start=1):
         if key == "dxf" and project is not None:
             status = dxf_step["status"] if dxf_step["status"] != "ready" else ("ready" if dxf_reason is None else dxf_reason)
         else:

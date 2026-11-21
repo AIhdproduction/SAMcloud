@@ -130,6 +130,26 @@ def coordinates_to_ecef(coordinates: np.ndarray, crs: str) -> np.ndarray:
     return np.column_stack((x, y, z))
 
 
+def gcp_georeference_from_ecef(
+    control_points_ecef: np.ndarray,
+    crs: str,
+    residual_m: dict[str, float],
+) -> dict[str, Any]:
+    """Build the ENU-to-ECEF metadata for the enabled GCP solution."""
+    ecef = np.asarray(control_points_ecef, dtype=float)
+    if ecef.ndim != 2 or ecef.shape[1] != 3 or not len(ecef):
+        raise ValueError("At least one enabled control point with coordinates is required")
+    if not np.all(np.isfinite(ecef)):
+        raise ValueError("Control-point coordinates must be finite")
+    centroid = ecef.mean(axis=0)
+    enu_rotation = enu_rotation_at_ecef(centroid)
+    return {
+        "source_frame": "gcp_local_enu", "method": "gcp_bundle_adjustment", "scale": 1.0,
+        "rotation": enu_rotation.T.tolist(), "translation": centroid.tolist(), "pairs": len(ecef),
+        "residual_m": residual_m, "control_points": {"crs": crs, "origin_ecef": centroid.tolist()},
+    }
+
+
 def enu_rotation_at_ecef(ecef: np.ndarray) -> np.ndarray:
     """Return the ECEF-to-ENU rotation at an ECEF position on WGS84."""
     to_geodetic = strict_transformer("EPSG:4978", "EPSG:4979")

@@ -15,8 +15,9 @@ from typing import Callable
 import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
-from shapely import concave_hull
-from shapely.geometry import MultiPoint, Point, Polygon
+from shapely import concave_hull, contains_xy
+from shapely.geometry import MultiPoint, Polygon
+from shapely.ops import unary_union
 from shapely.wkt import dumps as wkt_dumps, loads as wkt_loads
 
 from samcloud.buildings.footprint import detect_facade_planes
@@ -49,7 +50,7 @@ def _copy_pointset(ps: PointSet) -> PointSet:
 
 
 def _normals(xyz: np.ndarray, supplied: np.ndarray | None) -> np.ndarray:
-    """Return upward-facing unit KNN-16 normals, estimating missing values with Open3D."""
+    """Return upward-facing unit KNN-16 normals with bounded vectorised batches."""
     points = np.asarray(xyz, dtype=np.float64)
     result = np.zeros_like(points)
     valid = np.zeros(len(points), dtype=bool)
@@ -60,20 +61,19 @@ def _normals(xyz: np.ndarray, supplied: np.ndarray | None) -> np.ndarray:
         result[valid] /= lengths[valid, None]
     missing = ~valid
     if missing.any() and len(points) >= 3:
-        try:
-            import open3d as o3d
-
-            cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-            cloud.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=min(16, len(points))))
-            estimated = np.asarray(cloud.normals)
-        except Exception:  # pragma: no cover - exercised only without Open3D
-            count = min(16, len(points))
-            indices = cKDTree(points).query(points, k=count, workers=-1)[1]
+        count = min(16, len(points))
+        tree = cKDTree(points)
+        missing_indices = np.flatnonzero(missing)
+        for start in range(0, len(missing_indices), 500_000):
+            target = missing_indices[start:start + 500_000]
+            indices = tree.query(points[target], k=count, workers=-1)[1]
+            indices = np.asarray(indices)
+            if indices.ndim == 1:
+                indices = indices[:, None]
             local = points[indices] - points[indices].mean(axis=1, keepdims=True)
             covariance = np.einsum("nki,nkj->nij", local, local) / max(count - 1, 1)
             _values, vectors = np.linalg.eigh(covariance)
-            estimated = vectors[:, :, 0]
-        result[missing] = estimated[missing]
+            result[target] = vectors[:, :, 0]
     lengths = np.linalg.norm(result, axis=1)
     usable = lengths > 1e-9
     result[usable] /= lengths[usable, None]
@@ -136,17 +136,21 @@ def _occupancy_components(xy: np.ndarray, z: np.ndarray, resolution: float, gap:
     """Component labels on a 2-D occupancy grid, retaining DSM discontinuities as gaps."""
     if len(xy) == 0:
         return []
-    lower = xy.min(axis=0)
-    cells = np.floor((xy - lower) / resolution).astype(np.int64)
+    origin = xy.min(axis=0)
+    cells = np.floor((xy - origin) / resolution).astype(np.int64)
     shape = tuple((cells.max(axis=0) + 1).tolist())
     flat = cells[:, 0] + shape[0] * cells[:, 1]
     unique, inverse = np.unique(flat, return_inverse=True)
-    height = np.zeros(len(unique), dtype=float)
-    variation = np.zeros(len(unique), dtype=float)
-    for index in range(len(unique)):
-        values = z[inverse == index]
-        height[index] = np.median(values)
-        variation[index] = np.std(values)
+    counts = np.bincount(inverse, minlength=len(unique))
+    offsets = np.r_[0, np.cumsum(counts[:-1])]
+    order = np.argsort(inverse, kind="stable")
+    ordered_z = z[order]
+    middle_lower = offsets + (counts - 1) // 2
+    middle_upper = offsets + counts // 2
+    height = (ordered_z[middle_lower] + ordered_z[middle_upper]) / 2.0
+    means = np.bincount(inverse, weights=z, minlength=len(unique)) / counts
+    second = np.bincount(inverse, weights=z * z, minlength=len(unique)) / counts
+    variation = np.sqrt(np.maximum(second - means * means, 0.0))
     occupied = np.zeros(shape, dtype=bool)
     ux, uy = unique % shape[0], unique // shape[0]
     occupied[ux, uy] = True
@@ -179,7 +183,7 @@ def _occupancy_components(xy: np.ndarray, z: np.ndarray, resolution: float, gap:
     orphan = np.flatnonzero(labels_for_points == 0)
     if len(orphan) and number:
         surviving_cells = np.column_stack(np.nonzero(allowed))
-        centres = surviving_cells * resolution + lower + resolution / 2.0
+        centres = surviving_cells * resolution + origin + resolution / 2.0
         tree = cKDTree(centres)
         near = tree.query(xy[orphan], workers=-1)[1]
         nearest_labels = labels[surviving_cells[near, 0], surviving_cells[near, 1]]
@@ -324,38 +328,75 @@ def assign_persistent_ids(instances: list[BuildingInstance], previous_path: str 
     return instances
 
 
-def _local_plane_metrics(xyz: np.ndarray, tree: cKDTree, radius: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return local PCA RMS, normal and neighbourhood size for every point."""
+def _local_plane_metrics(
+    xyz: np.ndarray,
+    tree: cKDTree,
+    radius: float = 0.5,
+    *,
+    k: int = 24,
+    chunk_size: int = 500_000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return local PCA metrics using bounded KNN queries in fixed-size chunks."""
+    xyz = np.asarray(xyz, dtype=np.float64)
     rms = np.full(len(xyz), np.inf)
     normals = np.zeros((len(xyz), 3), dtype=float)
     sizes = np.zeros(len(xyz), dtype=np.int32)
-    for index, neighbours in enumerate(tree.query_ball_point(xyz, radius, workers=-1)):
-        sizes[index] = len(neighbours)
-        if len(neighbours) < 6:
+    if len(xyz) == 0:
+        return rms, normals, sizes
+    k = max(1, min(int(k), len(xyz)))
+    if chunk_size < 1:
+        raise ValueError("plane chunk size must be positive")
+    for start in range(0, len(xyz), int(chunk_size)):
+        stop = min(start + int(chunk_size), len(xyz))
+        _distance, indices = tree.query(xyz[start:stop], k=k, distance_upper_bound=radius, workers=-1)
+        indices = np.asarray(indices)
+        if indices.ndim == 1:
+            indices = indices[:, None]
+        valid = indices < len(xyz)
+        count = valid.sum(axis=1).astype(np.int32)
+        sizes[start:stop] = count
+        usable = count >= 6
+        if not usable.any():
             continue
-        local = xyz[neighbours] - xyz[neighbours].mean(axis=0)
-        values, vectors = np.linalg.eigh(local.T @ local / len(local))
-        rms[index] = float(np.sqrt(max(values[0], 0.0)))
-        normals[index] = vectors[:, 0]
+        safe = np.where(valid[usable], indices[usable], 0)
+        local = xyz[safe]
+        local -= (local * valid[usable, :, None]).sum(axis=1, keepdims=True) / count[usable, None, None]
+        covariance = np.einsum("nki,nkj->nij", local, local * valid[usable, :, None]) / count[usable, None, None]
+        values, vectors = np.linalg.eigh(covariance)
+        target = start + np.flatnonzero(usable)
+        rms[target] = np.sqrt(np.maximum(values[:, 0], 0.0))
+        normals[target] = vectors[:, :, 0]
     normals[normals[:, 2] < 0] *= -1.0
     return rms, normals, sizes
 
 
-def plausibility_rules(ps: PointSet, dtm_sampler: Callable, *, building_instances: list[BuildingInstance]) -> tuple[PointSet, dict]:
+def _near_building_mask(xy: np.ndarray, outlines: list[Polygon]) -> np.ndarray:
+    """Vectorised interior test for the buffered building outlines."""
+    if not outlines:
+        return np.zeros(len(xy), dtype=bool)
+    area = unary_union(outlines)
+    return np.asarray(contains_xy(area, xy[:, 0], xy[:, 1]), dtype=bool)
+
+
+def plausibility_rules(
+    ps: PointSet,
+    dtm_sampler: Callable,
+    *,
+    building_instances: list[BuildingInstance],
+    plane_k: int = 24,
+    plane_chunk_size: int = 500_000,
+) -> tuple[PointSet, dict]:
     """Apply logged geometry-only corrections around existing building footprints."""
     result = _copy_pointset(ps)
     xyz = result.xyz
     hag = _hag(result, dtm_sampler)
     tree = cKDTree(xyz)
-    rms, local_normals, sizes = _local_plane_metrics(xyz, tree)
+    rms, local_normals, sizes = _local_plane_metrics(xyz, tree, k=plane_k, chunk_size=plane_chunk_size)
     normals = _normals(xyz, result.normals)
     normals[np.linalg.norm(local_normals, axis=1) > 0] = local_normals[np.linalg.norm(local_normals, axis=1) > 0]
     slopes = _slope_degrees(normals)
     outlines = [item.footprint.buffer(0.25) for item in building_instances if item.footprint and not item.footprint.is_empty]
-    near_building = np.zeros(len(result), dtype=bool)
-    if outlines:
-        for index, xy in enumerate(xyz[:, :2]):
-            near_building[index] = any(outline.covers(Point(float(xy[0]), float(xy[1]))) for outline in outlines)
+    near_building = _near_building_mask(xyz[:, :2], outlines)
     high_confidence = np.zeros(len(result), dtype=bool)
     if result.confidence is not None and result.margin is not None:
         high_confidence = (result.confidence > 0.8) & (result.margin > 0.3)
@@ -414,16 +455,32 @@ def _dtm_sampler_from_pointset(ps: PointSet, config: dict) -> Callable:
     return sample
 
 
-def run_semantics(products_dir: str | Path, out_dir: str | Path, *, dtm_sampler: Callable | None = None, config: dict | None = None) -> dict:
+def run_semantics(
+    products_dir: str | Path,
+    out_dir: str | Path,
+    *,
+    dtm_sampler: Callable | None = None,
+    config: dict | None = None,
+    pointset: PointSet | None = None,
+    frame=None,
+) -> dict:
     """Run semantic refinement and persist ``buildings/instances.json`` under ``out_dir``."""
-    from samcloud.drone.io import load_classified_pointset_lv95
-
     cfg = config or load_drone_config()
-    pointset, frame = load_classified_pointset_lv95(products_dir)
+    if pointset is None:
+        from samcloud.drone.io import load_classified_pointset_lv95
+
+        pointset, frame = load_classified_pointset_lv95(products_dir)
     sampler = dtm_sampler or _dtm_sampler_from_pointset(pointset, cfg)
     split, split_report = split_roof_facade(pointset, sampler)
     provisional = segment_buildings(split, sampler)
-    corrected, plausibility_report = plausibility_rules(split, sampler, building_instances=provisional)
+    semantics_cfg = cfg.get("semantics", {})
+    corrected, plausibility_report = plausibility_rules(
+        split,
+        sampler,
+        building_instances=provisional,
+        plane_k=int(semantics_cfg.get("plane_k", 24)),
+        plane_chunk_size=int(semantics_cfg.get("plane_chunk_size", 500_000)),
+    )
     instances = segment_buildings(corrected, sampler)
     output = Path(out_dir) / "buildings" / "instances.json"
     assign_persistent_ids(instances, output)

@@ -185,7 +185,8 @@ class ProjectManager:
         # Only SAM3 classifies with text prompts; FlurSeg's 11 classes are fixed by its training.
         if defaults["classification"]["engine"] == "sam3" and is_customized(custom_classes):
             defaults["classification"]["custom_classes"] = normalize_customization(custom_classes, class_set)
-        defaults["workflow"]["auto_dxf"] = bool(auto_dxf)
+        # DXF/IFC exist only for SAM3 projects (default ON there); FlurSeg delivers point clouds only.
+        defaults["workflow"]["auto_dxf"] = bool(auto_dxf) and defaults["classification"]["engine"] != "flurseg"
         defaults["workflow"]["control_points_enabled"] = control_points_mode in {"after_alignment", "automatic", "auto"}
         tag_settings = defaults.setdefault("apriltags", {})
         tag_settings.setdefault("outlier_pct", 3.0)

@@ -1,7 +1,8 @@
 """Terrain builder: labelled TIN -> ``TerrainElement`` (without pavement) + DXF TIN, contours, spot heights.
 
-The terrain element is the labelled TIN *without* road / sidewalk / path triangles (lawn stays part
-of the terrain, it is a classification only). Because pavement and terrain come from one TIN they
+The terrain element is the labelled TIN *without* road / sidewalk / path triangles. Lawn triangles stay in
+the element mesh (the DXF TIN is complete) but their indices are listed in ``evidence["lawn_triangle_indices"]``:
+the IFC export moves them to the lawn surface elements. Because pavement and terrain come from one TIN they
 share the boundary vertices, so there is no gap and no overlap.
 
 DXF: the full TIN as 3DFACE on S-TOPO-TIN (the writer freezes that layer), contours (SPLINE) on
@@ -23,6 +24,7 @@ from samcloud.drone import contracts as c
 LOGGER = logging.getLogger(__name__)
 
 PAVEMENT_LABELS = ("road", "sidewalk", "path")
+LAWN_TRIANGLE_KEY = "lawn_triangle_indices"
 TIN_LAYER = "S-TOPO-TIN"
 MAJOR_LAYER = "S-TOPO-MAJR"
 MINOR_LAYER = "S-TOPO-MINR"
@@ -176,6 +178,9 @@ def build_terrain_elements(
     evidence: dict = {
         "triangle_count": int(len(tri_idx)), "dropped_degenerate": int(bad.sum()),
         "lawn_triangles": int((np.asarray(terrain.labels)[~bad] == c.TIN_LABELS["lawn"]).sum()),
+        # Indices (into this element's triangles) of the lawn-labelled triangles: the IFC writer hands
+        # exactly these over to the lawn surface elements (samcloud/bim/core/ifc/outdoor.py).
+        LAWN_TRIANGLE_KEY: [int(i) for i in np.flatnonzero(np.asarray(terrain.labels)[~bad] == c.TIN_LABELS["lawn"])],
         "pavement_triangles_removed": int(len(tin.triangles) - len(terrain.triangles)),
         "area_m2": round(float(_xy_area(verts, tri_idx)), 3),
         "z_range_m": round(float(verts[:, 2].max() - verts[:, 2].min()), 3),
@@ -249,16 +254,27 @@ def _contours(
 
 def _spots(
     sampler: TinSampler, frame: c.LocalFrame, spacing: float, curbs: Sequence, manholes: Sequence,
+    validity: np.ndarray | None = None, dtm_bounds: tuple[float, float, float, float] | None = None,
+    resolution: float | None = None,
 ) -> list[dict]:
     from samcloud.ortho.vector.spots import SpotSettings, ground_grid_points, select_spots, spot_entities
 
     v = sampler.vertices
     bounds = (float(v[:, 0].min()), float(v[:, 1].min()), float(v[:, 0].max()), float(v[:, 1].max()))
-    on_tin = lambda x, y: bool(np.isfinite(sampler.sample(np.array([[x, y]]))[0]))  # noqa: E731
+    def measured(x: float, y: float) -> bool:
+        if validity is None or dtm_bounds is None or resolution is None:
+            return True
+        xmin, _ymin, _xmax, ymax = dtm_bounds
+        col = int(np.floor((x - xmin) / resolution))
+        row = int(np.floor((ymax - y) / resolution))
+        return 0 <= row < validity.shape[0] and 0 <= col < validity.shape[1] and validity[row, col] == MEASURED
+
+    on_tin = lambda x, y: measured(x, y) and bool(np.isfinite(sampler.sample(np.array([[x, y]]))[0]))  # noqa: E731
     curb_xy = [(float(p[0]), float(p[1])) for a in curbs for p in np.asarray(getattr(a, "points", a))]
     mh_xy = [(float(m[0]), float(m[1])) for m in manholes]
     settings = SpotSettings(grid_spacing_m=float(spacing))
-    groups = [("manhole", mh_xy), ("curb", curb_xy), ("grid", ground_grid_points(bounds, spacing, on_tin))]
+    groups = [("manhole", [p for p in mh_xy if on_tin(*p)]), ("curb", [p for p in curb_xy if on_tin(*p)]),
+              ("grid", ground_grid_points(bounds, spacing, on_tin))]
     spots = select_spots(groups, settings)
     if not spots:
         return []
@@ -304,7 +320,8 @@ def terrain_dxf_entities(
         contours, info = _contours(dtm, validity, dtm_bounds, resolution, frame, cfg)
         out.update(contours)
     if len(triangles):
-        spots = _spots(TinSampler(vertices, triangles), frame, float(cfg.get("dxf", {}).get("spot_spacing_m", 10.0)), curbs, manholes)
+        spots = _spots(TinSampler(vertices, triangles), frame, float(cfg.get("dxf", {}).get("spot_spacing_m", 10.0)),
+                       curbs, manholes, validity, dtm_bounds, resolution)
         if spots:
             out[SPOT_LAYER] = spots
     return out, info

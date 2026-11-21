@@ -1,7 +1,8 @@
 {
   "unavailable": {
     "no_project": "Open a project first",
-    "not_classified": "Classify the point cloud first"
+    "not_classified": "Classify the point cloud first",
+    "flurseg": "DXF/IFC only with SAM3"
   },
   "source": {
     "none": "no point cloud found",
@@ -48,7 +49,8 @@
     "unknown_layer": "Unknown layer '{layer}'",
     "z_band_order": "The z band needs a lower value below the upper value",
     "no_cached_plan": "No cached DXF plan exists for this target. Compute it first.",
-    "png_encoding_failed": "PNG encoding of the snapshot failed"
+    "png_encoding_failed": "PNG encoding of the snapshot failed",
+    "environment_running": "The environment run is already in progress."
   },
   "review_canvas": {
     "hint": "Wheel: zoom · drag: pan · hold H: hide DXF",

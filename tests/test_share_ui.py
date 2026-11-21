@@ -166,3 +166,16 @@ async def test_settings_page_has_cloudflare_section(tmp_path: Path, monkeypatch:
         assert _element(user, "share-settings-delete").enabled
         user.find(marker="share-settings-delete").click()
         assert creds.load_credentials() is None
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows ACL test")
+def test_delete_credentials_after_old_rw_acl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import subprocess
+
+    _isolate(monkeypatch, tmp_path)
+    path = creds.save_credentials(CREDS)
+    user = os.environ["USERNAME"]
+    subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"], capture_output=True, check=False)
+    assert creds.delete_credentials() is True
+    assert not path.exists()
