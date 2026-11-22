@@ -16,7 +16,7 @@ Worked examples per capture type, each on its own page:
 
 | Capture type | Example | Status |
 |---|---|---|
-| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v11_tag` from input to DXF and IFC, plus the current export of `test_home_v12_tag` (a later run of the same recording) |
+| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v12_tag`, from input to DXF and IFC |
 | 360 degree camera, outdoor | [360 degree outdoor](docs/examples/outdoor_360.md) | capture guide; example results follow |
 | Drone GPS/RTK | [Drone photos](docs/examples/drone.md) | capture guide; example results follow |
 | Standard camera | [Phone and handheld photos](docs/examples/phone.md) | capture guide; example results follow |

@@ -235,7 +235,7 @@ so they are no independent validation. The table and the totals after it are
 from their earlier exports (2026-11-19), before the metric scale decision,
 the wall corrections and the new objects; the dimensions still contain the
 storey-height scale estimate. The export of the current code is shown in the
-[indoor example](examples/indoor_360.md#current-dxf-and-ifc-test_home_v12_tag).
+[indoor example](examples/indoor_360.md#7-ifc-model).
 
 | | `test_home_v10_tag` | `test_home_v11_tag` |
 |---|---|---|
