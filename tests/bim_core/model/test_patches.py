@@ -99,7 +99,7 @@ def test_thickness_change_updates_everything_and_undo_is_exact(
     assert scene.derived["spaces"][space]["area"] == pytest.approx(17.39, abs=1e-9)
 
     record = engine.apply(
-        [thickness_op(west, 0.5)], author="domenic", author_kind="user", reason="measured"
+        [thickness_op(west, 0.5)], author="reviewer", author_kind="user", reason="measured"
     )
 
     wall = scene.elements[west]
@@ -119,7 +119,7 @@ def test_thickness_change_updates_everything_and_undo_is_exact(
     assert f"/elements/{west}/params/layers/0/thickness" in paths
     assert f"/elements/{west}/param_origin/thickness" in paths
     assert not any(p.startswith("/derived") for p in paths + [o["path"] for o in record.inverse])
-    assert record.author == "domenic"
+    assert record.author == "reviewer"
     assert record.author_kind is AuthorKind.USER
     assert record.reason == "measured"
     assert record.timestamp == "2026-11-07T12:00:01.000Z"
@@ -219,7 +219,7 @@ def test_user_may_unlock_but_ai_may_not(scene: Scene, engine: PatchEngine) -> No
     with pytest.raises(PatchRejected, match="locked"):
         engine.apply(unlock, "ai-agent", "ai")
     assert scene.elements[west].locked
-    engine.apply(unlock, "domenic", "user")
+    engine.apply(unlock, "reviewer", "user")
     assert not scene.elements[west].locked
     engine.apply([thickness_op(west, 0.4)], "u", "user")  # editable again
 

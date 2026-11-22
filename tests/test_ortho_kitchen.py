@@ -154,7 +154,7 @@ def test_chamfer_only_where_the_evidence_fills_the_inner_corner(upm: float) -> N
     run = build_kitchen_run(plain, grid, walls, upm, KitchenRunSettings(), _heights(grid, plain, upm))
     assert run is not None and len(run.pieces[0].exterior.coords) - 1 == 6  # square inner corner without evidence
 
-    corner = np.asarray([(3.4, 0.6), (2.8, 0.6), (3.4, 1.2)]) * upm  # the diagonal fill of Domenic's counter
+    corner = np.asarray([(3.4, 0.6), (2.8, 0.6), (3.4, 1.2)]) * upm  # the diagonal fill of the counter
     filled = plain | _mask_of(grid, Polygon(corner))
     run = build_kitchen_run(filled, grid, walls, upm, KitchenRunSettings(), _heights(grid, filled, upm))
     assert run is not None

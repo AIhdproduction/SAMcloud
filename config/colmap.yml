@@ -77,7 +77,7 @@ dense_reconstruction:
   # prior: pixels COLMAP left empty are back-projected with the aligned prior
   # and kept only when >= min_agreeing_views neighbouring views agree within
   # tolerance and no COLMAP depth sees a surface behind them (depth_fill.py).
-  # Replaces the plane grid fill below (Domenic, 2026-11-07).
+  # Replaces the plane grid fill below (2026-11-07).
   depth_fill:
     enabled: true
     stride: 2
@@ -180,7 +180,7 @@ dense_reconstruction:
     chunk_size: 100000
   # Grid fill of floor/ceiling/wall planes, disabled: looked artificial.
   # floor/ceiling/wall planes (fitted to measured points of that class) are
-  # filled on a fill_spacing_m grid. rule sam_plane_free_space (Domenic,
+  # filled on a fill_spacing_m grid. rule sam_plane_free_space (as of
   # 2026-11-07): a 3 cm cell is filled when >= min_support_views cameras see
   # it unoccluded with the plane's SAM class, those are >= min_class_ratio of
   # all cameras seeing it, and no camera measures a surface behind it. Gaps

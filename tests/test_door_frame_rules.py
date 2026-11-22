@@ -1,4 +1,4 @@
-"""Door rules of the 3D refinement (Domenic): the FRAME decides where a door is, a leaf is never an opening or a wall.
+"""Door rules of the 3D refinement: the FRAME decides where a door is, a leaf is never an opening or a wall.
 
 1. a seed door is measured on the wall line running in its own direction and a line that ends at the gap is continued over it
 2. a candidate without casing that lies along the open leaf of a door on another wall is that leaf, no opening

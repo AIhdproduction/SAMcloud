@@ -1,6 +1,6 @@
 """Door invariants of the indoor model, checked after the opening refinement and in the IFC builder.
 
-Rules (Domenic, generic, never project specific):
+Rules (generic, never project specific):
 
 1. A door is never a wall: every door / passage has an opening in a wall (a host) and no wall body stands in its span.
 2. The frame decides where a door is: a door is backed by frame evidence (jamb strip / head strip), a lintel or a closed leaf measured at
