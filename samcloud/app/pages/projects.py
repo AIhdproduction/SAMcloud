@@ -10,6 +10,7 @@ from typing import Any
 from nicegui import events, ui
 
 from samcloud.app.i18n import catalogue, current_language, t, translate_or
+from samcloud.app.components.preflight import PreflightPanel
 from samcloud.app.layout import render_page
 from samcloud.app.pages.control_points import crs_options, local_crs_hint
 from samcloud.app.state import state
@@ -245,7 +246,7 @@ def render() -> None:
             ):
                 image_directory = ui.input(
                     t("projects.create.image_directory"), placeholder="D:\\data\\camera-images"
-                ).classes("w-full")
+                ).classes("w-full").mark("image-directory-input")
                 rtk_enabled = ui.switch(t("projects.create.rtk"), value=True)
 
                 def choose_image_directory() -> None:
@@ -291,17 +292,27 @@ def render() -> None:
                 ui.label(t("projects.create.panorama_hint")).classes("text-sm")
                 panorama_video_path = ui.input(
                     t("projects.create.panorama_video"), placeholder="D:\\data\\tour.mp4"
-                ).classes("w-full")
+                ).classes("w-full").mark("panorama-video-input")
                 panorama_image_directory = ui.input(
                     t("projects.create.panorama_directory"),
                     placeholder="D:\\data\\insta360-photos",
-                ).classes("w-full")
+                ).classes("w-full").mark("panorama-directory-input")
                 frame_interval_seconds = ui.number(
                     t("projects.create.frame_interval"),
                     value=panorama_defaults.get("frame_interval_seconds", 1.0),
                     min=0.1,
                     step=0.1,
-                ).classes("w-full")
+                ).classes("w-full").mark("frame-interval-input")
+
+            PreflightPanel(
+                capture_type=capture_type,
+                image_directory=image_directory,
+                panorama_video_path=panorama_video_path,
+                panorama_image_directory=panorama_image_directory,
+                frame_interval=frame_interval_seconds,
+                storage_switches=storage_switches,
+                projects_directory=lambda: state.projects.projects_directory,
+            )
 
             def create_project() -> None:
                 try:
