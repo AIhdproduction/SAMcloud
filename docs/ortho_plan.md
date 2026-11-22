@@ -73,11 +73,21 @@ fingerprint includes the segmentation source, `instances.json`, and the
 settings, so a changed input marks the plan stale.
 
 **Indoor** (needs a level; thresholds are relative to the storey height so
-unscaled 360 scans still work, `units_per_metre` is derived automatically):
+unscaled 360 scans still work). The detectors always work in units normalised
+by the storey height. The results are converted with `units_per_metre`: 1.0
+when the cloud has metric evidence (`samcloud/core/metric_scale.py`,
+`clean_plan.metric_scale`), else the storey height over 2.5 m. The reason is
+stored as `source.scale_source` in `plan_model.json`.
 
 - walls from measured wall faces in the upper height band, straightened and
   merged, with thickness estimated from the points; weak boundaries and stubs
   filtered (`wall_lines.py`, `regularize.py`);
+- slanted walls at least 5 degrees off the two main directions
+  (`wall_directions.py`); a piece that deviates by less than 0.40 m over its
+  length is not used, so short walls at a small angle are missed;
+- columns (`A-COLS`), beams (`S-BEAM`, dashed), straight stairs, and wall,
+  floor and ceiling heights from the points (`structure/`); stairs and
+  heights go to `plan_model.json` and the IFC;
 - openings: doors and windows detected from wall gaps, door and window classes,
   and sills and lintels, drawn as door and window blocks;
 - room boundaries from the ceiling (`A-AREA`) and **semantic room names** such
@@ -101,6 +111,11 @@ With `walls.double_line: true` in `config/ortho_plan.yaml` (the default) every
 indoor wall is drawn with both faces as a closed outline on `A-WALL`, filled on
 `A-WALL-PATT` (`samcloud/ortho/vector/double_walls.py`):
 
+Two parallel faces that the scan proves to be the two sides of one wall are
+paired before these steps (`wall_sides.py`: rooms on both outer sides, no
+ceiling running through, no third face between); such a wall stands on both
+measured faces. The steps below decide the other walls.
+
 1. **Solid side.** The side of a measured face with a room (ceiling room or free
    floor) in front of it is the room side; the other side is the wall body. Faces
    with no room on either side are oriented by a measured partner face, else the
@@ -117,6 +132,8 @@ indoor wall is drawn with both faces as a closed outline on `A-WALL`, filled on
    or `exterior_thickness_m`. Collinear faces of one wall line share the measured
    thickness and are aligned on one line, so a face seen only in part still gets a
    straight, consistent second face.
+   Above a door with a measured head two scanned planes replace such an assumed
+   thickness of wall and lintel (`lintel_band`); a measured face never moves.
 5. **Wall bodies.** Every face run becomes a band on its solid side; ends are
    extended into L corners, gaps up to `joint_reach_m` are closed, bands are united
    (clean L/T/X joints) and each door and window is cut through the full thickness
@@ -169,10 +186,11 @@ applies the refined openings, and the 3D refinement decides for every door candi
 **passage** or **no opening at all**:
 
 - **door**: a casing of door-class points (Cyclone 103) around the opening (a jamb strip and the head strip), or a
-  closed leaf that fills the opening, or a lintel (at least 0.30 m of wall above a measured head of at least 1.85 m)
-  on an observed wall. Weak door evidence (a single jamb strip, door-class points in the gap) keeps the safe
-  default, a door.
-- **passage**: no door evidence, the opening reaches the ceiling (headroom below 0.30 m, measured) and its cells are
+  closed leaf that fills the opening, or a lintel on an observed wall (at least 0.15 m of wall above a measured head of
+  at least 1.85 m or 0.66 of the storey height; where the first pass saw no opening, also a measured free gap with floor
+  under it). Weak door evidence (a single jamb strip, door-class points in the gap) keeps the safe default, a door,
+  where the first pass had one.
+- **passage**: no door evidence, the opening reaches the ceiling (headroom below 0.15 m, measured) and its cells are
   measured free. A passage stays an opening without leaf or swing arc, rooms on both sides are one room, and its head
   height is the measured one (about 2.4 m instead of the 2.0 m default).
 - **no opening**: neither door evidence nor a measured free gap, or no wall beside the opening that was actually
@@ -198,7 +216,7 @@ After the double-line walls, `samcloud/ortho/vector/plan_polish.py` cleans the p
 
 - **Rooms** (`A-AREA` and the room names) are the wall cells: the free cells of the wall
   bodies with door and window spans closed. Their outlines are the inner wall faces, so
-  they are rectilinear and never cross a room interior. An open-plan space with no wall
+  they are rectilinear (except along slanted walls) and never cross a room interior. An open-plan space with no wall
   between its parts is one room (kitchen run + sofa = "Wohnen / Küche"). A cell that holds
   several measured ceiling rooms is split only at a passage: a straight or one-step cut
   between two wall corners, at most `room_split_max_m` long, that leaves each ceiling room
@@ -266,7 +284,7 @@ After the double-line walls, `samcloud/ortho/vector/plan_polish.py` cleans the p
 - **Kitchen run** (`A-EINB`): each leg is moved flush onto the final inner wall face behind
   it and all legs get one depth (0.60 m when the measurement is within the tolerance); a
   peninsula keeps its measured position, a diagonal inner-corner unit (chamfer) is kept at
-  the moved corner. Loose front lines that retrace the run or double a wall face are
+  the moved corner until the scanned fronts decide about it (next point). Loose front lines that retrace the run or double a wall face are
   dropped; upper cabinets move onto the same wall.
 - **CAD kitchen** (`kitchen_layout: true`, `kitchen_layout.py`): a wall-backed leg grows
   along its wall while counter heights (0.75–1.05 m) are measured in its front 0.30 m, up
@@ -275,12 +293,19 @@ After the double-line walls, `samcloud/ortho/vector/plan_polish.py` cleans the p
   0.15–0.60 m deep) as a bar: it becomes part of the counter and the step is an inner
   line; its free end continues to where counter-or-bar heights end. Cooktop and sink are
   mounted on the counter at their labels measured at counter height (densest label
-  cluster), centred in the counter depth and fully inside it; a sink in a chamfered corner
-  sits on the diagonal. A full-depth tall unit (≥ 1.60 m) beyond a free leg end becomes a
+  cluster), centred in the counter depth and fully inside it. A diagonal measured in the
+  scan carries its insert parallel to it; a chamfer that only the label raster suggests
+  does not turn it (`appliance_on_chamfer` is off). A full-depth tall unit (≥ 1.60 m) beyond a free leg end becomes a
   rectangle with a cross and "KS" (fridge label) or "HS". Upper cabinets (`A-OBEN`,
   dashed) get a cross. Traced furniture standing on the final counter or bar is absorbed.
   Finally the counter is drawn by its front and end lines only (`_counter_front`); the side
   on a wall face is the wall's line.
+- **Kitchen fronts from the scan** (`kitchen_fronts.py`, `kitchen_legs.py`): a front across
+  an inner corner becomes a diagonal unit at its measured angle (no evidence: square
+  corner), a base steps back under its worktop (`A-FURN-DETL`), an upper cabinet ends
+  where the scan sees the wall behind it, and a leg the label raster lost is added when
+  its front, worktop, kitchen labels, join to the run and back are all found. A kitchen
+  without any detected run gets none of this.
 - **Labels**: an object label sits inside its object (horizontal, or along a narrow
   object), else beside it inside the room; labels of objects below
   `label_min_object_area_m2` are omitted. Inside an object a label keeps `label_margin_m`
@@ -315,6 +340,11 @@ is moved into `products/dxf/export/`. The file is named
 `<project>_<level>_clean.dxf` (`<project>_site_clean.dxf` outdoors). Export is
 refused when the cached plan is stale; run **Generate clean plan** again.
 
+Indoors the export adds what comes from `plan_model.json`: furniture outlines
+as the projection of the [3D shapes](ifc_export.md#shapes-and-objects-from-the-scan)
+and objects on the ceiling on the dashed layer `A-CLNG-OBJ`. The preview on
+the page shows the cached plan without both.
+
 ## Review on the DXF page
 
 - **Plan variant** switches the review between the point cloud and the clean
@@ -335,9 +365,12 @@ segmentation source, view options) are stored in `products/dxf/state.json`.
 
 - The orthophoto needs the COLMAP model and the source photos; if the photos
   were moved, the stage fails with a message.
-- Indoor plans work best on georeferenced or scaled projects; unscaled scans
-  rely on the ceiling height as scale.
+- Indoor plans work best on georeferenced or scaled projects; only scans
+  without metric evidence rely on the ceiling height as scale.
 - Wall thickness is measured only where both faces of a wall are seen; elsewhere
   it comes from the neighbouring room edge, the learned thickness classes or the
-  configured exterior default (double-line walls).
+  configured exterior default (double-line walls). Outer walls scanned only
+  from inside normally get 0.30 m.
+- The indoor rules were tried on real data of one flat and one recording, plus
+  synthetic scenes.
 - Heavy stages use the GPU and can take minutes to hours on large projects.

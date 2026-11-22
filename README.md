@@ -16,7 +16,7 @@ Worked examples per capture type, each on its own page:
 
 | Capture type | Example | Status |
 |---|---|---|
-| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v11_tag`, from input to DXF plan |
+| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v11_tag` from input to DXF and IFC, plus the current export of `test_home_v12_tag` (a later run of the same recording) |
 | 360 degree camera, outdoor | [360 degree outdoor](docs/examples/outdoor_360.md) | capture guide; example results follow |
 | Drone GPS/RTK | [Drone photos](docs/examples/drone.md) | capture guide; example results follow |
 | Standard camera | [Phone and handheld photos](docs/examples/phone.md) | capture guide; example results follow |
@@ -32,13 +32,13 @@ Each page shows the full workflow for that capture type, from input to classifie
 5. [Targets, scale, and control points](#targets-scale-and-control-points)
 6. [LAS export and coordinate systems](#las-export-and-coordinate-systems)
 7. [DXF export](#dxf-export) (incl. [IFC export](#ifc-export))
-8. [User interface](#user-interface)
+8. [User interface](#user-interface) (incl. [sharing by QR code](#sharing-by-qr-code))
 9. [Capture types, processing modes, and coordinates](#capture-types-processing-modes-and-coordinates)
 10. [Architecture](#architecture)
 11. [Configuration](#configuration)
 12. [Project files](#project-files)
 13. [Installation and start on Windows](#installation-and-start-on-windows)
-14. [Tests](#tests)
+14. [Tests](#tests) (incl. [synthetic indoor bench](#synthetic-indoor-bench))
 15. [Scope and independent work](#scope-and-independent-work)
 16. [Author and license](#author-and-license)
 
@@ -99,14 +99,23 @@ Main features:
 - **DXF plans:** a fast point-cloud plan and a clean plan from a true
   orthophoto, per storey (indoor) or as a site plan (outdoor). Indoor clean
   plans have double-line walls with measured or learned thickness, rooms
-  bounded by the walls with name and area, and regularised furniture, see
+  bounded by the walls with name and area, slanted walls, and regularised
+  furniture. A 3D DXF is written next to the 2D plan, see
   [DXF export](#dxf-export) and [docs/ortho_plan.md](docs/ortho_plan.md).
 - **IFC4 building model (indoor):** the same button that makes the DXF also
   writes an IFC4 file from the same building model (`plan_model.json`), so
   walls, rooms, doors and windows match the DXF. Windows and doors are
   measured on the wall planes from the photos and the cloud (sill, head,
-  mullions), and an IFC viewer on the DXF page shows the result, see
-  [IFC export](#ifc-export) and [docs/ifc_export.md](docs/ifc_export.md).
+  mullions). Furniture gets a 3D shape from its points; screens, ceiling
+  objects, columns, beams, straight stairs and measured wall and ceiling
+  heights are added where the scan gives evidence. An IFC viewer on the DXF
+  page shows the result, see [IFC export](#ifc-export) and
+  [docs/ifc_export.md](docs/ifc_export.md).
+- **Storage check:** the create-project form shows the image count, the
+  estimated storage and the free space before anything is processed.
+- **Sharing by QR code:** a point cloud, or a whole project with plan, cloud
+  and IFC model, can be published as a web view in your own Cloudflare R2
+  bucket, see [Sharing by QR code](#sharing-by-qr-code).
 - **German and English UI:** the interface is German by default and can be
   switched to English in the settings; project files, reports and exports do
   not depend on the language ([docs/i18n.md](docs/i18n.md)).
@@ -220,7 +229,7 @@ detection of step 6.
 To update the classes from a newer Nomivox preset:
 
 ```bat
-venv\Scripts\python -m samcloud.tools.import_nomivox_classes D:\Nomivox\presets\default.json
+venv\Scripts\python -m samcloud.tools.import_nomivox_classes <nomivox-folder>\presets\default.json
 ```
 
 ### Own classes per project (SAM3)
@@ -295,6 +304,11 @@ other fine classes. The model is not part of the repository; see *Download and i
 The dashboard button **Klassifizierung neu rechnen** (pipeline `--reclassify`)
 re-runs only classification, step 6 and geometry on the kept dense cloud, so
 SAM3 and FlurSeg can be compared on exactly the same points.
+If the dense inputs are only left in the processing cache, they are hard-linked
+into a `reclassify_staging_<id>` folder inside the project, which stays there
+after the run; where linking is impossible they are copied, and only when they
+fit on the drive. The cache keeps the previous classes, so recomputing step 6
+from it is refused after a reclassification.
 
 More prompts cost time: indoor 360 runs take about 2 s per cubemap face
 (one SAM pass per 1024 px face); large drone photos are tiled and take longer.
@@ -411,13 +425,15 @@ venv\Scripts\python samcloud\engine\geometry\refine.py --input <classified_raw.p
 SAM3's instance head also yields object masks. With `classification.instances.enabled`
 (default on, `--no-instances` on the pipeline) every dense point of an
 *instance class* gets an `instance_id` (0 = none): indoor furniture,
-appliances, sanitary fixtures, doors, windows, HVAC, electrical and columns;
-outdoor vehicles, construction machinery, trees, tree trunks, utility poles,
+appliances, sanitary fixtures, doors, windows, HVAC, electrical, columns and
+ceiling equipment; outdoor vehicles, construction machinery, trees, tree trunks, utility poles,
 traffic signs, manholes and columns (`instance_classes` in `config/classes.json`).
 Walls, floors and ceilings never get one. Per-view masks are associated in 3D,
 then merged by label aliases (for example "casement window" to window),
 soft furnishing is absorbed into its bed or sofa, and each object grows over
 connected points of its class by at most 0.6 m (`samcloud/engine/instances.py`).
+Screens and ceiling equipment form a secondary layer that is associated on its
+own and only takes points the other objects left free.
 The result is `instance_id` in `classified.ply`, the sidecar
 `products/classified/instances.json` (label, class, point count, bounding box,
 views, confidence), an `instance_id` extra dimension in the exported LAS, and
@@ -526,6 +542,9 @@ in `reports/run_summary.txt` (details in `reports/auto_dxf.json`). Turn it off
 with **Create DXF/IFC automatically after processing** (project creation or
 Settings, key `workflow.auto_dxf`, default on). For a finished project run it by
 hand with `python -m samcloud.engine.auto_dxf --project <project directory>`.
+After a processing run, outdoor projects run the environment chain
+(`samcloud/drone/run_environment.py`) at this stage instead of these jobs.
+FlurSeg projects deliver point clouds only: they get no DXF or IFC.
 
 ### Plan variants
 
@@ -557,6 +576,29 @@ or rectilinear shapes along the wall axes, cut back at walls and overlaps,
 and labelled inside their room; texts are written after the fills, so no
 hatch covers them. Details:
 [docs/ortho_plan.md](docs/ortho_plan.md#double-line-walls).
+
+Indoor clean plans also contain, where the scan gives evidence for it:
+
+- **slanted walls** next to the two main wall directions, and walls placed on
+  both scanned faces; the wall above an opening has the faces of its wall;
+- **kitchens** with a diagonal corner unit at its measured angle, a sink turned
+  with it, and a base that steps back under its worktop;
+- **columns** (`A-COLS`) and **beams** (`S-BEAM`, dashed);
+- **objects on the ceiling** (`A-CLNG-OBJ`, dashed) and furniture outlines
+  taken from the 3D reconstruction. These two are written at export, so they
+  are in the DXF file but not in the preview on the page.
+
+**3D DXF.** The IFC step also writes `<project>_<level>_3d.dxf` to
+`products/dxf/export/`: the IFC elements as meshes in metres, one layer per
+IFC class (`3D-IfcWall`, `3D-IfcFurniture`, ...), without spaces and opening
+voids. It uses the IFC coordinates.
+
+**Scale.** A cloud with metric evidence (AprilTag scale, georeference, control
+points, GPS/RTK or a scale set on the DXF page) is exported in true metres
+(`clean_plan.metric_scale` in `config/ortho_plan.yaml`, default on). Only a
+cloud without such evidence is scaled from the storey height (2.5 m nominal).
+`plan_model.json` records the reason in `source.scale_source`; the scale line
+on the DXF page shows only a factor set on that page.
 
 Instance labels from `instances.json` (for example *Sofa*, *Tisch*) are written
 as text and block attributes in both variants when the classified cloud has
@@ -621,7 +663,14 @@ lists as "Custom 82": rename that class to **Road marking** in Cyclone 3DR once.
 - Wall thickness is measured only where both faces of a wall are seen;
   elsewhere it comes from the neighbouring room edge, the learned thickness
   classes or the configured exterior default (clean plan). The point-cloud
-  plan estimates it from the points.
+  plan estimates it from the points. Outer walls scanned only from inside
+  normally get the default of 0.30 m.
+- Objects and structure are modelled only with evidence from the points:
+  small dark monitors, small ceiling fixtures and columns close to a wall can
+  be missing, and only straight stairs are detected.
+- The indoor rules were tried on real data of one flat and one recording
+  (processed several times), plus a [synthetic bench](#synthetic-indoor-bench).
+  Other buildings may need other thresholds.
 - Door swing arcs are off by default.
 - COLMAP reconstructions without GPS or control points have no metric scale;
   set the scale before generating plans.
@@ -631,10 +680,10 @@ lists as "Custom 82": rename that class to **Road marking** in Cyclone 3DR once.
 
 On indoor projects the DXF page is the **DXF/IFC** page. **Compute everything**
 runs: orthophoto, segmentation, clean plan, **Refine openings**, clean plan
-again (with the refined openings), DXF export and IFC export. One button
-therefore produces a DXF and an IFC4 file. Both are written from the same
-building model, `plan_model.json` in `products/dxf/<level id>/ortho/`, so
-walls, rooms, doors and windows are identical in both files.
+again (with the refined openings), DXF export and IFC export (with the 3D
+DXF). One button therefore produces a 2D DXF, a 3D DXF and an IFC4 file. All
+are written from the same building model, `plan_model.json` in `products/dxf/<level id>/ortho/`, so
+walls, rooms, doors and windows are identical in the files.
 
 - **Refine openings** measures every window and door on its wall plane
   (SAM3 window/door masks from the photos, projected with the COLMAP poses
@@ -643,12 +692,22 @@ walls, rooms, doors and windows are identical in both files.
   blocks carry the attributes `BRH` (sill), `STH` (head) and `MULLIONS`, doors
   `H` and `GLAZED`.
 - The **IFC** has storey, walls with openings, doors, windows, rooms
-  (`IfcSpace` with name and area), floor slab, ceilings and the furniture, and
-  is checked against an IDS file with a QA report. It is written to
-  `products/bim/<level id>/`.
+  (`IfcSpace` with name and area), floor slab, ceilings (flat or sloped, per
+  room), measured wall heights, columns, beams, straight stairs, furniture,
+  screens and ceiling objects, and is checked against an IDS file with a QA
+  report. It is written to `products/bim/<level id>/`.
+- **Furniture** is reconstructed from its points: parts such as table top and
+  legs, seat and back, a compact mesh, or the footprint body when the evidence
+  is weak (`config/furniture_recon.yaml`). Wall-hung and resting objects keep
+  their measured bottom (`config/room_objects.yaml`).
+- **QA** includes a check that the wall above and beside every opening is
+  flush with its wall (5 mm); a step prevents "IFC4 OK".
+- With more than one level a **combined IFC** is written to
+  `products/bim/building/` when the levels share frame and scale. This is
+  tested on synthetic data only.
 - An **IFC viewer** below the DXF preview shows the model in 3D (element
-  classes can be shown or hidden, click for properties, horizontal section) and
-  offers the IFC download.
+  classes including ceiling objects and structure can be shown or hidden, click
+  for properties, horizontal section) and offers the IFC download.
 
 Details, outputs and the command line are in [docs/ifc_export.md](docs/ifc_export.md).
 
@@ -658,14 +717,25 @@ The UI is built with NiceGUI and opens at `http://127.0.0.1:8080`.
 
 | Page | Purpose |
 |---|---|
-| Overview | project dashboard: start processing, progress per stage, manual LAS export |
-| Projects | create, reopen, or delete projects; select images or 360 degree sources |
+| Overview | project dashboard: start processing, progress per stage, manual LAS export, **Share project** by QR code |
+| Projects | create, reopen, or delete projects; select images or 360 degree sources; image count and storage check before creation |
 | Sparse cloud | inspect the aligned sparse model (cleaned for display only, `viewer.sparse_cleaning`), cameras, and the control point review workspace (marker table, photo strip, pixel viewer, **Optimize**, **Continue processing**) |
 | Control points | import and mark ground control points in the images; AprilTag print dialog, surveyed tag coordinates (table, CSV import) and the AprilTag report |
 | Targets | printable PDFs: AprilTags (150 mm, `tag36h11`) and numbered 180 mm cross targets; works without an open project |
-| Dense cloud | 3D viewer of the classified cloud in RGB or class mode, with class filters and colours, a height filter, object click and highlight, and AprilTag markers |
-| DXF | optional CAD export: preview, scale, alignment, levels, side view, DXF review, orthophoto clean plan and export |
+| Dense cloud | 3D viewer of the classified cloud in RGB or class mode, with class filters and colours, a height filter, object click and highlight, AprilTag markers, and **Share (QR)** for the point cloud |
+| DXF (indoor: DXF/IFC) | optional CAD export: preview, scale, alignment, levels, side view, DXF review, orthophoto clean plan, export, and the IFC viewer; hidden for FlurSeg projects |
 | Settings | UI language (German/English), coordinate systems, GPU, capture options, control point mode, classification settings, Improve & filter switches |
+
+**Storage check.** The create-project form shows the images found (for 360
+degree sources: panoramas and cube faces), the storage needed during and after
+processing, and the free space on the projects drive with a status (enough,
+tight, not enough). It follows the paths, the frame interval and the storage
+switches, warns about unusable sources, and suggests a longer interval when a
+video does not fit. The numbers are estimates calibrated on one 360 degree and
+one drone project (`samcloud/acquisition/preflight.py`); the check never
+blocks creation.
+
+<img src="assets/project_preflight.jpg" alt="Image count and storage check in the create-project form" width="800">
 
 **Language.** The interface is available in German (default) and English.
 The default comes from `application.language` in `config/defaults.yml`; the
@@ -700,6 +770,28 @@ click on an instance shows its card and highlights the object (original colours,
 bounding box), and a height filter hides points below or above a level. Without
 Potree or the converter the viewer falls back to a downsampled canvas preview
 of up to 300 000 points.
+
+### Sharing by QR code
+
+SAMcloud can publish a read-only web view and show a QR code and a link for it:
+
+| Button | Where | Available when | Content |
+|---|---|---|---|
+| **Share (QR)** | Dense cloud | step 6 is finished | classified point cloud |
+| **Share project** | Overview | classified cloud, a clean DXF export and an IFC model exist | one link with plan (DXF, top view), point cloud and IFC model, with all exported levels |
+
+The files are uploaded to your own Cloudflare R2 bucket; a setup guide in the
+app asks for the five values it needs and stores them outside the repository
+(`share_credentials.yaml` in the user's application data folder). The cloud is
+thinned to at most `max_points` (20 million). Before upload the package is
+checked for photos and GPS files, and its text files for local paths (binary
+files such as the 3D model are not searched). Links are set to expire after
+15 days, which needs the bucket's deletion rule; they can be extended or
+deleted in the dialog. Settings: `config/share.yaml`.
+
+The pages offer no download, but this is no access protection: everyone who
+has the link can reach the files behind it. Do not share interiors you are not
+allowed to publish.
 
 ## Capture types, processing modes, and coordinates
 
@@ -759,8 +851,9 @@ samcloud/
 │   ├── locales/                 de/ and en/ translation files, one JSON file per namespace
 │   └── pages/                   home, projects, sparse (+ GCP review), control points, targets,
 │                                dense, dxf, settings
-├── acquisition/                 360 degree frame extraction and cubemap preparation
-├── core/                        paths, configuration, project persistence, workflow state, storage
+├── acquisition/                 360 degree frame extraction and cubemap preparation, storage estimate
+├── core/                        paths, configuration, project persistence, workflow state, storage,
+│                                metric scale decision
 ├── colmap/                      COLMAP commands, alignment, and step 6 modules (depth prior, depth
 │                                fill, surface fusion, mirror filter, point cleaning, plane fill,
 │                                superpoint vote, gravity alignment)
@@ -770,10 +863,13 @@ samcloud/
 ├── pointcloud/                  coordinate transformation services
 ├── viewer/                      point cloud previews, Potree conversion, camera payloads
 ├── dxf/                         DXF page backend: LAS source, alignment, levels, plan generation,
-│                                writer, background jobs (python -m samcloud.dxf.jobs)
+│                                2D and 3D writer, background jobs (python -m samcloud.dxf.jobs)
 ├── ortho/                       true orthophoto, segmentation, DSM, clean DXF plan (vector/)
 ├── bim/                         IFC4 export from plan_model.json, 3D opening refinement (openings3d/),
-│                                viewer assets, IDS/QA (python -m samcloud.bim.jobs)
+│                                furniture_recon/, room_objects/, viewer assets, IDS/QA
+│                                (python -m samcloud.bim.jobs), synthbench/
+├── drone/                       outdoor environment chain (site DXF and IFC)
+├── share/                       sharing by QR code (point cloud, whole project)
 ├── tools/                       command-line helpers (class import, gravity alignment)
 └── engine/                      processing implementation (run as subprocesses)
     ├── pipeline.py              orchestrates all stages
@@ -812,6 +908,8 @@ More details are in [the architecture documentation](docs/architecture.md).
 | `config/dxf_export.yaml`, `config/dxf_layers.yaml` | DXF export defaults and the code-to-layer mapping |
 | `config/cyclone_codes.yaml`, `config/model_profiles/` | Cyclone 3DR classification codes and per-model profiles |
 | `config/ortho.yaml`, `config/ortho_segment.yaml`, `config/ortho_plan.yaml` | orthophoto, orthophoto segmentation, and clean plan settings |
+| `config/furniture_recon.yaml`, `config/room_objects.yaml` | 3D furniture reconstruction; wall-hung objects, screens, and ceiling objects |
+| `config/share.yaml` | sharing by QR code: provider, link lifetime, point limit (no secrets) |
 | `config/bim_export.yaml`, `config/bim_scene.yaml`, `config/bim_openings.yaml`, `config/bim_furniture.yaml`, `config/bim/` | IFC export defaults, scene building, 3D opening refinement, furniture mapping, IDS file and tolerances (see [docs/ifc_export.md](docs/ifc_export.md)) |
 
 Each new project receives a copy of the defaults in
@@ -836,11 +934,13 @@ projects/<project-name>/
 │   │   ├── classified_raw.ply   SAM3 result before geometric refinement
 │   │   ├── classified_scores.npz  SAM3 confidence and second-best class per point
 │   │   ├── instances.json       object instances (label, class, size, bounding box)
+│   │   ├── screen_masks.json.gz outlines of screen and ceiling masks per photo
 │   │   └── fine_labels.json     vocabulary of the fine_term property
 │   ├── viewer/                  viewer previews, manifest, potree/ octrees
 │   ├── ortho/<level>|site/      orthophoto, height rasters, segmentation (DXF page)
 │   ├── dxf/                     DXF page state and caches, export/, snapshots/
-│   └── bim/<level>/             IFC, qa.json, viewer model (DXF page, indoor)
+│   ├── share/                   QR codes of shared links
+│   └── bim/<level>/             IFC, qa.json, viewer model (DXF page); building/ for several levels
 └── reports/                     pipeline log, run summary, classification, geometry and
                                  control point summaries, apriltag_report.json
 ```
@@ -935,7 +1035,7 @@ committed.
 
 ## Tests
 
-`tests/` holds 1050 tests (1049 passed, 1 skipped on 2026-11-14) covering, among other things:
+`tests/` holds 3,785 tests (3,778 passed, 7 skipped on 2026-11-22) covering, among other things:
 
 - project persistence, storage compaction, and 360 degree acquisition
 - control points, automatic target detection, GCP adjustment, and the review API
@@ -950,6 +1050,9 @@ committed.
 - the DXF export: LAS source, alignment, levels, geometry, writer, and GUI
 - the orthophoto clean plan: orthophoto, segmentation, vector extraction,
   symbol catalogue, kitchen, niches, and outdoor contours
+- the indoor IFC and 3D DXF: openings and flush check, wall sides, furniture,
+  room objects, kitchen fronts, structure, and metric scale
+- the storage check and sharing by QR code
 - the UI translations: identical German/English key sets and placeholders,
   language resolution and fallbacks, and the settings language card
 
@@ -967,6 +1070,24 @@ repository). The folders are kept after the run.
 set SAMCLOUD_TEST_WORKDIR=%TEMP%\samcloud_test_work
 venv\Scripts\python -m pytest
 ```
+
+### Synthetic indoor bench
+
+The bench builds synthetic flats with known walls, openings, rooms, furniture
+and structure, simulates a 360 degree scan, runs the real DXF/IFC jobs and
+scores the result against the ground truth:
+
+```bat
+venv\Scripts\python -m samcloud.bim.synthbench run --set dev --out <folder> --jobs 1
+venv\Scripts\python -m samcloud.bim.synthbench report --out <folder>
+venv\Scripts\python -m samcloud.bim.synthbench compare-plan <old plan_model.json> <new plan_model.json>
+```
+
+Scene sets are `dev`, `val`, `objects` and `objects_val`, or a list such as
+`rect_basic:101,dense:107`. Thresholds are developed on the development sets
+and must not be tuned on the validation sets. Use `--jobs 1` when two runs are
+compared. The bench uses no SAM3, photos or depth products, so openings come
+from points only; it does not replace a test on real scans.
 
 ## Scope and independent work
 

@@ -10,7 +10,7 @@ and `samcloud/engine/classify.py`.
 
 - Only classes listed in `instance_classes` of `config/classes.json`:
   - indoor: furniture, appliances, sanitary fixtures, door, window, hvac,
-    electrical, column;
+    electrical, column, ceiling equipment;
   - outdoor: vehicle, construction machinery, tree, tree trunk, utility pole,
     traffic sign, manhole, column.
 - Walls, floors and ceilings never get an instance. Points without one have
@@ -41,6 +41,15 @@ and `samcloud/engine/classify.py`.
    - every object grows over connected unassigned points of its class by at
      most 0.6 m;
    - IDs are renumbered 1 to K by centroid and all metadata is recomputed.
+
+   **Secondary layer.** The prompts in `instance_secondary` of
+   `config/classes.json` (screens and the class ceiling equipment) compete and
+   associate only among themselves, after the other objects. They take only
+   free points, grow by at most 0.15 m, and get the IDs after the others, so
+   these prompts do not change the other objects. An added object joins an
+   existing one only when both are names of one family
+   (`instance_label_votes`, for example screen and television), overlap and
+   touch. Synonyms of a family count as one name when the label is chosen.
 4. **Step 6 survival.** Step 6 changes the point set, so the IDs are set aside
    before it (`instances_source.npz`) and moved onto the final cloud by nearest
    neighbour within 5 cm, guarded by the class (`attach_instances`). Objects that
@@ -55,7 +64,8 @@ project (see [configuration.md](configuration.md)).
 | Product | Content |
 |---|---|
 | `products/classified/classified.ply` | vertex property `instance_id` (uint32) next to `fine_term` |
-| `products/classified/instances.json` | `schema_version` and a list of instances: `id`, `class_id`, `class_name`, `label` (English, canonical), `label_index` (1, 2, ... per label, ordered by position), `point_count`, `centroid`, `bbox_min`, `bbox_max`, `view_count`, `confidence` |
+| `products/classified/instances.json` | `schema_version` and a list of instances: `id`, `class_id`, `class_name`, `label` (English, canonical), `label_index` (1, 2, ... per label, ordered by position), `point_count`, `centroid`, `bbox_min`, `bbox_max`, `view_count`, `confidence`, and `secondary: true` for objects of the secondary layer |
+| `products/classified/screen_masks.json.gz` | per view the camera and the outlines of the screen and ceiling masks, used to measure screens that have almost no points |
 | LAS export | extra dimension `instance_id` (uint32); `fine_term` (uint8) is written the same way |
 | Potree viewer data | the viewer LAS stores the instance ID in `point_source_id` (16 bit; IDs above 65 535 are set to 0) and the fine term in `user_data` |
 | `products/classified/instances_source.npz` (and a copy in `processing_cache/`) | snapshot set aside before step 6 and used by step 6 re-runs |
@@ -93,6 +103,9 @@ project (see [configuration.md](configuration.md)).
 
 - Instance quality depends on SAM3: overlapping objects of the same label can
   merge, and a large object can fragment before refinement merges it.
+- Small dark monitors and small ceiling fixtures often get too few points for
+  an instance. A cloud classified before these prompts existed has none of
+  them until it is reclassified.
 - Fine terms come from a fixed vocabulary (`fine_terms` in `config/classes.json`);
   unknown objects fall back to their class.
 - Viewer data only carries 16-bit IDs; in a project with more than 65 535
