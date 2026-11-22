@@ -46,9 +46,22 @@ def classify_features(features: FrameFeatures, config: Settings, seeded: bool = 
     # of the neighbouring door lying flat beside / in the gap) are no door.
     closed_leaf = features.door_fraction >= float(config.frames.closed_leaf_fraction) and features.head_cov >= float(cfg.closed_leaf_min_head_cov)
     on_wall = max(features.side_wall_cov.values(), default=0.0) >= float(cfg.min_side_wall_cov)
+    # The head is a door head when it reaches the absolute door-head height OR a share of the storey height: the share is
+    # independent of the metric scale of the plan (an approximate storey scale shrinks every height by the same factor).
+    head_fraction = float(getattr(cfg, "lintel_min_head_fraction", 0.0) or 0.0)
+    head_is_door_head = features.head_m is not None and (
+        features.head_m >= float(cfg.lintel_min_head_m)
+        or (head_fraction > 0.0 and features.ceiling_m > 0.0 and features.head_m >= head_fraction * features.ceiling_m)
+    )
+    # A lintel over a gap that only the wall-plane measurement found needs that gap measured free (furniture or an unscanned
+    # stretch in front of the wall leaves the same "head" signature); a gap the plan saw keeps the lenient rule.
+    # Such a gap must also show the floor running through the wall band (furniture against the wall hides wall AND floor; its
+    # unmeasured cells look "free" without photographs).
+    floor_through = seeded or features.floor_fraction >= float(getattr(cfg, "unseeded_min_floor_fraction", 0.0) or 0.0)
+    lintel_free = seeded or (features.free_fraction >= float(getattr(cfg, "lintel_unseeded_min_free_fraction", 0.0) or 0.0) and floor_through)
     lintel = (
-        features.head_m is not None and features.headroom_m is not None
-        and features.headroom_m >= float(cfg.lintel_min_headroom_m) and features.head_m >= float(cfg.lintel_min_head_m)
+        head_is_door_head and features.headroom_m is not None
+        and features.headroom_m >= float(cfg.lintel_min_headroom_m) and lintel_free
     )
     weak = bool(features.frame_jambs or features.head_frame or features.flat_leaf_sides) or features.door_fraction >= float(cfg.weak_door_fraction)
     # Headroom below the limit, or no point at all between the search height and the ceiling (the gap runs up to the ceiling).
@@ -59,7 +72,7 @@ def classify_features(features: FrameFeatures, config: Settings, seeded: bool = 
         return "door", f"closed leaf (door cells {features.door_fraction:.2f}, head strip {features.head_cov:.2f})"
     if lintel and on_wall:
         return "door", f"lintel (headroom {features.headroom_m:.2f} m, head {features.head_m:.2f} m)"
-    if on_wall and to_ceiling and features.free_fraction >= float(cfg.passage_min_free_fraction):
+    if on_wall and to_ceiling and features.free_fraction >= float(cfg.passage_min_free_fraction) and floor_through:
         shown = "no point up to the ceiling" if features.headroom_m is None else f"headroom {features.headroom_m:.2f} m"
         return "passage", f"free gap to the ceiling ({shown}, free cells {features.free_fraction:.2f}), no frame"
     if weak and seeded:

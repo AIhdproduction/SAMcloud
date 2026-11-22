@@ -650,6 +650,8 @@ def _deduplicate(records: list[RefinedOpening], plan: BuildingPlan, config: Sett
                 duplicate = True
             if _distance_m(other.center, record.center, upm) < cfg.centre_distance_m and other.kind == record.kind:
                 duplicate = True
+            if other.line != record.line and _same_family(other, record) and _parallel_overlap(other, record, upm) > cfg.overlap_fraction * min(other.width_m, record.width_m):
+                duplicate = True  # one physical opening seen on two wall lines of the same wall (a wall split into collinear lines)
         if duplicate:
             rejected.append({"what": "duplicate", "center": record.center, "reason": "overlaps higher-confidence opening"})
             if duplicates is not None:
@@ -657,6 +659,24 @@ def _deduplicate(records: list[RefinedOpening], plan: BuildingPlan, config: Sett
             continue
         kept.append(record)
     return kept
+
+
+def _same_family(first: RefinedOpening, second: RefinedOpening) -> bool:
+    return (first.kind == "window") == (second.kind == "window")
+
+
+def _parallel_overlap(first: RefinedOpening, second: RefinedOpening, units_per_metre: float) -> float:
+    """Overlap (m) of two openings' spans along a common wall direction; 0 unless parallel and within one wall thickness."""
+    a1, a2 = float(first.axis_angle), float(second.axis_angle)
+    if abs(math.sin(a1 - a2)) > math.sin(math.radians(10.0)):
+        return 0.0
+    axis = np.array([math.cos(a1), math.sin(a1)])
+    delta = (np.asarray(second.center, float) - np.asarray(first.center, float)) / units_per_metre
+    across = abs(float(delta @ np.array([-axis[1], axis[0]])))
+    if across > max(float(first.wall_thickness_m), float(second.wall_thickness_m), 0.1) / 2.0 + 0.15:
+        return 0.0
+    along = float(delta @ axis)
+    return max(0.0, min(first.width_m / 2.0, along + second.width_m / 2.0) - max(-first.width_m / 2.0, along - second.width_m / 2.0))
 
 
 def _number(records: list[RefinedOpening]) -> list[RefinedOpening]:

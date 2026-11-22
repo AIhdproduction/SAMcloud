@@ -11,7 +11,9 @@ Fixes for the problems seen when the old Raumlot pipeline ran its own wall extra
 * spaces come from the plan rooms (``SpaceParams.outline``), not from the wall network,
 * ceilings are per room and clipped by the wall footprints (they end at the inner wall faces),
 * openings that sit in a gap between two wall pieces bridge the gap (the wall becomes one
-  continuous host); openings without any host are skipped with a warning.
+  continuous host); openings without any host are skipped with a warning,
+* an opening has both faces of its host: merging pieces never moves them, a measured step between two pieces stays, the
+  door reveal belongs to the rooms and no ceiling runs into the lintel above it (``samcloud.bim.opening_flush`` is the check).
 """
 
 from __future__ import annotations
@@ -66,12 +68,17 @@ from samcloud.bim.core.model.elements import (
 )
 from samcloud.bim.core.model.scene import Building, Site, Storey
 from samcloud.bim.furniture import FurnitureMapping, load_furniture_mapping
+from samcloud.bim.ceiling_scene import add_ceiling_objects
 from samcloud.bim.plan_model import BuildingPlan, PlanFurniture, PlanOpening, PlanWall
+from samcloud.bim.structure_scene import add_structure_elements, room_ceiling_pieces, space_height_properties
 
 NAMESPACE = uuid.UUID("3f6c1c0e-8d0a-5b0e-9c55-53414d636c64")
 """Fixed namespace of the deterministic scene element ids."""
 
 _MIN_INTERIOR_AREA_M2 = 1e-4
+_MEASURED_WALL_FACES = frozenset({"face", "depth"})
+_MEASURED_WALL_HEIGHTS = frozenset({"room_ceiling", "points", "ceiling_occluded"})
+"""Plan wall height sources measured from the wall's own points (``adjacent_ceiling`` is inferred from the rooms)."""
 """Smallest meaningful plan opening; smaller rings are clipping artefacts."""
 
 _DEFAULTS: dict[str, Any] = {
@@ -91,7 +98,7 @@ _DEFAULTS: dict[str, Any] = {
         },
         "join": {"reach_m": 0.40, "min_angle_deg": 20.0},
     },
-    "openings": {"host_angle_deg": 12.0, "host_offset_m": 0.12, "bridge_gap_m": 0.40, "min_width_m": 0.20, "lintel_reach_m": 1.0, "max_join_shift_m": 0.10},
+    "openings": {"host_angle_deg": 12.0, "host_offset_m": 0.12, "bridge_gap_m": 0.40, "min_width_m": 0.20, "lintel_reach_m": 1.0, "max_join_shift_m": 0.10, "flush_m": 0.005, "proven_step_m": 0.06},
     "qa": {"max_wall_overlap_share": 0.05, "max_ceiling_wall_overlap_m2": 0.0001},
     "furniture": {"min_area_m2": 1e-4, "simplify_m": 0.01},
 }
@@ -209,6 +216,17 @@ def _interior_rings(polygon: Polygon, *, min_area_m2: float) -> list[list[tuple[
     return rings
 
 
+def _without_holes(polygon: Polygon) -> list[Polygon]:
+    """Pieces without interior rings covering ``polygon`` (a ceiling outline is a single ring): cut through each hole."""
+    if not polygon.interiors:
+        return [polygon]
+    middle = Polygon(polygon.interiors[0]).representative_point().x
+    x0, y0, x1, y1 = polygon.bounds
+    below = Polygon([(x0 - 1.0, y0 - 1.0), (middle, y0 - 1.0), (middle, y1 + 1.0), (x0 - 1.0, y1 + 1.0)])
+    above = Polygon([(middle, y0 - 1.0), (x1 + 1.0, y0 - 1.0), (x1 + 1.0, y1 + 1.0), (middle, y1 + 1.0)])
+    return [piece for side in (below, above) for part in _polygons(polygon.intersection(side)) for piece in _without_holes(part)]
+
+
 def _ring(polygon: Polygon, *, ccw: bool = True) -> list[tuple[float, float]]:
     coords = [(float(x), float(y)) for x, y in polygon.exterior.coords[:-1]]
     area2 = sum(coords[i][0] * coords[(i + 1) % len(coords)][1] - coords[(i + 1) % len(coords)][0] * coords[i][1] for i in range(len(coords)))
@@ -229,6 +247,8 @@ class _Wall:
     members: list[str]
     height: float | None = None
     single_line: bool = False
+    height_source: str = "storey"  # plan wall height source (samcloud.ortho.vector.structure)
+    evidence: str = ""  # plan wall evidence (how the faces were found)
 
     @property
     def length(self) -> float:
@@ -274,7 +294,7 @@ def _plan_walls(plan: BuildingPlan, cfg: dict[str, Any], report: SceneBuildRepor
             thickness = wcfg["default_exterior_thickness_m"] if item.kind == "exterior" else wcfg["default_interior_thickness_m"]
             report.single_line_default_thickness += 1
             report.warnings.append(f"wall {item.id}: single line, default thickness {thickness:.2f} m used")
-        walls.append(_Wall(item.id, p0, p1, thickness, item.kind, [item.id], item.height_m, single))
+        walls.append(_Wall(item.id, p0, p1, thickness, item.kind, [item.id], item.height_m, single, str(getattr(item, "height_source", "storey") or "storey"), str(item.evidence or "")))
     return walls
 
 
@@ -285,6 +305,10 @@ def _merge_pair(keep: _Wall, other: _Wall) -> None:
     hi = max(keep.length, float(np.dot(other.p0 - keep.p0, d)), float(np.dot(other.p1 - keep.p0, d)))
     keep.set_interval(lo, hi)
     keep.members.extend(other.members)
+    measured_heights = [value for value in (keep.height, other.height) if value]
+    if other.height and (not keep.height or other.height > keep.height):
+        keep.height_source = other.height_source
+    keep.height = max(measured_heights) if measured_heights else None
     if other.kind == "exterior" and keep.kind != "exterior":
         keep.kind = "exterior"
 
@@ -303,8 +327,18 @@ def _collinear(a: _Wall, b: _Wall, max_angle: float, offset_factor: float) -> bo
     return abs(a.offset(mid)) < offset_factor * max(a.thickness, b.thickness)
 
 
-def _dedup(walls: list[_Wall], cfg: dict[str, Any], report: SceneBuildReport) -> tuple[list[_Wall], dict[str, str]]:
+def _band_difference(keep: _Wall, other: _Wall, points: tuple[np.ndarray, ...]) -> float:
+    """Largest distance between the faces of two parallel pieces at ``points`` (on or beside their lines)."""
+    half = abs(keep.thickness - other.thickness) / 2.0
+    return max(abs(keep.offset(other.p0 + other.direction * other.along(point))) for point in points) + half
+
+
+def _dedup(
+    walls: list[_Wall], cfg: dict[str, Any], report: SceneBuildReport, hosts: frozenset[str] = frozenset()
+) -> tuple[list[_Wall], dict[str, str]]:
+    """Merge duplicate and touching collinear pieces.  Pieces that only touch never chain when that moves a face of a host (``hosts``)."""
     dcfg = cfg["walls"]["dedup"]
+    flush = float(cfg["openings"].get("flush_m", 0.005))
     merged_into: dict[str, str] = {}
     changed = True
     while changed:
@@ -325,6 +359,8 @@ def _dedup(walls: list[_Wall], cfg: dict[str, Any], report: SceneBuildReport) ->
                 if overlap > dcfg["min_overlap_share"] * shorter:
                     report.duplicates_merged += 1
                 elif gap <= dcfg["chain_gap_m"] and abs(keep.thickness - other.thickness) <= dcfg["chain_thickness_tol_m"]:
+                    if hosts.intersection([*keep.members, *other.members]) and _band_difference(keep, other, (other.p0, other.p1)) > flush:
+                        continue
                     report.chained += 1
                 else:
                     continue
@@ -514,7 +550,7 @@ def _split_crossings(walls: list[_Wall], cfg: dict[str, Any], report: SceneBuild
                 for suffix, (q0, q1) in (("a", (victim.p0, point)), ("b", (point, victim.p1))):
                     walls.append(
                         _Wall(f"{victim.id}{suffix}", q0.copy(), q1.copy(), victim.thickness, victim.kind,
-                              [*victim.members], victim.height, victim.single_line)
+                              [*victim.members], victim.height, victim.single_line, evidence=victim.evidence)
                     )
                 report.split_crossings += 1
                 changed = True
@@ -524,14 +560,17 @@ def _split_crossings(walls: list[_Wall], cfg: dict[str, Any], report: SceneBuild
     return walls
 
 
-def _extension_blocked(host: _Wall, lo: float, hi: float, walls: list[_Wall], ignore: set[int]) -> bool:
-    """True when growing ``host`` to ``[lo, hi]`` (along its line) would cross another wall."""
+def _extension_blocked(host: _Wall, lo: float, hi: float, walls: list[_Wall], ignore: set[int], tolerance: float = 0.005) -> bool:
+    """True when growing ``host`` to ``[lo, hi]`` (along its line) would cross another wall.
+
+    Reaching the axis of a wall within ``tolerance`` (the flush tolerance, metres) is a corner, no crossing.
+    """
     d = host.direction
     parts = []
-    if lo < 0.0:
-        parts.append((lo, 0.0))
-    if hi > host.length:
-        parts.append((host.length, hi))
+    if lo < -tolerance:
+        parts.append((lo + tolerance, 0.0))
+    if hi > host.length + tolerance:
+        parts.append((host.length, hi - tolerance))
     for a, b in parts:
         segment = LineString([host.p0 + d * a, host.p0 + d * b])
         for other in walls:
@@ -622,7 +661,11 @@ def _lintel_host(
         else:
             other.set_interval(0.0, target)
         report.warnings.append(f"opening {opening.id}: wall {other.id} cut back to the lintel face")
-    wall = _Wall(f"L_{opening.id}", c + d * lo, c + d * hi, thickness, kind, [], None, False)
+    # The lintel reaches as high as the wall it sits in (measured wall heights; None = storey height).
+    neighbours = [reference] if reference is not None else [w for w in walls if LineString([w.p0, w.p1]).distance(Point(c)) <= thickness + 0.30]
+    measured = [(w.height, w.height_source) for w in neighbours if w.height]
+    lintel_height, lintel_source = max(measured) if measured else (None, "storey")
+    wall = _Wall(f"L_{opening.id}", c + d * lo, c + d * hi, thickness, kind, [], lintel_height, False, lintel_source)
     new_opening = opening
     if hi - lo < opening.width_m - 0.005:
         mid = c + d * ((lo + hi) / 2.0)
@@ -636,6 +679,20 @@ def _lintel_host(
     why = "axis inconsistent" if reference is not None and _angle_between(reference.direction, axis) > ocfg["host_angle_deg"] else "hosting would cross another wall"
     report.warnings.append(f"opening {opening.id}: dedicated lintel wall {wall.id} created ({why})")
     return wall, new_opening
+
+
+def _line_reference(opening: PlanOpening, centre: np.ndarray, axis: np.ndarray, walls: list[_Wall], cfg: dict[str, Any]) -> _Wall | None:
+    """The nearest piece on the line of an opening that lies in a gap (or beyond a wall end): the lintel continues its band."""
+    ocfg = cfg["openings"]
+    best: tuple[float, _Wall] | None = None
+    for wall in walls:
+        if _angle_between(wall.direction, axis) > ocfg["host_angle_deg"] or abs(wall.offset(centre)) > wall.thickness / 2.0 + ocfg["host_offset_m"]:
+            continue
+        along = wall.along(centre)
+        gap = max(along - opening.width_m / 2.0 - wall.length, -along - opening.width_m / 2.0, 0.0)
+        if gap <= ocfg["lintel_reach_m"] and (best is None or gap < best[0]):
+            best = (gap, wall)
+    return None if best is None else best[1]
 
 
 def _resolve_openings(
@@ -701,6 +758,10 @@ def _resolve_openings(
                 a, b = sorted((float(np.dot(other.p0 - host.p0, d)), float(np.dot(other.p1 - host.p0, d))))
                 if b < lo - ocfg["bridge_gap_m"] or a > hi + ocfg["bridge_gap_m"]:
                     continue
+                # Two pieces with both faces measured and a clear step are a real reveal: the opening takes the host's faces.
+                if host.evidence in _MEASURED_WALL_FACES and other.evidence in _MEASURED_WALL_FACES:
+                    if _band_difference(host, other, (centre,)) >= ocfg["proven_step_m"]:
+                        continue
                 if _extension_blocked(host, min(0.0, a), max(host.length, b), walls, {id(other)}):
                     continue
                 _merge_pair(host, other)
@@ -739,7 +800,7 @@ def _resolve_openings(
                 )
         host = try_host(opening, centre, candidates) if candidates else None
         if host is None:
-            reference = reference or (candidates[0][1] if candidates else None)
+            reference = reference or (candidates[0][1] if candidates else _line_reference(opening, centre, axis, walls, cfg))
             made = _lintel_host(opening, centre, axis, reference, walls, plan, cfg, report)
             if made is None:
                 report.openings_skipped += 1
@@ -823,11 +884,15 @@ def _build_joins(walls: list[_Wall], cfg: dict[str, Any]) -> list[tuple[str, str
                 touching = (dist <= reach) if not inside else (dist <= end_zone)
                 info.append((touching, end, dist, inside))
             (ta, ea, dista, _), (tb, eb, distb, _) = info
-            if ta and tb and not _inside_third_wall(point, a, b, walls):
+            corner_blocked = _inside_third_wall(point, a, b, walls)
+            if ta and tb and not corner_blocked:
                 candidates.append((0, dista + distb, "L", a, ea, b, eb))
-            if ta and 0.0 <= sb <= b.length:
+            # A T-join whose end must be EXTENDED to a corner inside a third wall would run through that wall: the decision
+            # follows the geometry, not the reach threshold (a lintel end touching the next wall piece was T-joined through it
+            # to the wall behind at 0.398 m and left alone at 0.402 m reach).  An end already reaching into the path wall is kept.
+            if ta and 0.0 <= sb <= b.length and not (corner_blocked and dista > b.thickness / 2.0):
                 candidates.append((1, dista, "T", a, ea, b, "path"))
-            if tb and 0.0 <= sa <= a.length:
+            if tb and 0.0 <= sa <= a.length and not (corner_blocked and distb > a.thickness / 2.0):
                 candidates.append((1, distb, "T", b, eb, a, "path"))
     candidates.sort(key=lambda item: (item[0], item[1], item[3].id, item[5].id))
     used: set[tuple[str, str]] = set()
@@ -907,7 +972,7 @@ def build_scene(
     # --- walls --------------------------------------------------------------------
     walls = _plan_walls(plan, cfg, report)
     report.walls_in = len(walls)
-    walls, merged_into = _dedup(walls, cfg, report)
+    walls, merged_into = _dedup(walls, cfg, report, frozenset(o.host_wall_id for o in plan.openings if o.host_wall_id))
     walls = _trim_overlaps(walls, cfg, report)
     walls = _split_crossings(walls, cfg, report)
     merged_into = {k: v for k, v in merged_into.items()}
@@ -950,7 +1015,7 @@ def build_scene(
                     "start": ParamOrigin.FITTED,
                     "end": ParamOrigin.FITTED,
                     "thickness": ParamOrigin.ASSUMED if wall.single_line else ParamOrigin.MEASURED,
-                    "height": ParamOrigin.ASSUMED,
+                    "height": ParamOrigin.MEASURED if wall.height and wall.height_source in _MEASURED_WALL_HEIGHTS else ParamOrigin.ASSUMED,
                 },
                 notes=notes,
             )
@@ -1016,6 +1081,8 @@ def build_scene(
                 )
 
     # --- openings -----------------------------------------------------------------
+    reveals: dict[str, Polygon] = {}  # door / passage: the stretch of its host between both faces
+    lintels: list[Polygon] = []  # ... those with wall above them up to the top
     for opening_id in sorted(hosted):
         wall, opening = hosted[opening_id]
         centre = np.asarray(opening.center, dtype=float) / upm
@@ -1111,6 +1178,13 @@ def build_scene(
                 )
             )
         report.openings_hosted += 1
+        if opening.kind in ("door", "passage") and trimmed is not None:
+            placed = max(position, width / 2.0)
+            first, last = placed - width / 2.0, placed + width / 2.0
+            right, left = trimmed.offset_right - 1e-6, trimmed.offset_left + 1e-6  # (1 micrometre: no hairlines along the faces)
+            reveals[opening.id] = Polygon([trimmed.point(first, right), trimmed.point(last, right), trimmed.point(last, left), trimmed.point(first, left)])
+            if top < wall_height - 1e-3:
+                lintels.append(reveals[opening.id])
 
     # --- spaces + ceilings --------------------------------------------------------
     room_polygons: list[tuple[str, Polygon, Polygon]] = []  # (space id, clipped, original)
@@ -1120,12 +1194,19 @@ def build_scene(
     for opening in plan.openings:
         if opening.kind not in ("door", "passage"):
             continue
+        if opening.id in reveals:
+            doorways.append(reveals[opening.id])
+            continue
         axis = np.array([math.cos(opening.axis_angle), math.sin(opening.axis_angle)])
         normal = np.array([-axis[1], axis[0]])
         centre = np.asarray(opening.center, dtype=float) / upm
         half_w, half_t = float(opening.width_m) / 2.0, max(float(opening.wall_thickness_m), 0.05) / 2.0
         doorways.append(Polygon([tuple(centre + axis * a + normal * b) for a, b in ((-half_w, -half_t), (half_w, -half_t), (half_w, half_t), (-half_w, half_t))]))
     room_wall_union = wall_union.difference(unary_union(doorways)) if doorways and not wall_union.is_empty else wall_union
+    lintel_union = unary_union(lintels) if lintels else Polygon()
+    # walls that reach the ceiling (a half-height wall or a pillar hole keeps the ceiling above it)
+    reach_top = height - float(cfg["ceiling"]["thickness_m"])
+    tall_walls = unary_union([footprints[key] for key in footprints if geometries[key].height >= reach_top])
     for room in sorted(plan.rooms, key=lambda r: r.id):
         exterior = np.asarray(room.polygon["exterior"], dtype=float) / upm
         holes = [np.asarray(h, dtype=float) / upm for h in room.polygon.get("holes", [])]
@@ -1171,6 +1252,7 @@ def build_scene(
                 properties={
                     "PlanArea": PropertyValue(value=float(room.area_m2), value_type="number"),
                     "PlanRoomId": PropertyValue(value=room.id, value_type="text"),
+                    **space_height_properties(room, upm, elevation),
                 },
             )
             scene.add(space)
@@ -1182,26 +1264,42 @@ def build_scene(
             if lost > 0.02 * max(original.area, 1e-9):
                 report.warnings.append(f"room {room.id} {room.name!r}: {lost:.2f} m2 lost to wall clipping")
 
-            ceiling_shell = Polygon(clipped.exterior)
-            scene.add(
-                CeilingElement(
-                    id=_uid(plan, "ceiling", piece_key),
-                    name=f"Ceiling {room.name}" if room.name else f"Ceiling {room.id}",
-                    tag=piece_key,
-                    storey_id=storey.id,
-                    building_id=building.id,
-                    space_ids=[space_id],
-                    params=CeilingParams(
-                        outline=_ring(ceiling_shell),
-                        elevation=elevation + height,
-                        thickness=float(cfg["ceiling"]["thickness_m"]),
-                        trim_to_walls=False,
-                    ),
-                    param_origin={"outline": ParamOrigin.FITTED, "elevation": ParamOrigin.ASSUMED, "thickness": ParamOrigin.ASSUMED},
+            # A hole with a full-height wall in it is an island of walls (or a room inside this one): no ceiling of this room there.
+            ceiling_shell = Polygon(clipped.exterior, [hole for hole in clipped.interiors if Polygon(hole).intersection(tall_walls).area > 1e-4])
+            # The floor runs through a door reveal, the ceiling ends at the wall above the door.
+            shells = [ceiling_shell]
+            if ceiling_shell.interiors:
+                shells = _without_holes(ceiling_shell)
+            if not lintel_union.is_empty and ceiling_shell.intersects(lintel_union):
+                # Room outline and lintel share their edges: opened by 0.1 mm, so no hairline spike of either is left in the outline.
+                trimmed_shell = ceiling_shell.difference(lintel_union).buffer(-1e-4, join_style=2).buffer(1e-4, join_style=2).simplify(1e-5, preserve_topology=True)
+                shells = [piece for part in _polygons(make_valid(trimmed_shell)) for piece in _without_holes(part) if piece.area >= 0.05]
+            # Measured per-room ceiling (flat, sloped plane, or two planes split at the ridge / valley), else the storey ceiling.
+            for ceiling_index, (ceiling_piece, ceiling_elevation, plane_normal, plane_offset, ceiling_measured) in enumerate(
+                piece_of for shell in shells for piece_of in room_ceiling_pieces(room, upm, elevation + height, shell)
+            ):
+                ceiling_key = piece_key if ceiling_index == 0 else f"{piece_key}/c{ceiling_index + 1}"
+                scene.add(
+                    CeilingElement(
+                        id=_uid(plan, "ceiling", ceiling_key),
+                        name=(f"Ceiling {room.name}" if room.name else f"Ceiling {room.id}") + ("" if ceiling_index == 0 else f" {ceiling_index + 1}"),
+                        tag=ceiling_key,
+                        storey_id=storey.id,
+                        building_id=building.id,
+                        space_ids=[space_id],
+                        params=CeilingParams(
+                            outline=_ring(ceiling_piece),
+                            elevation=ceiling_elevation,
+                            plane_normal=plane_normal,
+                            plane_offset=plane_offset,
+                            thickness=float(cfg["ceiling"]["thickness_m"]),
+                            trim_to_walls=False,
+                        ),
+                        param_origin={"outline": ParamOrigin.FITTED, "elevation": ParamOrigin.MEASURED if ceiling_measured else ParamOrigin.ASSUMED, "thickness": ParamOrigin.ASSUMED},
+                    )
                 )
-            )
             report.ceilings += 1
-            overlap = ceiling_shell.intersection(room_wall_union).area if not room_wall_union.is_empty else 0.0
+            overlap = unary_union(shells).intersection(room_wall_union).area if shells and not room_wall_union.is_empty else 0.0
             report.ceiling_wall_overlap_max_m2 = max(report.ceiling_wall_overlap_max_m2, float(overlap))
 
     # --- floor slabs --------------------------------------------------------------
@@ -1240,6 +1338,13 @@ def build_scene(
 
     # --- furniture ----------------------------------------------------------------
     _add_furniture(plan, scene, storey, building.id, room_polygons, mapping, cfg, report, instances or {}, elevation, height)
+    # --- objects on the ceiling -----------------------------------------------------
+    scene.derived["samcloud_ceiling_objects"] = add_ceiling_objects(
+        plan, scene, storey, building.id, lambda key: _uid(plan, "ceiling-object", key), room_polygons, mapping, report.warnings,
+    )
+    # --- measured structure: columns, beams, stairs ---------------------------------
+    structure_counts = add_structure_elements(plan, scene, storey, building.id, lambda kind, key: _uid(plan, kind, key), elevation, height, report.warnings)
+    scene.derived["samcloud_structure"] = structure_counts
 
     scene.derived["samcloud_frame"] = {
         "UnitsPerMetre": float(plan.units_per_metre),
@@ -1295,7 +1400,10 @@ def _add_furniture(
             z0 = 0.0
             z1 = float(item.default_height_m or mapping.fallback_height_m)
         # Depth evidence of furniture voxels at floor level inside the footprint says the object stands on the floor (a shelf unit beside a wall).
-        hanging = _is_wall_mounted_furniture(item) and _furniture_near_wall(polygon, plan, upm) and item.floor_contact is not True
+        if item.mounting:  # decided by the evidence of the scan, not by the name
+            hanging = item.mounting != "standing"
+        else:
+            hanging = _is_wall_mounted_furniture(item) and _furniture_near_wall(polygon, plan, upm) and item.floor_contact is not True
         elevated_component = (item.catalogue_kind or "").lower() in {"worktop", "kitchen_sink", "cooktop"}
         # Scan bboxes often start at the visible tabletop, mattress or fridge
         # front.  Everything that can stand therefore starts on the floor; only
@@ -1334,7 +1442,7 @@ def _add_furniture(
                     z_bottom=elevation + z0,
                     z_top=elevation + z1,
                     parts=solid_parts,
-                    mounting="hanging" if hanging else "grounded",
+                    mounting="resting" if item.mounting == "resting" else "hanging" if hanging else "grounded",
                     object_type=object_type,
                     colour=list(klass.colour),
                     label=item.label,
@@ -1347,6 +1455,8 @@ def _add_furniture(
                     class_key=klass.key,
                     facing_deg=item.facing_deg,
                     back_wall_id=item.back_wall_id,
+                    shape_source=item.shape_source,
+                    **_furniture_shape(item, upm, elevation + height),
                 ),
             )
         )
@@ -1377,6 +1487,36 @@ def _furniture_near_wall(polygon: Polygon, plan: BuildingPlan, upm: float, maxim
             if line.length and polygon.distance(line) <= limit:
                 return True
     return False
+
+
+def _furniture_shape(item: PlanFurniture, upm: float, z_limit: float) -> dict[str, Any]:
+    """Reconstructed 3D shape (samcloud.bim.furniture_recon) in scene metres: {"solids": [...]} or {"mesh": {...}}; {} for footprint bodies.
+
+    Solids: {"type", "role", "part_source", "outline" (ring), "z_bottom", "z_top", "center"/"radius" for cylinders}; z absolute, capped at
+    the storey top ``z_limit``.  Mesh: {"vertices", "faces"} (absolute metres)."""
+    if item.shape_source == "mesh" and item.mesh and item.mesh.get("vertices") and item.mesh.get("faces"):
+        vertices = np.asarray(item.mesh["vertices"], dtype=float) / upm
+        vertices[:, 2] = np.minimum(vertices[:, 2], z_limit)
+        return {"mesh": {"vertices": vertices.tolist(), "faces": [[int(v) for v in face] for face in item.mesh["faces"]]}}
+    if item.shape_source != "parametric" or not item.solids:
+        return {}
+    solids: list[dict[str, Any]] = []
+    for raw in item.solids:
+        ring = raw.get("outline") or []
+        if len(ring) < 3:
+            continue
+        bottom, top = float(raw["z_min"]) / upm, min(float(raw["z_max"]) / upm, z_limit)
+        if top - bottom < 0.005:
+            continue
+        solid = {
+            "type": str(raw.get("type") or "extrusion"), "role": str(raw.get("role") or ""), "part_source": str(raw.get("part_source") or "measured"),
+            "outline": [[float(x) / upm, float(y) / upm] for x, y in ring], "z_bottom": bottom, "z_top": top,
+        }
+        if solid["type"] == "cylinder" and raw.get("center") is not None and raw.get("radius"):
+            solid["center"] = [float(raw["center"][0]) / upm, float(raw["center"][1]) / upm]
+            solid["radius"] = float(raw["radius"]) / upm
+        solids.append(solid)
+    return {"solids": solids} if solids else {}
 
 
 def _furniture_parts(

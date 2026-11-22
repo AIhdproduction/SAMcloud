@@ -329,6 +329,25 @@ def refine_level_openings(
         return RefineOutcome("failed", "", 0, False, time.time() - started, message=str(error))
 
 
+def refined_openings_applied(project_root: Path | str, level_key: str) -> tuple[bool, str]:
+    """(applied, reason): whether the level's plan_model.json contains the refined openings of its openings_3d.json.
+
+    True without an openings_3d.json (nothing to apply).  The reason names why a refinement was not applied (stale pass-1
+    snapshot, different wall set, unreadable plan).
+    """
+    directory = level_cache_dir(project_root, level_key)
+    if openings_3d_sha256(directory) is None:
+        return True, "no refined openings"
+    try:
+        source = json.loads((directory / "plan_model.json").read_text(encoding="utf-8")).get("source") or {}
+    except (OSError, ValueError) as error:
+        return False, f"plan_model.json unreadable: {error}"
+    info = source.get("openings_3d") or {}
+    if info.get("applied"):
+        return True, "applied"
+    return False, str(info.get("reason") or ("openings_3d.json belongs to a different wall set" if info.get("sha256") else "no refinement info in the plan"))
+
+
 def plan_has_current_openings(project_root: Path | str, level_key: str) -> bool:
     """True when the level's plan_model.json was generated with the current openings_3d.json (or none exists).
 

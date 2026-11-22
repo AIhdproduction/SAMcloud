@@ -3753,6 +3753,309 @@
                 </property>
             </requirements>
         </specification>
+        <specification name="IfcSensor" ifcVersion="IFC4" description="IfcSensor: scanned furniture / equipment with name, type, storey and SAMcloud_Scan.">
+            <applicability minOccurs="0" maxOccurs="unbounded">
+                <entity>
+                    <name>
+                        <simpleValue>IFCSENSOR</simpleValue>
+                    </name>
+                </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
+            </applicability>
+            <requirements>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>Name</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>Description</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>ObjectType</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>PredefinedType</simpleValue>
+                    </name>
+                </attribute>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Label</simpleValue>
+                    </baseName>
+                </property>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>ZSource</simpleValue>
+                    </baseName>
+                </property>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Layer</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Length</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Width</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Height</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>ZMin</simpleValue>
+                    </baseName>
+                </property>
+            </requirements>
+        </specification>
+        <specification name="IfcAirTerminal" ifcVersion="IFC4" description="IfcAirTerminal: scanned furniture / equipment with name, type, storey and SAMcloud_Scan.">
+            <applicability minOccurs="0" maxOccurs="unbounded">
+                <entity>
+                    <name>
+                        <simpleValue>IFCAIRTERMINAL</simpleValue>
+                    </name>
+                </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
+            </applicability>
+            <requirements>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>Name</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>Description</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>ObjectType</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>PredefinedType</simpleValue>
+                    </name>
+                </attribute>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Label</simpleValue>
+                    </baseName>
+                </property>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>ZSource</simpleValue>
+                    </baseName>
+                </property>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Layer</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Length</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Width</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Height</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>ZMin</simpleValue>
+                    </baseName>
+                </property>
+            </requirements>
+        </specification>
+        <specification name="IfcFireSuppressionTerminal" ifcVersion="IFC4" description="IfcFireSuppressionTerminal: scanned furniture / equipment with name, type, storey and SAMcloud_Scan.">
+            <applicability minOccurs="0" maxOccurs="unbounded">
+                <entity>
+                    <name>
+                        <simpleValue>IFCFIRESUPPRESSIONTERMINAL</simpleValue>
+                    </name>
+                </entity>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
+            </applicability>
+            <requirements>
+                <partOf relation="IFCRELCONTAINEDINSPATIALSTRUCTURE" cardinality="required">
+                    <entity>
+                        <name>
+                            <simpleValue>IFCBUILDINGSTOREY</simpleValue>
+                        </name>
+                    </entity>
+                </partOf>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>Name</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>Description</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>ObjectType</simpleValue>
+                    </name>
+                </attribute>
+                <attribute cardinality="required">
+                    <name>
+                        <simpleValue>PredefinedType</simpleValue>
+                    </name>
+                </attribute>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Label</simpleValue>
+                    </baseName>
+                </property>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>ZSource</simpleValue>
+                    </baseName>
+                </property>
+                <property cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Layer</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Length</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Width</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>Height</simpleValue>
+                    </baseName>
+                </property>
+                <property dataType="IFCLENGTHMEASURE" cardinality="required">
+                    <propertySet>
+                        <simpleValue>SAMcloud_Scan</simpleValue>
+                    </propertySet>
+                    <baseName>
+                        <simpleValue>ZMin</simpleValue>
+                    </baseName>
+                </property>
+            </requirements>
+        </specification>
         <specification name="IfcBuildingStorey" ifcVersion="IFC4" description="Storeys: name, elevation, aggregated into the building.">
             <applicability minOccurs="0" maxOccurs="unbounded">
                 <entity>

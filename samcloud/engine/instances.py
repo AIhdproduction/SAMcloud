@@ -140,8 +140,15 @@ def _metadata(instance_id, xyz, component_sources, vinst_class, vinst_conf, vins
         prompts = vinst_prompt[sources]
         specific = [int(prompt) for prompt in prompts if int(prompt) not in generic_prompt_ids]
         selected = specific or [int(prompt) for prompt in prompts]
-        labels = [str(prompt_texts[prompt]) for prompt in selected if 0 <= prompt < len(prompt_texts)]
-        label = Counter(labels).most_common(1)[0][0] if labels else _class_name(class_id, params)
+        known = [index for index, prompt in enumerate(selected) if 0 <= prompt < len(prompt_texts)]
+        labels = [str(prompt_texts[selected[index]]) for index in known]
+        if labels:
+            views = vinst_view[sources]
+            if specific:
+                views = views[[int(prompt) not in generic_prompt_ids for prompt in prompts]]
+            label = Counter(_family_votes(labels, views[known])).most_common(1)[0][0]
+        else:
+            label = _class_name(class_id, params)
         records.append({
             "id": int(identifier),
             "class_id": class_id,
@@ -220,6 +227,10 @@ def _spatial_components_exact(xyz: np.ndarray, root: np.ndarray, radius: float) 
 _SOFT_LABELS = frozenset({"cushion", "pillow", "blanket", "mattress"})
 _HOST_LABELS = frozenset({"bed", "sofa"})
 _ALIAS_CACHE: dict | None = None
+_VOTE_CACHE: dict | None = None
+_SECONDARY_GROW_M = 0.15            # an added object is compact: it does not flood the free points around it
+_DUPLICATE_BOX_SHARE = 0.5          # of the smaller box inside the other one
+_DUPLICATE_CONTACT_SHARE = 0.10     # of the smaller object's points touching the other one
 _NEIGHBOURS = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
                if (dx, dy, dz) != (0, 0, 0)]
 
@@ -235,6 +246,89 @@ def _default_label_aliases() -> dict:
         except (OSError, ValueError):
             _ALIAS_CACHE = {}
     return _ALIAS_CACHE
+
+
+def _family_votes(labels: list[str], views, rules: dict | None = None, aliases: dict | None = None) -> list[str]:
+    """Votes of one instance in which the synonyms of an object family count for a single name.
+
+    One screen is found by ``television``, ``flat screen`` and ``computer monitor`` at the same time, so the raw
+    prompt majority would split its votes. The family is named by its member seen in most views (several synonyms
+    in one view count once); a weak member (``screen``) only names it when nothing more precise was found, and a tie
+    goes to the member listed first. Labels outside the families are returned unchanged.
+    """
+    rules = _default_label_votes() if rules is None else rules
+    families = rules.get("families") or []
+    if not families:
+        return labels
+    aliases = _default_label_aliases() if aliases is None else aliases
+    names = [_canonical_label(label, aliases) for label in labels]
+    weak = set(rules.get("weak") or [])
+    votes = list(labels)
+    for family in families:
+        members = [index for index, name in enumerate(names) if name in family]
+        if not members:
+            continue
+        seen: dict[str, set] = defaultdict(set)
+        for index in members:
+            seen[names[index]].add(int(views[index]))
+        candidates = [name for name in seen if name not in weak] or list(seen)
+        winner = min(candidates, key=lambda name: (-len(seen[name]), family.index(name)))
+        for index in members:
+            votes[index] = winner
+    return votes
+
+
+def _default_label_votes() -> dict:
+    """``instance_label_votes`` of the global config/classes.json (cached, {} when unreadable)."""
+    global _VOTE_CACHE
+    if _VOTE_CACHE is None:
+        try:
+            path = Path(__file__).resolve().parents[2] / "config" / "classes.json"
+            _VOTE_CACHE = dict(json.loads(path.read_text(encoding="utf-8")).get("instance_label_votes", {}))
+        except (OSError, ValueError, TypeError, AttributeError):
+            _VOTE_CACHE = {}
+    return _VOTE_CACHE
+
+
+def secondary_prompt_indices(config: dict | None, class_set, class_names, prompt_entries) -> set[int]:
+    """Flat prompt indices of the secondary instance layer (``instance_secondary`` of classes.json).
+
+    The layer holds what was added to the instance query set later.  Its masks compete and associate only among
+    themselves, so adding a prompt cannot change how every other object is associated.  A project file written
+    before the key existed takes the list of the global file.
+    """
+    rules = (config or {}).get("instance_secondary")
+    if rules is None and config is not None:
+        try:
+            path = Path(__file__).resolve().parents[2] / "config" / "classes.json"
+            rules = json.loads(path.read_text(encoding="utf-8")).get("instance_secondary")
+        except (OSError, ValueError):
+            rules = None
+    entry = (rules or {}).get(class_set) or {}
+    classes = set(entry.get("classes") or ())
+    prompts = {str(text).strip().lower() for text in entry.get("prompts") or ()}
+    selected: set[int] = set()
+    flat = 0
+    for index, group in enumerate(prompt_entries):
+        values = [group] if isinstance(group, str) else list(group)
+        if index < len(class_names):  # not the suppress / mirror / protection queries behind the classes
+            whole = str(class_names[index]).split(",", 1)[0].strip() in classes
+            selected.update(flat + offset for offset, text in enumerate(values)
+                            if whole or str(text).strip().lower() in prompts)
+        flat += len(values)
+    return selected
+
+
+def recorded_prompt_indices(class_set, prompt_texts, secondary) -> set[int]:
+    """Prompts whose mask outlines are kept (screen_masks.py): the secondary layer and every screen name."""
+    if class_set != "indoor":
+        return set()
+    aliases = _default_label_aliases()
+    families = _default_label_votes().get("families") or []
+    screens = next((set(family) for family in families if "screen" in family), set())
+    selected = {int(value) for value in secondary}
+    selected.update(index for index, text in enumerate(prompt_texts) if _canonical_label(text, aliases) in screens)
+    return selected
 
 
 def _canonical_label(label, aliases: dict) -> str:
@@ -513,6 +607,127 @@ def associate_instances(point_idx, vinst_idx, vinst_class, vinst_conf, vinst_pro
                         vinst_view=None, exclude_mask=None):
     """Associate per-image SAM masks into class-consistent 3D object IDs.
 
+    Masks of ``params["secondary_prompt_ids"]`` are associated on their own, after the others: they only claim points
+    the primary objects left free, and their ids follow the primary ids.  The primary objects are exactly those of a
+    run without the secondary prompts, except that a synonym of the same physical object (screen / television) joins it.
+    """
+    params = dict(params or {})
+    added = list(params.get("secondary_prompt_ids") or ())
+    prompts = np.asarray(vinst_prompt, dtype=np.int32)
+    count = len(prompts)
+    if not added or len(vinst_class) != count or len(vinst_conf) != count:
+        return _associate_layer(point_idx, vinst_idx, vinst_class, vinst_conf, vinst_prompt, n_points, resolved_class,
+                                xyz, params, prompt_texts, generic_prompt_ids, vinst_view, exclude_mask)
+    point_idx, vinst_idx = np.asarray(point_idx, dtype=np.int32), np.asarray(vinst_idx, dtype=np.int32)
+    if len(vinst_idx) and (vinst_idx.min() < 0 or vinst_idx.max() >= count):
+        raise ValueError("vinst_idx contains an out-of-range instance")
+    views = np.arange(count, dtype=np.int32) if vinst_view is None else np.asarray(vinst_view, dtype=np.int32)
+    is_added = np.isin(prompts, np.asarray(added, dtype=np.int32))
+
+    def layer(selected, layer_params, mask):
+        number = np.cumsum(selected, dtype=np.int32) - 1  # keeps the order, hence the numbering of the roots
+        rows = selected[vinst_idx]
+        return _associate_layer(
+            point_idx[rows], number[vinst_idx[rows]], np.asarray(vinst_class)[selected],
+            np.asarray(vinst_conf)[selected], prompts[selected], n_points, resolved_class, xyz,
+            layer_params, prompt_texts, generic_prompt_ids, views[selected], mask,
+        )
+
+    ids, metadata = layer(~is_added, params, exclude_mask)
+    if not is_added.any():
+        return ids, metadata
+    taken = ids > 0
+    if exclude_mask is not None:
+        taken = taken | np.asarray(exclude_mask, dtype=bool)
+    added_params = {**params, "instance_grow_max_m": float(params.get("secondary_grow_max_m", _SECONDARY_GROW_M))}
+    added_ids, added_metadata = layer(is_added, added_params, taken)
+    return _add_secondary_layer(xyz, ids, metadata, added_ids, added_metadata, params)
+
+
+def _box_share(first, second, pad: float) -> float:
+    """Share of the smaller padded robust box that lies inside the other one."""
+    low_a, high_a = np.percentile(first, (2, 98), axis=0) + np.array([[-pad], [pad]])
+    low_b, high_b = np.percentile(second, (2, 98), axis=0) + np.array([[-pad], [pad]])
+    inside = np.prod(np.clip(np.minimum(high_a, high_b) - np.maximum(low_a, low_b), 0, None))
+    return float(inside / max(min(np.prod(high_a - low_a), np.prod(high_b - low_b)), 1e-12))
+
+
+def _add_secondary_layer(xyz, ids, metadata, added_ids, added_metadata, params):
+    """Append the secondary objects; one physical object found under two names of a family stays one object.
+
+    An added object joins another object of its family only when the boxes overlap and the points touch.  Two
+    primary objects are never joined, and no primary object of another family gains or loses a point.
+    """
+    if not added_metadata:
+        return ids, metadata
+    xyz = np.asarray(xyz, dtype=np.float64)
+    out = np.asarray(ids, dtype=np.uint32).copy()
+    rules = _default_label_votes()
+    families, weak = rules.get("families") or [], set(rules.get("weak") or ())
+    aliases = _default_label_aliases()
+    radius = float(params.get("split_radius_m", 0.05))
+    min_points = int(params.get("min_points", 100))
+    min_contacts = int(params.get("instance_merge_min_contacts", 30))
+    records = [dict(item) for item in metadata]
+    by_id = {int(item["id"]): item for item in records}
+    next_id = max(by_id, default=0) + 1
+    groups = [(np.flatnonzero(np.asarray(added_ids) == int(item["id"])), item) for item in added_metadata]
+    groups = sorted((group for group in groups if len(group[0]) >= min_points), key=lambda group: -len(group[0]))
+
+    def family_of(label):
+        name = _canonical_label(label, aliases)
+        return next((number for number, family in enumerate(families) if name in family), None)
+
+    changed = set()
+    for rows, item in groups:
+        family = family_of(item.get("label"))
+        best = None
+        for target in records if family is not None else ():
+            if target.get("class_id") != item.get("class_id") or family_of(target.get("label")) != family:
+                continue
+            others = np.flatnonzero(out == int(target["id"]))
+            if not len(others) or _box_share(xyz[rows], xyz[others], radius) < _DUPLICATE_BOX_SHARE:
+                continue
+            small, large = (rows, others) if len(rows) <= len(others) else (others, rows)
+            contacts = int(np.isfinite(cKDTree(xyz[large]).query(xyz[small], distance_upper_bound=radius)[0]).sum())
+            if contacts >= max(min_contacts, _DUPLICATE_CONTACT_SHARE * len(small)) and (best is None or contacts > best[0]):
+                best = (contacts, target)
+        if best is None:
+            record = {**item, "id": next_id, "secondary": True}
+            out[rows] = next_id
+            records.append(record)
+            next_id += 1
+        else:
+            record = best[1]
+            out[rows] = int(record["id"])
+            if record.get("label") in weak and item.get("label") not in weak:
+                record["label"] = item["label"]
+            for key in ("view_count", "confidence"):
+                if key in record and key in item:
+                    record[key] = max(record[key], item[key])
+        changed.add(int(record["id"]))
+    used: dict[str, int] = defaultdict(int)
+    for record in records:
+        if not record.get("secondary"):
+            used[record["label"]] = max(used[record["label"]], int(record.get("label_index") or 0))
+    for record in records:
+        if int(record["id"]) in changed:
+            points = xyz[out == int(record["id"])]
+            record.update({
+                "point_count": len(points), "centroid": points.mean(0).tolist(),
+                "bbox_min": points.min(0).tolist(), "bbox_max": points.max(0).tolist(),
+            })
+        if record.get("secondary"):
+            used[record["label"]] += 1
+            record["label_index"] = used[record["label"]]
+    return out, records
+
+
+def _associate_layer(point_idx, vinst_idx, vinst_class, vinst_conf, vinst_prompt, n_points,
+                     resolved_class, xyz, params, prompt_texts, generic_prompt_ids=(),
+                     vinst_view=None, exclude_mask=None):
+    """Associate the masks of one layer.
+
     ``point_idx`` and ``vinst_idx`` are one compact membership row per visible
     point.  All large temporary indices are int32; scipy owns the sparse matrix
     itself, which avoids a dense view-instance by point allocation.
@@ -705,7 +920,6 @@ def attach_instances(source_path: Path, final_ply: Path, params=None, *, keep_so
 
     vertex = read_vertex_array(final_ply)
     xyz = np.column_stack((vertex["x"], vertex["y"], vertex["z"])).astype(np.float64)
-    instance_id = np.zeros(len(vertex), dtype=np.uint32)
     original = np.asarray(source["instance_id"], dtype=np.uint32)
     if tag_report is None:  # <project>/products/classified/classified.ply -> <project>/reports/
         for candidate in (final_ply.parent.parent.parent, final_ply.parent.parent):
@@ -717,27 +931,45 @@ def attach_instances(source_path: Path, final_ply: Path, params=None, *, keep_so
         source_mask = tag_point_mask(source["xyz"], tag_report)
         if source_mask is not None:
             original = np.where(source_mask, 0, original).astype(np.uint32)
-    valid = original > 0
-    if np.any(valid) and len(vertex):
-        distance, nearest = cKDTree(np.asarray(source["xyz"])[valid]).query(
-            xyz, distance_upper_bound=float(params.get("attach_radius_m", 0.05))
-        )
-        kept_ids = original[valid]
-        kept_classes = np.asarray(source["scalar_class"])[valid]
-        found = np.isfinite(distance) & (nearest < len(kept_ids))
-        instance_id[found] = kept_ids[nearest[found]]
-        same_class = np.zeros(len(vertex), dtype=bool)
-        same_class[found] = np.asarray(vertex["scalar_class"])[found] == kept_classes[nearest[found]]
-        instance_id[~same_class] = 0
-    min_points = int(params.get("min_points", 100))
-    order, identifiers, starts, counts = _group_by_id(instance_id)
-    small = identifiers[counts < min_points]
-    if len(small):
-        instance_id[np.isin(instance_id, small)] = 0
-        order, identifiers, starts, counts = _group_by_id(instance_id)
     old_metadata = json.loads(str(source.get("metadata_json", "[]").item()))
-    remapped, metadata = refine_instance_ids(xyz, np.asarray(vertex["scalar_class"]), instance_id,
-                                             old_metadata, params, tag_mask)
+    min_points = int(params.get("min_points", 100))
+    point_class = np.asarray(vertex["scalar_class"])
+
+    def transfer(source_ids, blocked=None):
+        result = np.zeros(len(vertex), dtype=np.uint32)
+        valid = source_ids > 0
+        if np.any(valid) and len(vertex):
+            distance, nearest = cKDTree(np.asarray(source["xyz"])[valid]).query(
+                xyz, distance_upper_bound=float(params.get("attach_radius_m", 0.05))
+            )
+            kept_ids = source_ids[valid]
+            kept_classes = np.asarray(source["scalar_class"])[valid]
+            found = np.isfinite(distance) & (nearest < len(kept_ids))
+            result[found] = kept_ids[nearest[found]]
+            same_class = np.zeros(len(vertex), dtype=bool)
+            same_class[found] = point_class[found] == kept_classes[nearest[found]]
+            result[~same_class] = 0
+        if blocked is not None:
+            result[blocked] = 0
+        identifiers, counts = _group_by_id(result)[1::2]
+        small = identifiers[counts < min_points]
+        if len(small):
+            result[np.isin(result, small)] = 0
+        return result
+
+    # the same two layers as in the association: the primary objects transfer and grow as if there was no other
+    added = np.isin(original, [int(item["id"]) for item in old_metadata if item.get("secondary")])
+    instance_id = transfer(np.where(added, 0, original).astype(np.uint32))
+    remapped, metadata = refine_instance_ids(xyz, point_class, instance_id,
+                                             [item for item in old_metadata if not item.get("secondary")], params, tag_mask)
+    if added.any():
+        taken = remapped > 0 if tag_mask is None else (remapped > 0) | tag_mask
+        added_params = {**params, "instance_grow_max_m": float(params.get("secondary_grow_max_m", _SECONDARY_GROW_M))}
+        added_id, added_metadata = refine_instance_ids(
+            xyz, point_class, transfer(np.where(added, original, 0).astype(np.uint32), taken),
+            [item for item in old_metadata if item.get("secondary")], added_params, taken,
+        )
+        remapped, metadata = _add_secondary_layer(xyz, remapped, metadata, added_id, added_metadata, params)
     _write_ply_with_instance_id(final_ply, vertex, remapped)
     write_instances_json(final_ply.with_name(JSON_NAME), metadata)
     return {"enabled": True, "count": len(metadata), "points": int(np.count_nonzero(remapped)), "instances": metadata}

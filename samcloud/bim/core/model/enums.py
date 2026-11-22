@@ -94,6 +94,8 @@ class ElementKind(StrEnum):
     MARKING = "marking"
     MANHOLE = "manhole"
     VEGETATION_AREA = "vegetation_area"
+    COLUMN = "column"
+    BEAM = "beam"
 
 
 class WallJustification(StrEnum):

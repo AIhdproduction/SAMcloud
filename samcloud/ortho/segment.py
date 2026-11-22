@@ -23,6 +23,17 @@ from samcloud.dxf.cancel import CancelToken, ProgressCallback, check_cancel, rep
 from samcloud.dxf.levels import Level
 from samcloud.ortho.build import OrthoError, load_ortho_result, ortho_output_dir
 
+# The fine list up to classes revision 1. Outdoor never reads fine prompts, so its fingerprint keeps this list.
+_FINE_PROMPTS_V1 = (
+    "toilet", "washbasin", "bathtub", "shower tray", "kitchen sink", "stove", "bed", "sofa",
+    "armchair", "table", "chair", "wardrobe", "shelf", "desk", "refrigerator", "washing machine",
+    "radiator", "cushion", "pillow", "blanket", "clothes", "nightstand", "coffee table",
+    "sideboard", "tv stand", "kitchen counter", "kitchen cabinet", "cat tree", "plant",
+    "floor lamp", "television", "mirror",
+)
+# Screens only: the indoor top view is cut below the ceiling, so ceiling fixtures are never visible in it.
+_SCREEN_PROMPTS = ("flat screen", "computer monitor", "laptop")
+
 SegmentSource = Literal["pointcloud", "sam3", "flurseg", "combined"]
 ImageModel = Literal["sam3", "flurseg"]
 
@@ -43,13 +54,7 @@ class SegmentConfig:
     outdoor_low_codes: tuple[int, ...] = (2, 3, 9, 11, 71, 73, 82)
     indoor_high_codes: tuple[int, ...] = (100, 108, 117)
     indoor_low_codes: tuple[int, ...] = (102,)
-    fine_prompts_indoor: tuple[str, ...] = (
-        "toilet", "washbasin", "bathtub", "shower tray", "kitchen sink", "stove", "bed", "sofa",
-        "armchair", "table", "chair", "wardrobe", "shelf", "desk", "refrigerator", "washing machine",
-        "radiator", "cushion", "pillow", "blanket", "clothes", "nightstand", "coffee table",
-        "sideboard", "tv stand", "kitchen counter", "kitchen cabinet", "cat tree", "plant",
-        "floor lamp", "television", "mirror",
-    )
+    fine_prompts_indoor: tuple[str, ...] = (*_FINE_PROMPTS_V1, *_SCREEN_PROMPTS)
     fine_allowed_codes_indoor: tuple[int, ...] = (114, 117, 120, 121, 180)
 
     def fine_allowed_codes(self, mode: Literal["indoor", "outdoor"] = "indoor") -> tuple[int, ...]:
@@ -288,9 +293,17 @@ def segment_fingerprint(
         "model_profile": profile.name,
         "class_list": class_names,
         "prompts": prompts,
-        "config": asdict(config or load_segment_config()),
+        "config": _fingerprint_settings(config or load_segment_config(), mode),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _fingerprint_settings(config: SegmentConfig, mode: str) -> dict[str, Any]:
+    """Settings that enter the fingerprint; the indoor-only fine prompts cannot invalidate an outdoor result."""
+    values = asdict(config)
+    if mode == "outdoor":
+        values["fine_prompts_indoor"] = _FINE_PROMPTS_V1
+    return values
 
 
 def _codes(values: Any) -> tuple[int, ...]:

@@ -192,12 +192,14 @@ def door_bounded_rooms(
     support: np.ndarray | None = None,
     wall_pieces: Iterable[dict[str, Any]] = (),
     theta: float = 0.0,
+    passage_reveals: Iterable[Polygon] = (),
 ) -> tuple[list[Polygon], dict[str, Any]]:
     """Complete ``rooms`` (wall cells / measured rooms) to the whole interior floor, split only by walls and door lines.
 
     ``openings`` are Opening-like objects (``kind`` DOOR / WINDOW / passage, ``center``, ``axis_angle``, ``width``,
     ``wall_thickness``).  Returns the rooms (the input rooms grown by what belongs to them, plus new rooms for floor
-    that is reached only through doors) and statistics.
+    that is reached only through doors) and statistics.  ``passage_reveals`` (optional) are the passages between both faces of
+    their host wall: the detected slab lies on ONE face and need not reach the room behind the other one.
     """
     upm = max(float(units_per_metre), 1e-9)
     stats: dict[str, Any] = {"door_room_exterior_gaps": 0, "door_room_cores_cut": 0, "door_room_gaps_closed": 0, "door_room_pieces": 0, "door_room_new": 0, "door_room_pockets": 0, "door_room_halves": 0, "door_room_area_added_m2": 0.0}
@@ -367,7 +369,8 @@ def door_bounded_rooms(
     probes = [door_probes(item, tolerance) for item in doors]
     stats["door_room_open_merged"] = _merge_open_rooms(rooms_out, blocked, settings.merge_contact_m * upm, tolerance * 2.0, probes)
     # --- a passage is plain floor: the rooms on both sides of it are one room
-    merged_count = _merge_through_passages(rooms_out, [slab.difference(walls) if not walls.is_empty else slab for slab in passage_slabs], tolerance * 2.0)
+    free = (lambda shape: shape.difference(walls)) if not walls.is_empty else (lambda shape: shape)
+    merged_count = _merge_through_passages(rooms_out, [free(slab) for slab in passage_slabs], tolerance * 2.0, [free(shape) for shape in passage_reveals])
     stats["door_room_merged"] = merged_count
     # --- pockets between a room and a wall / room outline (ragged around furniture) belong to the room they touch most
     live = [room for room in rooms_out if room is not None]
@@ -417,12 +420,15 @@ def door_bounded_rooms(
             rooms_out[touching[0]] = unary_union([rooms_out[touching[0]], gap])
             stats["door_room_wall_pockets"] += 1
     result: list[Polygon] = []
-    for room in rooms_out:
-        if room is None or room.is_empty:
-            continue
+    final = [room for room in rooms_out if room is not None and not room.is_empty]
+    for index, room in enumerate(final):
         cleaned = _fill_holes(room.buffer(0.01 * upm, join_style=2).buffer(-0.01 * upm, join_style=2))  # furniture leaves no hole; a pillar is cut out again
         if not walls.is_empty:
             cleaned = cleaned.difference(walls)
+        # Every m2 belongs to one room: a room enclosed by this one, or a reveal half the smaller room took, is no floor of this one.
+        for other_index, other in enumerate(final):
+            if (other.area, other_index) < (room.area, index) and cleaned.intersection(other).area > 1e-6 * upm * upm:
+                cleaned = cleaned.difference(other)
         polygon = _largest_polygon(cleaned)
         if polygon is not None and polygon.area > 0.0:
             result.append(polygon)
@@ -484,15 +490,28 @@ def _merge_open_rooms(rooms: list[Any], blocked: Any, minimum: float, tolerance:
     return merged
 
 
-def _merge_through_passages(rooms: list[Any], passages: list[Any], reach: float) -> int:
-    """Merge (in place; a merged-away entry becomes None) all rooms that touch the same passage opening."""
+def _merge_through_passages(rooms: list[Any], passages: list[Any], reach: float, reveals: Iterable[Any] = ()) -> int:
+    """Merge (in place; a merged-away entry becomes None) all rooms that touch the same passage opening.
+
+    ``reveals`` reach from face to face of the host wall: rooms that only meet across one are joined by its floor.  Where the
+    passage itself already touches all of them nothing is added.
+    """
+    reveal_list = [reveal for reveal in reveals if not reveal.is_empty]
     merged = 0
     for passage in passages:
         if passage.is_empty:
             continue
         touching = [index for index, room in enumerate(rooms) if room is not None and room.distance(passage) <= reach]
+        across = [reveal for reveal in reveal_list if reveal.intersects(passage)]
+        if across:
+            span = unary_union([passage, *across])
+            meeting = [index for index, room in enumerate(rooms) if room is not None and room.distance(span) <= reach]
+            if len(meeting) > max(len(touching), 1):
+                touching = meeting
+            else:
+                across = []
         for other in touching[1:]:
-            rooms[touching[0]] = unary_union([rooms[touching[0]], rooms[other]])
+            rooms[touching[0]] = unary_union([rooms[touching[0]], rooms[other], *across])
             rooms[other] = None
             merged += 1
     return merged

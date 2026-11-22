@@ -479,6 +479,10 @@ class HeadFusionLabeler:
         self.last_fine_probs = None
         self.instance_classes = {int(value) for value in (instance_classes or [])}
         self.instance_params = dict(instance_params or {})
+        # These prompts have a per-point competition of their own: an added mask never takes a point from the others.
+        self.secondary_prompt_ids = {int(value) for value in self.instance_params.get("secondary_prompt_ids") or ()}
+        # Masks of these prompts are also returned as outlines (screen_masks.py); the association never sees them.
+        self.record_prompt_ids = {int(value) for value in self.instance_params.get("record_prompt_ids") or ()}
         self.last_instances = None
         overrides = dict(
             conf=conf,
@@ -573,7 +577,22 @@ class HeadFusionLabeler:
         scores = np.zeros((u.size, len(self.class_names)), dtype=np.float32)
         point_local_instance = np.full(u.size, -1, dtype=np.int32)
         instance_best = np.zeros(u.size, dtype=np.float32)
+        secondary_ids = getattr(self, "secondary_prompt_ids", None) or set()
+        point_secondary_instance = np.full(u.size, -1, dtype=np.int32)
+        secondary_best = np.zeros(u.size, dtype=np.float32)
         local_instances = []
+        record_ids = getattr(self, "record_prompt_ids", None) or set()
+        recorded_masks = []
+        record_error = None
+        if record_ids:
+            try:
+                if __package__:
+                    from .screen_masks import mask_outline
+                else:
+                    from screen_masks import mask_outline
+            except Exception as error:  # noqa: BLE001 - optional product
+                record_error = error
+                record_ids = self.record_prompt_ids = set()
         labels = best = raw_labels = raw_best = None
         if label_threshold is not None:
             labels = np.zeros((height, width), dtype=np.uint8)
@@ -611,6 +630,17 @@ class HeadFusionLabeler:
                         pixel_count = int(np.count_nonzero(mask >= threshold))
                         if pixel_count < min_pixels:
                             continue
+                        if int(prompt_idx) in record_ids:  # also without a single visible point: a dark screen
+                            try:
+                                outline = mask_outline(mask, (x0, y0, x1, y1), threshold)
+                                if outline is not None:
+                                    recorded_masks.append({
+                                        "prompt_idx": int(prompt_idx), "conf": float(confidence), "outline": outline[0],
+                                        "cut": outline[1],
+                                    })
+                            except Exception as error:  # noqa: BLE001 - optional product: stop recording, keep classifying
+                                record_error = error
+                                record_ids = self.record_prompt_ids = set()
                         # Nearest sampling at the mask grid via pixel centres, matching the
                         # coordinate scale used when mask-resolution semantic
                         # maps are expanded to the tile.
@@ -630,11 +660,15 @@ class HeadFusionLabeler:
                         })
                         positions = local_positions[belongs]
                         strength = float(confidence) * probabilities[belongs]
-                        better = strength > instance_best[positions]
+                        winner, winning = (
+                            (point_secondary_instance, secondary_best) if int(prompt_idx) in secondary_ids
+                            else (point_local_instance, instance_best)
+                        )
+                        better = strength > winning[positions]
                         if np.any(better):
                             chosen = positions[better]
-                            point_local_instance[chosen] = local_id
-                            instance_best[chosen] = strength[better]
+                            winner[chosen] = local_id
+                            winning[chosen] = strength[better]
             if labels is not None:
                 raw_tile_best, raw_tile_class = final_probs.max(dim=0)
                 raw_tile_best = raw_tile_best.detach().float().cpu().numpy()
@@ -661,7 +695,13 @@ class HeadFusionLabeler:
         if instances_out is not None:
             instances_out.clear()
             instances_out["point_local_instance"] = point_local_instance
+            if secondary_ids:
+                instances_out["point_secondary_instance"] = point_secondary_instance
             instances_out["instances"] = local_instances
+            if record_error is not None:
+                instances_out["record_error"] = record_error
+            elif record_ids:
+                instances_out["recorded_masks"] = recorded_masks
         if labels is not None:
             if return_raw_labels:
                 return scores, labels, raw_labels

@@ -592,13 +592,23 @@ def sofa_details(
                 for part in _line_parts(cut):
                     if part.length >= 0.10 * upm:
                         modules.append(part)
-    merged = linemerge(unary_union(lines + modules)) if lines or modules else GeometryCollection()
+    merged = _merge_lines(lines + modules)
     output = [line for line in _line_parts(merged) if line.length >= 0.10 * upm]
     output = [LineString([line.coords[0], line.coords[-1]]) if _straight(line) else line for line in output]
     label_area = seat_area
     if seat_area is not None and modules:
         label_area = _largest(seat_area.difference(unary_union(modules).buffer(0.005 * upm))) or seat_area
     return SofaDetail(output, label_area, len(strips))
+
+
+def _merge_lines(lines: list[LineString]) -> Any:
+    """Join touching line pieces; robust for 0, 1 or many pieces (``linemerge`` rejects a single LineString)."""
+    parts = [part for part in _line_parts(unary_union(lines)) if part.length > 0.0] if lines else []
+    if not parts:
+        return GeometryCollection()
+    if len(parts) == 1:
+        return parts[0]
+    return linemerge(MultiLineString(parts))
 
 
 def _straight(line: LineString) -> bool:

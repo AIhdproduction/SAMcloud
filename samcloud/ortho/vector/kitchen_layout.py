@@ -13,6 +13,11 @@ heights and the appliance labels it
 * marks tall units at a leg end (full-depth evidence above ``tall_min_m``) as full-depth rectangles with a
   diagonal cross and "KS" (fridge label) or "HS" (unless the wall stage already resolved the unit there); a leg
   end within ``tall_snap_m`` of a tall unit's side reaches it;
+* adds a leg the label raster lost where its scanned front, worktop, labels and back all prove it (``kitchen_legs``);
+* reads the fronts from the scan points (``kitchen_fronts``): a diagonal corner unit at its measured angle, a base
+  standing back under its worktop, the end of an upper cabinet; ``_run_solids`` carries the run as abutting solids
+  (base, worktop) for the 3D model, so 2D and 3D follow the same fronts;
+* keeps the measured rotation of an insert: parallel to the diagonal unit it sits in, or its own clearly measured one;
 * gives upper cabinets (A-OBEN, dashed) their diagonal cross;
 * absorbs traced furniture that stands on the final counter or bar.
 
@@ -34,8 +39,11 @@ from shapely.geometry import GeometryCollection, LineString, MultiLineString, Po
 from shapely.ops import linemerge, unary_union
 
 from .indoor import _uniform_insert
+from .kitchen_fronts import CornerFront, KitchenFrontSettings, ScanPoints, measure_corner_fronts, measure_recesses, seen_through_ends, split_run
+from .kitchen_legs import FrontLegSettings, recover_front_legs
+from .measured_rotation import clear_point_rotation
 from .plan_polish import _LegBox, _closed_polyline, _furniture_off_counter, _largest, _points, _room_of
-from .symbols import CATALOGUE
+from .symbols import CATALOGUE, SINK_BASINS
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +72,8 @@ class KitchenLayoutSettings:
     tall_share: float = 0.50
     tall_min_length_m: float = 0.45
     tall_snap_m: float = 0.30
-    # A sink / hob on the diagonal of a chamfered inner corner would be a 45 degree solid sticking out of the counter: every kitchen insert
-    # is square to its run and lies inside it (round 5, owner feedback); the diagonal mounting is only kept when this is switched on.
+    # A sink / hob on a diagonal that only the label raster suggests would be a guessed 45 degree solid sticking out of the counter: such
+    # an insert stays square to its run unless this is switched on.  A diagonal measured in the scan always carries its insert.
     appliance_on_chamfer: bool = False
 
 
@@ -82,17 +90,26 @@ def kitchen_cad_layout(
     height_of: Callable[[np.ndarray], np.ndarray] | None,
     appliances: dict[str, np.ndarray] | None = None,
     settings: KitchenLayoutSettings = KitchenLayoutSettings(),
+    scan_points: np.ndarray | None = None,
+    front_settings: KitchenFrontSettings = KitchenFrontSettings(),
+    kitchen_labels: np.ndarray | None = None,
+    leg_settings: FrontLegSettings = FrontLegSettings(),
 ) -> dict[str, Any]:
     """Turn the fitted run(s) on A-EINB into a CAD kitchen (see the module docstring); returns statistics.
 
     ``appliances`` maps a catalogue kind (``COOKTOP``, ``KITCHEN_SINK``) or ``REFRIGERATOR`` to the local points of
-    its label pixels measured at counter height (fridge: any height).
+    its label pixels measured at counter height (fridge: any height).  ``scan_points`` are local points of the scan
+    around the kitchen with z = height above the floor (plan units); without them the run keeps the fitted fronts.
+    ``kitchen_labels`` are the local points of the kitchen labels; without them no lost leg is looked for.
     """
     upm = max(float(units_per_metre), 1e-9)
     stats: dict[str, Any] = {"kitchen_legs_extended_m": 0.0, "kitchen_bars": 0, "kitchen_bar_depth_m": None, "kitchen_appliances_mounted": [],
-                             "kitchen_tall_units": 0, "kitchen_upper_crosses": 0, "kitchen_layout_absorbed": 0}
+                             "kitchen_tall_units": 0, "kitchen_upper_crosses": 0, "kitchen_layout_absorbed": 0,
+                             "kitchen_corner_fronts": [], "kitchen_base_recesses": [], "kitchen_uppers_trimmed": [],
+                             "kitchen_legs_from_fronts": []}
     if not settings.enabled:
         return stats
+    scan = ScanPoints.of(scan_points, theta, upm) if front_settings.enabled and scan_points is not None and len(scan_points) else None
     appliances = appliances or {}
     local_walls = affinity.rotate(walls, -theta, origin=(0.0, 0.0), use_radians=True) if walls is not None and not walls.is_empty else None
     counters: list[Polygon] = []
@@ -118,13 +135,30 @@ def kitchen_cad_layout(
             for leg in legs:
                 if leg.back is not None:
                     leg.snap_ends(local_units, settings.tall_snap_m * upm)
+        top = _counter_top(legs, frame, settings, upm) if height_of is not None else 0.90 * upm
+        corners: list[CornerFront] = []
+        square: list[tuple[float, float]] = []
+        if scan is not None:
+            if kitchen_labels is not None and len(kitchen_labels):
+                known = len(legs)
+                labels = ScanPoints.of(np.column_stack((kitchen_labels, np.zeros(len(kitchen_labels)))), theta, upm).uv
+                stats["kitchen_legs_from_fronts"] += recover_front_legs(legs, scan, labels, local_walls, local_room, front_settings, upm, top / upm, leg_settings)
+                if len(legs) > known:
+                    entity["_kitchen_run"] = {1: "straight", 2: "L", 3: "U"}.get(len(legs), "U+")
+                    _drop_retraced_segments(layers, [leg.polygon(theta) for leg in legs[known:]], 0.15 * upm)
+            # the scanned fronts: diagonal units, and the straight fronts that meet them
+            corners, square = measure_corner_fronts(legs, scan, local_walls, local_room, front_settings, upm, top / upm)
         bars: list[tuple[Polygon, LineString]] = []
         if height_of is not None:
-            top = _counter_top(legs, frame, settings, upm)
             for leg in legs:
                 if leg.back is None:
                     bars.extend(_bars_of(leg, legs, local_walls, local_room, frame, top, settings, upm))
+        # a chamfer of the label raster stays only where the scan cannot judge the corner; a measured front replaces it
+        judged = [(float(item.corner[0]), float(item.corner[1])) for item in corners] + square
         chamfers = [Polygon(points) for points in entity.get("_chamfers", []) if len(points) >= 3]
+        chamfers = [chamfer for chamfer in chamfers if not _judged(chamfer, judged, theta, 0.20 * upm)]
+        triangles = [_inside_room(affinity.rotate(item.triangle, theta, origin=(0.0, 0.0), use_radians=True), walls, room, upm) for item in corners]
+        chamfers += [triangle for triangle in triangles if triangle is not None]
         shapes = [leg.polygon(theta) for leg in legs] + [affinity.rotate(bar, theta, origin=(0.0, 0.0), use_radians=True) for bar, _ in bars] + chamfers
         union = unary_union(shapes)
         if walls is not None and not walls.is_empty:
@@ -137,6 +171,23 @@ def kitchen_cad_layout(
         shape = shape.simplify(0.002 * upm, preserve_topology=True)
         entity["points"] = _points(shape)
         entity["_run_legs"] = [_points(leg.polygon(theta)) for leg in legs]
+        entity["_chamfers"] = [_points(chamfer) for chamfer in chamfers]
+        recesses = measure_recesses(legs, corners, scan, front_settings, upm, top / upm) if scan is not None else []
+        local_chamfers = [affinity.rotate(chamfer, -theta, origin=(0.0, 0.0), use_radians=True) for chamfer in chamfers]
+        entity["_run_solids"] = [
+            {"worktop": [_points(affinity.rotate(piece, theta, origin=(0.0, 0.0), use_radians=True)) for piece in tops],
+             "base": [_points(affinity.rotate(piece, theta, origin=(0.0, 0.0), use_radians=True)) for piece in bases]}
+            for tops, bases in split_run(legs, local_chamfers, recesses, upm)
+        ]
+        stats["kitchen_corner_fronts"] += [
+            {"angle_deg": round(item.angle_deg, 2), "length_m": round(float(np.hypot(*(item.second - item.first))) / upm, 3),
+             "coverage": round(item.coverage, 3), "residual_m": round(item.residual_m, 4)}
+            for item in corners
+        ]
+        for recess in recesses:
+            stats["kitchen_base_recesses"].append({"depth_m": round(recess.depth / upm, 3), "length_m": round(recess.length / upm, 3)})
+            step_line = affinity.rotate(LineString(recess.step), theta, origin=(0.0, 0.0), use_radians=True)
+            layers.setdefault("A-FURN-DETL", []).append({"type": "polyline", "points": [[float(x), float(y)] for x, y in step_line.coords], "closed": False, "_shape_detail": True, "_kitchen_detail": "base_step"})
         counters.append(shape)
         for bar, step in bars:
             stats["kitchen_bars"] += 1
@@ -147,11 +198,13 @@ def kitchen_cad_layout(
                 if part.length >= 0.10 * upm:
                     layers.setdefault("A-FURN-DETL", []).append({"type": "polyline", "points": [[float(x), float(y)] for x, y in part.coords], "closed": False, "_shape_detail": True, "_kitchen_detail": "bar_step"})
         # appliances ON the counter
-        layers["A-EINB"] = _mount_appliances(layers["A-EINB"], entity, legs, shape, chamfers, appliances, theta, settings, upm, stats)
+        layers["A-EINB"] = _mount_appliances(layers["A-EINB"], entity, legs, shape, chamfers, corners, appliances, theta, settings, upm, stats)
         if height_of is not None:
             _tall_units(layers, legs, local_walls, local_room, frame, appliances, theta, settings, upm, stats)
     if counters:
         stats["kitchen_layout_absorbed"] = _furniture_off_counter(layers, unary_union(counters), theta, upm)
+    if scan is not None:
+        stats["kitchen_uppers_trimmed"] = _trim_uppers(layers, local_walls, scan, theta, settings, front_settings, upm)
     # upper cabinets: dashed outline with a diagonal cross (A-OBEN)
     crosses: list[dict[str, Any]] = []
     for entity in layers.get("A-OBEN", []):
@@ -166,6 +219,76 @@ def kitchen_cad_layout(
         stats["kitchen_upper_crosses"] += 1
     layers.setdefault("A-OBEN", []).extend(crosses)
     return stats
+
+
+def kitchen_scan_bounds(
+    layers: dict[str, list[dict[str, Any]]], units_per_metre: float, kitchen_labels: np.ndarray | None = None,
+) -> tuple[float, float, float, float] | None:
+    """The part of the scan ``kitchen_cad_layout`` looks at (runs, uppers and labels, with room around); None without a run."""
+    runs = [entity for entity in layers.get("A-EINB", []) if _closed_polyline(entity) and entity.get("_run_legs")]
+    if not runs:
+        return None
+    rings = [entity["points"] for entity in runs] + [ring for entity in runs for ring in entity["_run_legs"]]
+    rings += [entity["points"] for entity in layers.get("A-OBEN", []) if _closed_polyline(entity) and entity.get("_upper_cabinet")]
+    if kitchen_labels is not None and len(kitchen_labels):
+        rings.append(kitchen_labels)  # a leg the run lost is still labelled
+    xy = np.vstack([np.asarray(ring, dtype=float) for ring in rings])
+    margin = 0.6 * float(units_per_metre)
+    return float(xy[:, 0].min()) - margin, float(xy[:, 1].min()) - margin, float(xy[:, 0].max()) + margin, float(xy[:, 1].max()) + margin
+
+
+def _drop_retraced_segments(layers: dict[str, list[dict[str, Any]]], shapes: list[Polygon], reach: float) -> None:
+    """Loose built-in segments that only retrace a recovered leg (the wall fit does the same for the known legs)."""
+    zone = unary_union(shapes).buffer(reach)
+    kept: list[dict[str, Any]] = []
+    for entity in layers["A-EINB"]:
+        if entity.get("_einb_kind") == "segment" and entity.get("type") == "polyline" and len(entity.get("points", [])) >= 2:
+            line = LineString(entity["points"])
+            if line.intersection(zone).length >= 0.5 * line.length:
+                continue
+        kept.append(entity)
+    layers["A-EINB"][:] = kept
+
+
+def _judged(chamfer: Polygon, judged: list[tuple[float, float]], theta: float, reach: float) -> bool:
+    local = affinity.rotate(chamfer, -theta, origin=(0.0, 0.0), use_radians=True)
+    return any(local.distance(Point(point)) <= reach for point in judged)
+
+
+def _inside_room(shape: Polygon, walls: Any, room: Any, upm: float) -> Polygon | None:
+    clipped: Any = shape if walls is None or walls.is_empty else shape.difference(walls)
+    if room is not None:
+        clipped = clipped.intersection(room.buffer(1e-6 * upm, join_style=2))
+    return _largest(clipped)
+
+
+def _trim_uppers(
+    layers: dict[str, list[dict[str, Any]]], local_walls: Any, scan: ScanPoints, theta: float, settings: KitchenLayoutSettings,
+    front_settings: KitchenFrontSettings, upm: float,
+) -> list[dict[str, float]]:
+    """Cut the end of an upper cabinet where the scan sees through to the wall behind it."""
+    trimmed: list[dict[str, float]] = []
+    for entity in layers.get("A-OBEN", []):
+        if not _closed_polyline(entity) or not entity.get("_upper_cabinet") or not entity.get("_z_range_m"):
+            continue
+        unit = _LegBox.of(Polygon(entity["points"]), theta)
+        if unit is None:
+            continue
+        length = (unit.u1 - unit.u0) if unit.horizontal else (unit.v1 - unit.v0)
+        if length < 1.5 * unit.depth:
+            continue  # a square unit has no along direction
+        unit.back = _back_side(unit, local_walls, settings.wall_touch_m * upm)
+        ends = seen_through_ends(unit, tuple(entity["_z_range_m"]), scan, front_settings, upm)
+        if ends is None:
+            continue
+        window = box(ends[0], unit.v0, ends[1], unit.v1) if unit.horizontal else box(unit.u0, ends[0], unit.u1, ends[1])
+        window = affinity.rotate(window.buffer(1e-6 * upm, join_style=2), theta, origin=(0.0, 0.0), use_radians=True)
+        shape = _largest(Polygon(entity["points"]).intersection(window))
+        if shape is None:
+            continue
+        entity["points"] = _points(shape.simplify(0.002 * upm, preserve_topology=True))
+        trimmed.append({"from_m": round(length / upm, 3), "to_m": round((ends[1] - ends[0]) / upm, 3)})
+    return trimmed
 
 
 def counter_lines(layers: dict[str, list[dict[str, Any]]], walls: Any, units_per_metre: float) -> int:
@@ -421,10 +544,10 @@ def _raised_band(
 # --------------------------------------------------------------------------------------------- appliances
 
 def _mount_appliances(
-    einb: list[dict[str, Any]], run: dict[str, Any], legs: list[_LegBox], counter: Polygon, chamfers: list[Polygon],
+    einb: list[dict[str, Any]], run: dict[str, Any], legs: list[_LegBox], counter: Polygon, chamfers: list[Polygon], corners: list[CornerFront],
     appliances: dict[str, np.ndarray], theta: float, settings: KitchenLayoutSettings, upm: float, stats: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Cooktop / sink inserts re-mounted on the final counter at their label position, fully inside it."""
+    """Cooktop / sink inserts re-mounted on the final counter at their label position (and measured rotation), fully inside it."""
     zone = counter.buffer(0.10 * upm)
     output: list[dict[str, Any]] = []
     existing: dict[str, list[dict[str, Any]]] = {}
@@ -451,7 +574,10 @@ def _mount_appliances(
             footprint = _block_footprint(olds[0], upm)
             if footprint is not None:
                 points = np.asarray([footprint.centroid.coords[0]], dtype=float)
-        placed = _mount(kind, points, legs, counter, chamfers, theta, settings, upm, label or ("Spüle" if kind == "KITCHEN_SINK" else "Herd"), reach=reach)
+        name = label or ("Spüle" if kind == "KITCHEN_SINK" else "Herd")
+        placed = _mount_measured(kind, points, legs, counter, corners, theta, upm, name, labelled=reach <= 0.15 * upm)
+        if placed is None:
+            placed = _mount(kind, points, legs, counter, chamfers, theta, settings, upm, name, reach=reach)
         if placed is None:
             output.extend(olds)
             continue
@@ -481,6 +607,91 @@ def _densest_cluster(points: np.ndarray, radius: float) -> np.ndarray:
     counts = [int(np.count_nonzero(np.hypot(*(points - point).T) <= radius)) for point in sample]
     seed = sample[int(np.argmax(counts))]
     return points[np.hypot(*(points - seed).T) <= 2.0 * radius]
+
+
+def _mount_measured(
+    kind: str, points: np.ndarray, legs: list[_LegBox], counter: Polygon, corners: list[CornerFront], theta: float, upm: float, label: str, *,
+    labelled: bool,
+) -> dict[str, Any] | None:
+    """An insert at its measured rotation: parallel to the diagonal unit it sits in, else its own clearly measured one."""
+    if not labelled:
+        return None  # an old block only gives a position
+    cluster = _densest_cluster(points, 0.25 * upm)
+    for _ in range(2):  # all of the object around its middle, not only around its densest spot
+        middle = np.median(cluster, axis=0)
+        cluster = points[np.hypot(*(points - middle).T) <= 0.50 * upm]
+        if not len(cluster):
+            return None
+    cos, sin = math.cos(theta), math.sin(theta)
+
+    def to_plan(vector: np.ndarray) -> np.ndarray:
+        return np.asarray((vector[0] * cos - vector[1] * sin, vector[0] * sin + vector[1] * cos))
+
+    centre = np.median(np.column_stack((cluster[:, 0] * cos + cluster[:, 1] * sin, -cluster[:, 0] * sin + cluster[:, 1] * cos)), axis=0)
+    for corner in corners:
+        if _in_corner_unit(centre, corner, upm):
+            return _mount_turned(kind, cluster, to_plan(corner.normal), to_plan(corner.first), counter, upm, label)
+    rectangle = clear_point_rotation(cluster, theta, upm)
+    if rectangle is None:
+        return None
+    ring = np.asarray(rectangle.exterior.coords[:4], dtype=float)
+    first, second = ring[1] - ring[0], ring[2] - ring[1]
+    normal = second if np.hypot(*first) >= np.hypot(*second) else first
+    backed = [leg for leg in legs if leg.back is not None]
+    if backed:
+        # +Y looks away from the wall behind its leg (the side of the rectangle nearest to that direction)
+        leg = min(backed, key=lambda item: box(item.u0, item.v0, item.u1, item.v1).distance(Point(*centre)))
+        sign = 1.0 if leg.back.endswith("0") else -1.0
+        into_room = to_plan(np.asarray((0.0, sign) if leg.horizontal else (sign, 0.0)))
+        normal = max((first, -first, second, -second), key=lambda side: float(side @ into_room) / float(np.hypot(*side)))
+    return _mount_turned(kind, cluster, normal / float(np.hypot(*normal)), None, counter, upm, label)
+
+
+def _in_corner_unit(point: np.ndarray, corner: CornerFront, upm: float) -> bool:
+    """Behind a diagonal front, between its ends and inside the depth of the two legs that meet there."""
+    for end in (corner.first, corner.second):
+        edge = end - corner.corner
+        cut = float(np.hypot(*edge))
+        if not -0.90 * upm <= float((point - corner.corner) @ edge) / cut <= cut:
+            return False
+    return float((point - corner.first) @ corner.normal) <= 0.0
+
+
+def _mount_turned(kind: str, points: np.ndarray, normal: np.ndarray, front: np.ndarray | None, counter: Polygon, upm: float, label: str) -> dict[str, Any] | None:
+    """The block of the measured size at the measured place, +Y along ``normal`` (into the room), inside the counter."""
+    x_axis = np.asarray((normal[1], -normal[0]))
+    along, across = points @ x_axis, points @ normal
+    low_a, high_a = np.percentile(along, (2.0, 98.0))
+    low_n, high_n = np.percentile(across, (2.0, 98.0))
+    width, depth = float(high_a - low_a) / upm, float(high_n - low_n) / upm
+    standard = list(CATALOGUE[kind])
+    basins = list(SINK_BASINS) if kind == "KITCHEN_SINK" else []
+    if len(points) >= 30 and width >= 0.30 and depth >= 0.25:
+        # the extent is measured
+        entries = sorted(standard + basins, key=lambda entry: abs(entry.width_m - width) + abs(entry.depth_m - depth))
+        middle_a, middle_n = (low_a + high_a) / 2.0, (low_n + high_n) / 2.0
+    else:
+        # only a place: the standard block, a smaller one where that does not fit
+        entries = standard + basins[::-1]
+        middle_a, middle_n = float(np.median(along)), float(np.median(across))
+    inside = counter.buffer(1e-4 * upm)
+    step = 0.01 * upm
+    # nearest to the measured place first
+    offsets = sorted(((da, dn) for da in range(-15, 16) for dn in range(-15, 16)), key=lambda item: (item[0] ** 2 + item[1] ** 2, item))
+    edge = None if front is None else float(front @ normal) - 0.03 * upm  # the rim of the worktop in front of it
+    for entry in entries:
+        for da, dn in offsets:
+            centre_n = middle_n + dn * step
+            if edge is not None and centre_n + entry.depth_m * upm / 2.0 > edge + 1e-9:
+                continue
+            origin = x_axis * (middle_a + da * step) + normal * (centre_n - entry.depth_m * upm / 2.0)
+            insert = _uniform_insert(entry, origin, x_axis, upm, {"attributes": {"LABEL": label}}, 0.0, True)
+            footprint = _block_footprint(insert, upm)
+            if footprint is None or not inside.covers(footprint):
+                continue
+            insert["_catalogue"].update({"on_kitchen_run": True, "measured_rotation": True, **({"corner": True} if front is not None else {})})  # type: ignore[union-attr]
+            return insert
+    return None
 
 
 def _mount(kind: str, points: np.ndarray, legs: list[_LegBox], counter: Polygon, chamfers: list[Polygon], theta: float, settings: KitchenLayoutSettings, upm: float, label: str, *, reach: float) -> dict[str, Any] | None:

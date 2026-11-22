@@ -1,6 +1,22 @@
 {
   "schema_version": 2,
   "source": "D:\\Nomivox\\presets\\default.json (Default Outdoor and Indoor, imported 2026-11-07)",
+  "classes_revision": 2,
+  "class_upgrades": [
+    {
+      "revision": 2,
+      "indoor": {
+        "prompts": {
+          "furniture": {"add": ["television", "flat screen tv", "flat screen", "computer monitor", "computer screen", "screen", "laptop"]},
+          "ceiling equipment": {
+            "add": ["spotlight", "ceiling spotlight", "track light", "downlight", "chandelier", "ceiling projector"],
+            "first": "ceiling mounted fixture"
+          }
+        },
+        "instance_classes": ["ceiling equipment"]
+      }
+    }
+  ],
   "unknown_class_id": 0,
   "unknown_class_name": "Unknown/noise",
   "prompts": {
@@ -154,12 +170,18 @@
         "ventilation grille"
       ],
       [
+        "ceiling mounted fixture",
         "ceiling light",
         "sprinkler",
-        "ceiling mounted fixture",
         "ceiling lamp",
         "pendant light",
-        "smoke detector"
+        "smoke detector",
+        "spotlight",
+        "ceiling spotlight",
+        "track light",
+        "downlight",
+        "chandelier",
+        "ceiling projector"
       ],
       [
         "furniture",
@@ -194,7 +216,13 @@
         "television",
         "cat tree",
         "plant",
-        "floor lamp"
+        "floor lamp",
+        "flat screen tv",
+        "flat screen",
+        "computer monitor",
+        "computer screen",
+        "screen",
+        "laptop"
       ],
       [
         "stove",
@@ -603,7 +631,7 @@
     "outdoor": []
   },
   "instance_classes": {
-    "indoor": ["furniture", "appliances", "sanitary fixtures", "door", "window", "hvac", "electrical", "column"],
+    "indoor": ["furniture", "appliances", "sanitary fixtures", "door", "window", "hvac", "electrical", "column", "ceiling equipment"],
     "outdoor": ["vehicle", "construction machinery", "tree", "tree trunk", "utility pole", "traffic sign", "manhole", "column"]
   },
   "instance_labels_de": {
@@ -626,7 +654,9 @@
     "bench": "Bank", "bookshelf": "Regal", "heater": "Heizung",
     "air conditioner": "Klimagerät", "fan": "Ventilator", "light switch": "Lichtschalter",
     "bidet": "Bidet", "towel rail": "Handtuchhalter", "trash can": "Abfalleimer", "printer": "Drucker",
-    "computer": "Computer", "monitor": "Monitor", "speaker": "Lautsprecher", "piano": "Klavier"
+    "computer": "Computer", "monitor": "Monitor", "speaker": "Lautsprecher", "piano": "Klavier",
+    "screen": "Bildschirm", "laptop": "Laptop", "ceiling fixture": "Deckenobjekt", "pendant light": "Pendelleuchte",
+    "spotlight": "Spot", "smoke detector": "Rauchmelder", "sprinkler": "Sprinkler", "projector": "Beamer"
   },
   "instance_label_aliases": {
     "casement window": "window", "glass pane": "window", "window frame": "window", "window sash": "window",
@@ -649,7 +679,24 @@
     "closet": "wardrobe", "cupboard": "cabinet", "bookcase": "shelf", "bookshelf": "shelf",
     "shelving": "shelf", "radiator heater": "radiator", "tv": "television", "tv set": "television",
     "armchair seat": "armchair", "dining chair": "chair", "office chair": "chair",
-    "bedside table": "nightstand", "washer": "washing machine", "microwave": "microwave oven"
+    "bedside table": "nightstand", "washer": "washing machine", "microwave": "microwave oven",
+    "flat screen tv": "television", "computer monitor": "monitor", "computer screen": "monitor", "flat screen": "screen",
+    "laptop computer": "laptop", "ceiling mounted fixture": "ceiling fixture", "ceiling light": "ceiling lamp",
+    "chandelier": "pendant light", "ceiling spotlight": "spotlight", "track light": "spotlight", "downlight": "spotlight",
+    "ceiling projector": "projector", "smoke alarm": "smoke detector"
+  },
+  "instance_secondary": {
+    "indoor": {
+      "classes": ["ceiling equipment"],
+      "prompts": ["flat screen tv", "flat screen", "computer monitor", "computer screen", "screen", "laptop"]
+    }
+  },
+  "instance_label_votes": {
+    "families": [
+      ["monitor", "laptop", "television", "screen"],
+      ["smoke detector", "sprinkler", "projector", "pendant light", "ceiling lamp", "spotlight", "ceiling fixture"]
+    ],
+    "weak": ["screen", "ceiling fixture"]
   },
   "mirror": {
     "indoor": ["mirror, wall mirror, wardrobe mirror, mirror glass, bathroom mirror"],
@@ -692,13 +739,38 @@
       "washbasin",
       "bathtub",
       "shower tray",
-      "radiator"
+      "radiator",
+      "flat screen tv",
+      "computer monitor",
+      "computer screen",
+      "flat screen",
+      "screen",
+      "laptop",
+      "ceiling light",
+      "ceiling lamp",
+      "pendant light",
+      "chandelier",
+      "spotlight",
+      "ceiling spotlight",
+      "track light",
+      "downlight",
+      "smoke detector",
+      "sprinkler",
+      "ceiling projector"
     ],
     "outdoor": []
   },
   "fine_aliases": {
     "couch": "sofa",
-    "pillow": "cushion"
+    "pillow": "cushion",
+    "flat screen tv": "television",
+    "computer screen": "computer monitor",
+    "flat screen": "screen",
+    "ceiling light": "ceiling lamp",
+    "chandelier": "pendant light",
+    "ceiling spotlight": "spotlight",
+    "track light": "spotlight",
+    "downlight": "spotlight"
   },
   "fine_term_classes": {
     "indoor": {
@@ -737,7 +809,24 @@
       "washbasin": 121,
       "bathtub": 121,
       "shower tray": 121,
-      "radiator": 114
+      "radiator": 114,
+      "flat screen tv": 117,
+      "computer monitor": 117,
+      "computer screen": 117,
+      "flat screen": 117,
+      "screen": 117,
+      "laptop": 117,
+      "ceiling light": 116,
+      "ceiling lamp": 116,
+      "pendant light": 116,
+      "chandelier": 116,
+      "spotlight": 116,
+      "ceiling spotlight": 116,
+      "track light": 116,
+      "downlight": 116,
+      "smoke detector": 116,
+      "sprinkler": 116,
+      "ceiling projector": 116
     },
     "outdoor": {}
   },
@@ -757,8 +846,8 @@
     "cable, cable, cable tray, conduit, electrical wiring, electrical cable",
     "electrical, electrical cabinet, distribution board, switch box, socket, fuse box, electrical outlet",
     "hvac, air duct, ventilation duct, HVAC unit, air conditioning unit, radiator, heating unit, air vent, ventilation grille",
-    "ceiling equipment, ceiling light, sprinkler, ceiling mounted fixture, ceiling lamp, pendant light, smoke detector",
-    "furniture, furniture, cabinet, shelf, chair, table, desk, sofa, couch, armchair, bed, wardrobe, chest of drawers, dining table, bookcase, refrigerator, fridge, cushion, sofa cushion, throw pillow, pillow, bed pillow, blanket, duvet, bedding, mattress, nightstand, coffee table, sideboard, tv stand, television, cat tree, plant, floor lamp",
+    "ceiling equipment, ceiling mounted fixture, ceiling light, sprinkler, ceiling lamp, pendant light, smoke detector, spotlight, ceiling spotlight, track light, downlight, chandelier, ceiling projector",
+    "furniture, furniture, cabinet, shelf, chair, table, desk, sofa, couch, armchair, bed, wardrobe, chest of drawers, dining table, bookcase, refrigerator, fridge, cushion, sofa cushion, throw pillow, pillow, bed pillow, blanket, duvet, bedding, mattress, nightstand, coffee table, sideboard, tv stand, television, cat tree, plant, floor lamp, flat screen tv, flat screen, computer monitor, computer screen, screen, laptop",
     "appliances, stove, cooktop, kitchen oven, dishwasher, range hood, extractor hood, washing machine, clothes dryer, microwave oven, kitchen counter, kitchen cabinet, kitchen sink",
     "sanitary fixtures, toilet, toilet bowl, toilet cistern, bathtub, bath tub, washbasin, bathroom sink, shower tray, shower enclosure, bidet, urinal, faucet, shower head, wash basin, shower base"
   ],

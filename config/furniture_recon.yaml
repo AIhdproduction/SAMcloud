@@ -1,0 +1,66 @@
+# Furniture 3D reconstruction from the classified point cloud (samcloud/bim/furniture_recon).
+#
+# Every plan furniture item (plan_model.json) gets its real shape from the scan points inside its footprint:
+# parametric parts (table top + legs, chair seat/back/legs, sofa base/back/arms, bed + headboard, oriented boxes,
+# kitchen base + worktop at the measured worktop height) or a compact closed mesh (sanitary, lamps, plants, cat tree).
+# Items with too little evidence keep their footprint/parts body (shape_source: footprint).
+# All values are metres unless the key says otherwise; nothing here is project specific.
+
+enabled: true
+# furniture classes of the classified cloud (scalar_class index): furniture, appliances/kitchen, sanitary
+classes: [17, 18, 19]
+# points within this distance outside the plan footprint still belong to the item
+footprint_margin_m: 0.03
+# voxel size of the cleaned item points (equalises scan density, bounds the work per item)
+voxel_m: 0.01
+max_points: 40000
+# statistical outlier removal: k neighbours, mean + std_ratio * sigma
+outlier_k: 10
+outlier_std_ratio: 2.5
+# vertical runs: a band with (almost) no points this high separates two objects stacked in one footprint
+run_gap_m: 0.12
+# storage, lamps and plants may have open bands up to this height (open shelf, lamp pole) inside one object
+tall_run_gap_m: 0.5
+# evidence needed for a reconstruction; less keeps the footprint body
+min_points: 60
+min_xy_coverage: 0.15
+# acceptance against the footprint body: coverage may drop at most this much, mean distance may grow at most by factor
+max_coverage_drop: 0.15
+max_mean_factor: 1.5
+# the surface distance below which a point counts as explained by the reconstruction (coverage metric)
+coverage_distance_m: 0.03
+# mesh (stacked slice hulls): ring vertices per slice, slice height, triangle budget
+mesh_ring_vertices: 24
+mesh_slice_m: 0.05
+mesh_max_triangles: 3000
+# parametric priors (used only with evidence that the part exists, flagged part_source: prior)
+worktop_thickness_m: 0.04
+table_top_max_thickness_m: 0.08
+leg_prior_size_m: 0.045
+leg_prior_inset_m: 0.05
+# seat height of a chair whose seat is hidden (under a table) while its back is seen
+chair_seat_prior_m: 0.46
+# connected points of the item's own fine-term family up to this far outside its plan outline still belong to it
+# (a table top or wardrobe the plan outline cut short); never points inside another item's outline; 0 = off
+grow_m: 0.40
+# the grown area may add at most this share of the plan outline area (more = a neighbour, growth dropped)
+max_grow_ratio: 1.6
+# grown points stay inside the robust (p2..p98) 3D extent of the item's own instance grown by this margin
+grow_extent_margin_m: 0.10
+# the grown fit replaces the plain one only if it adds at most this volume factor, or gains at least this much coverage
+# of the item's own points (core + grown)
+grow_max_volume_factor: 1.25
+grow_min_coverage_gain: 0.05
+# scan instances (chairs, armchairs, tables; hob / sink on a kitchen run) that no plan item represents become items when
+# their evidence is strong (samcloud.bim.furniture_recon.discover)
+discover_instances: true
+# vertical search window (low, high above the floor) of each reconstruction family; high null = ceiling
+windows:
+  table: [0.0, 1.30]
+  chair: [0.0, 1.40]
+  sofa: [0.0, 1.40]
+  bed: [0.0, 1.60]
+  kitchen: [0.0, 1.25]
+  box: [0.0, null]
+  mesh: [0.0, null]
+  toilet: [0.0, 1.30]

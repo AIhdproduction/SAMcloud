@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from samcloud.bim.core.model.elements import (
+    BeamElement,
+    BeamParams,
+    ColumnElement,
+    ColumnParams,
     BuildingElement,
     BuildingParams,
     CeilingElement,
@@ -151,6 +155,10 @@ __all__ = [
     "StairFlight",
     "StairParams",
     "StairElement",
+    "ColumnElement",
+    "ColumnParams",
+    "BeamElement",
+    "BeamParams",
     "Status",
     "Storey",
     "TerrainElement",

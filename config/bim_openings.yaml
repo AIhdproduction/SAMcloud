@@ -1,5 +1,5 @@
 # Thresholds of the 3D opening refinement (samcloud/bim/openings3d). Metres unless the key says otherwise.
-# Values are the ones tuned on test_home_v10_tag and cross-checked on test_home_v11_tag (prototype C).
+# Values were tuned on one flat and checked on a second processing run of the same recording (prototype C).
 schema_version: 1
 
 grid:
@@ -13,6 +13,7 @@ walls:                            # plan walls -> collinear wall lines (gaps = o
   min_line_length_m: 0.3
   min_piece_length_m: 0.1
   seed_extend_max_m: 1.0          # a wall line continues over a plan door/passage gap that lies beyond its end (door at the end of a wall) up to this far
+  seed_extend_window_max_m: 3.2   # ... and over a plan window beyond its end (window in the last stretch of a wall) up to this far
   end_pad_m: 3.0                  # a line continues up to this far into the gap to the next collinear line (not bridged: gap > max_gap_m)
 
 selection:                        # which photographs look at which wall face
@@ -191,6 +192,7 @@ frames:                           # door casing measured from door-class points 
   door_cell_points: 1
   closed_leaf_fraction: 0.4       # door-class share of the opening cells at which a closed leaf fills the opening
   wall_cell_points: 2
+  floor_rows_m: [0.0, 0.10]       # floor rows of the opening: a doorway shows the floor running through the wall band
   blocked_cell_points: 2
 
 leaf:                             # open door leaf found by the hinge-ray search (leaves.py)
@@ -215,9 +217,12 @@ leaf:                             # open door leaf found by the hinge-ray search
 
 classify:                         # door / passage / none from the frame measurements (classify.py)
   min_side_wall_cov: 0.6          # wall-class row coverage beside at least one edge: the opening is on an observed wall
-  lintel_min_headroom_m: 0.30     # headroom (ceiling - measured head) at which a lintel exists ...
-  lintel_min_head_m: 1.85         # ... and the measured head is a door head
-  passage_max_headroom_m: 0.30    # an opening up to the ceiling (less headroom) without frame is a passage ...
+  lintel_min_headroom_m: 0.15     # headroom (ceiling - measured head) at which a lintel exists (3 grid rows of wall above the gap) ...
+  lintel_min_head_m: 1.85         # ... and the measured head is a door head (this absolute height ...
+  lintel_min_head_fraction: 0.66  # ... or this share of the storey height: scale-independent, 1.65 m at 2.5 m, 1.85 m at 2.8 m)
+  lintel_unseeded_min_free_fraction: 0.6  # a lintel door that only the wall-plane measurement found needs this share of its cells measured free
+  unseeded_min_floor_fraction: 0.5  # ... and a lintel door / passage the plan did not see needs floor points under this share of its width
+  passage_max_headroom_m: 0.15    # an opening up to the ceiling (less headroom: a few cm of noise) without frame is a passage ...
   passage_min_free_fraction: 0.6  # ... when this share of its cells is measured free of points
   passage_unmeasured_head_open: true  # no point at all between the head search height and the ceiling (head not measured) counts as an opening up to the ceiling
   closed_leaf_min_head_cov: 0.5   # a closed leaf (door-class cells fill the opening) also needs a head strip of this coverage; door-class points without a head are a leaf lying flat beside / in the gap
@@ -257,6 +262,14 @@ points_only:                      # fallback without photographs: hole rectangle
   door_head_range_m: [1.6, 2.6]
   door_max_width_m: 2.6
   door_min_points: 40
+  door_min_width_m: 0.6           # a floor-reaching hole narrower than this is a projection / niche / furniture gap, never a doorway
+  glazing_door_dominance: 3.0     # a hole whose window-class points outnumber its door-class points this many times is a window ...
+  glazing_min_cover: 0.3          # ... spanning the rows / columns where at least this share of the cells hold window points ...
+  glazing_min_fill: 0.5           # ... and filling that glazing box at least this densely (else the hole rules decide)
+  shadow_max_window_density: 0.2  # a wall-bounded hole with at most this many window-class points per cell ...
+  shadow_probe_m: 0.3             # ... and furniture points in this many metres just below it ...
+  shadow_column_points: 3         # (a column counts as covered with at least this many furniture points in those rows)
+  shadow_min_cover: 0.3          # ... under at least this share of its width is the scan shadow above a furniture top, not a window
   window_sill_range_m: [0.25, 1.4]
   window_min_height_m: 0.35
   window_max_head_m: 2.6

@@ -22,6 +22,7 @@ import ifcopenshell.api.aggregate
 import ifcopenshell.api.boundary
 import ifcopenshell.api.root
 import ifcopenshell.guid
+import ifcopenshell.util.unit
 from shapely.geometry import LineString
 from shapely.geometry.base import BaseGeometry
 
@@ -206,11 +207,18 @@ def _horizontal_boundary(
         ctx.file,
         rel_space_boundary=relation,
         outer_boundary=ring(space_geometry.exterior),
-        inner_boundaries=[ring(hole) for hole in space_geometry.holes],
         location=(0.0, 0.0, z - space_origin[2]),
         axis=(0.0, 0.0, -1.0 if downward else 1.0),
         ref_direction=(1.0, 0.0, 0.0),
     )
+    if space_geometry.holes:
+        # (assign_connection_geometry stacks all inner boundaries into one array and fails on holes with different vertex counts)
+        scale = ifcopenshell.util.unit.calculate_unit_scale(ctx.file)
+        inner = []
+        for hole in space_geometry.holes:
+            points = [ctx.file.createIfcCartesianPoint((float(x) / scale, float(y) / scale)) for x, y in ring(hole)]
+            inner.append(ctx.file.createIfcPolyline([*points, points[0]]))
+        relation.ConnectionGeometry.SurfaceOnRelatingElement.InnerBoundaries = inner
 
 
 def write_space_boundaries(ctx: ExportContext) -> None:

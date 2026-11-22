@@ -1,0 +1,123 @@
+# Objects read directly from the scan for the indoor plan (samcloud/bim/room_objects): wall-hung furniture, screens,
+# objects on the ceiling.  Nothing here is project specific: lengths are metres, shares are 0..1.
+#
+# Geometry comes only from measured surfaces: the classified cloud plus the COLMAP-supported voxels of the depth product
+# (products/depth).  Depth-Anything-only voxels never give a size, an edge or a face.
+
+enabled: true
+# depth product voxels used as measurement: COLMAP supported and seen from at least this many views
+depth_min_views: 2
+
+extent:
+  enabled: true
+  min_points: 80                # own points needed before a bottom edge is trusted
+  min_bottom_m: 0.25            # lower than this is standing (plinth, short legs, occluded foot)
+  wall_gap_m: 0.15              # a hanging object touches its wall
+  plan_face_error_m: 0.25       # the plan face only gives the direction, the face itself is measured at the object
+  wall_band_m: 0.06             # measured wall points lie this close to the wall face
+  seen_band_m: 0.60             # height band directly below the object that is inspected
+  seen_share: 0.50              # wall seen in this share of the band = nothing stands in front of it
+  support_band_m: 0.15          # furniture points this close to the floor inside the outline = it stands
+  support_min_points: 8
+  carrier_gap_m: 0.08           # bottom edge this close to the top of the piece below = it rests on it
+  min_protrusion_m: 0.07        # flatter than this on its wall = a front that goes on downwards
+  below_used_share: 0.30        # points in this share of the height below it, in front of the wall = it stands
+  max_item_share: 3.0           # the instance is only a fragment of a plan item this many times larger ...
+  small_item_m2: 0.10           # ... counted from this outline area on (a shelf board is tiny)
+  discover_min_points: 150      # a shelf instance the top view lost needs this many points ...
+  discover_min_bottom_m: 0.60   # ... this high above the floor, and the same wall evidence
+
+screens:
+  enabled: true
+  min_points: 60
+  link_m: 0.06                  # voxel edge of the connected components
+  plane_tolerance_m: 0.035
+  curved_rms_m: 0.04            # a curved monitor still fits one (chord) panel
+  merge_gap_m: 0.30
+  max_tilt_deg: 30.0
+  min_planar_share: 0.60        # less = not a flat object
+  min_term_share: 0.15          # an instance labelled screen needs the screen term on this share of its points
+  width_m: [0.22, 3.20]
+  height_m: [0.14, 1.90]
+  aspect: [0.5, 2.8]
+  ultrawide_aspect: 3.8         # desk monitors up to 1.4 m wide
+  grow_m: 0.35                  # measured bezel points may extend the labelled part this far
+  grow_cell_m: 0.04
+  complete_fill: 0.60           # a labelled part this densely filled only extends to a measured bezel frame
+  thickness_m: 0.04
+  wall_gap_m: 0.12
+  stand_reach_m: 0.35
+  stand_gap_m: 0.25             # a foot is never taller than this
+  unlabelled_term_share: 0.08   # without a screen instance this share of the panel carries the screen term
+  small_screen_m: 0.85          # narrower and standing on furniture: never called a television ...
+  monitor_term_share: 0.05      # ... but a monitor when this share of its points says so, else a screen
+  body_row_share: 0.50          # lines narrower than this share of the width are the foot, not the panel
+
+ceiling:
+  enabled: true
+  band_m: 0.80                  # how far below the ceiling an object is searched
+  min_height_m: 1.50            # never lower than this above the floor
+  above_tolerance_m: 0.10       # points higher above the ceiling are outside the room
+  attach_gap_m: 0.08            # the top of the object reaches the ceiling
+  pendant_gap_m: 0.50           # a pendant shade may hang on a cord the scan did not see
+  pendant_wall_m: 0.40          # ... only this far away from the walls
+  pendant_min_points: 200       # ... and with this much evidence
+  link_m: 0.05
+  min_points: 50
+  min_area_m2: 0.003
+  max_size_m: 3.0
+  cell_m: 0.02
+  density_share: 0.20           # thinner cells are glare and stray points, not the body
+  neck_gap_m: 0.15              # a lamp with its top this close to the ceiling is closed up to it
+  flat_drop_m: 0.06             # flush objects: spots, grilles, covers
+  flat_depth_m: 0.03
+  vent_drop_m: 0.10
+  luminous_level: 225           # brightness (0..255) of the bright points of a lamp that is on
+  spot_core_share: 0.50         # a spot that is on: only the dense core is the spot, the halo is glare
+  glare_size_m: 0.35            # flush, bright and irregular from this size on = light on the ceiling, not a lamp
+  spot_max_m: 0.22              # an unlabelled flush bright disc larger than this is glare
+  rail_piece_m: 0.12            # a narrow piece along a window is a piece of the curtain rail
+  rail_aspect: 4.0
+  rail_wall_m: 0.25             # long, narrow and this close along a wall = curtain rail / wall top
+  curtain_window_m: 0.50        # long, narrow and this close along a window = curtain rail
+  curtain_reach_m: 1.50         # ... up to this far beyond the ends of the window
+  wall_touch_m: 0.06
+  detector_size_m: 0.22
+
+screen_frames:                  # panels from the mask outlines of the SAM pass (screen_masks.json.gz)
+  enabled: true
+  min_conf: 0.5                 # masks from this confidence on are candidates ...
+  median_conf: 0.65             # ... the agreeing ones must reach this in the middle
+  quad_fill: 0.86               # the outline is a quadrilateral
+  min_edge_px: 10.0
+  min_views: 3                  # the same four corners in this many photos ...
+  monitor_conf: 0.8             # a real screen also answers to "computer monitor / screen" with this confidence ...
+  monitor_share: 0.45           # ... in this share of those photos; pictures, mirrors and oven doors do not
+  min_places: 3                 # ... from this many camera places ...
+  place_m: 0.20                 # ... this far apart
+  min_parallax_deg: 8.0
+  max_distance_m: 6.0
+  ray_gap_m: 0.05               # the corner rays of two photos meet this closely
+  corner_share: 0.035           # of the mask diagonal: corner error of an agreeing photo ...
+  corner_px: 4.0                # ... plus this
+  hypotheses: 30
+  rectangle_tolerance: 0.12     # opposite edges
+  level_share: 0.08             # the top and bottom edge are level
+  max_tilt_deg: 20.0
+  flat_m: 0.04
+  width_m: [0.22, 3.20]
+  height_m: [0.14, 1.90]
+  aspect: [0.5, 3.8]
+  min_bottom_m: 0.25            # lower is a bed front or a box on the floor
+  support_distance_m: 3.5       # photos this near, in the same room, looking at the front ...
+  support_cosine: 0.5
+  support_share: 0.35           # ... must fire a screen prompt this often (a picture fires now and then)
+  same_size_share: 0.10         # a panel measured in the cloud stays when both agree this closely
+
+reflection:
+  match_m: 0.30                 # distance between an object's mirror image and the real object
+  size_ratio: 0.50
+  twin_point_share: 0.10        # without a mirror report: a twin lamp across a wall with this few points is a reflection ...
+  twin_size_share: 0.20         # ... of the same size ...
+  twin_wall_m: 1.00             # ... with a wall half way, or behind a wardrobe there (0.70 deep + match_m)
+  lateral_m: 1.80               # sideways reach around the centre of the mirror

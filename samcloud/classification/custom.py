@@ -46,10 +46,78 @@ def _free_custom_codes() -> list[int]:
     )
 
 
+def upgrade_classes_config(config: dict, reference: dict | None = None) -> dict:
+    """Return a copy of a project class file with the prompt upgrades it has not seen yet.
+
+    A project file is a full snapshot of the classes of the day it was written. ``class_upgrades`` of the global file
+    lists what later revisions added; only that is merged, so edited prompt lists, own classes, every class id and the
+    position of every existing fine term stay. A file of the current revision is never touched: a prompt somebody
+    removed there stays removed.
+    """
+    config = deepcopy(config)
+    reference = reference if reference is not None else json.loads(global_classes_path().read_text(encoding="utf-8"))
+    stored = int(config.get("classes_revision", 1) or 1)
+    for upgrade in reference.get("class_upgrades") or []:
+        revision = int(upgrade["revision"])
+        if revision <= stored:
+            continue
+        for class_set, change in upgrade.items():
+            if class_set != "revision" and _is_class_snapshot(config, class_set, change):
+                _apply_class_upgrade(config, reference, class_set, change)
+                config["classes_revision"] = revision
+    return config
+
+
+def _is_class_snapshot(config: dict, class_set: str, change: dict) -> bool:
+    """Whether ``config`` really carries this standard class set (and is not some other class list)."""
+    entries = config.get(class_set)
+    prompts = (config.get("prompts") or {}).get(class_set)
+    if not isinstance(entries, list) or not isinstance(prompts, list) or len(entries) != len(prompts):
+        return False
+    if not (config.get("las_codes") or {}).get(class_set):
+        return False
+    return set(change.get("prompts") or {}) <= {class_name(entry) for entry in entries}
+
+
+def _apply_class_upgrade(config: dict, reference: dict, class_set: str, change: dict) -> None:
+    entries, prompts = config[class_set], config["prompts"][class_set]
+    names = [class_name(entry) for entry in entries]
+    standard = {class_name(entry) for entry in reference[class_set]}
+    # A prompt that an own class already queries stays with that class.
+    owned = {str(item).strip().lower() for name, group in zip(names, prompts) if name not in standard
+             for item in ([group] if isinstance(group, str) else group)}
+    for name, additions in (change.get("prompts") or {}).items():
+        index = names.index(name)
+        original = [prompts[index]] if isinstance(prompts[index], str) else list(prompts[index])
+        values = list(original)
+        values += [item for item in additions.get("add", []) if item not in values and item not in owned]
+        first = additions.get("first")  # the generic prompt of a class, which never names an instance
+        if first in values:
+            values.remove(first)
+            values.insert(0, first)
+        if values != original:
+            prompts[index] = values
+            entries[index] = ", ".join([name, *values])
+    if "instance_classes" not in config:
+        config["instance_classes"] = deepcopy(reference.get("instance_classes", {}))
+    listed = config["instance_classes"].setdefault(class_set, [])
+    listed.extend(item for item in change.get("instance_classes", []) if item not in listed)
+    terms = config.setdefault("fine_terms", {}).setdefault(class_set, [])
+    terms.extend(term for term in (reference.get("fine_terms") or {}).get(class_set, []) if term not in terms)
+    owners = config.setdefault("fine_term_classes", {}).setdefault(class_set, {})
+    for term, code in (reference.get("fine_term_classes") or {}).get(class_set, {}).items():
+        owners.setdefault(term, code)
+    for key in ("fine_aliases", "instance_labels_de", "instance_label_aliases"):
+        if reference.get(key):
+            values = config.setdefault(key, {})
+            for term, value in reference[key].items():
+                values.setdefault(term, value)
+
+
 def migrate_classes_config(config: dict) -> dict:
     """Return an in-memory Cyclone-safe migration of a legacy project class configuration."""
-    config = deepcopy(config)
     global_config = json.loads(global_classes_path().read_text(encoding="utf-8"))
+    config = upgrade_classes_config(config, global_config)
     if "suppress" not in config:
         config["suppress"] = deepcopy(global_config.get("suppress", {}))
     if "instance_classes" not in config:

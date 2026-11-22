@@ -28,6 +28,8 @@ class WallFace:
     axis_snapped: bool = False
     z_span: float = 0.0
     source: str = "measured"
+    # Unit normal towards the measured empty (room) side; None when unknown or both sides are empty.
+    facing: tuple[float, float] | None = None
 
     @property
     def length(self) -> float:
@@ -91,7 +93,7 @@ def extract_wall_faces(
     return [face for face in faces if face.length >= min_length * units_per_metre]
 
 
-def extract_axis_wall_faces(evidence: np.ndarray, grid: RasterGrid, *, units_per_metre: float, passable: np.ndarray | None = None) -> list[WallFace]:
+def extract_axis_wall_faces(evidence: np.ndarray, grid: RasterGrid, *, units_per_metre: float, passable: np.ndarray | None = None, extra_directions: object | None = None) -> list[WallFace]:
     """Recover measured orthogonal faces with the validated projection method.
 
     ``evidence`` contains every structural point as ``x, y, z_above_floor``.
@@ -113,66 +115,115 @@ def extract_axis_wall_faces(evidence: np.ndarray, grid: RasterGrid, *, units_per
     theta = _projection_axis_angle(points)
     rotation = np.asarray(((math.cos(theta), math.sin(theta)), (-math.sin(theta), math.cos(theta))))
     rotated = points @ rotation.T
-    along_bin, across_bin = 0.06 * units_per_metre, 0.01 * units_per_metre
+    faces: list[WallFace] = []
+    # Optional (``indoor_wall_directions.axis_thin_wall_faces``): keep both faces of thin axis walls.
+    side_aware = bool(getattr(extra_directions, "enabled", False) and getattr(extra_directions, "axis_thin_wall_faces", False))
+    for axis_index in (0, 1):
+        faces.extend(projection_faces(points, heights, rotated, rotation, axis_index, units_per_metre, side_aware_nms=side_aware))
+    _merge_axis_faces(faces, units_per_metre, grid=grid, passable=passable)
+    _close_corners(faces, 0.30 * units_per_metre)
+    _drop_isolated_short_faces(faces, units_per_metre)
+    result = [face for face in faces if face.line is not None and face.length >= 0.40 * units_per_metre]
+    if extra_directions is not None and getattr(extra_directions, "enabled", False):
+        # Walls off the dominant orthogonal pair (slanted walls, a second wing).
+        # Without significant residual evidence the axis faces are returned unchanged.
+        from .wall_directions import add_direction_faces
+
+        result = add_direction_faces(result, data, theta, grid, units_per_metre, extra_directions, passable=passable)
+    return result
+
+
+def projection_faces(
+    points: np.ndarray,
+    heights: np.ndarray,
+    rotated: np.ndarray,
+    rotation: np.ndarray,
+    axis_index: int,
+    units_per_metre: float,
+    *,
+    axis_snapped: bool = True,
+    along_bin_m: float = 0.06,
+    across_bin_m: float = 0.01,
+    side_aware_nms: bool = False,
+) -> list[WallFace]:
+    """Faces running along ``axis_index`` of the rotated frame (projection binning).
+
+    ``rotated = points @ rotation.T``.  A face is a row of across-bins whose
+    along-bins are occupied (>= 3 points, >= 3 vertical 10 cm bins within the
+    +-2 bin band) over >= 0.40 m with >= 60 % fill and an empty side.
+
+    Non-maximum suppression removes weaker parallel candidates within 0.15 m.
+    With ``side_aware_nms`` it only does so for candidates whose empty side is
+    the same: the two faces of a thin wall (0.07-0.15 m) face opposite rooms and
+    both survive, so the wall thickness is measured instead of learned.
+    """
+    along_bin, across_bin = along_bin_m * units_per_metre, across_bin_m * units_per_metre
     band, minimum_points = 2, 3
     gap, minimum_length, minimum_fraction = 0.25 * units_per_metre, 0.40 * units_per_metre, 0.60
     side_start, side_end, face_fraction = 0.07 * units_per_metre, 0.18 * units_per_metre, 0.50
     nms = 0.15 * units_per_metre
     faces: list[WallFace] = []
-    for axis_index in (0, 1):
-        along, across = rotated[:, axis_index], rotated[:, 1 - axis_index]
-        along0, across0 = float(along.min()), float(across.min())
-        ia = np.floor((along - along0) / along_bin).astype(np.int32)
-        ic = np.floor((across - across0) / across_bin).astype(np.int32)
-        count = np.zeros((int(ic.max()) + 1, int(ia.max()) + 1), dtype=np.int32)
-        np.add.at(count, (ic, ia), 1)
-        z_index = np.clip(np.floor(heights / (0.10 * units_per_metre)).astype(np.int32), 0, 40)
-        zmask = np.zeros_like(count, dtype=np.int64)
-        np.bitwise_or.at(zmask, (ic, ia), (np.int64(1) << z_index).astype(np.int64))
-        band_count = cv2.filter2D(count.astype(np.float32), -1, np.ones((2 * band + 1, 1), dtype=np.float32), borderType=cv2.BORDER_CONSTANT)
-        band_zmask = zmask.copy()
-        for delta in range(1, band + 1):
-            band_zmask[delta:] |= zmask[:-delta]
-            band_zmask[:-delta] |= zmask[delta:]
-        vertical_bins = _bit_population(band_zmask)
-        occupied = (band_count >= minimum_points) & (vertical_bins >= 3)
-        candidates: list[tuple[float, int, int, int]] = []
-        for row in range(occupied.shape[0]):
-            row_occupied = occupied[row]
-            indices = np.flatnonzero(row_occupied)
-            if not len(indices):
+    if len(points) < 2:
+        return faces
+    along, across = rotated[:, axis_index], rotated[:, 1 - axis_index]
+    along0, across0 = float(along.min()), float(across.min())
+    ia = np.floor((along - along0) / along_bin).astype(np.int32)
+    ic = np.floor((across - across0) / across_bin).astype(np.int32)
+    count = np.zeros((int(ic.max()) + 1, int(ia.max()) + 1), dtype=np.int32)
+    np.add.at(count, (ic, ia), 1)
+    z_index = np.clip(np.floor(heights / (0.10 * units_per_metre)).astype(np.int32), 0, 40)
+    zmask = np.zeros_like(count, dtype=np.int64)
+    np.bitwise_or.at(zmask, (ic, ia), (np.int64(1) << z_index).astype(np.int64))
+    band_count = cv2.filter2D(count.astype(np.float32), -1, np.ones((2 * band + 1, 1), dtype=np.float32), borderType=cv2.BORDER_CONSTANT)
+    band_zmask = zmask.copy()
+    for delta in range(1, band + 1):
+        band_zmask[delta:] |= zmask[:-delta]
+        band_zmask[:-delta] |= zmask[delta:]
+    vertical_bins = _bit_population(band_zmask)
+    occupied = (band_count >= minimum_points) & (vertical_bins >= 3)
+    candidates: list[tuple[float, int, int, int]] = []
+    sides: dict[tuple[int, int, int], int] = {}
+    for row in range(occupied.shape[0]):
+        row_occupied = occupied[row]
+        indices = np.flatnonzero(row_occupied)
+        if not len(indices):
+            continue
+        start = previous = int(indices[0])
+        for index in [*map(int, indices[1:]), None]:
+            if index is not None and (index - previous) * along_bin <= gap:
+                previous = index
                 continue
-            start = previous = int(indices[0])
-            for index in [*map(int, indices[1:]), None]:
-                if index is not None and (index - previous) * along_bin <= gap:
-                    previous = index
-                    continue
-                length = (previous - start + 1) * along_bin
-                fraction = float(row_occupied[start:previous + 1].mean())
-                if length >= minimum_length and fraction >= minimum_fraction:
-                    lower = count[max(0, row - int(math.ceil(side_end / across_bin))):max(0, row - int(math.floor(side_start / across_bin)) + 1), start:previous + 1].sum(axis=0)
-                    upper = count[row + int(math.floor(side_start / across_bin)):row + int(math.ceil(side_end / across_bin)) + 1, start:previous + 1].sum(axis=0)
-                    if max(float((lower == 0).mean()), float((upper == 0).mean())) >= face_fraction:
-                        candidates.append((float(band_count[row, start:previous + 1].sum()), row, start, previous))
-                if index is not None:
-                    start = previous = index
-        candidates.sort(reverse=True)
-        selected: list[tuple[int, int, int]] = []
-        for support, row, start, end in candidates:
-            if any(abs(row - kept_row) * across_bin <= nms and min(end, kept_end) - max(start, kept_start) > 0 for kept_row, kept_start, kept_end in selected):
-                continue
-            selected.append((row, start, end))
-            support_mask = (np.abs(ic - row) <= band) & (ia >= start) & (ia <= end)
-            fitted_across = float(np.median(across[support_mask])) if support_mask.any() else across0 + row * across_bin
-            residuals = np.abs(across[support_mask] - fitted_across)
-            first, last = along0 + start * along_bin, along0 + (end + 1) * along_bin
-            rotated_endpoints = [(first, fitted_across), (last, fitted_across)] if axis_index == 0 else [(fitted_across, first), (fitted_across, last)]
-            line = LineString(np.asarray(rotated_endpoints) @ rotation)
-            faces.append(WallFace("line", points[support_mask], line=line, rms=_rms(residuals), max_residual=float(np.percentile(residuals, 90.0)) if len(residuals) else 0.0, axis_snapped=True, z_span=float(np.ptp(heights[support_mask])) if support_mask.any() else 0.0))
-    _merge_axis_faces(faces, units_per_metre, grid=grid, passable=passable)
-    _close_corners(faces, 0.30 * units_per_metre)
-    _drop_isolated_short_faces(faces, units_per_metre)
-    return [face for face in faces if face.line is not None and face.length >= 0.40 * units_per_metre]
+            length = (previous - start + 1) * along_bin
+            fraction = float(row_occupied[start:previous + 1].mean())
+            if length >= minimum_length and fraction >= minimum_fraction:
+                lower = count[max(0, row - int(math.ceil(side_end / across_bin))):max(0, row - int(math.floor(side_start / across_bin)) + 1), start:previous + 1].sum(axis=0)
+                upper = count[row + int(math.floor(side_start / across_bin)):row + int(math.ceil(side_end / across_bin)) + 1, start:previous + 1].sum(axis=0)
+                lower_empty, upper_empty = float((lower == 0).mean()), float((upper == 0).mean())
+                if max(lower_empty, upper_empty) >= face_fraction:
+                    candidates.append((float(band_count[row, start:previous + 1].sum()), row, start, previous))
+                    # -1: empty below, +1: empty above, 0: both sides empty (free-standing element)
+                    sides[(row, start, previous)] = 0 if min(lower_empty, upper_empty) >= face_fraction else (1 if upper_empty > lower_empty else -1)
+            if index is not None:
+                start = previous = index
+    candidates.sort(reverse=True)
+    selected: list[tuple[int, int, int]] = []
+    for support, row, start, end in candidates:
+        side = sides[(row, start, end)]
+        if any(abs(row - kept_row) * across_bin <= nms and min(end, kept_end) - max(start, kept_start) > 0 and (not side_aware_nms or side == 0 or sides[(kept_row, kept_start, kept_end)] in (0, side)) for kept_row, kept_start, kept_end in selected):
+            continue
+        selected.append((row, start, end))
+        support_mask = (np.abs(ic - row) <= band) & (ia >= start) & (ia <= end)
+        fitted_across = float(np.median(across[support_mask])) if support_mask.any() else across0 + row * across_bin
+        residuals = np.abs(across[support_mask] - fitted_across)
+        first, last = along0 + start * along_bin, along0 + (end + 1) * along_bin
+        rotated_endpoints = [(first, fitted_across), (last, fitted_across)] if axis_index == 0 else [(fitted_across, first), (fitted_across, last)]
+        line = LineString(np.asarray(rotated_endpoints) @ rotation)
+        face = WallFace("line", points[support_mask], line=line, rms=_rms(residuals), max_residual=float(np.percentile(residuals, 90.0)) if len(residuals) else 0.0, axis_snapped=axis_snapped, z_span=float(np.ptp(heights[support_mask])) if support_mask.any() else 0.0)
+        if side_aware_nms and side:
+            across_axis = np.asarray(rotation[1 - axis_index], dtype=float)
+            face.facing = (float(side * across_axis[0]), float(side * across_axis[1]))
+        faces.append(face)
+    return faces
 
 
 def _projection_axis_angle(points: np.ndarray) -> float:
@@ -454,7 +505,10 @@ def face_entities(faces: list[WallFace]) -> list[dict[str, object]]:
     entities: list[dict[str, object]] = []
     for face in faces:
         if face.kind == "line" and face.line is not None:
-            entities.append({"type": "polyline", "points": [[float(x), float(y)] for x, y in face.line.coords], "closed": False, "_rms": face.rms, "_max_residual": face.max_residual, "_axis_snapped": face.axis_snapped, "_source": face.source})
+            entity = {"type": "polyline", "points": [[float(x), float(y)] for x, y in face.line.coords], "closed": False, "_rms": face.rms, "_max_residual": face.max_residual, "_axis_snapped": face.axis_snapped, "_source": face.source}
+            if face.facing is not None:
+                entity["_facing"] = [float(face.facing[0]), float(face.facing[1])]
+            entities.append(entity)
         elif face.kind == "arc" and face.center is not None and face.radius is not None and face.start_angle is not None and face.end_angle is not None:
             entities.append({"type": "arc", "center": [float(face.center[0]), float(face.center[1])], "radius": float(face.radius), "start_angle": float(face.start_angle), "end_angle": float(face.end_angle), "_rms": face.rms, "_max_residual": face.max_residual, "_axis_snapped": False})
     return entities
@@ -711,15 +765,19 @@ def _merge_collinear(lines: list[WallFace], offset: float, gap: float) -> None:
     lines[:] = [line for line in lines if line.line is not None]
 
 
-def _close_corners(lines: list[WallFace], distance: float) -> None:
+def _close_corners(lines: list[WallFace], distance: float, *, minimum_angle_deg: float = 60.0, involving: set[int] | None = None) -> None:
     # Corners are only closed between clearly non-parallel faces.  Snapping to
     # a parallel (offset) neighbour would bend a face into a diagonal stub.
-    minimum_sine = math.sin(math.radians(60.0))
+    # ``involving`` (face ids) restricts the pass to pairs with such a face;
+    # slanted faces use a smaller ``minimum_angle_deg`` (acute/obtuse corners).
+    minimum_sine = math.sin(math.radians(minimum_angle_deg))
     for index, first in enumerate(lines):
         if first.line is None:
             continue
         for second in lines[index + 1:]:
             if second.line is None:
+                continue
+            if involving is not None and id(first) not in involving and id(second) not in involving:
                 continue
             a0, a1 = np.asarray(first.line.coords[0]), np.asarray(first.line.coords[-1])
             b0, b1 = np.asarray(second.line.coords[0]), np.asarray(second.line.coords[-1])
@@ -751,6 +809,8 @@ def _close_corners(lines: list[WallFace], distance: float) -> None:
             for other in lines:
                 if other is face or other.line is None:
                     continue
+                if involving is not None and id(face) not in involving and id(other) not in involving:
+                    continue
                 q0, q1 = np.asarray(other.line.coords[0], dtype=float), np.asarray(other.line.coords[-1], dtype=float)
                 other_direction = q1 - q0
                 other_length = float(np.linalg.norm(other_direction))
@@ -777,7 +837,7 @@ def _close_corners(lines: list[WallFace], distance: float) -> None:
 def _face_segment(face: WallFace, start: float, end: float) -> WallFace:
     assert face.line is not None
     segment = LineString([face.line.interpolate(start), face.line.interpolate(end)])
-    return WallFace("line", face.points, line=segment, rms=face.rms, max_residual=face.max_residual, axis_snapped=face.axis_snapped)
+    return WallFace("line", face.points, line=segment, rms=face.rms, max_residual=face.max_residual, axis_snapped=face.axis_snapped, facing=face.facing)
 
 
 def _cross2(first: np.ndarray, second: np.ndarray) -> np.ndarray:

@@ -94,7 +94,8 @@ def _jambs(layers: dict) -> list[dict]:
 
 def test_door_with_measured_leaf_keeps_hinge_swing_and_is_drawn_on_them(runs: dict[str, Run]) -> None:
     run = runs["leaf"]
-    door = next(o for o in run.plan2.openings if o.kind == "door" and abs(o.center[1] - 0.2 * run.upm) < 0.1 * run.upm)
+    # the plan's opening centre lies between both faces of its wall: measured face at 0.2 m, body away from the room
+    door = next(o for o in run.plan2.openings if o.kind == "door" and abs(o.center[1] - (0.2 - o.wall_thickness_m / 2.0) * run.upm) < 0.02 * run.upm)
     assert (door.hinge_side, door.swing_side, door.leaf_detected, door.leaf_angle_deg) == ("right", 1, True, 80.0)
     inserts = _inserts(run.layers)
     assert len(inserts) == 1
@@ -137,7 +138,7 @@ def test_dropped_candidate_closes_the_wall(runs: dict[str, Run]) -> None:
 
 def test_new_door_from_the_scan_is_added_and_hosted_on_its_wall(runs: dict[str, Run]) -> None:
     run = runs["entrance"]
-    left_wall = [o for o in run.plan2.openings if o.kind == "door" and abs(o.center[0] - 0.2 * run.upm) < 0.1 * run.upm]
+    left_wall = [o for o in run.plan2.openings if o.kind == "door" and abs(o.center[0] - (0.2 - o.wall_thickness_m / 2.0) * run.upm) < 0.02 * run.upm]
     assert len(left_wall) == 1, [o.to_dict() for o in run.plan2.openings]
     door = left_wall[0]
     assert door.host_wall_id is not None and door.width_m == pytest.approx(0.9)

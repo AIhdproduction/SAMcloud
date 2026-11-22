@@ -48,3 +48,7 @@ fine_prompts:
     - floor lamp
     - television
     - mirror
+    # screens; ceiling fixtures are not listed: the indoor top view is cut below the ceiling
+    - flat screen
+    - computer monitor
+    - laptop

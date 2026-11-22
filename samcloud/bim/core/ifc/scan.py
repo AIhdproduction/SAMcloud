@@ -8,7 +8,10 @@ repeated), ``z_bottom`` and ``z_top`` (absolute metres).  Optional: ``object_typ
 
 Per element:
 
-* Body: ``IfcExtrudedAreaSolid`` of the footprint from ``z_bottom`` to ``z_top`` (SweptSolid),
+* Body of a reconstructed item (``solids`` / ``mesh`` from samcloud.bim.furniture_recon): one
+  ``IfcExtrudedAreaSolid`` per part with its own position (cylinders with an ``IfcCircleProfileDef``,
+  SweptSolid) or one ``IfcTriangulatedFaceSet`` (Tessellation).
+* Body otherwise: ``IfcExtrudedAreaSolid`` of the footprint from ``z_bottom`` to ``z_top`` (SweptSolid),
   an ``IfcBoundingBox`` ("Box") and the outline as ``IfcGeometricCurveSet`` in the FootPrint
   context, plus one surface style per class colour.
 * One type object per ``(ifc_class, predefined type, object type)`` with ``Pset_*TypeCommon``
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import ifcopenshell
@@ -121,6 +125,81 @@ def _clean_ring(points: list[list[float]]) -> list[tuple[float, float]]:
     return ring
 
 
+@dataclass(frozen=True, slots=True)
+class _Reconstructed:
+    """Validated reconstructed shape of one element (scene metres, absolute)."""
+
+    solids: list[dict[str, Any]]
+    vertices: list[tuple[float, float, float]]
+    faces: list[tuple[int, int, int]]
+    bounds: tuple[float, float, float, float]
+    z0: float
+    z1: float
+
+
+def _reconstructed_geometry(extra: dict[str, Any]) -> _Reconstructed | None:
+    """The element's ``solids`` (vertical prisms) or ``mesh`` (closed triangles) when usable, else None (footprint body)."""
+    mesh = extra.get("mesh")
+    if isinstance(mesh, dict) and mesh.get("vertices") and mesh.get("faces"):
+        vertices = [(float(v[0]), float(v[1]), float(v[2])) for v in mesh["vertices"]]
+        count = len(vertices)
+        faces = [
+            (int(a), int(b), int(c)) for a, b, c in mesh["faces"]
+            if 0 <= int(a) < count and 0 <= int(b) < count and 0 <= int(c) < count and len({int(a), int(b), int(c)}) == 3
+        ]
+        if count >= 4 and len(faces) >= 4:
+            xs, ys, zs = [v[0] for v in vertices], [v[1] for v in vertices], [v[2] for v in vertices]
+            if max(zs) - min(zs) >= MIN_BODY_HEIGHT:
+                return _Reconstructed([], vertices, faces, (min(xs), min(ys), max(xs), max(ys)), min(zs), max(zs))
+    usable: list[dict[str, Any]] = []
+    for solid in extra.get("solids") or []:
+        if not isinstance(solid, dict):
+            continue
+        ring = _clean_ring(solid.get("outline") or [])
+        bottom, top = float(solid.get("z_bottom", 0.0)), float(solid.get("z_top", 0.0))
+        if top - bottom < 0.005:
+            continue
+        if solid.get("type") == "cylinder" and solid.get("center") is not None and float(solid.get("radius") or 0.0) > 1e-3:
+            cx, cy = float(solid["center"][0]), float(solid["center"][1])
+            r = float(solid["radius"])
+            usable.append({"type": "cylinder", "center": (cx, cy), "radius": r, "z_bottom": bottom, "z_top": top,
+                           "ring": [(cx - r, cy - r), (cx + r, cy - r), (cx + r, cy + r), (cx - r, cy + r)]})
+            continue
+        if len(ring) >= 3 and Polygon(ring).is_valid and Polygon(ring).area > 1e-6:
+            usable.append({"type": "prism", "ring": ring, "z_bottom": bottom, "z_top": top})
+    if not usable:
+        return None
+    xs = [p[0] for solid in usable for p in solid["ring"]]
+    ys = [p[1] for solid in usable for p in solid["ring"]]
+    return _Reconstructed(
+        usable, [], [], (min(xs), min(ys), max(xs), max(ys)),
+        min(solid["z_bottom"] for solid in usable), max(solid["z_top"] for solid in usable),
+    )
+
+
+def _reconstructed_body(ctx: ExportContext, recon: _Reconstructed, origin: tuple[float, float, float]) -> Entity:
+    """Body representation: one extruded solid per part (SweptSolid; cylinders with a circle profile) or one
+    IfcTriangulatedFaceSet (Tessellation)."""
+    f = ctx.file
+    ox, oy, oz = origin
+    if recon.vertices:
+        local = [(x - ox, y - oy, z - oz) for x, y, z in recon.vertices]
+        return shapes.tessellation_representation(ctx, shapes.triangulated_face_set(f, local, recon.faces))
+    items: list[Entity] = []
+    for solid in recon.solids:
+        depth = solid["z_top"] - solid["z_bottom"]
+        start = (0.0, 0.0, solid["z_bottom"] - oz)
+        if solid["type"] == "cylinder":
+            cx, cy = solid["center"]
+            profile = f.createIfcCircleProfileDef(
+                "AREA", None, f.createIfcAxis2Placement2D(f.createIfcCartesianPoint((cx - ox, cy - oy)), None), float(solid["radius"])
+            )
+        else:
+            profile = shapes.polygon_profile(f, [(x - ox, y - oy) for x, y in solid["ring"]])
+        items.append(shapes.extrusion(f, profile, depth, origin=start))
+    return shapes.swept_solid_representation(ctx, items)
+
+
 def write_furniture(ctx: ExportContext) -> int:
     """Write all ``FurnitureElement`` items that have a footprint; return how many were written."""
     f = ctx.file
@@ -158,6 +237,9 @@ def write_furniture(ctx: ExportContext) -> int:
             continue
         z0 = min(part[2] for part in solid_parts)
         z1 = max(part[3] for part in solid_parts)
+        recon = _reconstructed_geometry(extra)
+        if recon is not None:
+            z0, z1 = recon.z0, recon.z1
 
         ifc_class = element.ifc_class or "IfcFurniture"
         predefined = element.predefined_type or "NOTDEFINED"
@@ -177,20 +259,26 @@ def write_furniture(ctx: ExportContext) -> int:
         product.PredefinedType = predefined
         product.ObjectType = object_type or _type_name(ifc_class, predefined, object_type)
 
-        min_x = min(point[0] for part in solid_parts for point in part[0])
-        min_y = min(point[1] for part in solid_parts for point in part[0])
-        max_x = max(point[0] for part in solid_parts for point in part[0])
-        max_y = max(point[1] for part in solid_parts for point in part[0])
+        if recon is not None:
+            min_x, min_y, max_x, max_y = recon.bounds
+        else:
+            min_x = min(point[0] for part in solid_parts for point in part[0])
+            min_y = min(point[1] for part in solid_parts for point in part[0])
+            max_x = max(point[0] for part in solid_parts for point in part[0])
+            max_y = max(point[1] for part in solid_parts for point in part[0])
         shapes.place(ctx, product, (min_x, min_y, z0))
         local = [(x - min_x, y - min_y) for x, y in ring]
-        solids = [
-            shapes.extrusion(
-                f, shapes.polygon_profile(f, [(x - min_x, y - min_y) for x, y in part_ring]), top - bottom,
-                origin=(0.0, 0.0, bottom - z0),
-            )
-            for part_ring, _part_polygon, bottom, top in solid_parts
-        ]
-        body = shapes.swept_solid_representation(ctx, solids)
+        if recon is not None:
+            body = _reconstructed_body(ctx, recon, (min_x, min_y, z0))
+        else:
+            solids = [
+                shapes.extrusion(
+                    f, shapes.polygon_profile(f, [(x - min_x, y - min_y) for x, y in part_ring]), top - bottom,
+                    origin=(0.0, 0.0, bottom - z0),
+                )
+                for part_ring, _part_polygon, bottom, top in solid_parts
+            ]
+            body = shapes.swept_solid_representation(ctx, solids)
         colour = extra.get("colour")
         if colour:
             ifcopenshell.api.style.assign_representation_styles(
@@ -225,7 +313,8 @@ def write_furniture(ctx: ExportContext) -> int:
             "Width": f.create_entity("IfcLengthMeasure", float(edges[0])),
             "Height": f.create_entity("IfcLengthMeasure", float(z1 - z0)),
             "ZMin": f.create_entity("IfcLengthMeasure", float(z0)),
-            "PartCount": len(solid_parts),
+            "PartCount": len(recon.solids) if recon is not None and recon.solids else len(solid_parts),
+            "ShapeSource": str(extra.get("shape_source") or "footprint") if recon is not None else "footprint",
         }
         if extra.get("instance_id") is not None:
             props["InstanceId"] = int(extra["instance_id"])

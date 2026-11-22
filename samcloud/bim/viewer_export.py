@@ -41,6 +41,14 @@ CLASS_COLOURS: dict[str, tuple[float, float, float, float]] = {
     "IfcOpeningElement": (0.90, 0.30, 0.30, 0.30),
     "IfcFurnishingElement": (0.70, 0.55, 0.40, 1.0),
     "IfcFurniture": (0.70, 0.55, 0.40, 1.0),
+    "IfcSanitaryTerminal": (0.93, 0.95, 0.97, 1.0),
+    "IfcElectricAppliance": (0.80, 0.82, 0.84, 1.0),
+    "IfcLightFixture": (0.95, 0.90, 0.60, 1.0),
+    "IfcAudioVisualAppliance": (0.12, 0.12, 0.14, 1.0),
+    "IfcSpaceHeater": (0.92, 0.92, 0.92, 1.0),
+    "IfcSensor": (0.90, 0.90, 0.88, 1.0),
+    "IfcAirTerminal": (0.55, 0.62, 0.68, 1.0),
+    "IfcFireSuppressionTerminal": (0.85, 0.35, 0.30, 1.0),
 }
 DEFAULT_COLOUR = (0.70, 0.70, 0.70, 1.0)
 
@@ -56,6 +64,10 @@ IFC_CATEGORIES: dict[str, str] = {
     "IfcOpeningElement": "building",
     "IfcSpace": "building",
     "IfcBuildingElementProxy": "building",
+    "IfcColumn": "building",
+    "IfcBeam": "building",
+    "IfcStair": "building",
+    "IfcStairFlight": "building",
     "IfcGeographicElement": "vegetation",
     "IfcPlant": "vegetation",
     "IfcSite": "terrain",
@@ -67,6 +79,16 @@ IFC_CATEGORIES: dict[str, str] = {
     "IfcCivilElement": "pavement",
     "IfcFurnishingElement": "furniture",
     "IfcFurniture": "furniture",
+    # scanned fixtures and equipment belong with the furniture layer
+    "IfcSanitaryTerminal": "furniture",
+    "IfcElectricAppliance": "furniture",
+    "IfcLightFixture": "furniture",
+    "IfcAudioVisualAppliance": "furniture",
+    "IfcSpaceHeater": "furniture",
+    "IfcSystemFurnitureElement": "furniture",
+    "IfcSensor": "furniture",
+    "IfcAirTerminal": "furniture",
+    "IfcFireSuppressionTerminal": "furniture",
 }
 DEFAULT_CATEGORY = "other"
 

@@ -207,6 +207,15 @@ def _kitchen_sink(width: float, depth: float) -> tuple[dict[str, object], ...]:
     return tuple(entities)
 
 
+def _sink_basin(width: float, depth: float) -> tuple[dict[str, object], ...]:
+    half = width / 2.0
+    return (
+        _rect(-half, 0.0, half, depth),
+        _rrect(-half + 0.03, 0.08, half - 0.03, depth - 0.03, 0.04),
+        _circle(0.0, 0.04, 0.02),
+    )
+
+
 def _kitchen_island(width: float, depth: float) -> tuple[dict[str, object], ...]:
     half_w, half_d = width / 2.0, depth / 2.0
     return (_rect(-half_w, -half_d, half_w, half_d), _line(-half_w, half_d - 0.30, half_w, half_d - 0.30))
@@ -281,6 +290,12 @@ def _catalogue_entries() -> dict[str, tuple[CatalogueEntry, ...]]:
 
 
 CATALOGUE: dict[str, tuple[CatalogueEntry, ...]] = _catalogue_entries()
+# Built-in sinks without a drainboard.  They are used only where the basin itself was measured, so they are not part of
+# the catalogue: a label without a measured extent still gets a standard sink.
+SINK_BASINS: tuple[CatalogueEntry, ...] = tuple(
+    CatalogueEntry("KITCHEN_SINK", width, depth, f"KITCHEN_SINK_{round(width * 1000)}X{round(depth * 1000)}", "A-EINB", True)
+    for width, depth in ((0.40, 0.40), (0.45, 0.40), (0.50, 0.40), (0.55, 0.45), (0.60, 0.50), (0.78, 0.50))
+)
 _BUILDERS = {
     "WC_WALL": _wc_wall, "WASHBASIN": _washbasin, "BATHTUB": _bathtub, "SHOWER": _shower, "COOKTOP": _cooktop,
     "KITCHEN_SINK": _kitchen_sink, "KITCHEN_ISLAND": _kitchen_island, "BED_SINGLE": _bed, "BED_DOUBLE": _bed,
@@ -295,6 +310,8 @@ def _register_catalogue() -> None:
         # The bare kind name is the default (first) catalogue size.  This
         # replaces the earlier unit-scale WASHBASIN / BATHTUB / SHOWER blocks.
         SYMBOLS[kind] = SYMBOLS[entries[0].block]
+    for entry in SINK_BASINS:
+        SYMBOLS[entry.block] = SymbolDef(_sink_basin(entry.width_m, entry.depth_m))
 
 
 _register_catalogue()
@@ -303,7 +320,7 @@ _register_catalogue()
 def catalogue_entry_for_block(name: str) -> CatalogueEntry | None:
     """Return the catalogue entry of a size-specific block name."""
     key = str(name).upper()
-    return next((entry for entries in CATALOGUE.values() for entry in entries if entry.block == key), None)
+    return next((entry for entries in (*CATALOGUE.values(), SINK_BASINS) for entry in entries if entry.block == key), None)
 
 
 def symbol_extents(name: str) -> tuple[float, float, float, float]:

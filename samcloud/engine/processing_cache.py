@@ -25,6 +25,7 @@ SAM_CLOUD = "classified_after_sam.ply"
 SAM_SCORES = "classified_scores_after_sam.npz"
 INSTANCES_SOURCE = "instances_source.npz"
 MANIFEST = "cache.json"
+RECLASSIFIED = "reclassified.json"
 DENSE_TREES = ("stereo", "images", "sparse", "sparse_txt", "sam_labels", "sam_mirror")
 DENSE_FILES = ("fused.ply", "fused.ply.vis")
 
@@ -98,6 +99,41 @@ def save_depth_priors(project_directory: Path, dense_dir: Path) -> int:
     manifest["depth_prior"] = count > 0
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return count
+
+
+def mark_reclassified(project_directory: Path) -> bool:
+    """Note beside the cached SAM result that a later classification replaced it.  Nothing in the cache is touched;
+    the next full run replaces the cache and with it the note.  False without a cache.
+    """
+    cache = cache_directory(project_directory)
+    if not (cache / MANIFEST).is_file():
+        return False
+    note = {"reclassified_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        (cache / RECLASSIFIED).write_text(json.dumps(note, indent=2), encoding="utf-8")
+    except OSError as error:
+        print(
+            f"WARNING: The processing cache could not be marked as outdated ({error}); "
+            "recomputing step 6 from it would bring the previous classes back."
+        )
+        return False
+    return True
+
+
+def stale_cache_reason(project_directory: Path) -> str | None:
+    """Why step 6 must not be recomputed from the cache, or None while it holds the current classes."""
+    path = cache_directory(project_directory) / RECLASSIFIED
+    if not path.is_file():
+        return None
+    try:
+        when = str(json.loads(path.read_text(encoding="utf-8")).get("reclassified_at") or "later")
+    except (OSError, ValueError, AttributeError):
+        when = "later"
+    return (
+        f"The project was reclassified ({when}) after this processing cache was saved. Recomputing step 6 from the cache "
+        "would bring the old classes and objects back, so nothing was changed. Run the reclassification again (it "
+        "includes step 6) or process the project once to save a new cache."
+    )
 
 
 def load_manifest(project_directory: Path) -> dict | None:

@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -2009,7 +2008,17 @@ def _resolve_units_per_metre(args, dense_dir: Path, classified_raw: Path, fill_s
     if isinstance(setting, str) and setting.lower() == "auto":
         outdir = dense_dir.parent
         info: dict = {"units_per_metre": 1.0, "source": "georeferenced"}
+        metric = None
         if not (_is_georeferenced(outdir) or (outdir / "gps_ref.txt").is_file()):
+            # Same decision as the indoor plan (samcloud.core.metric_scale): an AprilTag-scaled or explicitly metric
+            # cloud keeps 1.0 instead of the storey-height approximation.
+            from samcloud.core.metric_scale import metric_scale_decision
+
+            metric = metric_scale_decision(outdir.parent)
+            if metric.known_scale:
+                unit = 1.0 if metric.units_per_metre is None else float(metric.units_per_metre)
+                info = {"units_per_metre": unit, "source": metric.source}
+        if not (_is_georeferenced(outdir) or (outdir / "gps_ref.txt").is_file() or (metric is not None and metric.known_scale)):
             try:
                 from samcloud.colmap.surface_fusion import derive_units_per_metre
                 from samcloud.engine.ply_io import read_vertex_array
@@ -2329,7 +2338,9 @@ def _refine_from_cache(
     classified_output: Path,
 ) -> None:
     """Re-run workflow step 6 from the processing cache (no COLMAP, no SAM)."""
-    from samcloud.engine.processing_cache import INSTANCES_SOURCE, SAM_CLOUD, SAM_SCORES, cache_directory, load_manifest
+    from samcloud.engine.processing_cache import (
+        INSTANCES_SOURCE, SAM_CLOUD, SAM_SCORES, cache_directory, load_manifest, stale_cache_reason,
+    )
 
     project_directory = outdir.parent
     manifest = load_manifest(project_directory)
@@ -2337,6 +2348,9 @@ def _refine_from_cache(
         sys.exit("No usable processing cache: enable 'Schritt 6 schnell neu rechnen' and process the project once.")
     if manifest.get("class_set") != args.class_set:
         sys.exit(f"The processing cache was made with class set {manifest.get('class_set')}, not {args.class_set}.")
+    stale = stale_cache_reason(project_directory)
+    if stale:
+        sys.exit(stale)
     cache = cache_directory(project_directory)
     dense_dir = cache / "dense"
     geometry_enabled = args.geometry_refinement == "1"
@@ -2411,6 +2425,9 @@ def _instance_arguments(args) -> list[str]:
     return [*values, *( ["--no-instances"] if args.no_instances else [])]
 
 
+RECLASSIFY_RESERVE_BYTES = 5 * 1024 ** 3  # working space for SAM rasters and depth priors next to copied inputs
+
+
 def _reclassify_project(
     args, outdir: Path, report_dir: Path, summary: RunSummary, progress: "ProgressTracker | None",
     classified_output: Path,
@@ -2430,8 +2447,10 @@ def _reclassify_project(
 
     dense_dir = outdir / "dense"
     cache_dense = outdir.parent / "processing_cache" / "dense"
-    if not (dense_dir / "fused.ply").exists() and (cache_dense / "fused.ply").is_file():
+    staged = not (dense_dir / "fused.ply").exists() and (cache_dense / "fused.ply").is_file()
+    if staged:
         dense_dir = _stage_reclassify_cache(cache_dense)
+        print(f"Reclassifying from the processing cache; staging folder: {dense_dir.parent}")
     for name in ("fused.ply", "fused.ply.vis"):
         _ensure_if_compressed(dense_dir / name)
     missing = [str(path) for path in (dense_dir / "fused.ply", dense_dir / "fused.ply.vis", dense_dir / "sparse")
@@ -2483,22 +2502,24 @@ def _reclassify_project(
     summary.settings["reclassified"] = True
     _classify_and_finish(
         args, outdir, dense_dir, sparse_txt, report_dir, summary, progress, classified_output, georeferenced,
-        cache_after_sam=False,
+        cache_after_sam=False, keep_caches=staged,
     )
 
 
 def _stage_reclassify_cache(cache_dense: Path) -> Path:
     """Create a disposable read-only-input staging workspace from a processing cache.
 
-    The cached files are only hard-linked as inputs. Files step 6 may produce are
-    deliberately omitted, so SAM and refinement never modify the cache copy.
+    The workspace is a sibling of ``processing_cache`` in the project. It is thus on the volume of the cache, where
+    hard links work, and step 6 finds the project (metric scale, depth product) two levels above it exactly as when it
+    runs on the cache. The cached files are only linked as inputs. Files step 6 may produce are deliberately omitted,
+    so SAM and refinement never modify the cache copy. When a link is impossible the file is copied, but only after a
+    check that all copies and the step 6 output fit.
     """
     cache_dense = Path(cache_dense)
+    staging_base = cache_dense.parent.parent
     # ``tempfile.mkdtemp`` can create an ACL-isolated directory under the
     # Windows service account. Make the unique directory directly instead.
-    staging_base = Path(os.environ.get("SAMCLOUD_TEST_WORKDIR", tempfile.gettempdir()))
-    staging_base.mkdir(parents=True, exist_ok=True)
-    staging_root = staging_base / f"samcloud_reclassify_{uuid.uuid4().hex}"
+    staging_root = staging_base / f"reclassify_staging_{uuid.uuid4().hex}"
     staging_root.mkdir()
     staging = staging_root / "dense"
     mutable_trees = {"sam_labels", "sam_mirror", "depth_prior"}
@@ -2506,6 +2527,7 @@ def _stage_reclassify_cache(cache_dense: Path) -> Path:
     # report files as hard links: replacing or truncating one must never alter
     # the cache inode.
     mutable_files = {"surface_fusion.json", "depth_prior.json", "depth_fill.json", "point_cleaning.json", "plane_fill.json"}
+    unlinked: list[tuple[Path, Path]] = []
     for source in cache_dense.rglob("*"):
         relative = source.relative_to(cache_dense)
         if relative.parts and relative.parts[0] in mutable_trees:
@@ -2516,14 +2538,26 @@ def _stage_reclassify_cache(cache_dense: Path) -> Path:
             try:
                 os.link(source, target)
             except OSError:
-                shutil.copy2(source, target)
+                unlinked.append((source, target))
+    if unlinked:
+        needed = sum(source.stat().st_size for source, _target in unlinked) + RECLASSIFY_RESERVE_BYTES
+        free = shutil.disk_usage(staging_base).free
+        if needed > free:
+            raise ValueError(
+                f"Cannot reclassify; {len(unlinked)} cached files cannot be hard-linked into {staging_root} and "
+                f"copying them needs {needed / 1024 ** 3:.1f} GB (including working space), but only "
+                f"{free / 1024 ** 3:.1f} GB are free. Free some space on that drive or keep the processing cache "
+                "on the drive of the project."
+            )
+        for source, target in unlinked:
+            shutil.copy2(source, target)
     return staging
 
 
 def _classify_and_finish(
     args, outdir: Path, dense_dir: Path, dense_sparse_txt: Path, report_dir: Path,
     summary: RunSummary, progress: ProgressTracker | None, classified_output: Path, georeferenced: bool,
-    *, cache_after_sam: bool = True,
+    *, cache_after_sam: bool = True, keep_caches: bool = False,
 ) -> None:
     """Run the unchanged classification, refinement, and optional export tail."""
     _plan_geometry_refinement(progress, georeferenced)
@@ -2556,8 +2590,13 @@ def _classify_and_finish(
     _snapshot_instances_safely(args, classified_raw)
     if cache_after_sam:
         _cache_after_sam(args, dense_dir, classified_raw, classified_scores)
+    else:  # a reclassification: the cached SAM result is the old one from here on
+        from samcloud.engine.processing_cache import mark_reclassified
+
+        if mark_reclassified(outdir.parent):
+            print("The processing cache still holds the previous classes; step 6 cannot be recomputed from it any more.")
     _refine_after_classification(args, dense_dir, classified_raw, classified_scores, summary, progress,
-                                 report_dir=report_dir)
+                                 report_dir=report_dir, keep_caches=keep_caches)
     _finish_classification(args, outdir, report_dir, summary, progress, classified_raw, classified_scores,
                            classified_output, georeferenced)
 

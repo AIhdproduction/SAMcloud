@@ -145,9 +145,23 @@ def _extend_to_seed_gaps(lines: list[WallLine], plan: BuildingPlan, config: Sett
     cfg = config.walls
     upm = plan.units_per_metre
     sin_limit = math.sin(math.radians(cfg.merge_angle_deg))
-    reach = float(cfg.seed_extend_max_m) * upm
+    door_reach = float(cfg.seed_extend_max_m) * upm
+    # A plan window in the last stretch of a wall (the wall piece ends at its jamb, the window runs on to the corner) is continued
+    # the same way; without a wall line over it the window has no wall-plane grid and is lost in the points-only refinement.
+    window_reach = float(getattr(cfg, "seed_extend_window_max_m", 0.0) or 0.0) * upm
     result = list(lines)
-    for opening in sorted((o for o in plan.openings if o.kind in ("door", "passage")), key=lambda o: o.id):
+    seeds = sorted((o for o in plan.openings if o.kind in ("door", "passage") or (o.kind == "window" and window_reach > 0.0)), key=lambda o: o.id)
+    # Windows side by side in the last stretch of a wall extend the line one after the other: repeat until nothing changes.
+    for _ in range(max(1, len(seeds))):
+        if not _extend_once(result, seeds, upm, sin_limit, door_reach, window_reach, cfg):
+            break
+    return result
+
+
+def _extend_once(result: list[WallLine], seeds: list[Any], upm: float, sin_limit: float, door_reach: float, window_reach: float, cfg: Settings) -> bool:
+    changed = False
+    for opening in seeds:
+        reach = window_reach if opening.kind == "window" else door_reach
         axis = np.array([math.cos(opening.axis_angle), math.sin(opening.axis_angle)])
         centre = np.asarray(opening.center, float)
         half = float(opening.width_m) * upm / 2.0
@@ -164,19 +178,21 @@ def _extend_to_seed_gaps(lines: list[WallLine], plan: BuildingPlan, config: Sett
                 covered = True
                 break
             gap = -u if u < 0 else u - line.length
-            if gap <= half + 1e-9 and gap + half <= reach:
+            slack = 0.10 * upm if opening.kind == "window" else 1e-9  # the window edge and the snapped wall end differ by a few cm
+            if gap <= half + slack and gap + half <= reach:
                 candidates.append((gap, index, u))
         if covered or not candidates:
             continue
         _, index, u = min(candidates)
         line = result[index]
+        changed = True
         if u < 0:
             extra = -(u - half)
             result[index] = replace(line, a=line.a + line.d * (u - half), length=line.length + extra, length_m=(line.length + extra) / upm, pad_start_m=line.pad_start_m + extra / upm)
         else:
             extra = (u + half) - line.length
             result[index] = replace(line, length=line.length + extra, length_m=(line.length + extra) / upm, pad_end_m=line.pad_end_m + extra / upm)
-    return result
+    return changed
 
 
 def wall_faces(lines: list[WallLine]) -> list[WallFace]:

@@ -37,6 +37,7 @@ class VerticalEvidence:
     ceiling_z: np.ndarray | None = None
     soffit: np.ndarray | None = None
     wall_bits: np.ndarray | None = None
+    floor_points: np.ndarray | None = None  # cells with measured floor-class points at floor height
 
 
 @dataclass(frozen=True, slots=True)

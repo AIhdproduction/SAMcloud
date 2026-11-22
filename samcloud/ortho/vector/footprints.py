@@ -1398,6 +1398,8 @@ def _drop_short_edges(poly: Polygon, minimum: float) -> Polygon | None:
                 del points[(index + 1) % len(points)]
                 changed = True
                 break
+    if len(points) < 3:  # every edge was shorter than ``minimum``: no polygon is left (the caller keeps its fallback)
+        return None
     return _single_polygon(Polygon(points))
 
 

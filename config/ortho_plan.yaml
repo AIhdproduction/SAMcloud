@@ -125,6 +125,11 @@ clean_plan:
   # These are fractions of floor-to-ceiling height; metric defaults remain the
   # fallback whenever the ceiling is unknown.
   nominal_storey_height: 2.5
+  # Metric clouds (AprilTag scale, georeference / GCP / RTK, DXF scale) export true metres (1.0 units per metre) instead
+  # of the storey-height estimate (samcloud/core/metric_scale.py; recorded as plan_model source.scale_source). The plan
+  # detectors always run in storey-normalised units (plan.py _indoor_detector_units), so the plan itself does not depend
+  # on this switch. Explicit project settings (project.samcloud.yml settings.scale.*) apply either way.
+  metric_scale: true
   indoor_bands:
     wall: [0.72, 0.94]
     section: [0.36, 0.52]
@@ -233,6 +238,45 @@ indoor_furniture_solids:
 # Thicknesses in metres, scaled by the project units per metre. Interior thickness classes are
 # learned from measured face pairs and room edges; exterior walls use measured exterior pairs or
 # exterior_thickness_m. See docs/ortho_plan.md "Double-line walls".
+# Indoor wall faces off the dominant orthogonal axis pair (slanted walls, trapezoid rooms, a second wing at another angle).
+# Residual wall evidence (points farther than max(explained_m, 4 x median face RMS) from the axis faces) is searched for line
+# directions at least min_axis_offset_deg away from the axes (Hough on vertically persistent 2 cm cells, TLS-refined angle);
+# faces of such a direction use the same projection criteria as the axis faces.  A new face must also reach the top of the wall
+# band (q95 height within top_reach_m) and cover vertical_fill of its 10 cm height bins (door leaves end at ~2.0 m), be at least
+# min_length_m long (or min_joined_length_m with both ends within join_reach_m of other faces), and must not run within
+# near_parallel_reach_m of an existing face at less than near_parallel_angle_deg (door leaf / curtain / wall irregularity).
+# Without such evidence the axis faces stay exactly unchanged.  Corners with slanted faces close down to corner_min_angle_deg.
+indoor_wall_directions:
+  enabled: true
+  min_axis_offset_deg: 5.0
+  explained_m: 0.05
+  min_length_m: 1.0
+  min_joined_length_m: 0.40
+  join_reach_m: 0.30
+  top_reach_m: 0.15
+  vertical_fill: 0.50
+  max_directions: 4
+  corner_min_angle_deg: 15.0
+  near_parallel_angle_deg: 20.0
+  near_parallel_reach_m: 0.25
+  # Faces of a new direction always keep both faces of a thin wall (suppression only between faces with the same empty side);
+  # the measured empty side (_facing) then lets the double-line stage pair them although the closed floor mask covers the wall.
+  # axis_thin_wall_faces does the same for the dominant axes (0.07-0.15 m axis walls measured instead of learned).  Default OFF:
+  # it changes axis faces of existing projects (v12: 10 extra raw candidates); synthetic thin axis walls are exact with it on.
+  axis_thin_wall_faces: false
+  # A new-direction face must deviate from the axis direction by >= min_slant_m over its length (length x sin(angle)): below that
+  # it is a diagonal through a smeared wall band (v10 unfused cloud, face spread 85-115 mm: false 6-11 deg faces of 0.5-1.95 m, max 0.35 m).
+  min_slant_m: 0.40
+# Ceiling-completed wall pieces on the edge of an unscanned area are no walls: a piece is dropped when fewer than
+# min_vertical_support of its samples have point evidence (any class) in >= min_height_bins height bins above the lowest
+# skip_low_bins (floor) bins within 6 cm, AND the space beyond it is unobserved (observed share < max_observed_share).
+# Window walls keep frame/sill/lintel/curtain points (v12 minimum 0.11), so they stay.
+indoor_unobserved_edges:
+  enabled: true
+  min_vertical_support: 0.05
+  max_observed_share: 0.30
+  min_height_bins: 2
+  skip_low_bins: 2
 walls:
   double_line: true
   # An open door leaf is never a wall: a wall run lying along the measured open leaf of a door (both ends within leaf_run_distance_m of the
@@ -270,9 +314,36 @@ walls:
   door_span_enter_m: 0.20
   door_min_piece_m: 0.17
   door_fill_reach_m: 1.5
+  # An opening has both faces of the wall it interrupts.  Above a door with a measured head the scan sees both faces: two planes that each
+  # cover lintel_band_min_share of the width, >= lintel_band_min_m apart with a valley between them (<= valley share of the far plane),
+  # replace an assumed thickness (exterior default / learned / filled gap) of that wall and lintel; a measured face never moves for it.
+  # Within lintel_corner_snap_m the face ends on the crossing wall's jamb.  Pieces beside an opening differing more than opening_flush_m
+  # are aligned (joints kept) unless both faces of both pieces are measured.
+  lintel_band: true
+  lintel_band_tolerance_m: 0.03
+  lintel_band_min_m: 0.10
+  lintel_band_min_share: 0.60
+  lintel_band_valley_share: 0.30
+  lintel_band_clearance_m: 0.05
+  lintel_band_min_height_m: 0.15
+  lintel_band_min_plane_m: 0.08     # each plane rises this far (a flat soffit / casing top is no wall face)
+  lintel_corner_snap_m: 0.04
+  opening_flush_m: 0.005
   min_thickness_m: 0.06
   max_thickness_m: 0.45
   exterior_thickness_m: 0.30
+  # Without a measured outer face (pairs), the exterior thickness comes from window reveals: wall points of both jambs from the
+  # inner face to the frame (depth d >= reveal_min_depth_m) give 2 x (d + reveal_frame_m / 2) - frame assumed in the wall middle.
+  # Pieces then carry evidence "exterior-reveal"; without reveals the 0.30 default ("exterior") stays.
+  # OFF: DEV exterior error 0.041 -> 0.032 m, VAL neutral, but on VAL l_kitchen_212 the changed thickness lost a hidden wall (recall 1.00 -> 0.83).
+  exterior_from_reveals: false
+  reveal_frame_m: 0.08
+  reveal_min_depth_m: 0.04
+  # Hidden-wall room edges additionally needing vertical point evidence (off: drops real hidden exterior walls on v12).
+  room_edge_vertical_evidence: false
+  # A room edge where the data ends (depth <= 5 cm) and whose outside up to a measured wall (within max_thickness_m + 0.5 m) holds no data is an unscanned pocket, no wall.
+  # OFF: on bench VAL l_kitchen_212 it removed a real hidden kitchen wall (wall recall 1.00 -> 0.83).
+  room_edge_unscanned_pocket: false
   interior_thickness_m: 0.12
   probe_m: 0.80
   side_probe_m: 0.25
@@ -463,6 +534,36 @@ indoor_kitchen_run:
   min_leg_length_m: 0.60
   corner_reach_m: 0.50
 
+# Kitchen fronts measured from the scan points (kitchen_fronts.py): a front across an inner corner at any angle, the base
+# standing back under its worktop, the end of an upper cabinet that the scan sees through.  No evidence = square corner.
+indoor_kitchen_fronts:
+  enabled: true
+  band_min_m: 0.12                  # cabinet fronts between plinth ...
+  band_max_m: 0.84                  # ... and worktop
+  line_tolerance_m: 0.035           # scan noise plus handles and door gaps of one front
+  max_shift_m: 0.08                 # a straight front moves at most this far from the fitted run
+  corner_min_cut_m: 0.15            # smallest / largest cut of a diagonal unit along a leg
+  corner_max_cut_m: 1.10
+  corner_min_angle_deg: 15.0        # flatter than this is the straight front itself
+  corner_min_coverage: 0.75         # share of the diagonal seen over the front height
+  corner_max_residual_m: 0.02       # median distance of its points to the line
+  recess: true
+  recess_min_depth_m: 0.12
+  recess_min_length_m: 0.40
+  upper_trim: true
+  upper_trim_min_m: 0.15
+
+# A kitchen leg the label raster lost, established from its scanned front (kitchen_legs.py).  It needs the front from plinth to
+# worktop, the worktop at the run's level, kitchen labels, a join to the run and a wall (peninsula: its own back face) behind.
+indoor_kitchen_front_legs:
+  enabled: true
+  min_length_m: 0.60                # straight front
+  min_coverage: 0.75                # share of it seen over the front height
+  worktop_tolerance_m: 0.07         # same level as the known run
+  min_label_share: 0.60             # a table or sideboard along the second wall carries no kitchen labels
+  min_depth_m: 0.45                 # wall behind the front
+  max_depth_m: 0.80
+
 # Outdoor surveyor / DGM site-plan standard (metres).
 outdoor_trunk:
   search_radius_m: 1.0
@@ -518,3 +619,68 @@ indoor_door_zone:
   max_overlap_share: 0.25
   # Niches / upper cabinets belong to the kitchen zone widened by this much (the room outline stops at the counter front).
   kitchen_zone_margin_m: 0.80
+
+# Structure beyond plain walls (samcloud/ortho/vector/structure): per-room floor / ceiling (flat, one or two planes), wall
+# heights, free-standing columns, beams (soffit drops) and straight stairs from the classified points. Metres / degrees /
+# shares; every threshold is a physical default, nothing project-specific. enabled: false keeps storey heights and draws
+# no columns / beams / stairs.
+structure:
+  enabled: true
+  max_points: 8000000
+  wall_bin_m: 0.2
+  wall_min_points_per_bin: 8
+  wall_min_bin_share: 0.3
+  wall_top_percentile: 98.0
+  wall_top_quantile: 75.0
+  wall_ceiling_tolerance_m: 0.1
+  wall_free_above_ratio: 0.15
+  wall_min_height_m: 0.3
+  room_erode_m: 0.15
+  room_cell_m: 0.25
+  room_min_points: 30
+  room_min_ceiling_coverage: 0.15
+  ceiling_min_clear_m: 1.5
+  ceiling_slope_min_deg: 3.0
+  ceiling_plane_min_inliers: 0.6
+  ceiling_plane_min_rise_m: 0.1
+  ceiling_two_plane_gain: 0.15
+  ceiling_two_plane_min_share: 0.75
+  ceiling_two_plane_min_part: 0.15
+  ceiling_two_plane_min_angle_deg: 5.0
+  column_cell_m: 0.04
+  column_max_section_m: 0.8
+  column_min_section_m: 0.08
+  column_max_aspect: 2.5
+  column_min_height_share: 0.7
+  column_top_gap_m: 0.15
+  column_wall_clearance_m: 0.1
+  column_opening_clearance_m: 0.15
+  column_min_points: 60
+  column_max_foreign_share: 0.3
+  column_max_furniture_overlap: 0.3
+  column_max_instance_overlap: 0.6
+  column_attached_density: 0.2
+  column_max_residual_m: 0.025
+  column_max_relative_residual: 0.1
+  column_slab_extent_ratio: 1.4
+  beam_cell_m: 0.1
+  beam_min_drop_m: 0.08
+  beam_max_drop_m: 0.8
+  beam_min_width_m: 0.08
+  beam_max_width_m: 0.8
+  beam_min_length_m: 1.0
+  beam_min_elongation: 4.0
+  beam_min_fill: 0.55
+  beam_support_reach_m: 0.35
+  beam_wall_adjacent_m: 0.15
+  beam_side_clear_share: 0.6
+  stair_min_points: 80
+  stair_cluster_m: 0.25
+  stair_riser_m: [0.12, 0.23]
+  stair_tread_m: [0.18, 0.4]
+  stair_comfort_m: [0.5, 0.8]
+  stair_min_width_m: 0.6
+  stair_max_width_m: 3.0
+  stair_min_risers: 3
+  stair_min_r2: 0.7
+  stair_min_level_share: 0.6

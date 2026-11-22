@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import combinations
+import logging
 import math
 import re
 from typing import Any
@@ -23,6 +24,7 @@ from shapely.geometry.polygon import orient
 from shapely.ops import polylabel, split, unary_union
 
 from .furniture_shapes import FurnitureShapeSettings, fit_furniture_shape, is_sofa, sofa_details
+from .measured_rotation import clear_rotation
 from .raster_grid import RasterGrid, mask_to_polygons
 
 
@@ -103,6 +105,27 @@ def enclosed_cells(walls: Any, upm: float, minimum_m2: float = 0.5) -> list[Poly
     return cells
 
 
+def _bridge_stub(first: Polygon, second: Polygon, reach: float) -> Any:
+    """Hull of two spans outside both and within ``reach`` of both; robust against GEOS topology errors.
+
+    Nearly collinear span edges can make the overlay fail ("Ring edge missing"); the stub is then recomputed on
+    inputs snapped to a grid far below the drawing tolerance (reach / 1000), and skipped when that fails as well.
+    """
+
+    def stub(a: Polygon, b: Polygon) -> Any:
+        return unary_union([a, b]).convex_hull.difference(a).difference(b).intersection(a.buffer(reach, join_style=2)).intersection(b.buffer(reach, join_style=2))
+
+    try:
+        return stub(first, second)
+    except GEOSException:
+        grid_size = max(float(reach) * 1e-3, 1e-9)
+        try:
+            return stub(shapely.make_valid(shapely.set_precision(first, grid_size)), shapely.make_valid(shapely.set_precision(second, grid_size)))
+        except GEOSException:
+            logging.getLogger(__name__).warning("wall stub between two openings skipped (GEOS topology error)", exc_info=True)
+            return GeometryCollection()
+
+
 def bridge_barriers(barriers: list[Polygon], reach: float, max_area: float) -> list[Polygon]:
     """Wall stubs between two close door / window spans (the wall bodies there were cut away, e.g. a 25 cm jamb between a door and a window).
 
@@ -114,7 +137,7 @@ def bridge_barriers(barriers: list[Polygon], reach: float, max_area: float) -> l
         for second in barriers[index + 1:]:
             if first.intersects(second) or first.distance(second) > reach:
                 continue
-            stub = unary_union([first, second]).convex_hull.difference(first).difference(second).intersection(first.buffer(reach, join_style=2)).intersection(second.buffer(reach, join_style=2))
+            stub = _bridge_stub(first, second, reach)
             for piece in _parts(stub):
                 if 0.0 < piece.area <= max_area:
                     bridges.append(piece)
@@ -628,8 +651,12 @@ def regularize_furniture(
             continue
         shape = shapes[id(entity)]
         kind = str(entity.get("_footprint_kind", ""))
+        turned = None if kind in {"circle", "ellipse"} else clear_rotation(evidences[id(entity)], theta, upm)
         if kind in {"circle", "ellipse"}:
             regular = shape
+        elif turned is not None:
+            # clearly measured (elongation, residual, coverage): free-standing furniture keeps its rotation
+            regular, kind = turned, "rect_free"
         else:
             fit = regular_furniture_shape(shape, theta, upm, settings)
             if fit is None:
@@ -639,7 +666,12 @@ def regularize_furniture(
             if settings.furniture_shapes:
                 label = entity.get("_semantic_label") or entity.get("_label")
                 extra = [("rectilinear", regular, (len(regular.exterior.coords) - 5) / 2.0 + 0.5)] if kind == "rectilinear" else []
-                choice = fit_furniture_shape(evidences[id(entity)], theta, upm, label, shape_settings, extra)
+                try:
+                    choice = fit_furniture_shape(evidences[id(entity)], theta, upm, label, shape_settings, extra)
+                except Exception:  # noqa: BLE001 - a degenerate trace keeps its regularised outline
+                    logging.getLogger(__name__).warning("furniture shape choice failed for %r; regular outline kept", label, exc_info=True)
+                    stats["furniture_shape_failures"] = stats.get("furniture_shape_failures", 0) + 1
+                    choice = None
                 # A notched or round outline replaces the rectangle when the evidence supports it; a rectilinear
                 # trace that does not pay for its vertices becomes the best rectangle; a fitted rectangle stays.
                 adopt = choice is not None and (choice.kind in {"L", "U", "circle", "ellipse"} or (kind == "rectilinear" and choice.kind == "rect" and choice.iou >= shape_settings.min_rect_iou))
@@ -730,7 +762,12 @@ def regularize_furniture(
         for entity in final:
             if not is_sofa(entity.get("_semantic_label") or entity.get("_label")) or entity.get("_footprint_kind") in {"circle", "ellipse", "rect_free"}:
                 continue
-            detail = sofa_details(shapes[id(entity)], theta, upm, height_of, shape_settings)
+            try:
+                detail = sofa_details(shapes[id(entity)], theta, upm, height_of, shape_settings)
+            except Exception:  # noqa: BLE001 - one degenerate sofa keeps its outline without details, never kills the plan
+                logging.getLogger(__name__).warning("sofa details failed for %r; outline kept without details", entity.get("_label"), exc_info=True)
+                stats["furniture_detail_failures"] = stats.get("furniture_detail_failures", 0) + 1
+                continue
             if not detail.lines:
                 continue
             stats["furniture_sofa_details"] += 1

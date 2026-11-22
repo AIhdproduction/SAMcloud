@@ -78,6 +78,104 @@ def _hole_rectangles(solid: np.ndarray, config: Settings) -> list[dict[str, Any]
     return rectangles
 
 
+def _option(section: Settings, name: str, default: Any) -> Any:
+    """Optional threshold (older config files / test overrides may not have it)."""
+    try:
+        return getattr(section, name)
+    except AttributeError:
+        return default
+
+
+def _gap_runs(mask: np.ndarray, max_gap: int) -> list[tuple[int, int]]:
+    """(start, stop) of every True run of ``mask``; gaps of up to ``max_gap`` cells do not end a run."""
+    index = np.flatnonzero(mask)
+    if index.size == 0:
+        return []
+    runs: list[tuple[int, int]] = []
+    start = previous = int(index[0])
+    for value in [*index[1:].tolist(), None]:
+        if value is not None and value - previous <= max_gap + 1:
+            previous = value
+            continue
+        runs.append((start, previous + 1))
+        if value is not None:
+            start = previous = value
+    return runs
+
+
+def _longest_run(mask: np.ndarray, max_gap: int) -> tuple[int, int] | None:
+    """The longest run of :func:`_gap_runs`, None when ``mask`` is all False."""
+    runs = _gap_runs(mask, max_gap)
+    return max(runs, key=lambda run: run[1] - run[0]) if runs else None
+
+
+def _window_extents(grids: dict[str, np.ndarray], rect: dict[str, Any], counts: dict[str, int], config: Settings) -> list[dict[str, float]]:
+    """Glazing spans (u0, u1, v0, v1 in metres) of a hole dominated by window-class points; empty when it is not.
+
+    The window-class points (frame and glass returns) give the windows; the hole rectangle can be larger (furniture and its scan
+    shadow below the sill, a shelf beside the window, two windows whose holes merged).  Requires window points that clearly
+    dominate door points and fill each glazing box densely, so a door, a glass door with its frame or a hole with stray window
+    points never qualifies.
+    """
+    cfg = config.points_only
+    cell = float(config.grid.cell_m)
+    dominance = float(_option(cfg, "glazing_door_dominance", 0.0))
+    if dominance <= 0.0 or counts["win"] <= dominance * max(counts["door"], 1):
+        return []
+    # The glazing may reach beyond the hole rectangle (a rectangle of an L-shaped hole, a sill hidden by furniture): it is searched
+    # over the full height and half a metre beside the rectangle.
+    pad = int(round(0.5 / cell))
+    u0 = max(rect["u0"] - pad, 0)
+    win = grids["win"][u0:min(rect["u1"] + pad, grids["win"].shape[0]), :] > 0
+    if not win.any():
+        return []
+    min_cover = float(_option(cfg, "glazing_min_cover", 0.3))
+    min_fill = float(_option(cfg, "glazing_min_fill", 0.5))
+    column_rows = max(2, int(round(float(cfg.window_min_height_m) / cell * min_cover)))
+    extents: list[dict[str, float]] = []
+    for c0, c1 in _gap_runs(win.sum(1) >= column_rows, 2):
+        rows = _longest_run(win[c0:c1].mean(0) >= min_cover, 2)
+        if rows is None:
+            continue
+        columns = _longest_run(win[c0:c1, rows[0]:rows[1]].mean(1) >= min_cover, 2)
+        if columns is None:
+            continue
+        a0, a1 = c0 + columns[0], c0 + columns[1]
+        box = win[a0:a1, rows[0]:rows[1]]
+        width, height = (a1 - a0) * cell, (rows[1] - rows[0]) * cell
+        if float(box.mean()) < min_fill or width < float(cfg.min_width_m) or height < float(cfg.window_min_height_m) or width * height < float(cfg.min_rect_area_m2):
+            continue
+        if rows[1] * cell > float(cfg.window_max_head_m):
+            continue
+        if min(u0 + a1, rect["u1"]) - max(u0 + a0, rect["u0"]) <= 0:
+            continue  # glazing beside the hole is another opening (found from its own hole)
+        extents.append({"u0": (u0 + a0) * cell, "u1": (u0 + a1) * cell, "v0": rows[0] * cell, "v1": rows[1] * cell})
+    return extents
+
+
+def _furniture_shadow(grids: dict[str, np.ndarray], rect: dict[str, Any], counts: dict[str, int], config: Settings) -> bool:
+    """True when a wall-bounded hole without any window-class point sits on furniture points (a scan shadow above a furniture top).
+
+    Furniture standing in front of the wall hides the wall above its top edge from a scanner below that edge; the hidden stretch
+    is bounded by wall on three sides like a window.  A window leaves window-class points (frame, glass); this hole leaves none,
+    and furniture-class points fill the rows at its bottom edge.
+    """
+    cfg = config.points_only
+    cell = float(config.grid.cell_m)
+    limit = float(_option(cfg, "shadow_max_window_density", 0.0))
+    if limit <= 0.0:
+        return False
+    area = max((rect["u1"] - rect["u0"]) * (rect["v1"] - rect["v0"]), 1)
+    if counts["win"] / area > limit:
+        return False
+    depth = max(1, int(round(float(_option(cfg, "shadow_probe_m", 0.3)) / cell)))
+    below = grids["other"][rect["u0"]:rect["u1"], max(rect["v0"] - depth, 0):rect["v0"] + depth]  # just below and in the hole's bottom rows
+    if below.size == 0:
+        return False
+    # a column is covered by furniture when it holds a few points there (scattered stray points are no furniture top)
+    return float((below.sum(1) >= int(_option(cfg, "shadow_column_points", 3))).mean()) >= float(_option(cfg, "shadow_min_cover", 0.3))
+
+
 def detect_point_openings(ev: LineEvidence, config: Settings) -> list[dict[str, Any]]:
     """Windows/doors/passages of one line from the point grid alone (items in the layout of ``detect``)."""
     cfg = config.points_only
@@ -90,6 +188,7 @@ def detect_point_openings(ev: LineEvidence, config: Settings) -> list[dict[str, 
         sl = (slice(max(rect["u0"] - 2, 0), rect["u1"] + 2), slice(max(rect["v0"] - 2, 0), rect["v1"] + 2))
         return {name: int(grids[name][sl].sum()) for name in ("win", "door", "other", "wall")}
 
+    door_min_width = float(_option(cfg, "door_min_width_m", 0.0))
     for rect in _hole_rectangles(solid, config):
         counts = evidence(rect)
         area = (rect["u1"] - rect["u0"]) * (rect["v1"] - rect["v0"])
@@ -100,12 +199,20 @@ def detect_point_openings(ev: LineEvidence, config: Settings) -> list[dict[str, 
         kind = None
         if rect["edge"] and density_door <= cfg.window_evidence_density and density_window <= cfg.window_evidence_density:
             continue
+        glazing = _window_extents(grids, rect, counts, config)
+        if glazing:
+            # The hole is dominated by window-class points: windows whose glazing (not the hole) gives the span.  Furniture in front of
+            # the wall below the sill and its scan shadow merge with the glass into one hole that reaches the floor; that hole is no door.
+            candidates.extend({"kind": "window", **extent, "ev": counts, "rect": rect} for extent in glazing)
+            continue
         if v0 < cfg.door_floor_v_m:
+            if width < door_min_width:
+                continue  # narrower than any door: a wall projection, a niche or a gap between furniture, not a doorway
             v0 = 0.0
             if cfg.door_head_range_m[0] <= v1 <= cfg.door_head_range_m[1] and width <= cfg.door_max_width_m and ((bounded >= 2 and rect["top"] > 0.35) or density_door > cfg.window_evidence_density):
                 kind = "door" if counts["door"] > cfg.door_min_points else "passage"
         elif cfg.window_sill_range_m[0] <= v0 <= cfg.window_sill_range_m[1] and (v1 - v0) >= cfg.window_min_height_m and v1 <= cfg.window_max_head_m:
-            if bounded >= 3 and rect["bot"] > 0.35:
+            if bounded >= 3 and rect["bot"] > 0.35 and not _furniture_shadow(grids, rect, counts, config):
                 kind = "window"
             elif density_window > cfg.window_evidence_density and bounded >= 2:
                 kind = "window"
@@ -166,6 +273,14 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return runs(mask)
 
 
+def _spans_overlap(record: RefinedOpening, seed: SeedLike, units_per_metre: float) -> bool:
+    """True when the plan seed lies on the record's wall (across < 0.5 m) and their spans along it overlap."""
+    axis = np.array([np.cos(record.axis_angle), np.sin(record.axis_angle)])
+    delta = (np.asarray(seed.center, float) - np.asarray(record.center, float)) / units_per_metre
+    along, across = abs(float(delta @ axis)), abs(float(delta @ np.array([-axis[1], axis[0]])))
+    return across < 0.5 and along < (float(record.width_m) + float(seed.width_m)) / 2.0
+
+
 def _window_confidence(item: dict[str, Any], config: Settings) -> float:
     return round(config.points_only.confidence + 0.1 * min(1.0, (item["ev"]["win"] + item["ev"]["door"]) / 200.0), 3)
 
@@ -197,6 +312,11 @@ def points_only_detection(evidence: dict[str, LineEvidence], seeds: list[SeedLik
             continue
         near = [r for r in kept if np.hypot(r.center[0] - seed.center[0], r.center[1] - seed.center[1]) / upm < config.dedupe.plan_door_merge_distance_m]
         if near:
+            # The measured hole IS the plan's door / passage: it keeps the seed, so the classification knows the 2D plan saw an
+            # opening there (weak door evidence then keeps the safe default, a door).
+            same = [r for r in near if r.kind in ("door", "passage") and r.plan_seed is None and _spans_overlap(r, seed, upm)]
+            if same:
+                min(same, key=lambda r: np.hypot(r.center[0] - seed.center[0], r.center[1] - seed.center[1])).plan_seed = seed.id
             continue
         kept.append(RefinedOpening(
             id="", kind=seed.kind, center=[round(float(seed.center[0]), 3), round(float(seed.center[1]), 3)], width_m=round(float(seed.width_m), 3), axis_angle=round(float(seed.axis_angle), 4),

@@ -184,6 +184,12 @@ def test_run_all_skips_fresh_ifc_but_force_reruns(monkeypatch: pytest.MonkeyPatc
         (directory / name).write_bytes(b"x")
     manifest = {"plan_model_sha256": bim_jobs.plan_model_sha256(project, LEVEL), "ifc": "m.ifc", "glb": "model.glb", "props": "props.json"}
     (directory / "export.json").write_text(json.dumps(manifest), encoding="utf-8")
+    # the IFC step also writes the 3D DXF of the IFC: a missing 3D DXF makes the step run again
+    jobs.run_all(project, project / "c.las", LEVEL, lambda *_a: None, CancelToken(), LOGGER, mode="indoor")
+    assert calls == ["export_ifc"]
+    calls.clear()
+    dxf3d = project / "products" / "dxf" / "export" / f"{jobs.sanitize_dxf_name(project.name)}_1_3d.dxf"
+    dxf3d.write_text("dxf", encoding="utf-8")
 
     jobs.run_all(project, project / "c.las", LEVEL, lambda *_a: None, CancelToken(), LOGGER, mode="indoor")
     assert calls == []

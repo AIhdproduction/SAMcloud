@@ -13,6 +13,7 @@ openings and furniture.  Conventions:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 from dataclasses import dataclass, field, fields
@@ -24,6 +25,7 @@ import yaml
 from shapely.geometry import LineString, MultiPoint, Point, Polygon
 from shapely.ops import unary_union
 
+_LOGGER = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 PLAN_MODEL_FILENAME = "plan_model.json"
 PASS1_PLAN_FILENAME = "plan_model_pass1.json"
@@ -49,6 +51,11 @@ class PlanWall:
     face_b: list[Point2] | None = None
     body_id: int | None = None  # index into BuildingPlan.wall_bodies (closed wall body ring)
     height_m: float | None = None  # None -> storey height
+    # room_ceiling | points (measured half-height wall) | ceiling_occluded | adjacent_ceiling | storey (samcloud.ortho.vector.structure)
+    height_source: str = "storey"
+    # As detected, where a measured band moved this piece or one joining it; None = same.  The refinement scans these.
+    detected_centreline: list[Point2] | None = None
+    detected_thickness_m: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)
@@ -67,6 +74,13 @@ class PlanRoom:
     label_point: Point2
     floor_z: float | None = None  # None -> storey
     ceiling_z: float | None = None
+    # Sloped ceiling: z = a * x + b * y + c in local plan units ([a, b, c]); None = flat at ceiling_z.
+    ceiling_plane: list[float] | None = None
+    ceiling_source: str = "level"  # points | plane | planes | level
+    floor_source: str = "level"  # points | level
+    # Two-plane ceiling (gable / valley): both [a, b, c] (local units) and how they combine: min = ridge, max = valley.
+    ceiling_planes: list[list[float]] | None = None
+    ceiling_envelope: str = "min"
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)
@@ -78,6 +92,8 @@ class PlanRoom:
 
 @dataclass(slots=True)
 class PlanOpening:
+    """An opening in its host wall: ``center`` lies between both faces and ``wall_thickness_m`` is the host's thickness."""
+
     id: str
     kind: str  # door | window | passage
     center: Point2
@@ -97,6 +113,9 @@ class PlanOpening:
     mullion_u: list[float] = field(default_factory=list)  # metres from the left edge along the axis (windows)
     glazed: bool = False  # glazed door / floor-to-ceiling glazing
     confidence: float | None = None  # 3D refinement confidence, None for 2D-only openings
+    # As detected (centre ON a wall face, own thickness estimate); None = same as centre / thickness.  Seeds of the refinement.
+    detected_center: Point2 | None = None
+    detected_thickness_m: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)
@@ -130,6 +149,17 @@ class PlanFurniture:
     # whose face carries its back.  Same values for the DXF block and the IFC property set; None = no facing rule applied.
     facing_deg: float | None = None
     back_wall_id: str | None = None
+    # 3D reconstruction from the scan points (samcloud.bim.furniture_recon), all optional:
+    # ``solids`` vertical prisms {"type": box|cylinder|extrusion, "role", "part_source": measured|symmetry|prior, "outline" (local ring),
+    # "z_min", "z_max" (local units), box/cylinder also "center", "dims_m", "rotation_deg" / "radius"}; ``mesh`` {"vertices": [[x, y, z]]
+    # local units, "faces": [[i, j, k]]} closed, outward normals; ``shape_source`` parametric | mesh | footprint; ``fit`` metrics.
+    solids: list[dict[str, Any]] = field(default_factory=list)
+    mesh: dict[str, Any] | None = None
+    shape_source: str = "footprint"
+    fit: dict[str, Any] | None = None
+    # Set only with evidence from the scan (samcloud.bim.room_objects): wall | resting = ``z_min`` is the measured bottom and is
+    # never pulled to the floor; standing = measured on the floor; None = the rules of the kind decide.
+    mounting: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)
@@ -155,6 +185,12 @@ class BuildingPlan:
     wall_bodies: list[dict[str, Any]] = field(default_factory=list)  # closed wall body rings {"exterior", "holes"}
     source: dict[str, Any] = field(default_factory=dict)  # {"result_fingerprint": ...}
     schema_version: int = SCHEMA_VERSION
+    # Structure from the points (samcloud.ortho.vector.structure): plain dicts, geometry in local units, *_m in metres.
+    columns: list[dict[str, Any]] = field(default_factory=list)
+    beams: list[dict[str, Any]] = field(default_factory=list)
+    stairs: list[dict[str, Any]] = field(default_factory=list)
+    # Objects on the ceiling (samcloud.bim.room_objects): plain dicts like the structure, geometry in local units.
+    ceiling_objects: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +208,10 @@ class BuildingPlan:
             "furniture": [item.to_dict() for item in self.furniture],
             "wall_bodies": self.wall_bodies,
             "source": self.source,
+            "columns": self.columns,
+            "beams": self.beams,
+            "stairs": self.stairs,
+            "ceiling_objects": self.ceiling_objects,
         }
 
     @classmethod
@@ -188,6 +228,8 @@ class BuildingPlan:
             openings=[PlanOpening.from_dict(item) for item in data.get("openings", [])],
             furniture=[PlanFurniture.from_dict(item) for item in data.get("furniture", [])],
             wall_bodies=list(data.get("wall_bodies", [])), source=dict(data.get("source", {})), schema_version=version,
+            columns=list(data.get("columns") or []), beams=list(data.get("beams") or []), stairs=list(data.get("stairs") or []),
+            ceiling_objects=list(data.get("ceiling_objects") or []),
         )
 
 
@@ -235,9 +277,68 @@ def save_pass1_snapshot(directory: Path | str) -> Path:
 
 
 def load_refine_plan(directory: Path | str) -> BuildingPlan:
-    """Plan the opening refinement works on: the pass-1 snapshot when it exists (never the refined plan), else plan_model.json."""
+    """Plan the opening refinement works on: the pass-1 snapshot when it exists (never the refined plan), else plan_model.json.
+
+    Returned in the plan's detector units (see :func:`plan_in_detector_units`), like the clean plan that applies the result.
+    """
     snapshot = pass1_plan_path(directory)
-    return load_plan_model(snapshot if snapshot.is_file() else directory)
+    return plan_in_detector_units(_at_detection(load_plan_model(snapshot if snapshot.is_file() else directory)))
+
+
+def _at_detection(plan: BuildingPlan) -> BuildingPlan:
+    """The plan as detected: openings on their faces, walls before measured bands moved them (stable refinement inputs)."""
+    from dataclasses import replace
+
+    if all(item.detected_center is None for item in plan.openings) and all(wall.detected_centreline is None for wall in plan.walls):
+        return plan
+    walls = [
+        wall if wall.detected_centreline is None else replace(
+            wall, centreline=wall.detected_centreline, face_a=None, face_b=None, detected_centreline=None, detected_thickness_m=None,
+            thickness_m=wall.thickness_m if wall.detected_thickness_m is None else float(wall.detected_thickness_m),
+        )
+        for wall in plan.walls
+    ]
+    return replace(plan, walls=walls, openings=[
+        item if item.detected_center is None else replace(
+            item, center=list(item.detected_center), detected_center=None, detected_thickness_m=None,
+            wall_thickness_m=item.wall_thickness_m if item.detected_thickness_m is None else float(item.detected_thickness_m),
+        )
+        for item in plan.openings
+    ])
+
+
+def plan_in_detector_units(plan: BuildingPlan) -> BuildingPlan:
+    """The plan expressed in the storey-normalised detector units of the clean plan (``source.scale.detector_units_per_metre``).
+
+    The indoor detectors (clean plan and opening refinement) run in units that follow the measured storey height, so their
+    grids and thresholds do not move with the metric scale.  Metric fields are converted (value * metric / detector) so
+    every ``*_m`` value times ``units_per_metre`` still gives the same local length.  Plans without the key are returned as is.
+    """
+    from dataclasses import replace
+
+    scale = (plan.source or {}).get("scale") if isinstance(plan.source, dict) else None
+    detector = scale.get("detector_units_per_metre") if isinstance(scale, dict) else None
+    try:
+        detector = float(detector)
+    except (TypeError, ValueError):
+        return plan
+    metric = float(plan.units_per_metre)
+    if not (math.isfinite(detector) and detector > 0.0) or abs(detector - metric) <= 1e-12 * max(metric, 1.0):
+        return plan
+    factor = metric / detector
+    return replace(
+        plan, units_per_metre=detector,
+        walls=[replace(wall, thickness_m=wall.thickness_m * factor, height_m=None if wall.height_m is None else wall.height_m * factor) for wall in plan.walls],
+        rooms=[replace(room, area_m2=room.area_m2 * factor * factor) for room in plan.rooms],
+        openings=[
+            replace(
+                item, width_m=item.width_m * factor, wall_thickness_m=item.wall_thickness_m * factor, sill_m=item.sill_m * factor, head_m=item.head_m * factor,
+                detected_thickness_m=None if item.detected_thickness_m is None else item.detected_thickness_m * factor,
+            )
+            for item in plan.openings
+        ],
+        source={**plan.source, "units": "detector"},
+    )
 
 
 def load_plan_model(directory_or_file: Path | str) -> BuildingPlan:
@@ -376,6 +477,8 @@ def _walls_from_pieces(pieces: list[dict[str, Any]], bodies: list[Polygon]) -> l
             id=f"W{index:03d}", centreline=_points(centre), thickness_m=float(piece["thickness"]),
             kind=str(piece.get("kind") or "interior"), evidence=str(piece.get("evidence") or ""),
             face_a=_points(a), face_b=_points(b), body_id=body_id,
+            detected_centreline=None if piece.get("detected_centreline") is None else _points(piece["detected_centreline"]),
+            detected_thickness_m=None if piece.get("detected_thickness") is None else float(piece["detected_thickness"]),
         ))
     return walls
 
@@ -399,27 +502,40 @@ def _walls_from_lines(entities: list[dict[str, Any]]) -> list[PlanWall]:
 
 def _host_wall(center: np.ndarray, width: float, thickness: float, axis_angle: float, walls: list[PlanWall], upm: float) -> str | None:
     """Nearest wall piece whose centreline passes the opening centre and runs along its axis."""
+    from samcloud.ortho.vector.opening_bands import host_index
+
     axis = np.asarray((math.cos(axis_angle), math.sin(axis_angle)))
-    best: tuple[float, str] | None = None
-    for wall in walls:
-        line = LineString(wall.centreline)
-        if line.length <= 1e-9:
-            continue
-        direction = np.asarray(wall.centreline[1]) - np.asarray(wall.centreline[0])
-        direction = direction / max(float(np.linalg.norm(direction)), 1e-12)
-        if abs(float(np.dot(direction, axis))) < 0.9:
-            continue
-        limit = width / 2.0 + max(wall.thickness_m * upm, thickness) / 2.0 + 0.05 * upm
-        # Perpendicular offset must stay inside the wall body; along-axis the piece may end at the opening edge.
-        distance = line.distance(Point(*center))
-        offset = abs(float(np.dot(center - np.asarray(wall.centreline[0]), np.asarray((-direction[1], direction[0])))))
-        if distance <= limit and offset <= max(wall.thickness_m * upm, thickness) / 2.0 + 0.05 * upm and (best is None or distance < best[0]):
-            best = (distance, wall.id)
-    return None if best is None else best[1]
+    index = host_index(center, axis, width, thickness, [wall.centreline for wall in walls], [wall.thickness_m * upm for wall in walls], upm)
+    return None if index is None else walls[index].id
 
 
-def _openings(openings: list[Any], walls: list[PlanWall], upm: float, config: dict[str, Any]) -> list[PlanOpening]:
+def _on_host_band(centre: np.ndarray, axis_angle: float, host: PlanWall) -> np.ndarray:
+    """The opening centre between both faces of its host: openings are detected ON a face, only the offset across the wall changes."""
+    start, end = np.asarray(host.centreline[0], dtype=float), np.asarray(host.centreline[1], dtype=float)
+    direction = (end - start) / max(float(np.linalg.norm(end - start)), 1e-12)
+    foot = start + direction * float(np.dot(centre - start, direction))
+    normal = np.asarray((-math.sin(axis_angle), math.cos(axis_angle)))
+    return centre + normal * float(np.dot(foot - centre, normal))
+
+
+def _walls_as_detected(walls: list[PlanWall], pieces: list[dict[str, Any]] | None) -> list[PlanWall]:
+    """The walls with the band they were detected with, for picking hosts only (a measured band never changes the host)."""
+    from dataclasses import replace
+
+    if pieces is None or len(pieces) != len(walls):
+        return walls
+    return [
+        replace(wall, centreline=_points(piece["detected_centreline"]), thickness_m=float(piece["detected_thickness"]))
+        if piece.get("detected_centreline") is not None else wall
+        for wall, piece in zip(walls, pieces, strict=True)
+    ]
+
+
+def _openings(
+    openings: list[Any], walls: list[PlanWall], upm: float, config: dict[str, Any], host_walls: list[PlanWall] | None = None,
+) -> list[PlanOpening]:
     defaults = config["defaults"]
+    by_id = {wall.id: wall for wall in walls}
     result: list[PlanOpening] = []
     for index, opening in enumerate(openings, start=1):
         kind = {"DOOR": "door", "WINDOW": "window", "PASSAGE": "passage"}.get(str(opening.kind).upper(), str(opening.kind).lower())
@@ -434,15 +550,22 @@ def _openings(openings: list[Any], walls: list[PlanWall], upm: float, config: di
         mullion_u = [float(value) for value in getattr(opening, "mullion_u", ())]
         if measured:
             sill, head = float(opening.sill_m), float(opening.head_m)
+        host_id = _host_wall(centre, float(opening.width), float(opening.wall_thickness), float(opening.axis_angle), host_walls or walls, upm)
+        thickness = float(opening.wall_thickness) / upm
+        host = by_id.get(host_id) if host_id else None
+        detected: tuple[Point2 | None, float | None] = (None, None)
+        if host is not None and host.thickness_m > 0.0:  # (a single-line wall has no band: the detected values stay)
+            detected = ([float(centre[0]), float(centre[1])], thickness)
+            centre, thickness = _on_host_band(centre, float(opening.axis_angle), host), float(host.thickness_m)
         result.append(PlanOpening(
             id=f"O{index:03d}", kind=kind, center=[float(centre[0]), float(centre[1])], width_m=float(opening.width) / upm,
-            axis_angle=float(opening.axis_angle), wall_thickness_m=float(opening.wall_thickness) / upm,
-            host_wall_id=_host_wall(centre, float(opening.width), float(opening.wall_thickness), float(opening.axis_angle), walls, upm),
+            axis_angle=float(opening.axis_angle), wall_thickness_m=thickness,
+            host_wall_id=host_id,
             hinge_side=opening.hinge_side, swing_side=None if opening.swing_side is None else int(opening.swing_side),
             leaf_angle_deg=None if opening.leaf_angle_deg is None else float(opening.leaf_angle_deg),
             leaf_detected=opening.leaf_detected, sill_m=sill, head_m=head, height_source=str(opening.height_source) if measured else "default",
             mullion_count=len(mullion_u), evidence=str(opening.evidence or ""), mullion_u=mullion_u, glazed=bool(getattr(opening, "glazed", False)),
-            confidence=getattr(opening, "confidence", None),
+            confidence=getattr(opening, "confidence", None), detected_center=detected[0], detected_thickness_m=detected[1],
         ))
     return result
 
@@ -489,6 +612,7 @@ def _furniture(
     instances: list[dict[str, Any]] | None = None, floor_z: float = 0.0, units_per_metre: float = 1.0,
     footprints: Any = None, depth: Any = None, depth_report: dict[str, Any] | None = None,
     row_points: np.ndarray | None = None, wall_union: Any = None, wall_lines: list[LineString] | None = None, row_settings: Any = None,
+    measure_extents: Callable[[list[PlanFurniture]], None] | None = None,
 ) -> list[PlanFurniture]:
     result: list[PlanFurniture] = []
     instances = instances or []
@@ -496,6 +620,8 @@ def _furniture(
     kitchen_cfg = config["defaults"]
     seen_runs: set[tuple[tuple[float, float], ...]] = set()
     kitchen_legs: list[Polygon] = []
+    kitchen_pieces: list[Polygon] = []  # what the worktops cover, diagonal corner units included
+    rotated_inserts: set[str] = set()  # inserts with a measured rotation
     for layer in FURNITURE_LAYERS:
         for entity in layers.get(layer, []):
             outline = entity.get("_counter_outline") or (entity.get("points") if entity.get("_run_legs") and entity.get("closed") else None)
@@ -504,8 +630,12 @@ def _furniture(
                 # enclosing outline.  The latter would incorrectly turn the free
                 # centre of the kitchen into a solid slab.
                 leg_outlines = entity.get("_run_legs") or [outline]
+                # with the kitchen layout: abutting solids per leg that follow the measured fronts of the 2D counter
+                run_solids = entity.get("_run_solids") or []
+                if len(run_solids) != len(leg_outlines):
+                    run_solids = [None] * len(leg_outlines)
                 emitted = False
-                for leg_outline in leg_outlines:
+                for leg_outline, leg_solids in zip(leg_outlines, run_solids, strict=True):
                     if not leg_outline or len(leg_outline) < 3:
                         continue
                     key = tuple((round(float(x), 3), round(float(y), 3)) for x, y in leg_outline)
@@ -518,16 +648,23 @@ def _furniture(
                         continue
                     emitted = True
                     kitchen_legs.append(run)
-                    ring = _points(list(run.exterior.coords)[:-1])
+                    if leg_solids is None:
+                        ring = _points(list(run.exterior.coords)[:-1])
+                        base_rings, top_rings = [ring], [ring]
+                    else:
+                        base_rings, top_rings = ([_points(ring) for ring in leg_solids.get(key) or [] if len(ring) >= 3] for key in ("base", "worktop"))
+                    kitchen_pieces.extend(Polygon(ring) for ring in top_rings)
                     base, top = float(kitchen_cfg["kitchen_base_height_m"]), float(kitchen_cfg["kitchen_worktop_top_m"])
-                    result.append(PlanFurniture(
-                        id=f"F{len(result) + 1:03d}", instance_id=None, label="Unterschrank", semantic_label="kitchen cabinet", catalogue_kind="kitchen_base",
-                        layer=layer, footprint=ring, default_height_m=base,
-                    ))
-                    result.append(PlanFurniture(
-                        id=f"F{len(result) + 1:03d}", instance_id=None, label="Arbeitsplatte", semantic_label="worktop", catalogue_kind="worktop",
-                        layer=layer, footprint=ring, default_z_m=[base, top],
-                    ))
+                    for ring in base_rings:
+                        result.append(PlanFurniture(
+                            id=f"F{len(result) + 1:03d}", instance_id=None, label="Unterschrank", semantic_label="kitchen cabinet", catalogue_kind="kitchen_base",
+                            layer=layer, footprint=ring, default_height_m=base,
+                        ))
+                    for ring in top_rings:
+                        result.append(PlanFurniture(
+                            id=f"F{len(result) + 1:03d}", instance_id=None, label="Arbeitsplatte", semantic_label="worktop", catalogue_kind="worktop",
+                            layer=layer, footprint=ring, default_z_m=[base, top],
+                        ))
                 if emitted:
                     continue
             kind_name: str | None = None
@@ -571,6 +708,8 @@ def _furniture(
                 default_height_override = float(measured_height)
             else:
                 default_height_override = None
+            if kind_name in ("KITCHEN_SINK", "COOKTOP") and catalogue_flags.get("measured_rotation"):
+                rotated_inserts.add(f"F{len(result) + 1:03d}")
             if kind_name in ("KITCHEN_SINK", "COOKTOP") and catalogue_flags.get("on_kitchen_run"):
                 # On the worktop: the sink basin sits flush in it, the hob lies on it.
                 top = float(kitchen_cfg["kitchen_worktop_top_m"])
@@ -640,9 +779,11 @@ def _furniture(
     if footprints is not None:
         _complete_thin_slabs(result, footprints, upm, floor_z, depth_report)
     if kitchen_legs:
-        _square_kitchen_inserts(result, kitchen_legs, upm, depth_report)
+        _square_kitchen_inserts(result, kitchen_legs, upm, depth_report, rotated_inserts, kitchen_pieces)
         if row_points is not None and len(row_points):
             result = _apply_tall_rows(result, kitchen_legs, row_points, wall_union, wall_lines or [], footprints, upm, floor_z, _row_settings(config, row_settings), depth_report)
+    if measure_extents is not None:
+        measure_extents(result)  # before the depth rules: the free space under a wall shelf does not reject the shelf
     if depth is not None:
         result = _apply_depth_rules(result, depth, upm, floor_z, depth_report)
     return result
@@ -693,17 +834,24 @@ def _leg_angle(leg: Polygon) -> float:
     return float(math.atan2(edge[1], edge[0]))
 
 
-def _square_kitchen_inserts(items: list[PlanFurniture], legs: list[Polygon], upm: float, report: dict[str, Any] | None) -> None:
-    """A sink / hob lies inside its kitchen run and is square to it: a diagonal or protruding insert is clipped to the leg it stands on."""
+def _square_kitchen_inserts(
+    items: list[PlanFurniture], legs: list[Polygon], upm: float, report: dict[str, Any] | None,
+    rotated: Iterable[str] = (), pieces: list[Polygon] | None = None,
+) -> None:
+    """A sink / hob lies inside its kitchen run and is square to it: a diagonal or protruding insert is clipped to the leg it stands on.
+
+    An insert with a measured rotation (``rotated`` ids) keeps it as long as it lies on the worktop ``pieces``.
+    """
     from shapely import affinity
     from shapely.geometry import box as _box
 
     union = unary_union(legs).buffer(0.01 * upm)
+    measured, worktop = set(rotated), unary_union(pieces or legs).buffer(0.01 * upm, join_style=2)
     for item in items:
         if item.catalogue_kind not in ("KITCHEN_SINK", "COOKTOP") or item.layer == "A-OBEN":
             continue
         polygon = _footprint_polygon(item)
-        if polygon is None:
+        if polygon is None or (item.id in measured and worktop.covers(polygon)):
             continue
         best = max(legs, key=lambda leg: polygon.intersection(leg).area)
         angle = _leg_angle(best)
@@ -906,7 +1054,7 @@ def _apply_depth_rules(items: list[PlanFurniture], depth: Any, upm: float, floor
             continue
         z0 = (float(item.z_min) - floor_z) if item.z_min is not None else (float(item.default_z_m[0]) * upm if item.default_z_m else 0.0)
         z1 = (float(item.z_max) - floor_z) if item.z_max is not None else (float(item.default_z_m[1]) * upm if item.default_z_m else float(item.default_height_m or 0.0) * upm)
-        if item.layer != "A-OBEN":
+        if item.layer != "A-OBEN" and not item.mounting:
             z0 = max(z0, 0.05 * upm)
         share = depth.free_share(polygon, z0 + 0.03 * upm, z1 - 0.03 * upm) if z1 - z0 > 0.10 * upm else 0.0
         if report is not None:
@@ -915,7 +1063,7 @@ def _apply_depth_rules(items: list[PlanFurniture], depth: Any, upm: float, floor
             if report is not None:
                 report.setdefault("rejected_in_free_space", []).append({"id": item.id, "label": item.label, "free_share": round(share, 3)})
             continue
-        if len(low) and item.layer != "A-OBEN":
+        if len(low) and item.layer != "A-OBEN" and not item.mounting:
             item.floor_contact = bool(int(depth.points_inside(polygon.buffer(0.03 * upm), low).sum()) >= 8)
         kept.append(item)
     return kept
@@ -942,6 +1090,89 @@ def _parts_matching_footprint(parts: Any, footprint: Polygon, minimum_iou: float
     from samcloud.bim.furniture_parts import tile_parts_to_footprint
 
     return tile_parts_to_footprint(items, footprint, units_per_metre)
+
+
+def _reconstruct_furniture(items: list[PlanFurniture], frame: Any, level: Any, upm: float, instances_path: Path | str | None) -> dict[str, Any] | None:
+    """3D furniture shapes from the classified cloud beside ``instances.json`` (samcloud.bim.furniture_recon); never fails the plan."""
+    try:
+        from samcloud.bim.furniture_recon import reconstruct_from_project_files
+
+        return reconstruct_from_project_files(
+            items, frame=frame, floor_z=float(level.floor_z), ceiling_z=None if level.ceiling_z is None else float(level.ceiling_z),
+            units_per_metre=upm, instances_path=instances_path,
+        )
+    except Exception as error:  # noqa: BLE001 - optional detail; the footprint bodies stay
+        import logging
+
+        logging.getLogger(__name__).warning("furniture 3D reconstruction failed; footprint bodies kept", exc_info=True)
+        return {"error": f"{type(error).__name__}: {error}"}
+
+
+def _load_room_objects(instances_path: Path | str | None, frame: Any, level: Any, upm: float) -> tuple[Any, Any]:
+    """(evidence, settings) of the room objects; (None, None) without a classified cloud or when switched off; never fails the plan."""
+    if instances_path is None:
+        return None, None
+    try:
+        from samcloud.bim.room_objects import load_room_evidence, load_room_object_settings
+
+        settings = load_room_object_settings()
+        if not settings.enabled:
+            return None, None
+        evidence = load_room_evidence(
+            instances_path, frame, units_per_metre=upm, floor_z=float(level.floor_z),
+            ceiling_z=None if level.ceiling_z is None else float(level.ceiling_z), depth_min_views=settings.depth_min_views,
+        )
+        return (evidence, settings) if evidence is not None else (None, None)
+    except Exception:  # noqa: BLE001 - optional detail
+        _LOGGER.warning("room objects unavailable; the plan keeps its furniture only", exc_info=True)
+        return None, None
+
+
+def _measure_extents(items: list[PlanFurniture], evidence: Any, settings: Any, wall_lines: list[LineString], report: dict[str, Any]) -> None:
+    """Measured bottom edges of hanging and resting furniture; never fails the plan."""
+    try:
+        from shapely import affinity
+
+        from samcloud.bim.room_objects import apply_measured_extents
+
+        scale = 1.0 / evidence.units_per_metre
+        lines = [affinity.scale(line, scale, scale, origin=(0.0, 0.0)) for line in wall_lines]
+        report["extent"] = apply_measured_extents(items, evidence, lines, settings.extent)
+    except Exception as error:  # noqa: BLE001
+        _LOGGER.warning("measured furniture extents failed; the kind rules stay", exc_info=True)
+        report["extent_error"] = f"{type(error).__name__}: {error}"
+
+
+def _window_lines(openings: list[Any]) -> list[LineString]:
+    lines = []
+    for opening in openings:
+        if str(opening.kind).lower() != "window":
+            continue
+        centre = np.asarray(opening.center, dtype=float)[:2]
+        half = 0.5 * float(opening.width) * np.asarray((math.cos(float(opening.axis_angle)), math.sin(float(opening.axis_angle))))
+        if float(opening.width) > 0.0:
+            lines.append(LineString((centre - half, centre + half)))
+    return lines
+
+
+def _add_room_objects(
+    items: list[PlanFurniture], evidence: Any, settings: Any, rooms: list[Polygon], wall_lines: list[LineString], wall_area: Any,
+    windows: list[LineString], report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Screens (appended to ``items``) and ceiling objects (returned); never fails the plan."""
+    try:
+        from samcloud.bim.room_objects import add_room_objects
+
+        objects, found = add_room_objects(
+            items, evidence, rooms=rooms, wall_lines=wall_lines, wall_area=wall_area, settings=settings, item_factory=PlanFurniture,
+            window_lines=windows,
+        )
+        report.update(found)
+        return objects
+    except Exception as error:  # noqa: BLE001
+        _LOGGER.warning("screens and ceiling objects failed; the plan is written without them", exc_info=True)
+        report["objects_error"] = f"{type(error).__name__}: {error}"
+        return []
 
 
 def build_plan_model(
@@ -994,22 +1225,39 @@ def build_plan_model(
 
         footprints = InstanceFootprints(instance_points, wall_lines, wall_union, upm, tight_settings or TightFootprintSettings())
     depth_report: dict[str, Any] = {}
+    evidence, object_settings = _load_room_objects(instances_path, frame, level, upm)
+    objects_report: dict[str, Any] = {}
     furniture = _furniture(
         layers, load_instance_z_ranges(instances_path, frame), cfg, load_instance_hulls(instances_path, frame), float(level.floor_z), upm,
         footprints=footprints, depth=depth, depth_report=depth_report,
         row_points=class_points, wall_union=wall_union, wall_lines=wall_lines, row_settings=row_settings,
+        measure_extents=None if evidence is None else (
+            lambda items: _measure_extents(items, evidence, object_settings, wall_lines, objects_report)
+        ),
     )
     _assign_back_walls(furniture, walls, upm)
     furniture = _drop_unmounted_uppers(furniture, walls, upm, float(cfg["defaults"].get("upper_cabinet_wall_max_m", 0.30)), depth_report)
-    extra = {**(source_extra or {})}
+    ceiling_objects: list[dict[str, Any]] = []
+    if evidence is not None:
+        # before the reconstruction: a screen owns its points, so they never enlarge the piece that carries it
+        # the wall bodies with their holes: ``wall_union`` above is filled, the rooms would lie inside it
+        wall_area = unary_union(bodies) if bodies else None
+        ceiling_objects = _add_room_objects(
+            furniture, evidence, object_settings, [polygon for polygon, _name in rooms], wall_lines, wall_area,
+            _window_lines(openings), objects_report,
+        )
+    recon_report = _reconstruct_furniture(furniture, frame, level, upm, instances_path)
+    extra = {**(source_extra or {}), **({"furniture_recon": recon_report} if recon_report else {})}
     if depth_report:
         extra["depth_furniture"] = depth_report
+    if objects_report:
+        extra["room_objects"] = objects_report
     return BuildingPlan(
         project_name=project_name, level_id=str(level.id), level_name=str(level.name), units_per_metre=upm,
         frame={"origin": [float(v) for v in frame.origin], "scale_factor": float(frame.scale_factor), "rotation": np.asarray(frame.rotation, dtype=float).tolist()},
         floor_z=float(level.floor_z), ceiling_z=None if level.ceiling_z is None else float(level.ceiling_z),
-        walls=walls, rooms=plan_rooms, openings=_openings(openings, walls, upm, cfg),
-        furniture=furniture,
+        walls=walls, rooms=plan_rooms, openings=_openings(openings, walls, upm, cfg, _walls_as_detected(walls, wall_pieces)),
+        furniture=furniture, ceiling_objects=ceiling_objects,
         wall_bodies=[_polygon_dict(body) for body in bodies], source={"result_fingerprint": result_fingerprint, **extra},
     )
 

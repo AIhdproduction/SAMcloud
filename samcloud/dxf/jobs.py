@@ -478,6 +478,13 @@ def run_refine_openings(
         return
     logger.info("Regenerating the clean plan with the refined openings...")
     run_clean_plan(project_dir, las_path, level_id, inner(0.6, 1.0), cancel, logger, mode=effective_mode, source=source)
+    from samcloud.bim.openings3d.pipeline import refined_openings_applied
+
+    applied, reason = refined_openings_applied(project_dir, level.id)
+    if not applied:
+        # The plan silently stays the unrefined pass 1 (2D openings) otherwise; say so loudly (a code or config change during
+        # the run makes the pass-1 snapshot stale, then the refined openings are not applied).
+        logger.warning(f"REFINED OPENINGS NOT APPLIED for level '{level.name}': the plan keeps the unrefined pass-1 openings ({reason})")
 
 
 def run_export(
@@ -569,6 +576,10 @@ def run_export(
                 cache_dir = cache_directory(las_path, lvl, settings)
             logger.info(f"Loading cached result from {cache_dir}...")
             cached_result = replace(load_cached_result(cache_dir), project_name=project_dir.name)
+            if variant == "ortho":  # furniture outlines = plan projection of the 3D reconstruction (plan_model.json beside the result)
+                from samcloud.bim.furniture_recon.dxf_outline import apply_reconstructed_outlines
+
+                cached_result = apply_reconstructed_outlines(cached_result, cache_dir)
             dest = export_plan(cached_result, temp_dir, coordinates=coordinates)
             if variant == "ortho":
                 clean_dest = dest.with_name(f"{dest.stem}_clean{dest.suffix}")
@@ -615,6 +626,17 @@ def run_export_ifc(
     logger.info(f"Exporting IFC for level '{level.name}'...")
     manifest = run_ifc_export(project_dir, level.id, progress, cancel.is_cancelled)
     logger.info(f"IFC export finished: {manifest['ifc']} (IDS failures: {manifest['ids_failures']})")
+    from samcloud.dxf.writer3d import export_level_3d_dxf
+
+    export_level_3d_dxf(project_dir, level.id, level.name, logger)  # 3D DXF of the IFC; logs a warning on failure, never raises
+    try:  # combined multi-storey IFC, only when the project has more than one level (never fatal)
+        from samcloud.bim.building_export import export_building_ifc
+
+        building = export_building_ifc(project_dir)
+        if building is not None:
+            logger.info(f"Building IFC: {building.get('ifc') or 'not written'} ({building.get('reason') or ', '.join(building.get('levels', []))})")
+    except Exception:  # noqa: BLE001 - the per-level IFC is complete without the combined file
+        logger.warning("combined building IFC could not be written", exc_info=True)
 
 
 def run_ortho(
@@ -854,7 +876,15 @@ def _run_all_steps(
         return not force and refine_openings_status(project_dir, level_id) == "fresh"
 
     def ifc_is_fresh() -> bool:
-        return not force and ifc_export_status(project_dir, level_id or "") == "fresh"
+        if force or ifc_export_status(project_dir, level_id or "") != "fresh":
+            return False
+        try:  # the IFC step also writes the 3D DXF: rerun it when that file is missing or older than the IFC
+            from samcloud.dxf.writer3d import dxf3d_is_current
+
+            level = _resolve_job_level(state, effective_mode, level_id, "IFC export")
+            return level is None or dxf3d_is_current(project_dir, level.id, level.name)
+        except Exception:  # noqa: BLE001 - freshness of the extra product never blocks the workflow
+            return True
 
     steps.extend(
         [

@@ -290,7 +290,9 @@ def attach_fine_terms(
     source_path, final_ply = Path(source_path), Path(final_ply)
     if not source_path.is_file():
         return {"enabled": False, "reason": "no fine term snapshot"}
-    config = json.loads(Path(classes_json).read_text(encoding="utf-8"))
+    from samcloud.classification.custom import upgrade_classes_config
+
+    config = upgrade_classes_config(json.loads(Path(classes_json).read_text(encoding="utf-8")))
     with np.load(source_path) as archive:
         source = {name: archive[name] for name in archive.files}
     labels = [str(label) for label in source["fine_labels"]]

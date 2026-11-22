@@ -101,20 +101,32 @@ def ifc_status(project_root: Path | str, level_key: str) -> IfcStatus:
 
 
 CATEGORY_ORDER: tuple[str, ...] = (
-    "walls", "ceilings", "floors", "doors", "windows", "furniture", "sanitary", "appliances", "builtins", "spaces", "openings", "other",
+    "walls", "ceilings", "ceiling_objects", "floors", "doors", "windows", "structure", "furniture", "sanitary", "appliances", "builtins", "spaces", "openings", "other",
 )
+CEILING_OBJECT_LAYER = "A-CLNG-OBJ"
 HIDDEN_BY_DEFAULT: tuple[str, ...] = ("spaces", "openings", "ceilings")
 
 _CLASS_CATEGORY: dict[str, str] = {
     "IfcWall": "walls", "IfcWallStandardCase": "walls", "IfcDoor": "doors", "IfcWindow": "windows",
     "IfcSpace": "spaces", "IfcOpeningElement": "openings", "IfcFurniture": "furniture",
     "IfcSanitaryTerminal": "sanitary", "IfcElectricAppliance": "appliances", "IfcSystemFurnitureElement": "builtins",
+    # lamps, TV, radiators are fixtures/equipment from the scan: shown with the appliances (no "other" leftovers)
+    "IfcLightFixture": "appliances", "IfcAudioVisualAppliance": "appliances", "IfcSpaceHeater": "appliances",
+    "IfcColumn": "structure", "IfcBeam": "structure", "IfcStair": "structure", "IfcStairFlight": "structure",
+    # only ever written for objects on the ceiling
+    "IfcSensor": "ceiling_objects", "IfcAirTerminal": "ceiling_objects", "IfcFireSuppressionTerminal": "ceiling_objects",
 }
 _CEILING_TYPES = {"ROOF", "USERDEFINED", "CEILING"}
 
 
-def category_of(ifc_class: str, predefined_type: str | None = None) -> str:
-    """Viewer category key of an IFC element (several classes/types share one checkbox)."""
+def category_of(ifc_class: str, predefined_type: str | None = None, layer: str | None = None) -> str:
+    """Viewer category key of an IFC element (several classes/types share one checkbox).
+
+    ``layer`` (``SAMcloud_Scan.Layer``) separates what hangs on the ceiling: it has its own checkbox and stays visible
+    while the ceilings themselves are hidden.
+    """
+    if layer == CEILING_OBJECT_LAYER:
+        return "ceiling_objects"
     kind = (predefined_type or "").upper()
     if ifc_class == "IfcSlab":
         return "ceilings" if kind in _CEILING_TYPES else "floors"
@@ -163,7 +175,7 @@ _OUTDOOR_CLASSES = frozenset({
 
 _INDOOR_ONLY_CLASSES = frozenset({
     "IfcSpace", "IfcDoor", "IfcWindow", "IfcOpeningElement", "IfcFurniture", "IfcSanitaryTerminal",
-    "IfcElectricAppliance", "IfcSystemFurnitureElement",
+    "IfcElectricAppliance", "IfcSystemFurnitureElement", "IfcSensor", "IfcAirTerminal", "IfcFireSuppressionTerminal",
 })
 
 
@@ -238,7 +250,11 @@ def category_index(data: dict[str, Any], outdoor: bool | None = None) -> tuple[d
             if outdoor:
                 category = outdoor_category_of(info)
             else:
-                category = category_of(str(info.get("ifc_class") or ""), info.get("predefined_type"))
+                psets = info.get("psets")
+                scan = psets.get("SAMcloud_Scan") if isinstance(psets, dict) else None
+                category = category_of(
+                    str(info.get("ifc_class") or ""), info.get("predefined_type"), scan.get("Layer") if isinstance(scan, dict) else None,
+                )
             by_node[str(guid)] = category
             counts[category] = counts.get(category, 0) + 1
     return by_node, {key: counts[key] for key in order if key in counts}

@@ -437,6 +437,55 @@ class StairElement(ElementBase):
     params: StairParams
 
 
+class ColumnParams(ParamsBase):
+    """Measured free-standing column: a rectangular or round profile extruded from ``base_z`` (absolute, m) by ``height``."""
+
+    center: Point2
+    profile: Literal["rect", "circle"] = "rect"
+    width: Positive
+    """Rectangle side along ``rotation`` (or the diameter of a round column)."""
+    depth: Positive | None = None
+    """Rectangle side across ``rotation``; ignored for a round column."""
+    rotation: Real = 0.0
+    """Direction of the ``width`` side in degrees, counter-clockwise from +x."""
+    base_z: Real = 0.0
+    height: Positive
+
+
+class BeamParams(ParamsBase):
+    """Measured beam (soffit drop): a rectangular section along ``start`` -> ``end``, underside at ``bottom_z`` (absolute, m)."""
+
+    start: Point2
+    end: Point2
+    width: Positive
+    depth: Positive
+    bottom_z: Real
+
+    @model_validator(mode="after")
+    def _validate(self) -> BeamParams:
+        if math.dist(self.start, self.end) <= MIN_WALL_LENGTH:
+            raise ValueError("beam start and end coincide")
+        return self
+
+
+class ColumnElement(ElementBase):
+    """Free-standing column (IfcColumn)."""
+
+    default_ifc_class: ClassVar[str] = "IfcColumn"
+    default_predefined_type: ClassVar[str | None] = "COLUMN"
+    kind: Literal[ElementKind.COLUMN] = ElementKind.COLUMN
+    params: ColumnParams
+
+
+class BeamElement(ElementBase):
+    """Beam (IfcBeam)."""
+
+    default_ifc_class: ClassVar[str] = "IfcBeam"
+    default_predefined_type: ClassVar[str | None] = "BEAM"
+    kind: Literal[ElementKind.BEAM] = ElementKind.BEAM
+    params: BeamParams
+
+
 class FurnitureElement(ElementBase):
     """Reserved: furniture (typed parameters follow in M10)."""
 
@@ -707,6 +756,8 @@ Element = Annotated[
     | DoorElement
     | SpaceElement
     | StairElement
+    | ColumnElement
+    | BeamElement
     | FurnitureElement
     | TerrainElement
     | BuildingElement
@@ -741,6 +792,8 @@ PARAMS_MODELS: dict[ElementKind, type[ParamsBase]] = {
     ElementKind.DOOR: DoorParams,
     ElementKind.SPACE: SpaceParams,
     ElementKind.STAIR: StairParams,
+    ElementKind.COLUMN: ColumnParams,
+    ElementKind.BEAM: BeamParams,
     ElementKind.TERRAIN: TerrainParams,
     ElementKind.BUILDING: BuildingParams,
     ElementKind.TREE: TreeParams,

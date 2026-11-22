@@ -150,6 +150,22 @@ PARAM_SCHEMAS: dict[ElementKind, tuple[ParamSpec, ...]] = {
         _typed("outline", "polygon", "m", "Explicit room outline; replaces room derivation from walls."),
         _typed("holes", "polygon_list", "m", "Holes of the explicit room outline."),
     ),
+    ElementKind.COLUMN: (
+        _typed("center", "point2", "m", "Plan centre of the column."),
+        _typed("profile", "string", "", "rect | circle."),
+        _num("width", "m", 0.05, 2.0, 0.005, "Side along the rotation (diameter of a round column)."),
+        _num("depth", "m", 0.05, 2.0, 0.005, "Side across the rotation (rectangular column)."),
+        _num("rotation", "deg", -360.0, 360.0, 0.1, "Direction of the width side."),
+        _num("base_z", "m", -1000.0, 1000.0, 0.005, "Absolute base height."),
+        _num("height", "m", 0.1, 30.0, 0.005, "Column height."),
+    ),
+    ElementKind.BEAM: (
+        _typed("start", "point2", "m", "Axis start (on a support)."),
+        _typed("end", "point2", "m", "Axis end (on a support)."),
+        _num("width", "m", 0.05, 2.0, 0.005, "Beam width."),
+        _num("depth", "m", 0.02, 2.0, 0.005, "Depth below the ceiling."),
+        _num("bottom_z", "m", -1000.0, 1000.0, 0.005, "Absolute underside height."),
+    ),
     ElementKind.STAIR: (
         _typed("start", "point2", "m", "Plan point at the foot of the first riser, centred."),
         _num(

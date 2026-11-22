@@ -4,7 +4,7 @@ Output folder: ``<project>/products/bim/<level_key>/``
 
 * ``<project_name>_<level_key>.ifc``
 * ``qa.json`` / ``qa.html`` (the validation chain of ``samcloud.bim.core.qa`` plus SAMcloud checks:
-  wall overlap after joins, ceiling-vs-wall overlap, consistency with plan_model.json)
+  wall overlap after joins, ceiling-vs-wall overlap, lintel and jambs flush with their wall, consistency with plan_model.json)
 * ``<stem>.validation.json|html`` and ``<stem>.ids.html`` (the raw validation reports)
 """
 
@@ -28,6 +28,7 @@ from samcloud.bim.core.ifc import write_ifc
 from samcloud.bim.core.model import ElementKind
 from samcloud.bim.core.qa.validate import validate_ifc
 from samcloud.bim.invariants import plan_violations
+from samcloud.bim.opening_flush import check_opening_flush
 from samcloud.bim.plan_model import BuildingPlan, load_plan_model
 from samcloud.bim.scene_builder import build_scene
 
@@ -157,6 +158,12 @@ def _consistency(plan: BuildingPlan, scene: Any, counts: dict[str, int]) -> dict
         "windows": {"plan_with_host": sum(1 for o in plan.openings if o.kind == "window" and o.host_wall_id), "plan_total": sum(1 for o in plan.openings if o.kind == "window"), "ifc": windows},
         "openings": {"plan_with_host": openings_with_host, "plan_total": len(plan.openings), "ifc_opening_elements": counts.get("IfcOpeningElement", 0)},
         "furniture": {"plan": len(plan.furniture), "ifc": kinds.get(ElementKind.FURNITURE, 0) and build.get("furniture_out", 0)},
+        # written as scanned elements with the IFC class of their type, counted on their own
+        "ceiling_objects": {"plan": len(plan.ceiling_objects), "ifc": int(scene.derived.get("samcloud_ceiling_objects", 0))},
+        # measured structure: own element kinds, never counted as furniture
+        "columns": {"plan": len(plan.columns), "ifc": counts.get("IfcColumn", 0)},
+        "beams": {"plan": len(plan.beams), "ifc": counts.get("IfcBeam", 0)},
+        "stairs": {"plan": len(plan.stairs), "ifc": counts.get("IfcStair", 0)},
         "room_area_m2": {"plan": round(build.get("room_area_plan_m2", 0.0), 3), "ifc": round(build.get("room_area_scene_m2", 0.0), 3)},
     }
 
@@ -211,6 +218,24 @@ def check_openings_consistency(
     return {"plan": plan_counts, "ifc": ifc_counts, "ok": not errors, "errors": errors}
 
 
+def _solid_wall_union(geometry: Any) -> Any:
+    """Plan union of what reaches the wall tops: the footprints without the voids that are open up to the top (passages)."""
+    from shapely.ops import unary_union
+
+    solids = []
+    for key, wall in geometry.walls.items():
+        solid = Polygon(wall.footprint)
+        for opening in geometry.openings.values():
+            if opening.host_wall_id != key or opening.z_max < wall.top_z - 1e-3:
+                continue
+            right, left = wall.offset_right - 1e-3, wall.offset_left + 1e-3
+            solid = solid.difference(Polygon([
+                wall.point(opening.s_min, right), wall.point(opening.s_max, right), wall.point(opening.s_max, left), wall.point(opening.s_min, left),
+            ]))
+        solids.append(solid)
+    return unary_union(solids) if solids else Polygon()
+
+
 def _qa_payload(
     plan: BuildingPlan, scene: Any, export: Any, report: Any, started: float, ifc_path: Path | str | None = None
 ) -> dict[str, Any]:
@@ -225,9 +250,7 @@ def _qa_payload(
     # overlap of one ceiling with the union of walls (several small overlaps add up)
     union_overlap = 0.0
     if wall_union:
-        from shapely.ops import unary_union
-
-        merged = unary_union(wall_union)
+        merged = _solid_wall_union(geometry)
         for ceiling in geometry.ceilings.values():
             union_overlap = max(union_overlap, float(Polygon(ceiling.outline).intersection(merged).area))
     build = dict(scene.derived.get("samcloud_build", {}))
@@ -236,14 +259,23 @@ def _qa_payload(
     consistency = _consistency(plan, scene, counts)
     consistency["furniture"]["ifc"] = counts.get("IfcFurniture", 0) + sum(
         counts.get(name, 0)
-        for name in ("IfcElectricAppliance", "IfcSanitaryTerminal", "IfcAudioVisualAppliance", "IfcLightFixture", "IfcSpaceHeater", "IfcBuildingElementProxy")
-    )
+        for name in (
+            "IfcElectricAppliance", "IfcSanitaryTerminal", "IfcAudioVisualAppliance", "IfcLightFixture", "IfcSpaceHeater",
+            "IfcBuildingElementProxy", "IfcSensor", "IfcAirTerminal", "IfcFireSuppressionTerminal",
+        )
+    ) - consistency["ceiling_objects"]["ifc"]
+    ceiling_text = f"{consistency['ceiling_objects']['ifc']} ceiling objects, " if plan.ceiling_objects else ""
     opening_check = check_openings_consistency(plan, ifc_path or export.path, build.get("skipped_openings", []))
     for error in opening_check["errors"]:
         warnings.append(f"openings_consistency: {error['kind']} {error['id']}: {error['reason']}")
     door_invariants = plan_violations(plan)
     for item in door_invariants:
         warnings.append(f"door_invariants: {item['rule']} {item['opening']}: {item['reason']}")
+    flush = check_opening_flush(plan, scene, geometry)
+    for item in flush["steps"]:
+        warnings.append(f"opening_flush: {item['kind']} {item['opening']}: {item['where']} step {1000.0 * item['step_m']:.0f} mm")
+    for item in flush["blocked_spans"]:
+        warnings.append(f"opening_span: {item['kind']} {item['opening']}: crossing wall {item['wall']} covers {1000.0 * item['overlap_m']:.0f} mm of its width")
     area_check = check_room_areas(build)
     for error in area_check["errors"]:
         warnings.append(f"room_areas: {error['room']} {error['name']}: plan {error['plan_m2']} m2 vs IFC {error['ifc_m2']} m2")
@@ -251,14 +283,16 @@ def _qa_payload(
     reimport_ok = report.reimport_checked and not report.reimport_mismatches
     overlaps = build.get("wall_overlaps", [])
     summary = (
-        f"IFC4 {'OK' if report.ok and not overlaps and area_check['ok'] else 'with findings'}: "
+        f"IFC4 {'OK' if report.ok and not overlaps and area_check['ok'] and flush['ok'] else 'with findings'}: "
         f"{counts.get('IfcWall', 0)} walls, {counts.get('IfcSpace', 0)} spaces, "
         f"{counts.get('IfcDoor', 0)} doors, {counts.get('IfcWindow', 0)} windows, "
-        f"{consistency['furniture']['ifc']} furniture items; "
+        f"{consistency['furniture']['ifc']} furniture items, {ceiling_text}"
+        f"{counts.get('IfcColumn', 0)} columns, {counts.get('IfcBeam', 0)} beams, {counts.get('IfcStair', 0)} stairs; "
         f"IDS failures {ids_n}, EXPRESS findings {express_n}, re-import {'ok' if reimport_ok else 'MISMATCH'}, "
         f"wall overlaps {len(overlaps)}, ceiling-wall overlap {union_overlap:.6f} m2, "
         f"openings plan-vs-IFC {'consistent' if opening_check['ok'] else str(len(opening_check['errors'])) + ' ERRORS'}, "
-        f"room areas plan-vs-IFC {'consistent' if area_check['ok'] else str(len(area_check['errors'])) + ' MISMATCHES'}."
+        f"room areas plan-vs-IFC {'consistent' if area_check['ok'] else str(len(area_check['errors'])) + ' MISMATCHES'}, "
+        f"opening steps {len(flush['steps'])}."
     )
     return {
         "ids_failures": ids_n,
@@ -277,6 +311,7 @@ def _qa_payload(
         "consistency": consistency,
         "openings_consistency": opening_check,
         "room_area_check": area_check,
+        "opening_flush": flush,
         "door_invariants": {"ok": not door_invariants, "violations": door_invariants},
         "openings_consistency_errors": opening_check["errors"],
         "ids_failure_details": [failure.to_dict() for failure in report.ids_failures[:100]],
@@ -307,6 +342,7 @@ def _qa_html(qa: dict[str, Any]) -> str:
             ("Re-import", "ok" if qa["reimport_ok"] else "mismatch"),
             ("Wall overlaps > 5 % (after joins)", qa["wall_overlap_count"]),
             ("Largest ceiling/wall overlap (m2)", f"{qa['ceiling_wall_overlap_max_m2']:.6f}"),
+            ("Openings not flush with their wall (> 5 mm)", len(qa["opening_flush"]["steps"])),
             ("Openings plan vs IFC", "consistent" if qa["openings_consistency"]["ok"] else f"{len(qa['openings_consistency']['errors'])} errors"),
             ("Georeferenced", "no" if qa["unreferenced"] else "yes"),
             ("Runtime (s)", qa["runtime_s"]),
@@ -324,6 +360,8 @@ def _qa_html(qa: dict[str, Any]) -> str:
         "<h2>Scene build</h2>",
         table(sorted(qa["build"].items())),
     ]
+    if qa["opening_flush"]["steps"]:
+        parts.append("<h2>Steps at openings</h2><ul>" + "".join(f"<li>{esc(json.dumps(item))}</li>" for item in qa["opening_flush"]["steps"]) + "</ul>")
     for title, key in (("Opening consistency errors", "openings_consistency_errors"), ("Wall overlaps", "wall_overlaps"), ("IDS failures", "ids_failure_details"), ("EXPRESS findings", "express_finding_details"), ("Re-import mismatches", "reimport_mismatches")):
         if qa[key]:
             parts.append(f"<h2>{title}</h2><ul>" + "".join(f"<li>{esc(json.dumps(item, ensure_ascii=False))}</li>" for item in qa[key]) + "</ul>")

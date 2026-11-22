@@ -255,7 +255,14 @@ def test_classes_json_fine_terms_are_queries() -> None:
         for term in ([group] if isinstance(group, str) else group)
     }
     fine = CONFIG["fine_terms"]["indoor"]
-    assert len(fine) == 36
+    assert fine[:36] == [  # persisted fine_term values follow this order: new terms are only ever appended
+        "sofa", "couch", "armchair", "bed", "nightstand", "table", "coffee table", "dining table", "desk", "chair",
+        "wardrobe", "chest of drawers", "shelf", "bookcase", "sideboard", "tv stand", "television", "cat tree", "plant",
+        "floor lamp", "cushion", "pillow", "blanket", "mattress", "clothes", "refrigerator", "washing machine",
+        "kitchen counter", "kitchen cabinet", "stove", "kitchen sink", "toilet", "washbasin", "bathtub", "shower tray",
+        "radiator",
+    ]
+    assert len(fine) == len(set(fine)) > 36
     for term in [*fine, *CONFIG["fine_aliases"]]:
         assert term in indoor_terms, f"fine term '{term}' is not a SAM query"
     for alias, label in CONFIG["fine_aliases"].items():

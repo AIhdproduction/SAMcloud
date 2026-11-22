@@ -27,6 +27,9 @@ EXPECTED_SPECIFICATIONS = [
     "IfcLightFixture",
     "IfcSpaceHeater",
     "IfcBuildingElementProxy",
+    "IfcSensor",
+    "IfcAirTerminal",
+    "IfcFireSuppressionTerminal",
     "IfcBuildingStorey",
 ]
 

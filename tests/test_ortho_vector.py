@@ -1475,7 +1475,7 @@ def test_all_fine_labels_have_german_names() -> None:
     terms = list(config["fine_terms"]["indoor"])
     aliases = dict(config["fine_aliases"])
     canonical = sorted({aliases.get(term, term) for term in terms})
-    assert len(canonical) == 34
+    assert len(canonical) == 43  # 34 + screens and ceiling fixtures
     english_leaks = {"chest of drawers", "dining table", "bookcase", "couch", "mattress", "kitchen counter", "kitchen cabinet", "stove", "kitchen sink", "toilet", "washbasin", "bathtub", "shower tray"}
     for label in terms:  # aliases included
         name = _furniture_display_name(label, {})

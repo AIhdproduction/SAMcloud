@@ -51,6 +51,9 @@ FURNITURE_CLASSES: tuple[tuple[str, str], ...] = (
     ("IfcLightFixture", "IFCLIGHTFIXTURE"),
     ("IfcSpaceHeater", "IFCSPACEHEATER"),
     ("IfcBuildingElementProxy", "IFCBUILDINGELEMENTPROXY"),
+    ("IfcSensor", "IFCSENSOR"),
+    ("IfcAirTerminal", "IFCAIRTERMINAL"),
+    ("IfcFireSuppressionTerminal", "IFCFIRESUPPRESSIONTERMINAL"),
 )
 
 PropertyTable = dict[str, dict[str, str | None]]

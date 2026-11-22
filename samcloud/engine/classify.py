@@ -11,6 +11,7 @@ if not __package__:  # run as a plain script by pipeline.py
     _repo_root = str(Path(__file__).resolve().parents[2])
     if _repo_root not in sys.path:
         sys.path.insert(0, _repo_root)
+from samcloud.classification.custom import upgrade_classes_config
 from samcloud.classification.profiles import NEVER_CLASSIFIED_ID
 
 if __package__:
@@ -18,13 +19,19 @@ if __package__:
     from .fine_terms import build_fine_vocabulary, mask_removed_class_votes, resolve_fine_terms
     from .ply_io import read_fused_points, read_vis_file, write_classified_ply
     from .sam_labeler import HeadFusionLabeler, SemanticLabeler
-    from .instances import associate_instances, tag_point_mask, write_instance_product
+    from .instances import (
+        associate_instances, recorded_prompt_indices, secondary_prompt_indices, tag_point_mask, write_instance_product,
+    )
+    from .screen_masks import FILE_NAME as SCREEN_MASKS_NAME, invalidate_screen_masks, view_record, write_screen_masks
 else:
     from colmap_model import load_model
     from fine_terms import build_fine_vocabulary, mask_removed_class_votes, resolve_fine_terms
     from ply_io import read_fused_points, read_vis_file, write_classified_ply
     from sam_labeler import HeadFusionLabeler, SemanticLabeler
-    from instances import associate_instances, tag_point_mask, write_instance_product
+    from instances import (
+        associate_instances, recorded_prompt_indices, secondary_prompt_indices, tag_point_mask, write_instance_product,
+    )
+    from screen_masks import FILE_NAME as SCREEN_MASKS_NAME, invalidate_screen_masks, view_record, write_screen_masks
 
 
 def mvs_image_order(sparse_dir, image_ids=None):
@@ -501,6 +508,27 @@ def make_point_labeler(args, class_names, unknown_id, prompts=None, fine_vocabul
     )
 
 
+def save_screen_masks(path: Path, views: list[dict], xyz, error: Exception | None) -> None:
+    """Optional product: a failure is one warning line, the classification continues and no older product is used."""
+    if error is None and views:
+        try:
+            write_screen_masks(path, views, xyz)
+            count = sum(len(view["masks"]) for view in views)
+            print(f"      Screen masks: {count:,} outlines of {len(views):,} views ({path.stat().st_size / 1024:.0f} KiB)")
+            return
+        except Exception as failure:  # noqa: BLE001 - scores and summary still have to be written
+            error = failure
+    note = ""
+    try:
+        invalidate_screen_masks(path)
+    except Exception as failure:  # noqa: BLE001
+        error = error or failure
+        note = f"; {path.name} of an earlier run could not be invalidated"
+    if error is not None:
+        reason = " ".join(f"{type(error).__name__}: {error}".split())
+        print(f"WARNING: Screen masks were not saved, continuing without them ({reason}){note}")
+
+
 def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, unknown_id, progress_path,
                      prompts=None, suppress_names=None, suppress_prompts=None,
                      mirror_names=None, mirror_prompts=None, protected_names=None, protected_prompts=None,
@@ -553,6 +581,15 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
             if value_index == 0:
                 generic_prompt_ids.add(len(flat_prompts))
             flat_prompts.append(str(value))
+    if instances_enabled:
+        instance_params["secondary_prompt_ids"] = sorted(secondary_prompt_indices(
+            fine_config, getattr(args, "class_set", None), class_names, prompt_entries,
+        ))
+        instance_params["record_prompt_ids"] = sorted(recorded_prompt_indices(
+            getattr(args, "class_set", None), flat_prompts, instance_params["secondary_prompt_ids"],
+        ))
+    mask_views: list[dict] = []
+    mask_error: Exception | None = None
     instance_point_rows, instance_vinst_rows = [], []
     instance_classes_meta, instance_conf_meta, instance_prompt_meta, instance_view_meta = [], [], [], []
     fine_scores = fine_counts = None
@@ -631,6 +668,18 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                 point_probs = labeler.score_points(image_path, ui, vi, image=image_pixels, **fine_kwargs, **instance_kwargs)
                 protected_clutter[sel_points] |= replace_mirror_point_winners(point_probs, mirror_ids, protected_ids)
             if instance_out is not None:
+                if mask_error is None:
+                    try:
+                        if "record_error" in instance_out:
+                            mask_error = instance_out["record_error"]
+                        elif "recorded_masks" in instance_out:  # every judged view, also one without a screen: it saw none there
+                            mask_views.append(view_record(
+                                image, cameras[image.camera_id], width, height, instance_out["recorded_masks"], flat_prompts,
+                            ))
+                    except Exception as error:  # noqa: BLE001 - optional product
+                        mask_error = error
+                    if mask_error is not None:
+                        mask_views.clear()  # a part of the views would misjudge what the others saw
                 local_ids = np.asarray(instance_out.get("point_local_instance", ()), dtype=np.int32)
                 local_meta = list(instance_out.get("instances", ()))
                 if len(local_ids) == len(sel_points) and local_meta:
@@ -640,10 +689,15 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
                         instance_conf_meta.append(float(item["conf"]))
                         instance_prompt_meta.append(int(item["prompt_idx"]))
                         instance_view_meta.append(int(processed - 1))
-                    valid_instance = (local_ids >= 0) & (point_probs.max(axis=1) >= args.background_threshold)
-                    if np.any(valid_instance):
-                        instance_point_rows.append(sel_points[valid_instance].astype(np.int32, copy=False))
-                        instance_vinst_rows.append((base + local_ids[valid_instance]).astype(np.int32, copy=False))
+                    confident = point_probs.max(axis=1) >= args.background_threshold
+                    for winners in (local_ids, instance_out.get("point_secondary_instance")):
+                        if winners is None:
+                            continue
+                        winners = np.asarray(winners, dtype=np.int32)
+                        valid_instance = (winners >= 0) & confident
+                        if np.any(valid_instance):
+                            instance_point_rows.append(sel_points[valid_instance].astype(np.int32, copy=False))
+                            instance_vinst_rows.append((base + winners[valid_instance]).astype(np.int32, copy=False))
             for threshold, (scores, view_counts, seen_counts) in vote_states.items():
                 accumulate_weighted_votes(scores, view_counts, sel_points, point_probs, threshold, seen_counts)
             if fine_size:  # same weighted vote and threshold, only for terms whose class kept its vote in this view
@@ -689,6 +743,7 @@ def run_segearth_ov3(args, xyz, rgb, cameras, images, image_items, class_names, 
             write_instance_product(destination, instance_id, instance_metadata,
                                    bool(instance_params.get("debug_ply", False)))
             print(f"      Instances: {len(instance_metadata):,} objects, {int(np.count_nonzero(instance_id)):,} points")
+            save_screen_masks(destination.with_name(SCREEN_MASKS_NAME), mask_views, xyz, mask_error)
         threshold_summary[f"{threshold:.2f}"] = {
             "class_counts": _class_counts(final_class, class_names),
             "unknown_points": int((final_class == unknown_id).sum()),
@@ -804,7 +859,7 @@ def main():
     dense_dir = Path(args.dense_dir)
     model_dir = Path(args.model_dir) if args.model_dir else dense_dir / "sparse"
     with open(args.classes_json, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+        cfg = upgrade_classes_config(json.load(f))  # a project's own classes.json also gets the prompts added later
     class_names = cfg[args.class_set]
     if args.engine == "flurseg":
         from samcloud.classification.profiles import flurseg_profile

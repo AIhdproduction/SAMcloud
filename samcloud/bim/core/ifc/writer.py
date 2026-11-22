@@ -28,6 +28,7 @@ from samcloud.bim.core.ifc.scan import write_furniture, write_project_frame
 from samcloud.bim.core.ifc.spaces import write_space_boundaries, write_spaces
 from samcloud.bim.core.ifc.spatial import create_project, create_spatial_tree
 from samcloud.bim.core.ifc.stairs import write_stairs
+from samcloud.bim.core.ifc.structure import write_structure
 from samcloud.bim.core.model import ElementKind, Scene
 
 SUPPORTED_KINDS = frozenset(
@@ -53,6 +54,8 @@ SUPPORTED_KINDS = frozenset(
         ElementKind.MARKING,
         ElementKind.MANHOLE,
         ElementKind.VEGETATION_AREA,
+        ElementKind.COLUMN,
+        ElementKind.BEAM,
     }
 )
 """Kinds the M1 writer exports; reserved kinds are skipped with a warning."""
@@ -141,6 +144,7 @@ def write_ifc(
     write_slabs(ctx)
     write_ceilings(ctx)
     write_stairs(ctx)
+    write_structure(ctx)
     write_openings(ctx)
     write_fillings(ctx)
     write_outdoor(ctx)

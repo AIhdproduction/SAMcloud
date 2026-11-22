@@ -38,6 +38,7 @@ class FrameFeatures:
     blocked_fraction: float = 0.0  # share of the opening cells holding non-structural (furniture) points
     wall_fraction: float = 0.0  # share of the opening cells holding wall-class points
     side_wall_cov: dict[str, float] = field(default_factory=dict)  # wall-class row coverage of the wall next to each edge
+    floor_fraction: float = 0.0  # share of the opening columns holding points in the floor rows (the floor runs through a doorway)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -148,6 +149,11 @@ def measure_opening(grids: dict[str, np.ndarray], u0: float, u1: float, ceiling_
     for name, edge, side in (("left", u0, -1), ("right", u1, 1)):
         near, far = edge + side * float(cfg.side_from_m), edge + side * float(cfg.side_to_m)
         features.side_wall_cov[name] = round(_row_coverage(grids["wall"], _cols(min(near, far), max(near, far), cell, nu), side_rows, int(cfg.side_min_points)), 3)
+    # A doorway shows the floor running through the wall band; furniture standing in front of the wall hides the floor there.
+    floor_rows = getattr(cfg, "floor_rows_m", None) or (0.0, 0.10)
+    floor_sub = anyg[_rows(float(floor_rows[0]), float(floor_rows[1]), cell, nv), inner_cols]
+    if floor_sub.size:
+        features.floor_fraction = round(float((floor_sub.sum(0) >= 1).mean()), 3)
     anyc, wallc, otherc = (grids[name][cells] for name in ("any", "wall", "other"))
     features.door_fraction = round(door_fraction, 3)
     if anyc.size:
