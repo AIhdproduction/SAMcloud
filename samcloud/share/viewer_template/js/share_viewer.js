@@ -141,17 +141,14 @@
         return !(startPitch < 0 && pivot.z >= v.position.z);
       };
       for (const candidate of candidates) {
-        const pivot = candidate();
-        if (!usable(pivot)) continue;
-        const distance = pivot.distanceTo(v.position);
-        const toPivot = pivot.clone().sub(v.position);
-        if (v.direction.clone().dot(toPivot) / distance < 0.985) {
-          const yaw = v.yaw, pitch = v.pitch;
-          v.lookAt(pivot);  // more than ~10 degrees off the view axis
-          if (startPitch < 0 && v.pitch > 0.2) { v.yaw = yaw; v.pitch = pitch; continue; }
-        }
-        v.radius = distance;
-        v.position.copy(pivot).sub(v.direction.clone().multiplyScalar(distance));
+        const picked = candidate();
+        if (!usable(picked)) continue;
+        /* The camera never turns here (a lookAt after a pan snapped the view back to the data centre): the pivot is
+           the point of the data projected onto the current view axis, at the real depth of the data. */
+        const depth = v.direction.clone().dot(picked.clone().sub(v.position));
+        if (!(depth > 0.05)) continue;
+        const pivot = v.position.clone().add(v.direction.clone().multiplyScalar(depth));
+        v.radius = depth;
         return pivot;
       }
       return v.getPivot();
@@ -179,7 +176,12 @@
           state.span = (state.span || v.radius) * factor;
         }
       }
+      const beforePan = v.position.clone();
       v.pan(-(current.cx - previous.cx) * scale, (current.cy - previous.cy) * scale);
+      /* the pan moves the pivot and the anchor with the camera: a following one-finger orbit must start HERE */
+      const moved = v.position.clone().sub(beforePan);
+      if (state.anchor) state.anchor.add(moved);
+      state.pivot = livePivot();
     };
     const doubleTap = (x, y) => {
       const rect = area.getBoundingClientRect();
@@ -205,6 +207,7 @@
       stopMotion();
       if (onTouch) onTouch();
       state.points = read(event);
+      state.residual = false;
       const centre = info(state.points);
       state.pivot = determinePivot(centre.cx, centre.cy);  // from the data, not from a possibly meaningless radius
       state.span = view().position.distanceTo(state.pivot);
@@ -217,6 +220,7 @@
       const current = read(event);
       const previous = state.points;
       state.points = current;
+      if (state.residual) return;  // remaining finger of a two-finger gesture: no accidental orbit around a stale pivot
       if (!previous || previous.length !== current.length || !current.length) return;
       if (current.length === 1) {
         const dx = current[0].x - previous[0].x;
@@ -232,6 +236,7 @@
       const touch = event.changedTouches && event.changedTouches[0];
       const isTap = event.type === "touchend" && touch && event.touches.length === 0 && state.moved < 10
         && Date.now() - state.startTime < 350;
+      state.residual = event.touches.length > 0 && (state.residual || (!!state.points && state.points.length > 1));
       state.points = event.touches.length ? read(event) : null;
       if (!isTap) return;
       const now = Date.now();

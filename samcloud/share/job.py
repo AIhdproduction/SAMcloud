@@ -13,27 +13,45 @@ import secrets
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from samcloud.share import export
 from samcloud.share.export import ShareCancelled
+from samcloud.share import project as project_share
 from samcloud.share.providers import ProviderError, ShareProvider, get_provider
 from samcloud.share.qr import make_qr
 
 LOGGER = logging.getLogger(__name__)
 
-PROGRESS_RELATIVE = Path("reports") / "share_progress.json"
-SHARE_RELATIVE = Path("products") / "share"
-PHASES: list[tuple[str, str, float]] = [
+_POINTCLOUD_PHASES: list[tuple[str, str, float]] = [
     ("prepare", "Vorbereiten", 0.15),
     ("octree", "Octree bauen", 0.45),
     ("assemble", "Viewer zusammenstellen", 0.05),
     ("upload", "Hochladen", 0.30),
     ("qr", "QR erzeugen", 0.05),
 ]
+_PROJECT_PHASES: list[tuple[str, str, float]] = [
+    ("prepare", "Vorbereiten", 0.12), ("octree", "Octree bauen", 0.40), ("dxf", "DXF aufbereiten", 0.10),
+    ("ifc", "IFC aufbereiten", 0.05), ("assemble", "Viewer zusammenstellen", 0.03),
+    ("upload", "Hochladen", 0.25), ("qr", "QR erzeugen", 0.05),
+]
 _ACTIVE_STATES = {"running"}
+
+
+@dataclass(frozen=True)
+class ShareKind:
+    """The storage and package rules of one independently shareable product."""
+
+    name: str
+    key: str
+    progress_relative: Path
+    output_relative: Path
+    phases: list[tuple[str, str, float]]
+    available: Callable[[Path, dict[str, Any] | None], bool]
+    build: Callable[..., dict[str, Any]]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -50,18 +68,46 @@ def share_available(project_dir: Path | str, project: dict[str, Any] | None = No
     return (directory / "products" / "classified" / "classified.ply").is_file()
 
 
-def get_share(project_dir: Path | str, project: dict[str, Any] | None = None) -> dict[str, Any] | None:
+def _build_pointcloud_package(project_dir: Path, package_dir: Path, *, config: dict[str, Any],
+                              progress_for_phase: Callable[[int], Callable[[float, str], None]], check: Callable[[], None],
+                              max_points: int, converter: Path | None = None) -> dict[str, Any]:
+    """The original point-cloud pipeline, retained as the default share kind."""
+    points, original = export.prepare_points(project_dir, max_points, progress_for_phase(0), check)
+    check()
+    metadata = export.build_octree(
+        points, package_dir.parent / "work", package_dir / export.OCTREE_DIRECTORY, progress_for_phase(1), check,
+        encoding=str(config.get("octree_encoding", "BROTLI")), converter=converter)
+    legend = export.assemble_package(project_dir, package_dir, points=points, original_points=original,
+                                     metadata=metadata, progress=progress_for_phase(2))
+    problems = export.scan_package(package_dir)
+    if problems:
+        raise RuntimeError("Datenschutzprüfung fehlgeschlagen: " + "; ".join(problems[:5]))
+    return {"points": int(legend["points"])}
+
+
+POINTCLOUD = ShareKind("pointcloud", "share", Path("reports") / "share_progress.json", Path("products") / "share",
+                       _POINTCLOUD_PHASES, share_available, _build_pointcloud_package)
+PROJECT = ShareKind("project", "project_share", Path("reports") / "project_share_progress.json", Path("products") / "share" / "project",
+                    _PROJECT_PHASES, project_share.project_share_available, project_share.build_project_package)
+
+# Backward-compatible aliases for existing imports and point-cloud tests.
+PROGRESS_RELATIVE = POINTCLOUD.progress_relative
+SHARE_RELATIVE = POINTCLOUD.output_relative
+PHASES = POINTCLOUD.phases
+
+
+def get_share(project_dir: Path | str, project: dict[str, Any] | None = None, *, kind: ShareKind = POINTCLOUD) -> dict[str, Any] | None:
     """The stored ``share:`` block of the project (url, share_id, ...) or ``None``."""
     if project is None:
         project = export._load_project(Path(project_dir))
-    block = project.get("share")
+    block = project.get(kind.key)
     return dict(block) if isinstance(block, dict) and block.get("url") else None
 
 
-def read_progress(project_dir: Path | str) -> dict[str, Any]:
+def read_progress(project_dir: Path | str, *, kind: ShareKind = POINTCLOUD) -> dict[str, Any]:
     """Current progress document (``{"state": "idle"}`` when there is none)."""
     try:
-        data = json.loads((Path(project_dir) / PROGRESS_RELATIVE).read_text(encoding="utf-8"))
+        data = json.loads((Path(project_dir) / kind.progress_relative).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {"state": "idle", "percent": 0.0}
     return data if isinstance(data, dict) else {"state": "idle", "percent": 0.0}
@@ -70,11 +116,12 @@ def read_progress(project_dir: Path | str) -> dict[str, Any]:
 class _ProgressWriter:
     """Writes the progress document atomically; thread safe."""
 
-    def __init__(self, project_dir: Path) -> None:
-        self.path = project_dir / PROGRESS_RELATIVE
+    def __init__(self, project_dir: Path, kind: ShareKind = POINTCLOUD) -> None:
+        self.kind = kind
+        self.path = project_dir / kind.progress_relative
         self.lock = threading.Lock()
         self.doc: dict[str, Any] = {
-            "state": "running", "phase": "", "phase_index": -1, "phases": [label for _k, label, _w in PHASES],
+            "state": "running", "phase": "", "phase_index": -1, "phases": [label for _k, label, _w in kind.phases],
             "phases_done": [], "percent": 0.0, "message": "", "error": None, "result": None,
             "started_at": time.time(), "finished_at": None,
         }
@@ -95,9 +142,9 @@ class _ProgressWriter:
                     time.sleep(0.025)
 
     def phase(self, index: int) -> Any:
-        key, label, _weight = PHASES[index]
-        base = sum(weight for _k, _l, weight in PHASES[:index])
-        weight = PHASES[index][2]
+        key, label, _weight = self.kind.phases[index]
+        base = sum(weight for _k, _l, weight in self.kind.phases[:index])
+        weight = self.kind.phases[index][2]
         with self.lock:
             done = list(self.doc["phases_done"])
         if key not in done:
@@ -115,9 +162,9 @@ class _ProgressWriter:
 # job
 # ------------------------------------------------------------------------------------------------
 
-def _remove_below(project_dir: Path, path: Path) -> None:
+def _remove_below(project_dir: Path, path: Path, kind: ShareKind = POINTCLOUD) -> None:
     """Remove ``path`` when it lies below ``<project>/products/share`` (own staging data only)."""
-    root = (project_dir / SHARE_RELATIVE).resolve()
+    root = (project_dir / kind.output_relative).resolve()
     resolved = path.resolve()
     if resolved != root and root in resolved.parents and resolved.exists():
         shutil.rmtree(resolved, ignore_errors=True)
@@ -128,15 +175,16 @@ class ShareJob:
 
     def __init__(self, project_dir: Path | str, *, config: dict[str, Any] | None = None,
                  provider: ShareProvider | None = None, max_points: int | None = None,
-                 project_manager: Any | None = None, converter: Path | None = None) -> None:
+                 project_manager: Any | None = None, converter: Path | None = None, kind: ShareKind = POINTCLOUD) -> None:
         self.project_dir = Path(project_dir).resolve()
         self.config = config if config is not None else export.load_share_config()
         self.provider = provider
         self.max_points = int(max_points or self.config.get("max_points") or export.DEFAULT_MAX_POINTS)
         self.converter = converter
+        self.kind = kind
         self._project_manager = project_manager
         self.cancel_event = threading.Event()
-        self.progress = _ProgressWriter(self.project_dir)
+        self.progress = _ProgressWriter(self.project_dir, kind)
         self.thread: threading.Thread | None = None
 
     # control ------------------------------------------------------------------------------------
@@ -161,39 +209,32 @@ class ShareJob:
     # execution ----------------------------------------------------------------------------------
     def run(self) -> dict[str, Any] | None:
         """Execute all phases; never raises. Returns the stored share block on success."""
-        share_root = self.project_dir / SHARE_RELATIVE
+        share_root = self.project_dir / self.kind.output_relative
         package_dir = share_root / "package"
         work_dir = share_root / "work"
         share_id: str | None = None
         provider = self.provider
         try:
             self.progress.update(state="running", started_at=time.time(), error=None, result=None, phases_done=[])
-            if not share_available(self.project_dir):
-                raise RuntimeError("Verfügbar nach Schritt 6: die klassifizierte Punktwolke fehlt.")
+            if not self.kind.available(self.project_dir, None):
+                raise RuntimeError(
+                    "Verfügbar nach dem DXF/IFC-Export: Punktwolke, DXF und IFC-Modell müssen vorhanden sein."
+                    if self.kind.name == PROJECT.name else "Verfügbar nach Schritt 6: die klassifizierte Punktwolke fehlt.")
             provider = provider or get_provider(self.config, self.project_dir)
             self._drop_previous_share()
             for stale in (package_dir, work_dir):
-                _remove_below(self.project_dir, stale)
+                _remove_below(self.project_dir, stale, self.kind)
 
-            report = self.progress.phase(0)
-            points, original = export.prepare_points(self.project_dir, self.max_points, report, self.check)
-            self.check()
+            metadata = self.kind.build(self.project_dir, package_dir, config=self.config, progress_for_phase=self.progress.phase,
+                                       check=self.check, max_points=self.max_points, converter=self.converter)
 
-            report = self.progress.phase(1)
-            metadata = export.build_octree(
-                points, work_dir, package_dir / export.OCTREE_DIRECTORY, report, self.check,
-                encoding=str(self.config.get("octree_encoding", "BROTLI")), converter=self.converter)
-
-            report = self.progress.phase(2)
-            legend = export.assemble_package(self.project_dir, package_dir, points=points, original_points=original,
-                                             metadata=metadata, progress=report)
             problems = export.scan_package(package_dir)
             if problems:
                 raise RuntimeError("Datenschutzprüfung fehlgeschlagen: " + "; ".join(problems[:5]))
             size_mb = round(export.package_size_mb(package_dir), 2)
             self.check()
 
-            report = self.progress.phase(3)
+            report = self.progress.phase(len(self.kind.phases) - 2)
             share_id = secrets.token_urlsafe(16)
             if provider.expiry_days:
                 try:
@@ -203,20 +244,23 @@ class ShareJob:
 
             def upload_progress(done: int, total: int) -> None:
                 self.check()
-                report(done / total if total else 1.0, f"Hochladen {done / 1e6:.1f} / {total / 1e6:.1f} MB")
+                report(done / total if total else 1.0, f"{done / 1e6:.1f} / {total / 1e6:.1f} MB")
 
             url = provider.upload(package_dir, share_id, upload_progress)
             self.check()
 
-            report = self.progress.phase(4)
+            report = self.progress.phase(len(self.kind.phases) - 1)
             share_root.mkdir(parents=True, exist_ok=True)
             make_qr(url, share_root / "qr.png", share_root / "qr.svg")
             report(1.0, "QR-Code erzeugt")
             created = datetime.now(timezone.utc)
             block = {
                 "url": url, "share_id": share_id, "created_at": created.isoformat(timespec="seconds"),
-                "provider": provider.name, "points": int(legend["points"]), "size_mb": size_mb,
+                "provider": provider.name, "points": int(metadata["points"]), "size_mb": size_mb,
             }
+            if self.kind.name == PROJECT.name:
+                block["views"] = list(metadata["views"])
+                block["levels"] = list(metadata["levels"])
             if provider.expiry_days:
                 block["expires_at"] = (created + timedelta(days=provider.expiry_days)).isoformat(timespec="seconds")
             self._store_share(block)
@@ -232,7 +276,7 @@ class ShareJob:
                                  message="Fehler", finished_at=time.time())
         finally:
             for staging in (package_dir, work_dir):
-                _remove_below(self.project_dir, staging)
+                _remove_below(self.project_dir, staging, self.kind)
         return None
 
     # helpers ------------------------------------------------------------------------------------
@@ -246,11 +290,11 @@ class ShareJob:
     def _store_share(self, block: dict[str, Any]) -> None:
         manager = self._manager()
         project = manager.load(self.project_dir)
-        project["share"] = block
+        project[self.kind.key] = block
         manager.save(self.project_dir, project)
 
     def _drop_previous_share(self) -> None:
-        previous = get_share(self.project_dir)
+        previous = get_share(self.project_dir, kind=self.kind)
         if previous is None:
             return
         try:
@@ -267,10 +311,10 @@ class ShareJob:
 
 
 def delete_share(project_dir: Path | str, *, config: dict[str, Any] | None = None, provider: ShareProvider | None = None,
-                 project_manager: Any | None = None) -> bool:
+                 project_manager: Any | None = None, kind: ShareKind = POINTCLOUD) -> bool:
     """Remove the published package and the stored ``share:`` block ("Link löschen"); False when none exists."""
     directory = Path(project_dir).resolve()
-    block = get_share(directory)
+    block = get_share(directory, kind=kind)
     if block is None:
         return False
     config = config if config is not None else export.load_share_config()
@@ -281,11 +325,11 @@ def delete_share(project_dir: Path | str, *, config: dict[str, Any] | None = Non
 
         project_manager = ProjectManager()
     project = project_manager.load(directory)
-    project.pop("share", None)
+    project.pop(kind.key, None)
     project_manager.save(directory, project)
     for name in ("qr.png", "qr.svg"):
-        (directory / SHARE_RELATIVE / name).unlink(missing_ok=True)
-    (directory / PROGRESS_RELATIVE).unlink(missing_ok=True)
+        (directory / kind.output_relative / name).unlink(missing_ok=True)
+    (directory / kind.progress_relative).unlink(missing_ok=True)
     return True
 
 
@@ -306,10 +350,10 @@ def share_state(block: dict[str, Any] | None, now: datetime | None = None) -> st
 
 
 def extend_share(project_dir: Path | str, *, config: dict[str, Any] | None = None, provider: ShareProvider | None = None,
-                 project_manager: Any | None = None) -> dict[str, Any]:
+                 project_manager: Any | None = None, kind: ShareKind = POINTCLOUD) -> dict[str, Any]:
     """"Verlängern": restart the lifetime of the published package (same link) and store the new ``expires_at``."""
     directory = Path(project_dir).resolve()
-    block = get_share(directory)
+    block = get_share(directory, kind=kind)
     if block is None:
         raise ProviderError("Es gibt keinen geteilten Link.")
     config = config if config is not None else export.load_share_config()
@@ -321,7 +365,7 @@ def extend_share(project_dir: Path | str, *, config: dict[str, Any] | None = Non
 
         project_manager = ProjectManager()
     project = project_manager.load(directory)
-    project["share"] = block
+    project[kind.key] = block
     project_manager.save(directory, project)
     return block
 
@@ -330,37 +374,39 @@ class ShareManager:
     """Keeps the running job per project; the UI starts, polls and cancels through it."""
 
     def __init__(self) -> None:
-        self._jobs: dict[Path, ShareJob] = {}
+        self._jobs: dict[tuple[Path, str], ShareJob] = {}
         self._lock = threading.Lock()
 
-    def is_running(self, project_dir: Path | str) -> bool:
+    def is_running(self, project_dir: Path | str, *, kind: ShareKind = POINTCLOUD) -> bool:
         with self._lock:
-            job = self._jobs.get(Path(project_dir).resolve())
+            job = self._jobs.get((Path(project_dir).resolve(), kind.name))
         return job is not None and job.is_alive()
 
     def start(self, project_dir: Path | str, **options: Any) -> ShareJob:
         """Start a job unless one already runs for the project (then that job is returned)."""
-        key = Path(project_dir).resolve()
+        kind = options.get("kind", POINTCLOUD)
+        directory = Path(project_dir).resolve()
+        key = (directory, kind.name)
         with self._lock:
             current = self._jobs.get(key)
             if current is not None and current.is_alive():
                 return current
-            job = ShareJob(key, **options)
+            job = ShareJob(directory, **options)
             self._jobs[key] = job
         return job.start()
 
-    def cancel(self, project_dir: Path | str) -> bool:
+    def cancel(self, project_dir: Path | str, *, kind: ShareKind = POINTCLOUD) -> bool:
         with self._lock:
-            job = self._jobs.get(Path(project_dir).resolve())
+            job = self._jobs.get((Path(project_dir).resolve(), kind.name))
         if job is None or not job.is_alive():
             return False
         job.cancel()
         return True
 
-    def status(self, project_dir: Path | str) -> dict[str, Any]:
+    def status(self, project_dir: Path | str, *, kind: ShareKind = POINTCLOUD) -> dict[str, Any]:
         """Progress document; a ``running`` file without a live job (app restart) is reported as an error."""
-        progress = read_progress(project_dir)
-        if progress.get("state") in _ACTIVE_STATES and not self.is_running(project_dir):
+        progress = read_progress(project_dir, kind=kind)
+        if progress.get("state") in _ACTIVE_STATES and not self.is_running(project_dir, kind=kind):
             progress = {**progress, "state": "error", "error": "Der Vorgang wurde unterbrochen."}
         return progress
 

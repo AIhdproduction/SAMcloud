@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>SAMcloud Plan (DXF)</title>
+<link rel="stylesheet" href="css/register.css">
+<link rel="stylesheet" href="css/dxf.css">
+</head>
+<body>
+<div id="dxf-stage" class="dxf-stage">
+  <canvas id="dxf-canvas" class="dxf-canvas"></canvas>
+
+  <div class="dxf-toolbar" id="dxf-toolbar">
+    <button type="button" id="btn-fit">Einpassen</button>
+    <button type="button" id="btn-layers">Ebenen</button>
+    <select id="level-select" class="dxf-level-select" hidden></select>
+  </div>
+
+  <aside id="dxf-legend" class="dxf-legend" hidden>
+    <div class="dxf-legend-header">
+      <div class="dxf-legend-actions">
+        <button type="button" id="btn-layers-all">Alle</button>
+        <button type="button" id="btn-layers-none">Keine</button>
+      </div>
+      <button type="button" id="btn-legend-close" class="dxf-legend-close" aria-label="Schliessen">&times;</button>
+    </div>
+    <div id="dxf-layer-list" class="dxf-layer-list"></div>
+  </aside>
+
+  <div id="dxf-scale" class="dxf-scale" hidden>
+    <div class="dxf-scale-bar" id="dxf-scale-bar"></div>
+    <div class="dxf-scale-label" id="dxf-scale-label"></div>
+  </div>
+
+  <div id="dxf-status" class="dxf-status">Plan wird geladen &hellip;</div>
+
+  <button type="button" id="error-button" class="dxf-error-button" hidden>Fehlerdetails</button>
+  <aside id="error-panel" class="dxf-error-panel" hidden>
+    <div class="dxf-error-actions">
+      <button type="button" id="error-copy">Kopieren</button>
+      <button type="button" id="error-close">Schliessen</button>
+    </div>
+    <pre id="error-text"></pre>
+  </aside>
+</div>
+
+<script src="js/register.js" data-root="" data-view="dxf"></script>
+<script src="js/dxf_viewer.js"></script>
+</body>
+</html>

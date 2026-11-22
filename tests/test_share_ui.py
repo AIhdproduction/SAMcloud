@@ -179,3 +179,62 @@ def test_delete_credentials_after_old_rw_acl(tmp_path: Path, monkeypatch: pytest
     subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"], capture_output=True, check=False)
     assert creds.delete_credentials() is True
     assert not path.exists()
+
+
+def _write_running_progress(project: Path, **overrides: Any) -> None:
+    import json
+
+    from samcloud.share.job import POINTCLOUD
+
+    doc = {"state": "running", "phase": "Hochladen", "phase_index": 3,
+           "phases": [label for _k, label, _w in POINTCLOUD.phases], "phases_done": ["prepare", "octree", "assemble", "upload"],
+           "percent": 68.0, "message": "3.0 / 30.6 MB", "error": None, "result": None}
+    doc.update(overrides)
+    path = project / POINTCLOUD.progress_relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+async def _running_dialog_texts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str, **overrides: Any) -> tuple[str, list[str]]:
+    from samcloud.app import i18n
+    from samcloud.share.job import share_manager
+
+    _isolate(monkeypatch, tmp_path, provider="local")
+    monkeypatch.setattr(i18n, "_language_cache", language)
+    monkeypatch.setattr(share_manager, "is_running", lambda *_a, **_k: True)
+    project = make_project(tmp_path, "p", with_cloud=False)
+    _write_running_progress(project, **overrides)
+    async with _page_user("/dense", _dense_route, project, monkeypatch) as user:
+        await asyncio.sleep(0.3)
+        user.find(marker="share-button").click()
+        await user.should_see(marker="share-progress-text")
+        text = _element(user, "share-progress-text").text
+        dialog = _element(user, "share-dialog")
+        labels = [e.text for e in dialog.descendants() if getattr(e, "text", None) and e.text[:2] in ("✓ ", "• ", "◦ ")]
+    return text, labels
+
+
+@pytest.mark.anyio
+async def test_progress_line_names_the_phase_once_in_german(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    text, _labels = await _running_dialog_texts(tmp_path, monkeypatch, "de", message="Hochladen 3.0 / 30.6 MB")
+    assert text == "Hochladen: 3.0 / 30.6 MB (68 %)"
+    assert text.count("Hochladen") == 1
+
+
+@pytest.mark.anyio
+async def test_progress_line_is_english_without_german_words(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    text, _labels = await _running_dialog_texts(tmp_path, monkeypatch, "en")
+    assert text == "Uploading: 3.0 / 30.6 MB (68 %)"
+    legacy, _ = await _running_dialog_texts(tmp_path / "b", monkeypatch, "en", message="Hochladen 3.0 / 30.6 MB")
+    assert "Hochladen" not in legacy and legacy.count("Uploading") == 1
+    other, _ = await _running_dialog_texts(tmp_path / "c", monkeypatch, "en", phase="Octree bauen", phase_index=1,
+                                          message="7'712'426 Punkte", percent=40.0)
+    assert other == "Building octree (40 %)"
+
+
+@pytest.mark.anyio
+async def test_phase_list_marks_done_active_and_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _text, labels = await _running_dialog_texts(tmp_path, monkeypatch, "en", phase="Viewer zusammenstellen", phase_index=2,
+                                                phases_done=["prepare", "octree", "assemble"])
+    assert [label[:2] for label in labels] == ["✓ ", "✓ ", "• ", "◦ ", "◦ "]
+    assert labels[2] == "• Assembling viewer"

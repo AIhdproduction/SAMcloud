@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>SAMcloud</title>
+<link rel="stylesheet" href="css/register.css">
+<style>body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; } .start-title { overflow-wrap: anywhere; }</style>
+</head>
+<body>
+<div class="start-page">
+  <div class="start-content">
+    <div class="start-brand"><strong>SAM</strong>cloud</div>
+    <h1 class="start-title" id="start-title">Lädt …</h1>
+    <div class="start-meta" id="start-meta"></div>
+    <div class="start-levels" id="start-levels" hidden></div>
+    <div class="start-cards" id="start-cards"></div>
+    <footer class="start-footer" id="start-footer">Erstellt mit SAMcloud</footer>
+  </div>
+</div>
+<script src="js/register.js" data-root="" data-view="home"></script>
+<script>
+(function () {
+  "use strict";
+
+  function formatPoints(num) {
+    if (!num && num !== 0) return "";
+    return String(Math.round(Number(num))).replace(/\B(?=(\d{3})+(?!\d))/g, "\u2009");
+  }
+
+  function render(project) {
+    const share = window.SAMShare || {};
+    const t = share.t || function (k) { return k; };
+    let currentLevel = share.level;
+
+    if (project.lang) {
+      document.documentElement.lang = project.lang;
+    }
+
+    const titleEl = document.getElementById("start-title");
+    const projectName = String(project.name || "Projekt");
+    titleEl.textContent = "";
+    projectName.split("_").forEach(function (part, i, arr) {
+      titleEl.appendChild(document.createTextNode(i < arr.length - 1 ? part + "_" : part));
+      if (i < arr.length - 1) titleEl.appendChild(document.createElement("wbr"));
+    });
+    document.title = (project.name || "Projekt") + " – SAMcloud";
+
+    const metaEl = document.getElementById("start-meta");
+    const metaParts = [];
+    if (project.created_at) metaParts.push(project.created_at);
+    if (project.points != null) {
+      metaParts.push(formatPoints(project.points) + " " + t("points"));
+    }
+    metaEl.textContent = metaParts.join(" · ");
+
+    const footerEl = document.getElementById("start-footer");
+    footerEl.textContent = t("created_with");
+
+    // Level chooser chips
+    const levelsEl = document.getElementById("start-levels");
+    const levels = Array.isArray(project.levels) ? project.levels : [];
+    if (levels.length > 1) {
+      levelsEl.innerHTML = "";
+      levelsEl.hidden = false;
+
+      const label = document.createElement("span");
+      label.className = "start-levels-label";
+      label.textContent = t("level") + ":";
+      levelsEl.appendChild(label);
+
+      levels.forEach(function (lvl) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "start-level-chip" + (lvl.key === currentLevel ? " is-active" : "");
+        chip.textContent = lvl.label || lvl.key;
+        chip.dataset.key = lvl.key;
+        chip.addEventListener("click", function () {
+          currentLevel = lvl.key;
+          if (share.setLevel) share.setLevel(currentLevel);
+          levelsEl.querySelectorAll(".start-level-chip").forEach(function (c) {
+            c.classList.toggle("is-active", c.dataset.key === currentLevel);
+          });
+          updateCards();
+        });
+        levelsEl.appendChild(chip);
+      });
+    } else {
+      levelsEl.hidden = true;
+    }
+
+    // View cards
+    const cardsEl = document.getElementById("start-cards");
+    cardsEl.innerHTML = "";
+
+    const views = Array.isArray(project.views) && project.views.length
+      ? project.views
+      : ["dxf", "pc", "ifc"];
+
+    const cardMap = {};
+
+    views.forEach(function (viewKey) {
+      const card = document.createElement("a");
+      card.className = "start-card";
+      card.dataset.view = viewKey;
+
+      let iconSvg = "";
+      let title = "";
+      let badge = "";
+      let desc = "";
+
+      if (viewKey === "dxf") {
+        title = t("dxf");
+        badge = "2D";
+        desc = t("dxf_desc");
+        iconSvg =
+          '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/><path d="M14 14l3 3m0-3l-3 3"/></svg>';
+      } else if (viewKey === "pc") {
+        title = t("pc");
+        badge = "3D";
+        desc = t("pc_desc");
+        iconSvg =
+          '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="6" cy="6" r="1.5" fill="currentColor"/><circle cx="12" cy="5" r="1.5" fill="currentColor"/><circle cx="18" cy="7" r="1.5" fill="currentColor"/><circle cx="8" cy="12" r="1.5" fill="currentColor"/><circle cx="14" cy="11" r="1.5" fill="currentColor"/><circle cx="19" cy="14" r="1.5" fill="currentColor"/><circle cx="5" cy="17" r="1.5" fill="currentColor"/><circle cx="11" cy="18" r="1.5" fill="currentColor"/><circle cx="17" cy="19" r="1.5" fill="currentColor"/></svg>';
+      } else if (viewKey === "ifc") {
+        title = t("ifc");
+        badge = "3D";
+        desc = t("ifc_desc");
+        iconSvg =
+          '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 4.5v9L12 21l-9-4.5v-9L12 3z"/><path d="M12 12l9-4.5"/><path d="M12 12v9"/><path d="M12 12L3 7.5"/></svg>';
+      } else {
+        return;
+      }
+
+      card.innerHTML =
+        '<div class="start-card-icon">' + iconSvg + '</div>' +
+        '<div class="start-card-body">' +
+          '<div class="start-card-header">' +
+            '<strong class="start-card-title">' + title + '</strong>' +
+            '<span class="start-card-badge">' + badge + '</span>' +
+          '</div>' +
+          '<div class="start-card-desc">' + desc + '</div>' +
+        '</div>';
+
+      cardsEl.appendChild(card);
+      cardMap[viewKey] = card;
+    });
+
+    function updateCards() {
+      const lvlQuery = currentLevel ? "?level=" + encodeURIComponent(currentLevel) : "";
+      if (cardMap.dxf) cardMap.dxf.href = "dxf.html" + lvlQuery;
+      if (cardMap.pc) cardMap.pc.href = "pc/index.html";
+      if (cardMap.ifc) cardMap.ifc.href = "ifc.html" + lvlQuery;
+    }
+
+    updateCards();
+  }
+
+  window.addEventListener("samshare:project", function (ev) {
+    render(ev.detail || {});
+  });
+
+  if (window.SAMShare && window.SAMShare.project) {
+    render(window.SAMShare.project);
+  }
+})();
+</script>
+</body>
+</html>

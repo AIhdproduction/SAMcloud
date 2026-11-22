@@ -1,6 +1,7 @@
 """Project dashboard page."""
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,10 @@ from samcloud.app.processing import (
     settings_use_flurseg,
 )
 from samcloud.app.state import state
+from samcloud.share.ui import render_project_share_button
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 _WORKFLOW = (
@@ -743,16 +748,38 @@ def _render_workflow(project: dict | None) -> None:
             after = float(storage.get("after_bytes", 0)) / 1024 ** 3
             ui.label(t("home.workflow.storage", size=f"{after:.1f}")).classes("text-xs sam-muted")
 
+    project_share_slot = None
+    previous_dxf_status = dxf_step["status"]
+    previous_classification_status = statuses.get("classification")
+    if project is not None:
+        with ui.column().classes("w-full") as project_share_slot:
+            def render_project_share(current_project: dict) -> None:
+                try:
+                    project_share_slot.clear()
+                    with project_share_slot:
+                        render_project_share_button(state.active_project_directory, current_project)
+                except Exception as error:
+                    LOGGER.warning("project share button unavailable: %s", error, exc_info=True)
+
+            render_project_share(project)
+
     if project is not None and dxf_step["status"] == "running" and dxf_bar is not None and dxf_status_label is not None:
         def refresh_dxf_step() -> None:
+            nonlocal previous_dxf_status
             current = _dxf_ifc_step(state.active_project_directory)
             dxf_bar.set_value(current["percent"] / 100.0)
             dxf_status_label.set_text(_status_text(current["status"]))
+            if current["status"] == "completed" and previous_dxf_status != "completed" and project_share_slot is not None:
+                current_project = state.active_project()
+                if current_project is not None:
+                    render_project_share(current_project)
+            previous_dxf_status = current["status"]
 
         ui.timer(2.0, refresh_dxf_step)
 
     if project is not None and _workflow_is_active(project.get("workflow", {})):
         def refresh_workflow() -> None:
+            nonlocal previous_classification_status, previous_dxf_status
             current_project = state.active_project()
             if current_project is None:
                 return
@@ -768,6 +795,17 @@ def _render_workflow(project: dict | None) -> None:
                     label.set_text(
                         _control_points_status_text(current_project, value) if stage == "control_points" else _status_text(value)
                     )
+            current_dxf_step = _dxf_ifc_step(state.active_project_directory)
+            project_share_became_available = (
+                current_dxf_step["status"] == "completed" and previous_dxf_status != "completed"
+            ) or (
+                current_statuses.get("classification") == "completed"
+                and previous_classification_status != "completed"
+            )
+            if project_share_became_available and project_share_slot is not None:
+                render_project_share(current_project)
+            previous_dxf_status = current_dxf_step["status"]
+            previous_classification_status = current_statuses.get("classification")
 
         ui.timer(1.0, refresh_workflow)
 

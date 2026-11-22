@@ -369,11 +369,17 @@ def _copy_tree(source: Path, destination: Path) -> None:
 
 
 def assemble_package(project_dir: Path, package_dir: Path, *, points: PointSet, original_points: int,
-                     metadata: dict[str, Any], progress: ProgressFn | None = None) -> dict[str, Any]:
+                     metadata: dict[str, Any], progress: ProgressFn | None = None, register: bool = False) -> dict[str, Any]:
     """Fill ``package_dir`` (octree already in ``package_dir/pointcloud``) with viewer, libraries and JSON data."""
     progress = progress or (lambda fraction, message: None)
     progress(0.0, "Viewer kopieren")
     _copy_tree(TEMPLATE_DIRECTORY, package_dir)
+    if register:
+        index = package_dir / "index.html"
+        html = index.read_text(encoding="utf-8")
+        html = html.replace("</head>", '<link rel="stylesheet" href="../css/register.css">\n</head>', 1)
+        html = html.replace("</body>", '<script src="../js/register.js" data-root="../" data-view="pc"></script>\n</body>', 1)
+        index.write_text(html, encoding="utf-8")
     for source, destination in _LIBRARY_FILES:
         target = package_dir / destination
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -423,17 +429,20 @@ def scan_package(package_dir: Path, *, allowed_image_dirs: tuple[str, ...] = (RE
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         relative = path.relative_to(root).as_posix()
         suffix = path.suffix.lower()
-        if suffix in _FORBIDDEN_SUFFIXES and not any(relative.startswith(prefix) for prefix in allowed_image_dirs):
+        in_potree_resources = "/lib/potree/resources/" in f"/{relative}"
+        if suffix in _FORBIDDEN_SUFFIXES and not (in_potree_resources or any(relative.startswith(prefix) for prefix in allowed_image_dirs)):
             problems.append(f"image file: {relative}")
             continue
         if path.name.lower().startswith("gps_ref") or path.name.lower() == "georeference.json":
             problems.append(f"gps data file: {relative}")
             continue
+        if suffix == ".glb":
+            continue
         if suffix in _TEXT_SUFFIXES:
             text = path.read_text(encoding="utf-8", errors="replace")
             if "gps_ref" in text:
                 problems.append(f"gps_ref reference: {relative}")
-            if relative.startswith("lib/"):  # third-party libraries: URLs in comments are not local paths
+            if "/lib/" in f"/{relative}":  # third-party libraries: URLs in comments are not local paths
                 continue
             if _WINDOWS_PATH.search(text) or _UNIX_HOME.search(text):
                 problems.append(f"absolute path: {relative}")

@@ -13,12 +13,14 @@ from typing import Any
 
 from nicegui import run, ui
 
-from samcloud.app.i18n import t
+from samcloud.app.i18n import current_language, t, translate_or
 from samcloud.core.project_manager import ProjectManager
 from samcloud.share import credentials as creds
 from samcloud.share import export
 from samcloud.share.job import (
-    SHARE_RELATIVE,
+    POINTCLOUD,
+    PROJECT,
+    ShareKind,
     delete_share,
     extend_share,
     get_share,
@@ -26,6 +28,7 @@ from samcloud.share.job import (
     share_manager,
     share_state,
 )
+from samcloud.share.project import project_share_available
 from samcloud.share.providers import ProviderError
 
 LOGGER = logging.getLogger(__name__)
@@ -186,8 +189,9 @@ def render_settings_card() -> None:
 class ShareDialog:
     """Progress, result (QR + link) and management of the share link of one project."""
 
-    def __init__(self, project_dir: Path) -> None:
+    def __init__(self, project_dir: Path, kind: ShareKind = POINTCLOUD) -> None:
         self.project_dir = Path(project_dir)
+        self.kind = kind
         self.dialog: ui.dialog | None = None
         self.body: ui.column | None = None
         self.timer: ui.timer | None = None
@@ -198,7 +202,7 @@ class ShareDialog:
     # opening -----------------------------------------------------------------------------------
     def open(self) -> None:
         with ui.dialog().props("persistent") as self.dialog, ui.card().classes("w-[34rem] max-w-full gap-3").mark("share-dialog"):
-            ui.label(t("share.title")).classes("text-lg font-medium")
+            ui.label(self._t("title")).classes("text-lg font-medium")
             self.body = ui.column().classes("w-full gap-2")
         self.dialog.on("hide", self._stop_timer)
         self.timer = ui.timer(1.0, self.poll)
@@ -214,37 +218,69 @@ class ShareDialog:
         if self.timer is not None:
             self.timer.cancel()
 
+    def _t(self, key: str, **params: Any) -> str:
+        """Translate a share key in the namespace for this kind, with point-cloud fallback."""
+        fallback = t(f"share.{key}", **params)
+        if self.kind is POINTCLOUD:
+            return fallback
+        return translate_or(f"share.project.{key}", fallback, **params)
+
     # state -------------------------------------------------------------------------------------
     def _state_key(self) -> tuple[Any, ...]:
-        progress = share_manager.status(self.project_dir)
-        block = get_share(self.project_dir)
-        return (progress.get("state"), share_state(block), (block or {}).get("share_id"), progress.get("error"))
+        progress = share_manager.status(self.project_dir, kind=self.kind)
+        block = get_share(self.project_dir, kind=self.kind)
+        return (progress.get("state"), share_state(block), (block or {}).get("share_id"), progress.get("error"),
+                progress.get("phase_index"), tuple(progress.get("phases_done") or ()))
+
+    def _phase_name(self, progress: dict[str, Any]) -> tuple[str, str]:
+        """Return (translated phase name, German phase label) of the active phase."""
+        label = str(progress.get("phase") or "")
+        try:
+            index = int(progress.get("phase_index", -1))
+        except (TypeError, ValueError):
+            index = -1
+        if 0 <= index < len(self.kind.phases):
+            return self._t(f"phase_{self.kind.phases[index][0]}"), str(self.kind.phases[index][1])
+        return label, label
+
+    def _progress_text(self, progress: dict[str, Any]) -> str:
+        name, label = self._phase_name(progress)
+        message = str(progress.get("message") or "").strip()
+        if label and message.startswith(label):
+            message = message[len(label):].strip()
+        if message in ("", label, name):
+            message = ""
+        elif current_language() != "de" and re.search(r"[^\W\d_]", re.sub(r"\b[kKMG]?B\b", "", message)):
+            message = ""  # German free text is not shown in other UI languages
+        percent = f"({float(progress.get('percent', 0)):.0f} %)"
+        head = f"{name}: {message}" if message else name
+        return f"{head} {percent}".strip()
 
     def poll(self) -> None:
         if self._state_key() != self._view:
             self.render()
             return
-        progress = share_manager.status(self.project_dir)
+        progress = share_manager.status(self.project_dir, kind=self.kind)
         if progress.get("state") == "running" and self._bar is not None and self._text is not None:
             self._bar.set_value(float(progress.get("percent", 0)) / 100.0)
-            self._text.set_text(f"{progress.get('phase', '')}: {progress.get('message', '')} ({progress.get('percent', 0):.0f} %)")
+            self._text.set_text(self._progress_text(progress))
 
     def render(self) -> None:
         assert self.body is not None
         self.body.clear()
         self._bar = self._text = None
         self._view = self._state_key()
-        progress = share_manager.status(self.project_dir)
-        block = get_share(self.project_dir)
+        progress = share_manager.status(self.project_dir, kind=self.kind)
+        block = get_share(self.project_dir, kind=self.kind)
         with self.body:
             if progress.get("state") == "running":
                 self._render_running(progress)
             elif block is not None:
                 self._render_result(block, share_state(block))
             elif progress.get("state") == "error":
-                self._render_message(str(progress.get("error") or t("share.error_unknown")), error=True)
+                self._render_message(str(progress.get("error") or self._t("error_unknown")), error=True)
             elif progress.get("state") == "cancelled":
-                self._render_message(t("share.cancelled"))
+                self._render_message(self._t("cancelled"))
             else:
                 self._render_start()
 
@@ -253,46 +289,65 @@ class ShareDialog:
         with ui.row().classes("w-full justify-end gap-2"):
             for label, handler, marker in buttons:
                 ui.button(label, on_click=handler).props("outline" if marker != "share-start" else "").mark(marker)
-            ui.button(t("share.close"), on_click=self.close).props("flat").mark("share-close")
+            ui.button(self._t("close"), on_click=self.close).props("flat").mark("share-close")
 
     def _render_start(self) -> None:
-        ui.label(t("share.intro", max_points=f"{int(export.load_share_config()['max_points']):,}".replace(",", "'"))).classes("text-sm")
-        self._footer((t("share.start"), self.start, "share-start"))
+        max_points = f"{int(export.load_share_config()['max_points']):,}".replace(",", "'")
+        ui.label(self._t("intro", max_points=max_points)).classes("text-sm")
+        self._footer((self._t("start"), self.start, "share-start"))
 
     def _render_message(self, message: str, *, error: bool = False) -> None:
         ui.label(message).classes("text-sm text-negative" if error else "text-sm").mark("share-message")
-        self._footer((t("share.retry"), self.start, "share-start"))
+        self._footer((self._t("retry"), self.start, "share-start"))
 
     def _render_running(self, progress: dict[str, Any]) -> None:
-        for label in progress.get("phases", []):
-            ui.label(("• " if label == progress.get("phase") else "◦ ") + str(label)).classes("text-sm")
+        done = {str(key) for key in progress.get("phases_done") or []}  # phase keys; the active phase is included
+        active = progress.get("phase_index", -1)
+        for index, label in enumerate(progress.get("phases", [])):
+            phase_key = self.kind.phases[index][0] if index < len(self.kind.phases) else ""
+            text = self._t(f"phase_{phase_key}") if phase_key else str(label)
+            if index == active:
+                ui.label("• " + text).classes("text-sm font-bold")
+            elif phase_key in done:
+                ui.label("✓ " + text).classes("text-sm")
+            else:
+                ui.label("◦ " + text).classes("text-sm sam-muted")
         self._bar = ui.linear_progress(value=float(progress.get("percent", 0)) / 100.0, show_value=False).mark("share-progress")
-        self._text = ui.label("").classes("text-sm").mark("share-progress-text")
+        self._text = ui.label(self._progress_text(progress)).classes("text-sm").mark("share-progress-text")
         with ui.row().classes("w-full justify-end"):
-            ui.button(t("share.cancel"), on_click=self.cancel).props("outline color=negative").mark("share-cancel")
+            ui.button(self._t("cancel"), on_click=self.cancel).props("outline color=negative").mark("share-cancel")
 
     def _render_result(self, block: dict[str, Any], state: str) -> None:
         expired = state == "expired"
         if expired:
-            ui.label(t("share.expired", date=_format_date(block.get("expires_at")))).classes("text-negative").mark("share-expired")
+            ui.label(self._t("expired", date=_format_date(block.get("expires_at")))).classes("text-negative").mark("share-expired")
         else:
-            qr = self.project_dir / SHARE_RELATIVE / "qr.png"
+            qr = self.project_dir / self.kind.output_relative / "qr.png"
             if qr.is_file():
                 encoded = base64.b64encode(qr.read_bytes()).decode("ascii")
                 ui.image(f"data:image/png;base64,{encoded}").classes("w-64 h-64 self-center bg-white").mark("share-qr")
             ui.link(str(block["url"]), str(block["url"]), new_tab=True).classes("break-all text-sm").mark("share-link")
             if block.get("expires_at"):
-                ui.label(t("share.valid_until", date=_format_date(block["expires_at"]))).classes("text-sm").mark("share-valid-until")
-            ui.label(t("share.info", points=f"{int(block.get('points', 0)):,}".replace(",", "'"), size=block.get("size_mb", 0))).classes("text-xs sam-muted")
+                ui.label(self._t("valid_until", date=_format_date(block["expires_at"]))).classes("text-sm").mark("share-valid-until")
+            ui.label(self._t("info", points=f"{int(block.get('points', 0)):,}".replace(",", "'"), size=block.get("size_mb", 0))).classes("text-xs sam-muted")
+            if self.kind is PROJECT:
+                labels = {"dxf": self._t("view_dxf"), "pc": self._t("view_pc"), "ifc": self._t("view_ifc")}
+                views = [labels[view] for view in block.get("views", []) if view in labels]
+                if views:
+                    details = self._t("views_line", views=" · ".join(views))
+                    levels = block.get("levels", [])
+                    if isinstance(levels, list) and len(levels) > 1:
+                        details += f" · {self._t('levels', count=len(levels))}"
+                    ui.label(details).classes("text-xs sam-muted").mark("share-project-views")
             with ui.row().classes("gap-2"):
-                ui.button(t("share.copy"), on_click=lambda: self._copy(str(block["url"]))).props("outline dense").mark("share-copy")
-                ui.button(t("share.save_png"), on_click=self._save_png).props("outline dense").mark("share-save-png")
-                ui.button(t("share.open"), on_click=lambda: ui.navigate.to(str(block["url"]), new_tab=True)).props("outline dense").mark("share-open")
+                ui.button(self._t("copy"), on_click=lambda: self._copy(str(block["url"]))).props("outline dense").mark("share-copy")
+                ui.button(self._t("save_png"), on_click=self._save_png).props("outline dense").mark("share-save-png")
+                ui.button(self._t("open"), on_click=lambda: ui.navigate.to(str(block["url"]), new_tab=True)).props("outline dense").mark("share-open")
         buttons: list[tuple[str, Any, str]] = []
         if not expired and block.get("expires_at"):
-            buttons.append((t("share.extend"), self.extend, "share-extend"))
-        buttons.append((t("share.recreate"), self.recreate, "share-recreate"))
-        buttons.append((t("share.delete"), self.delete, "share-delete"))
+            buttons.append((self._t("extend"), self.extend, "share-extend"))
+        buttons.append((self._t("recreate"), self.recreate, "share-recreate"))
+        buttons.append((self._t("delete"), self.delete, "share-delete"))
         self._footer(*buttons)
 
     # actions -----------------------------------------------------------------------------------
@@ -300,43 +355,45 @@ class ShareDialog:
         """Ask for the privacy confirmation once per project, then start the job."""
         manager = ProjectManager()
         project = manager.load(self.project_dir)
-        if project.get("settings", {}).get("share_confirmed"):
+        confirmation_key = "share_confirmed" if self.kind is POINTCLOUD else "project_share_confirmed"
+        if project.get("settings", {}).get(confirmation_key):
             self._launch()
             return
         with ui.dialog() as confirm, ui.card().mark("share-confirm"):
-            ui.label(t("share.confirm")).classes("text-sm")
+            ui.label(self._t("confirm")).classes("text-sm")
             with ui.row().classes("justify-end w-full gap-2"):
-                ui.button(t("share.confirm_no"), on_click=confirm.close).props("flat").mark("share-confirm-no")
-                ui.button(t("share.confirm_yes"), on_click=lambda: self._confirmed(confirm)).mark("share-confirm-yes")
+                ui.button(self._t("confirm_no"), on_click=confirm.close).props("flat").mark("share-confirm-no")
+                ui.button(self._t("confirm_yes"), on_click=lambda: self._confirmed(confirm)).mark("share-confirm-yes")
         confirm.open()
 
     def _confirmed(self, confirm: ui.dialog) -> None:
         manager = ProjectManager()
         project = manager.load(self.project_dir)
-        project.setdefault("settings", {})["share_confirmed"] = True
+        confirmation_key = "share_confirmed" if self.kind is POINTCLOUD else "project_share_confirmed"
+        project.setdefault("settings", {})[confirmation_key] = True
         manager.save(self.project_dir, project)
         confirm.close()
         self._launch()
 
     def _launch(self) -> None:
         try:
-            share_manager.start(self.project_dir)
+            share_manager.start(self.project_dir, kind=self.kind)
         except Exception as error:  # e.g. missing credentials: show it, never hang
             LOGGER.warning("share start failed: %s", error)
             ui.notify(str(error), type="negative")
         self.render()
 
     def cancel(self) -> None:
-        share_manager.cancel(self.project_dir)
-        ui.notify(t("share.cancelling"))
+        share_manager.cancel(self.project_dir, kind=self.kind)
+        ui.notify(self._t("cancelling"))
 
     async def extend(self) -> None:
         try:
-            block = await run.io_bound(extend_share, self.project_dir)
+            block = await run.io_bound(extend_share, self.project_dir, kind=self.kind)
         except ProviderError as error:
             ui.notify(str(error), type="negative")
             return
-        ui.notify(t("share.extended", date=_format_date(block.get("expires_at"))), type="positive")
+        ui.notify(self._t("extended", date=_format_date(block.get("expires_at"))), type="positive")
         self.render()
 
     def recreate(self) -> None:
@@ -344,19 +401,19 @@ class ShareDialog:
 
     async def delete(self) -> None:
         try:
-            await run.io_bound(delete_share, self.project_dir)
+            await run.io_bound(delete_share, self.project_dir, kind=self.kind)
         except ProviderError as error:
             ui.notify(str(error), type="negative")
             return
-        ui.notify(t("share.deleted"))
+        ui.notify(self._t("deleted"))
         self.render()
 
     def _copy(self, url: str) -> None:
         ui.run_javascript(f"navigator.clipboard.writeText({url!r})")
-        ui.notify(t("share.copied"))
+        ui.notify(self._t("copied"))
 
     def _save_png(self) -> None:
-        qr = self.project_dir / SHARE_RELATIVE / "qr.png"
+        qr = self.project_dir / self.kind.output_relative / "qr.png"
         if qr.is_file():
             ui.download(qr.read_bytes(), "samcloud-share-qr.png")
 
@@ -379,6 +436,25 @@ def render_share_button(project_dir: Path | None, project: dict[str, Any] | None
 
     def open_share() -> None:
         ShareDialog(project_dir).open()
+
+    def clicked() -> None:
+        if needs_credentials():
+            open_setup_dialog(open_share)
+        else:
+            open_share()
+
+    button.on_click(clicked)
+    return button
+
+
+def render_project_share_button(project_dir: Path | None, project: dict[str, Any] | None) -> ui.button | None:
+    """Render the complete-project QR sharing button when all project views are available."""
+    if project_dir is None or not project_share_available(project_dir, project):
+        return None
+    button = ui.button(t("share.project.button"), icon="qr_code_2").props("outline dense no-caps").classes("w-full q-mt-sm").mark("project-share-button")
+
+    def open_share() -> None:
+        ShareDialog(project_dir, kind=PROJECT).open()
 
     def clicked() -> None:
         if needs_credentials():

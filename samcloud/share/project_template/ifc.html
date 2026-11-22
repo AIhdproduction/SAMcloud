@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>SAMcloud IFC</title>
+  <link rel="stylesheet" href="css/register.css">
+  <link rel="stylesheet" href="css/ifc.css">
+</head>
+<body>
+  <main id="ifc-stage" class="ifc-stage">
+    <div id="ifc-canvas" class="ifc-canvas" aria-label="IFC 3D viewer"></div>
+    <div id="ifc-toolbar" class="ifc-toolbar" role="toolbar" aria-label="IFC viewer controls">
+      <button type="button" id="fit-button">Einpassen</button>
+      <button type="button" id="categories-button" aria-expanded="false">Kategorien</button>
+      <label id="level-control" class="ifc-level" hidden>
+        <span>Ebene</span>
+        <select id="level-select" aria-label="Ebene"></select>
+      </label>
+      <button type="button" id="reset-button">Ansicht zurücksetzen</button>
+    </div>
+    <aside id="category-legend" class="ifc-legend" aria-label="Kategorien" hidden></aside>
+    <div id="ifc-status" class="ifc-status" role="status">IFC-Modell wird geladen … 0 %</div>
+    <button type="button" id="error-button" class="ifc-error-button" hidden>Fehlerdetails</button>
+    <aside id="error-panel" class="ifc-error-panel" hidden aria-label="Fehlerdetails">
+      <div class="ifc-error-actions">
+        <button type="button" id="error-copy">Kopieren</button>
+        <button type="button" id="error-close">Schliessen</button>
+      </div>
+      <pre id="error-text"></pre>
+    </aside>
+    <section id="context-overlay" class="ifc-context-overlay" hidden aria-live="assertive">
+      <p id="context-message">Grafik wurde zurückgesetzt.</p>
+      <button type="button" id="context-reload">Neu laden</button>
+    </section>
+  </main>
+  <script src="js/register.js" data-root="" data-view="ifc"></script>
+  <script type="module" src="js/ifc_viewer.js"></script>
+</body>
+</html>

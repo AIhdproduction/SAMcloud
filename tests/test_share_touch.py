@@ -195,3 +195,68 @@ def test_touch_gestures_against_the_real_potree_view_maths(tmp_path: Path) -> No
     assert out["pickFailure"]["noMorePicks"] and out["pickFailure"]["firstCalls"] >= 1
     assert out["doubleTapWithoutPicking"] is None, "double tap does not call the picking zoom once picking is disabled"
     assert out["prevented"] is True
+
+
+_PAN_SCENARIO = r"""
+// Two-finger pan must stick: no snap back when fingers are lifted one by one or when the next gesture starts.
+const same = (a, b) => a.distanceTo(b) < 1e-9;
+const pan = {};
+setup(true); view.radius = view.position.distanceTo(data);
+const startPosition = view.position.clone(), startYaw = view.yaw, startPitch = view.pitch;
+fire("touchstart",[T(100,300),T(300,300)]);
+for (let i = 1; i <= 6; i++) fire("touchmove",[T(100 - 25*i, 300 + 12*i),T(300 - 25*i, 300 + 12*i)]);   // 150 px left, 72 px down
+const panned = view.position.clone();
+pan.moved = panned.distanceTo(startPosition) > 1;
+// fingers leave one after the other; the remaining finger wiggles a little
+fire("touchend",[T(150,372)],[T(-50,372)]);
+fire("touchmove",[T(155,380)]); fire("touchmove",[T(160,390)]);
+pan.afterWiggle = view.position.distanceTo(panned);
+fire("touchend",[],[T(160,390)]);
+pan.afterRelease = view.position.distanceTo(panned);
+// frames of the viewer update loop (controls update with their deltas) change nothing either
+for (let i = 0; i < 5; i++) { viewer.earthControls.stop(); }
+// the next gesture starts: the camera must neither move nor turn
+fire("touchstart",[T(200,400)]);
+pan.afterNextStart = view.position.distanceTo(panned);
+pan.yawChange = Math.abs(view.yaw - startYaw) + Math.abs(view.pitch - startPitch);
+const pivotBefore = view.getPivot();
+for (let i = 1; i <= 8; i++) fire("touchmove",[T(200 + 5*i, 400)]);
+const pivotAfter = view.getPivot();
+pan.orbitPivotDrift = pivotAfter.distanceTo(pivotBefore);
+pan.orbitRadius = Math.abs(view.position.distanceTo(pivotAfter) - view.radius);
+pan.yawTurned = Math.abs(view.yaw - startYaw) > 0.1;
+pan.pivotMovedWithPan = pivotBefore.distanceTo(data) > 1;
+fire("touchend",[],[T(240,400)]);
+// pinch combined with pan, finger lift order reversed: still sticks
+const beforePinch = view.position.clone();
+fire("touchstart",[T(100,300),T(300,300)]);
+for (let i = 1; i <= 4; i++) fire("touchmove",[T(100 - 10*i, 300),T(300 + 10*i, 300 - 5*i)]);
+const pinched = view.position.clone();
+pan.pinchMoved = pinched.distanceTo(beforePinch) > 0.1;
+fire("touchend",[T(140,300)],[T(340,280)]);
+fire("touchmove",[T(150,305)]);
+fire("touchend",[],[T(150,305)]);
+pan.pinchSticks = view.position.distanceTo(pinched);
+console.log(JSON.stringify(pan));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_two_finger_pan_sticks_and_next_orbit_uses_the_moved_pivot(tmp_path: Path) -> None:
+    """Old logic: state.pivot stayed at the pre-pan point, so the leftover finger (2 -> 1 touches) orbited around it and
+    pulled the camera back; the next touchstart also lookAt()-turned the camera to the data centre (view snapped back)."""
+    harness = tmp_path / "harness_pan.js"
+    harness.write_text(_HARNESS[:_HARNESS.index("function dragThenPinch")] + _PAN_SCENARIO, encoding="utf-8")
+    three = export.POTREE_ASSETS / "libs" / "three.js" / "build" / "three.min.js"
+    potree = export.POTREE_ASSETS / "build" / "potree" / "potree.js"
+    result = subprocess.run(["node", str(harness), str(TEMPLATE / "js" / "share_viewer.js"), str(three), str(potree)],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    pan = json.loads(result.stdout.strip().splitlines()[-1])
+    assert pan["moved"], "the two-finger pan moves the camera"
+    assert pan["afterWiggle"] < 1e-9, "the leftover finger after lifting one finger does not orbit around a stale pivot"
+    assert pan["afterRelease"] < 1e-9
+    assert pan["afterNextStart"] < 1e-9 and pan["yawChange"] < 1e-9, "next gesture start neither moves nor turns the camera"
+    assert pan["pivotMovedWithPan"] and pan["orbitPivotDrift"] < 1e-6, "one-finger orbit pivots around the moved pivot"
+    assert pan["orbitRadius"] < 1e-6 and pan["yawTurned"] is True, "the orbit really rotated"
+    assert pan["pinchMoved"] and pan["pinchSticks"] < 1e-9, "pinch + pan also sticks"

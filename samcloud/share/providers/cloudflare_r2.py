@@ -27,7 +27,7 @@ DEFAULT_EXPIRY_DAYS = 15
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
     ".json": "application/json", ".bin": "application/octet-stream", ".wasm": "application/wasm",
-    ".png": "image/png", ".svg": "image/svg+xml", ".txt": "text/plain; charset=utf-8",
+    ".png": "image/png", ".svg": "image/svg+xml", ".glb": "model/gltf-binary", ".txt": "text/plain; charset=utf-8",
 }
 
 
