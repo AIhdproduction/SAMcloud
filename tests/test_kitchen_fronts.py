@@ -340,6 +340,39 @@ def test_upper_cabinet_end_is_cut_only_where_the_wall_behind_is_seen(upm: float,
     assert len(stats["kitchen_uppers_trimmed"]) == int(seen)
 
 
+@pytest.mark.parametrize(("upm", "theta"), SCALES)
+@pytest.mark.parametrize("start", [1.756, 1.953])
+def test_upper_outline_over_a_cabinet_and_as_much_open_wall_is_cut_to_the_cabinet(upm: float, theta: float, start: float) -> None:
+    """The outline covers 0.713..2.913; the cabinet front starts at ``start`` (about half way), the wall behind is seen before
+    it.  The cabinet part (1.16 m or 0.96 m) is a unit: the outline is cut to it, be it more or less than half of the outline."""
+    rng = np.random.default_rng(31)
+    parts = [
+        _square_scene(rng), _face(rng, (start, 3.653), (2.913, 3.653), low=1.40, high=2.18),
+        _face(rng, (0.713, 3.992), (start - 0.03, 3.992), low=1.40, high=2.25, noise=0.004),
+    ]
+    layers, _, stats, _ = _layout(np.vstack(parts), upm, theta, uppers=(box(0.713, 3.653, 2.913, 4.0),))
+    unit = _metres(next(item for item in layers["A-OBEN"] if item.get("_upper_cabinet"))["points"], upm, theta)
+    assert unit[:, 0].min() == pytest.approx(start, abs=0.035) and unit[:, 0].max() == pytest.approx(2.913, abs=1e-3)
+    assert len(stats["kitchen_uppers_trimmed"]) == 1
+
+
+@pytest.mark.parametrize(("upm", "theta"), SCALES)
+@pytest.mark.parametrize("weak_top", [2.18, 1.86])
+def test_upper_trim_does_not_depend_on_a_front_with_holes_beside_the_open_stretch(upm: float, theta: float, weak_top: float) -> None:
+    """Open wall is seen to x 1.18; the cabinet front starts at 1.20.  Its first 0.35 m is scanned either over its whole height
+    or only up to 1.86 m (holes above: those stations do not reach the front share); from 1.55 it is solid.  The cut is at
+    1.20 both times."""
+    rng = np.random.default_rng(41)
+    parts = [
+        _square_scene(rng), _face(rng, (1.20, 3.653), (1.55, 3.653), low=1.40, high=weak_top), _face(rng, (1.55, 3.653), (2.913, 3.653), low=1.40, high=2.18),
+        _face(rng, (0.713, 3.992), (1.18, 3.992), low=1.40, high=2.25, noise=0.004),
+    ]
+    layers, _, stats, _ = _layout(np.vstack(parts), upm, theta, uppers=(box(0.713, 3.653, 2.913, 4.0),))
+    unit = _metres(next(item for item in layers["A-OBEN"] if item.get("_upper_cabinet"))["points"], upm, theta)
+    assert unit[:, 0].min() == pytest.approx(1.20, abs=0.04) and unit[:, 0].max() == pytest.approx(2.913, abs=1e-3)
+    assert len(stats["kitchen_uppers_trimmed"]) == 1
+
+
 @pytest.mark.parametrize("upm", [1.0, 0.8124])
 def test_rotation_is_kept_only_with_clear_support(upm: float) -> None:
     def turned(width: float, depth: float, angle: float) -> Polygon:

@@ -269,13 +269,42 @@ def _bar_groups(raster: np.ndarray, flag_length: int, gap: int, dmin: int, dmax:
 def _extract_bars(raster: np.ndarray, dmin: int, dmax: int, lmin: int, flag_length: int, gap: int) -> list[tuple[int, int, int, int]]:
     """Legs of the footprint as (row0, row1, col0, col1) boxes: long vertical legs first, then horizontal ones in the rest."""
     raster = np.asarray(raster, dtype=bool)
-    vertical = _bar_groups(raster, flag_length, gap, dmin, dmax)
+    vertical = [bar for bar in _bar_groups(raster, flag_length, gap, dmin, dmax) if not _is_cross_section(raster, bar, gap)]
     rest = raster.copy()
     for r0, r1, c0, c1 in vertical:
         rest[r0:r1, c0:c1] = False
     # Horizontal legs: transpose so that the same routine measures rows (thickness = rows, length = columns).
     horizontal = [(c0, c1, r0, r1) for r0, r1, c0, c1 in _bar_groups(rest.T, lmin, gap, dmin, dmax)]
     return vertical + horizontal
+
+
+# A column bar is the cross-section of a leg lying along the rows when at least this share of its length lies inside row runs that
+# are longer than the bar itself.  A real leg sticks out of the leg it crosses by at least its own depth again; with two thirds
+# inside, what sticks out is less than half the crossing leg's depth (0.3 m of a 0.6 m counter, 0.45 m of a 0.9 m peninsula):
+# shorter than any leg (min_leg_length_m), so it is an object standing beside the counter (stools at a bar), never a leg.
+_CROSS_SECTION_SHARE = 2.0 / 3.0
+
+
+def _is_cross_section(raster: np.ndarray, bar: tuple[int, int, int, int], gap: int) -> bool:
+    """True when the column bar ``(row0, row1, col0, col1)`` is only the thickness of a longer leg along the rows.
+
+    A peninsula with a raised bar and things standing beside it can be as thick as ``long_leg_m`` over a few columns.  Taken as a
+    leg along the columns, that stretch would be cut out of the middle of the peninsula and neither part would remain a leg.
+    """
+    r0, r1, c0, c1 = bar
+    length = r1 - r0
+    if length <= 0 or c1 <= c0:
+        return False
+    longer = 0
+    for row in range(r0, r1):
+        indices = np.flatnonzero(raster[row])
+        if len(indices) == 0:
+            continue
+        pieces = np.split(indices, np.flatnonzero(np.diff(indices) > gap + 1) + 1)
+        through = [piece for piece in pieces if piece[-1] >= c0 and piece[0] < c1]
+        if through and max(int(piece[-1] - piece[0] + 1) for piece in through) > length:
+            longer += 1
+    return longer >= _CROSS_SECTION_SHARE * length
 
 
 def _perpendicular_depths(plane: np.ndarray, boundary: float, forward: bool, reach: int, bridge: int) -> np.ndarray:

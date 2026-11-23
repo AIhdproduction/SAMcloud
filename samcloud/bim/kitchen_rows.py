@@ -8,7 +8,9 @@ hidden.  The detector works on the cloud points of the furniture classes (+ COLM
 2. connected tall cells near the kitchen run are decomposed into straight front-face segments along the wall axes (an L-shaped
    cluster = two rows), longest first, an overlapping duplicate (the end face of a row) is dropped;
 3. each segment is completed from its front face to the wall behind it (within ``wall_reach_m``, never deeper than ``max_depth_m``)
-   and along the row to the next wall / kitchen leg (within ``along_reach_m``);
+   and along the row to the next wall / kitchen leg (within ``along_reach_m``); without a scanned wall behind it (a partition
+   hidden between two rows of cabinets) the row is as deep as its own scanned end face, and without that it is no row; a face
+   stands at the median of its points, and a scanned end face is where the row ends;
 4. the row top is the robust measured top of its points.
 
 ``split_row`` cuts a row into units around fixed items (a fridge) that already own part of it.  All coordinates are plan-local units;
@@ -59,6 +61,16 @@ class KitchenRowSettings:
     min_top_points: int = 8
     # a row of fewer cells than this fraction touching the mid band is dropped
     ceiling_margin_m: float = 0.02
+    # No wall behind the front (a thin partition hidden between two rows of cabinets is never scanned): the row is as deep as its own
+    # scanned end face.  A cabinet body is 0.30 m (shelf unit) to 0.80 m (max_depth_m) deep; the end face starts at the end of the
+    # front and at the front line within end_face_join_m (two cells of the 0.05 m grid plus the 3 cm scan noise of a face).
+    end_face: bool = True
+    end_face_min_m: float = 0.30
+    end_face_join_m: float = 0.15
+    # A face lies at the median of its points above worktop level (mid_low_m and higher: no clutter of the floor zone), not on the
+    # outer side of its cells: a face seen 2-3 cells thick (handles, an oven door, 3 cm noise) put the front 3-13 cm into the room
+    # (against a robust line fit of the cloud: v12 3.0 and 4.5 cm, v13 10.0 and 12.6 cm).
+    face_fit: bool = True
 
 
 @dataclass(slots=True)
@@ -202,15 +214,31 @@ def detect_tall_rows(
                     "length": (last + 1 - first) * step, "member": number,
                 })
     segments.sort(key=lambda item: (-item["length"], item["axis"], item["lines"], item["along"]))
+
+    def spans(segment: dict[str, Any]) -> tuple[float, float, float, float]:
+        """(a0, a1, c_low, c_high): along range and the two sides of the face cells, wall-frame units."""
+        along0, across0 = (u0, v0) if segment["axis"] == "u" else (v0, u0)
+        return (along0 + segment["along"][0] * step, along0 + segment["along"][1] * step,
+                across0 + segment["lines"][0] * step, across0 + segment["lines"][1] * step)
+
+    above = z >= settings.mid_low_m
+
+    def cell_points(segment: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        """(along, across) of the points above worktop level in the cells of a face."""
+        a0, a1, c_low, c_high = spans(segment)
+        along, across = (u, v) if segment["axis"] == "u" else (v, u)
+        inside = above & (along >= a0) & (along < a1) & (across >= c_low) & (across < c_high)
+        return along[inside], across[inside]
+
+    def plane(segment: dict[str, Any]) -> float | None:
+        """Where the scanned face stands across its cells (None with too few points to say)."""
+        _, across = cell_points(segment)
+        return float(np.median(across)) if settings.face_fit and len(across) >= settings.min_top_points else None
+
+    # which side holds the wall behind each face: sample the rays at 20 / 50 / 80 % of the face
     for segment in segments:
         axis = segment["axis"]
-        a0, a1 = u0 + segment["along"][0] * step, u0 + segment["along"][1] * step
-        # (axis u: the face runs along u at v = lines) / (axis v: the face runs along v at u = lines)
-        c_low, c_high = (v0 if axis == "u" else u0) + segment["lines"][0] * step, (v0 if axis == "u" else u0) + segment["lines"][1] * step
-        if axis == "v":
-            a0, a1 = v0 + segment["along"][0] * step, v0 + segment["along"][1] * step
-        along_mid = (a0 + a1) / 2.0
-        # which side holds the wall behind the face: sample the rays at 25 / 50 / 75 % of the face
+        a0, a1, c_low, c_high = spans(segment)
         best: tuple[float, int] | None = None
         for sign in (1, -1):
             edge = c_low if sign == 1 else c_high
@@ -226,20 +254,61 @@ def detect_tall_rows(
                 distance = float(np.median(hits))
                 if best is None or distance < best[0]:
                     best = (distance, sign)
+        segment["wall"] = best
+    if settings.end_face:
+        # on which side of each face its own body lies, as far as the face says so itself (its wall, else its own end faces)
+        own = [None if segment["wall"] is not None else _end_face_depth(segment, segments, step, settings, upm) for segment in segments]
+        for segment, found in zip(segments, own, strict=True):
+            segment["side"] = segment["wall"][1] if segment["wall"] is not None else (None if found is None else found[1])
+    for segment in segments:
+        axis = segment["axis"]
+        a0, a1, c_low, c_high = spans(segment)
+        best = segment["wall"]
+        end_faces: list[dict[str, Any]] = []
+        walled = best is not None
+        if not walled and settings.end_face:
+            best = _end_face_depth(segment, segments, step, settings, upm, end_faces)
+        elif walled and settings.end_face and settings.face_fit:
+            # a row against a wall: its scanned end face still says where the row ends
+            _end_face_depth(segment, segments, step, settings, upm, end_faces, side=best[1], limit=best[0])
         if best is None:
             continue
         distance, sign = best
         depth = min(distance, settings.max_depth_m * upm)
         front = c_low if sign == 1 else c_high
         far = front + sign * depth
-        c0, c1 = (min(front, far), max(front, far))
-        # along the row: snap each end to a wall / kitchen leg within along_reach_m
         ends = [a0, a1]
+        measured_ends: set[int] = set()
+        if settings.face_fit:
+            # the body ends where its end face ends (without a wall behind it), and at the plane of that end face
+            reaches = []
+            for other in end_faces:
+                along_other, across_other = cell_points(other)
+                if len(along_other) < settings.min_top_points:
+                    continue
+                # the end face reaches somewhere into its last cell: half a cell less than the cell side, on average
+                low_other, high_other, _, _ = spans(other)
+                reaches.append(high_other - 0.5 * step if sign == 1 else low_other + 0.5 * step)
+                side = float(np.median(across_other))
+                nearest = 0 if abs(side - a0) <= abs(side - a1) else 1
+                ends[nearest] = side
+                measured_ends.add(nearest)
+            if reaches and not walled:
+                far = min(reaches) if sign == 1 else max(reaches)
+            measured = plane(segment)
+            if measured is not None and sign * (far - measured) > 0.0:
+                front = measured
+            if abs(far - front) > settings.max_depth_m * upm:
+                far = front + sign * settings.max_depth_m * upm
+        c0, c1 = (min(front, far), max(front, far))
+        # along the row: snap each end to a wall / kitchen leg within along_reach_m (an end with its scanned end face is measured)
         centre_across = (c0 + c1) / 2.0
         for index, direction_sign in ((0, -1), (1, 1)):
+            # (a measured end still abuts a wall / leg closer than one cell: the cells cannot tell a smaller gap from none)
+            reach = step if index in measured_ends else settings.along_reach_m * upm
             origin = np.asarray(to_plan(ends[index], centre_across) if axis == "u" else to_plan(centre_across, ends[index]), dtype=float)
             direction = np.asarray(to_plan(direction_sign, 0.0) if axis == "u" else to_plan(0.0, direction_sign), dtype=float)
-            hit = _ray(origin, direction, settings.along_reach_m * upm, stops)
+            hit = _ray(origin, direction, reach, stops)
             if hit is not None:
                 ends[index] = ends[index] + direction_sign * hit
         a0, a1 = ends
@@ -269,6 +338,58 @@ def detect_tall_rows(
             continue
         rows.append(TallRow(polygon, top, angle + (0.0 if axis == "u" else math.pi / 2.0), segment["cells"], f"{axis}{'+' if sign == 1 else '-'}"))
     return rows
+
+
+def _end_face_depth(
+    segment: dict[str, Any], segments: list[dict[str, Any]], step: float, settings: KitchenRowSettings, upm: float,
+    used: list[dict[str, Any]] | None = None, side: int | None = None, limit: float | None = None,
+) -> tuple[float, int] | None:
+    """(depth, side) of a front face from the scanned end face of its own body, for a row without a wall behind it.
+
+    ``used`` collects the end faces the depth was read from.  With a known ``side`` (the wall behind the row) and wall distance
+    ``limit`` only the end faces on that side, no longer than the way to the wall, are looked for.
+
+    ``segments`` are the straight faces of the tall cells (cell indices).  An end face belongs to the same cluster, runs square to
+    the front, starts at one of its ends and at the front line, and leaves it to one side only.  It is as long as the body is deep.
+    Two end faces must agree on the side; the shallower one is the depth (a neighbour standing beside the row can prolong one of them).
+    Nothing is assumed without an end face: a front alone has no measured depth.
+    """
+    join = max(1, int(round(settings.end_face_join_m * upm / step)))
+    shortest, longest = settings.end_face_min_m * upm, settings.max_depth_m * upm
+    if limit is not None:
+        longest = min(longest, limit)
+    line0, line1 = segment["lines"]
+    along0, along1 = segment["along"]
+    found: list[tuple[float, int]] = []
+    faces: list[dict[str, Any]] = []
+    for other in segments:
+        if other is segment or other["member"] != segment["member"] or other["axis"] == segment["axis"] or other.get("wall") is not None:
+            continue  # (a face with a wall behind it is the front of the neighbouring row, not the side of this one)
+        # the end face stands at an end of the front ...
+        position0, position1 = other["lines"]
+        at_end = min(abs(position0 - along0), abs(position1 - along0), abs(position0 - along1), abs(position1 - along1)) <= join
+        if not at_end or position0 < along0 - join or position1 > along1 + join:
+            continue
+        # ... and this front stands on its body side: a face whose own body lies on the other side is the front of the
+        # neighbouring row in an inner corner (two rows meeting at a right angle), this front runs out into the room before it
+        facing = other.get("side")
+        if facing is not None and facing != (1 if along0 + along1 > position0 + position1 else -1):
+            continue
+        # ... and runs from the front line to one side of it
+        start, stop = other["along"]
+        behind, before = stop - line1, line0 - start
+        for reach, sign, opposite in ((behind, 1, before), (before, -1, behind)):
+            if opposite > join or reach <= 0 or (side is not None and sign != side):
+                continue
+            depth = (reach + (line1 - line0)) * step  # measured from the outer side of the front face cells
+            if shortest <= depth <= longest + join * step:
+                found.append((min(depth, longest), sign))
+                faces.append(other)
+    if not found or len({sign for _, sign in found}) != 1:
+        return None
+    if used is not None:
+        used.extend(faces)
+    return min(depth for depth, _ in found), found[0][1]
 
 
 def _row_top(pts: np.ndarray, polygon: Polygon, upm: float, settings: KitchenRowSettings) -> float | None:

@@ -54,6 +54,11 @@ class FrontLegSettings:
     free_max_depth_m: float = 0.90
     min_back_face_share: float = 0.60
     max_overlap: float = 0.20  # a place that a known leg already occupies
+    # A free-standing leg of the label raster takes its measured body (``refit_free_legs``).  The labels of a peninsula often cover a
+    # raised bar and what stands beside it, so the raster leg is only roughly placed; the measured body is the same leg when the two
+    # share at least this much of the smaller one (half: a body one cabinet depth beside it shares nothing).
+    refit_free: bool = True
+    refit_min_overlap: float = 0.50
 
 
 @dataclass(slots=True)
@@ -135,6 +140,96 @@ def recover_front_legs(
                 if new.back is not None:
                     anchors.append(len(legs) - 1)
                 break
+    return found
+
+
+def refit_free_legs(
+    legs: MutableSequence[Any],
+    points: ScanPoints,
+    labels: np.ndarray,
+    obstacles: Any,
+    room: Any,
+    front_settings: KitchenFrontSettings,
+    units_per_metre: float,
+    counter_top_m: float = 0.90,
+    settings: FrontLegSettings = FrontLegSettings(),
+    trace: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Replace a free-standing raster leg (peninsula) by its body measured in the scan; returns what supported each of them.
+
+    The same evidence as for a lost leg is asked for, seen from the wall-backed leg the peninsula is joined to: its scanned front
+    from plinth to worktop, the worktop at the run's level, kitchen labels, no tall row, fronts that meet, and its own scanned back
+    face.  The measured body must be the raster leg itself (``refit_min_overlap``).  Without all of it the raster leg stays as it is.
+    Front, back and the end at the wall-backed leg are measured; the free end is never shorter than the raster leg's.
+
+    The wall-backed leg then ends at the back face of the measured peninsula: it reaches into the shared corner, and a stretch
+    beyond it that shows no cabinet front (objects labelled as kitchen beside the bar) is cut off.  Only the rough end of a fitted leg
+    (``end_before_m``) is given up that way, and never where a front is scanned.
+    """
+    upm = max(float(units_per_metre), 1e-9)
+    labels = np.asarray(labels, dtype=float).reshape(-1, 2)
+    if not settings.enabled or not settings.refit_free or not front_settings.enabled or not len(points.uv) or not len(labels):
+        return []
+    low, high = front_settings.band_min_m, min(front_settings.band_max_m, counter_top_m - 0.04)
+    if high - low < 0.30:
+        return []
+    band = points.band(low, high)
+    worktop = points.band(counter_top_m - settings.worktop_tolerance_m, counter_top_m + settings.worktop_tolerance_m)
+    tall = points.band(settings.tall_low_m, settings.tall_high_m)
+    found: list[dict[str, Any]] = []
+    for free in [leg for leg in legs if leg.back is None]:
+        raster = box(free.u0, free.v0, free.u1, free.v1)
+        for anchor in [leg for leg in legs if leg.back is not None and leg.horizontal != free.horizontal]:
+            if raster.distance(box(anchor.u0, anchor.v0, anchor.u1, anchor.v1)) > settings.join_m * upm:
+                continue
+            axis = 0 if anchor.horizontal else 1
+            ends = ("u0", "u1") if anchor.horizontal else ("v0", "v1")
+            opposite = {"u0": "u1", "u1": "u0", "v0": "v1", "v1": "v0"}[anchor.back]
+            centre = 0.5 * (getattr(free, ends[0]) + getattr(free, ends[1]))
+            out = 1.0 if centre >= 0.5 * (getattr(anchor, ends[0]) + getattr(anchor, ends[1])) else -1.0
+            # the view of a lost leg, set on the middle of the raster leg: both of its long faces lie in the search range
+            view = _View(axis, centre, getattr(anchor, opposite), out, 1.0 if opposite.endswith("1") else -1.0)
+            data = _Evidence(view, band, worktop, tall, labels, low, high, front_settings, settings, upm)
+            others = [leg for leg in legs if leg is not free]
+            index = next(number for number, leg in enumerate(others) if leg is anchor)
+            made = None
+            for face in data.faces():
+                trial, reason = _leg_from_face(others, index, data, face, obstacles, room)
+                if trial is not None:
+                    body = box(trial[0].u0, trial[0].v0, trial[0].u1, trial[0].v1)
+                    if body.intersection(raster).area >= settings.refit_min_overlap * min(body.area, raster.area):
+                        made = trial
+                        break
+                    reason = "another place than the raster leg"
+                if trace is not None:
+                    trace.append({"refit": True, "offset_m": round(face.offset / upm, 3), "start_m": round(face.start / upm, 3),
+                                  "length_m": round((face.stop - face.start) / upm, 3), "reason": reason})
+            if made is None:
+                continue
+            new, _, support = made
+            # The measured stretch ends where worktop and labels are no longer both seen (things standing on the end of a worktop hide
+            # it); the raster end is where the labelled counter surface ends.  The free end keeps the farther of the two.
+            far_name = ("v1" if view.into > 0 else "v0") if anchor.horizontal else ("u1" if view.into > 0 else "u0")
+            far_end = max(getattr(new, far_name), getattr(free, far_name)) if view.into > 0 else min(getattr(new, far_name), getattr(free, far_name))
+            free.u0, free.u1, free.v0, free.v1 = new.u0, new.u1, new.v0, new.v1
+            setattr(free, far_name, far_end)
+            support = {**support, "length_m": round(max(free.u1 - free.u0, free.v1 - free.v0) / upm, 3)}
+            # the wall-backed leg ends at the back face of the peninsula
+            end_name = ends[1] if out > 0 else ends[0]
+            back_face = getattr(free, end_name)
+            beyond = (getattr(anchor, end_name) - back_face) * out
+            if beyond < 0.0:
+                setattr(anchor, end_name, back_face)
+            elif data.step <= beyond <= settings.end_before_m * upm:
+                a, b = view.ab(band.uv)
+                near = np.abs(b) <= front_settings.max_shift_m * upm + data.tolerance
+                start = (back_face - centre) * out
+                _, seen = _front_offset(a[near], b[near], _bins(band.z[near], low, high, front_settings.band_bins), start, start + beyond, front_settings, upm)
+                if seen < settings.min_coverage:
+                    setattr(anchor, end_name, back_face)
+                    support = {**support, "anchor_cut_m": round(beyond / upm, 3), "anchor_front_share": round(float(seen), 3)}
+            found.append(support)
+            break
     return found
 
 
@@ -372,4 +467,4 @@ def _leg_from_face(
     }), ""
 
 
-__all__ = ["FrontLegSettings", "recover_front_legs"]
+__all__ = ["FrontLegSettings", "recover_front_legs", "refit_free_legs"]

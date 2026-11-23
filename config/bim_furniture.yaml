@@ -29,6 +29,7 @@ classes:
   oven_tower:       {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: OvenTower, colour: [0.34, 0.35, 0.38]}
   wall_cabinet:     {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: WallCabinet, colour: [0.85, 0.85, 0.82]}
   worktop:          {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: Worktop, colour: [0.35, 0.35, 0.37]}
+  bar_top:          {ifc_class: IfcFurniture, predefined_type: USERDEFINED, object_type: BarTop, colour: [0.35, 0.35, 0.37]}
   refrigerator:     {ifc_class: IfcElectricAppliance, predefined_type: REFRIGERATOR, colour: [0.82, 0.84, 0.86]}
   cooker:           {ifc_class: IfcElectricAppliance, predefined_type: ELECTRICCOOKER, colour: [0.25, 0.25, 0.27]}
   dishwasher:       {ifc_class: IfcElectricAppliance, predefined_type: DISHWASHER, colour: [0.78, 0.80, 0.82]}
@@ -76,6 +77,7 @@ by_catalogue_kind:
   counter: kitchen_unit
   kitchen_base: kitchen_unit
   worktop: worktop
+  bar_top: bar_top
   fine_kitchen: kitchen_unit
   segment: kitchen_unit
   island: kitchen_unit
@@ -141,6 +143,8 @@ by_label:
   builtin_front: tall_unit
   upper_cabinet: wall_cabinet
   worktop: worktop
+  "bar top": bar_top
+  theke: bar_top
   "wall cabinet": wall_cabinet
   # appliances
   refrigerator: refrigerator

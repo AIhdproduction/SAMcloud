@@ -11,6 +11,7 @@ from shapely.geometry import LineString, Polygon
 from samcloud.bim.room_objects import ceiling, screens
 from samcloud.bim.room_objects.evidence import SCREEN_LABELS, RoomEvidence, canonical
 from samcloud.bim.room_objects.extent import discover_wall_shelves
+from samcloud.bim.room_objects.geometry import enclosed_spaces
 from samcloud.bim.room_objects.settings import RoomObjectSettings
 
 CEILING_LAYER = "A-CLNG-OBJ"
@@ -46,9 +47,15 @@ def add_room_objects(
     area_m = None if wall_area is None or wall_area.is_empty else metric(wall_area)
 
     shelves = discover_wall_shelves(items, evidence, lines_m, settings.extent, item_factory)
+    # a screen or a lamp in a room the plan did not recognise is still inside the building: the walls close that space in.
+    # The spaces only place objects; no room is written.
+    spaces = enclosed_spaces(
+        rooms_m, lines_m, area_m, face_gap_m=settings.screens.space_face_gap_m,
+        min_area_m2=settings.screens.space_min_area_m2, min_width_m=settings.screens.space_min_width_m,
+    ) if rooms_m else []
     found_screens, screen_report = screens.detect_screens(
-        evidence, rooms_m=rooms_m, wall_lines_m=lines_m, settings=settings.screens, reflection=settings.reflection,
-        frames=settings.screen_frames,
+        evidence, rooms_m=rooms_m + spaces, wall_lines_m=lines_m, settings=settings.screens, reflection=settings.reflection,
+        frames=settings.screen_frames, wall_area_m=area_m,
     )
     replaced: list[str] = []
     renamed: list[str] = []
@@ -100,7 +107,7 @@ def add_room_objects(
         added.append({"id": item.id, "label": screen.semantic, "width_m": round(screen.width, 3), "height_m": round(screen.height, 3)})
 
     found, ceiling_report = ceiling.detect_ceiling_objects(
-        evidence, rooms_m=rooms_m, wall_lines_m=lines_m, wall_area_m=area_m, settings=settings.ceiling,
+        evidence, rooms_m=rooms_m + spaces, wall_lines_m=lines_m, wall_area_m=area_m, settings=settings.ceiling,
         reflection=settings.reflection, window_lines_m=[metric(line) for line in window_lines or []],
     )
     objects: list[dict[str, Any]] = []
@@ -117,7 +124,10 @@ def add_room_objects(
             "drop_m": round(entry.drop, 3), "points": entry.points, "luminous": bool(entry.luminous),
         })
     report = {
-        "wall_shelves_added": shelves, "screens": added, "screen_items_replaced": replaced, "screen_carriers_renamed": renamed, "screens_rejected": screen_report["rejected"],
+        "wall_shelves_added": shelves, "screens": added,
+        "screen_spaces_without_room": [
+            {"area_m2": round(space.area, 2), "centre": [round(value, 3) for value in space.centroid.coords[0]]} for space in spaces
+        ], "screen_items_replaced": replaced, "screen_carriers_renamed": renamed, "screens_rejected": screen_report["rejected"],
         "ceiling_objects": len(objects), "ceiling_rejected": ceiling_report["rejected"],
     }
     return objects, report

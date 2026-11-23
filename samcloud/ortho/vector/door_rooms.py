@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from types import SimpleNamespace
 import math
 from typing import Any
 
@@ -58,6 +59,8 @@ class DoorRoomSettings:
     pocket_min_contact_m: float = 0.25
     wall_pocket_max_m2: float = 1.0  # a corner pocket bounded by walls and one room is closed up to this area (0 = off)
     wall_face_reach_m: float = 0.60  # a pocket between rooms reaches the wall faces within this distance even where the measured support ends (floor hidden behind furniture)
+    pocket_open_share: float = 0.20  # a corner pocket outside every measured room is closed only when at most this share of its outline is open (neither wall nor room): a corner behind furniture is enclosed, a pocket open to unseen space is not
+    passage_front_reach_m: float = 0.15  # a room is in front of a passage when it comes this close to the probes just beyond the passage's wall faces (face position noise of a few cm plus the floor_grow tolerance of the room outline)
 
 
 def opening_slab(opening: Any) -> Polygon:
@@ -174,6 +177,60 @@ def exterior_gap_bridges(pieces: list[dict[str, Any]], open_slabs: list[Polygon]
     return bridges
 
 
+def _joined(core: Polygon, pieces: list[Polygon], tolerance: float) -> Any:
+    """``core`` with its attached ``pieces``; parts that stay apart only by a gap within ``tolerance`` are closed together."""
+    joined = unary_union([core, *pieces])
+    if len(_polygons(joined)) <= 1 or tolerance <= 0.0:
+        return joined
+    return joined.buffer(tolerance, join_style=2).buffer(-tolerance, join_style=2)
+
+
+def _open_share(gap: Polygon, walls: Any, rooms: list[Any], tolerance: float, openings: Any = None) -> float:
+    """Share of the outline of ``gap`` that runs along neither a wall body, a room nor a door / passage (``openings``: their slabs
+    and door lines); the rest is its open side towards unseen space."""
+    length = float(gap.boundary.length)
+    if length <= 0.0:
+        return 0.0
+    closed = unary_union([shape for shape in (walls, openings, *rooms) if shape is not None and not shape.is_empty]).buffer(tolerance, join_style=2)
+    return float(gap.boundary.difference(closed).length) / length
+
+
+def _onto_wall_band(opening: Any, bodies: Any) -> Any:
+    """``opening`` with centre and wall thickness of the wall band it stands in (probed across its centre and both ends).
+
+    The band is the run of wall body along the opening normal that holds or touches the detected slab (within a quarter wall
+    thickness), at most twice the
+    opening's wall thickness wide (a thicker band is a crossing wall, not the host); without such a band the opening is unchanged.
+    """
+    if bodies is None or bodies.is_empty:
+        return opening
+    ux, uy = math.cos(float(opening.axis_angle)), math.sin(float(opening.axis_angle))
+    normal = np.asarray((-uy, ux))
+    centre = np.asarray((float(opening.center[0]), float(opening.center[1])))
+    thickness = max(float(opening.wall_thickness), 1e-9)
+    half = float(opening.width) / 2.0
+    bands: list[tuple[float, float]] = []
+    for along in (-0.9 * half, 0.0, 0.9 * half):
+        point = centre + np.asarray((ux, uy)) * along
+        line = LineString([tuple(point - normal * 2.0 * thickness), tuple(point + normal * 2.0 * thickness)])
+        hit = line.intersection(bodies)
+        for part in getattr(hit, "geoms", [hit]):
+            if part.is_empty or part.geom_type != "LineString":
+                continue
+            values = sorted(float((np.asarray(xy) - point) @ normal) for xy in part.coords)
+            low, high = values[0], values[-1]
+            # the band holds or touches the detected slab (a quarter of a wall thickness of detection noise allowed)
+            if high - low <= 2.0 * thickness and low <= 0.75 * thickness and high >= -0.75 * thickness:
+                bands.append((low, high))
+    if not bands:
+        return opening
+    low, high = float(np.median([band[0] for band in bands])), float(np.median([band[1] for band in bands]))
+    if high - low <= 0.25 * thickness:
+        return opening
+    shifted = centre + normal * (low + high) / 2.0
+    return SimpleNamespace(kind=opening.kind, center=(float(shifted[0]), float(shifted[1])), axis_angle=float(opening.axis_angle), width=float(opening.width), wall_thickness=high - low)
+
+
 def _contact(piece: Polygon, room: Polygon, tolerance: float) -> float:
     """Length of the room outline that lies against ``piece`` (within ``tolerance``)."""
     shared = room.boundary.intersection(piece.buffer(tolerance, join_style=2))
@@ -204,6 +261,7 @@ def door_bounded_rooms(
     upm = max(float(units_per_metre), 1e-9)
     stats: dict[str, Any] = {"door_room_exterior_gaps": 0, "door_room_cores_cut": 0, "door_room_gaps_closed": 0, "door_room_pieces": 0, "door_room_new": 0, "door_room_pockets": 0, "door_room_halves": 0, "door_room_area_added_m2": 0.0}
     cores = [room for room in rooms if isinstance(room, Polygon) and not room.is_empty]
+    evidenced = unary_union(cores) if cores else GeometryCollection()  # the measured rooms / wall cells as given (before any cut-back)
     if not settings.enabled or not cores:
         return list(rooms), stats
     bodies = [body for body in wall_bodies if isinstance(body, Polygon) and not body.is_empty]
@@ -212,6 +270,10 @@ def door_bounded_rooms(
     doors = [item for item in opening_list if kind_of(item) == "DOOR"]
     passages = [item for item in opening_list if kind_of(item) == "PASSAGE"]
     windows = [item for item in opening_list if kind_of(item) == "WINDOW"]
+    # A window detected on one face of its wall stands in the wall's band: its span is moved onto the wall body it lies in, so it
+    # never reaches into the room beside it (the room ends at the wall face, not at the detected face + half a wall).
+    body_union = unary_union(bodies) if bodies else GeometryCollection()
+    windows = [_onto_wall_band(item, body_union) for item in windows]
     walls = unary_union(bodies + [opening_slab(item) for item in windows]) if (bodies or windows) else GeometryCollection()
     # A gap in the wall line narrower than any door (a missing piece beside an opening, a short unmeasured stub) is no way through:
     # it is closed for room building, so rooms never flood through it.  Door, window and passage spans stay open / closed as they are.
@@ -240,7 +302,8 @@ def door_bounded_rooms(
                 for side in (1.0, -1.0):
                     base = (cx - flip * ux * half - side * nx * thick / 2.0, cy - flip * uy * half - side * ny * thick / 2.0)
                     end = (cx + flip * ux * half - side * nx * thick / 2.0, cy + flip * uy * half - side * ny * thick / 2.0)
-                    offset = (-side * nx * thick, -side * ny * thick)
+                    # the other face of the SAME band (c -/+ t/2): the window's own wall stretch, never a band one thickness beside it
+                    offset = (side * nx * thick, side * ny * thick)
                     window_pieces.append({"kind": "exterior", "face": [list(base), list(end)], "face_b": [[base[0] + offset[0], base[1] + offset[1]], [end[0] + offset[0], end[1] + offset[1]]]})
         bridges = exterior_gap_bridges(list(wall_pieces) + window_pieces, [opening_slab(item) for item in doors + passages], upm, settings.exterior_gap_max_m * upm)
         if bridges:
@@ -346,7 +409,9 @@ def door_bounded_rooms(
             new_polygons.extend(_polygons(merged))
             stats["door_room_new"] += 1
 
-    rooms_out: list[Any] = [unary_union([core, *members[index]]) for index, core in enumerate(cores)]
+    # A piece joins its room because it lies within the contact tolerance of it: the hairline between them is floor too (else the
+    # union stays two parts and the smaller one is dropped below).
+    rooms_out: list[Any] = [_joined(core, members[index], tolerance) for index, core in enumerate(cores)]
     rooms_out.extend(new_polygons)
     # --- every door reveal: each half goes to the room it touches
     all_rooms = [_largest_polygon(item) for item in rooms_out]
@@ -370,7 +435,14 @@ def door_bounded_rooms(
     stats["door_room_open_merged"] = _merge_open_rooms(rooms_out, blocked, settings.merge_contact_m * upm, tolerance * 2.0, probes)
     # --- a passage is plain floor: the rooms on both sides of it are one room
     free = (lambda shape: shape.difference(walls)) if not walls.is_empty else (lambda shape: shape)
-    merged_count = _merge_through_passages(rooms_out, [free(slab) for slab in passage_slabs], tolerance * 2.0, [free(shape) for shape in passage_reveals])
+    reveal_list = [shape for shape in passage_reveals if isinstance(shape, Polygon) and not shape.is_empty]
+    # Only the rooms in front of a passage (at its middle, on both sides of its wall) are joined by it: a detected span that
+    # overshoots past a crossing wall touches the room behind that wall with its end, and that room is not reached through it.
+    fronts = [passage_probes(item, [opening_slab(item), *(shape for shape in reveal_list if shape.intersects(opening_slab(item)))], tolerance) for item in passages]
+    merged_count = _merge_through_passages(
+        rooms_out, [free(slab) for slab in passage_slabs], tolerance * 2.0, [free(shape) for shape in reveal_list],
+        fronts=fronts, front_reach=settings.passage_front_reach_m * upm, min_part=settings.min_room_m2 * upm * upm,
+    )
     stats["door_room_merged"] = merged_count
     # --- pockets between a room and a wall / room outline (ragged around furniture) belong to the room they touch most
     live = [room for room in rooms_out if room is not None]
@@ -413,6 +485,9 @@ def door_bounded_rooms(
             thin = gap.length > 0.0 and 2.0 * gap.area / gap.length <= settings.wall_face_reach_m * upm  # a strip along a wall: mean width within the wall-face reach
             if gap.area < settings.min_piece_m2 * upm * upm or not (gap.area <= settings.wall_pocket_max_m2 * upm * upm or thin):
                 continue
+            doorways = unary_union([slab_union, cut, *passage_slabs])
+            if gap.intersection(evidenced).area < 0.5 * gap.area and (doorways.is_empty or gap.distance(doorways) > tolerance * 2.0) and _open_share(gap, walls, rooms_out, tolerance * 2.0, doorways) > settings.pocket_open_share:
+                continue  # a pocket hidden behind furniture is enclosed by walls and the room (a pocket at a doorway is its reveal); one that opens onto unseen space is no floor of the room
             contacts = [_contact(gap, room, tolerance * 2.0) if room is not None else 0.0 for room in rooms_out]
             touching = [index for index, value in enumerate(contacts) if value >= settings.pocket_min_contact_m * upm]
             if len(touching) != 1:
@@ -490,15 +565,48 @@ def _merge_open_rooms(rooms: list[Any], blocked: Any, minimum: float, tolerance:
     return merged
 
 
-def _merge_through_passages(rooms: list[Any], passages: list[Any], reach: float, reveals: Iterable[Any] = ()) -> int:
+def passage_probes(opening: Any, spans: Iterable[Polygon], margin: float) -> list[tuple[Point, Point]]:
+    """Points just beyond both wall faces of a passage at the middle half of its width: ``(side +, side -)`` each.
+
+    ``spans`` (the passage slab and its face-to-face reveal) give the extent across the wall; the probes lie ``margin`` beyond it.
+    """
+    ux, uy = math.cos(float(opening.axis_angle)), math.sin(float(opening.axis_angle))
+    nx, ny = -uy, ux
+    cx, cy = float(opening.center[0]), float(opening.center[1])
+    thickness = max(float(opening.wall_thickness), 1e-9)
+    span = unary_union([shape for shape in spans if shape is not None and not shape.is_empty])
+    reach = 4.0 * thickness + float(opening.width)
+    probes: list[tuple[Point, Point]] = []
+    for fraction in (-0.25, 0.0, 0.25):
+        px, py = cx + ux * fraction * float(opening.width), cy + uy * fraction * float(opening.width)
+        low, high = -thickness / 2.0, thickness / 2.0
+        if not span.is_empty:
+            hit = LineString([(px - nx * reach, py - ny * reach), (px + nx * reach, py + ny * reach)]).intersection(span)
+            values = [(x - px) * nx + (y - py) * ny for part in getattr(hit, "geoms", [hit]) if not part.is_empty and part.geom_type == "LineString" for x, y in part.coords]
+            if values:
+                low, high = min(values), max(values)
+        probes.append((Point(px + nx * (high + margin), py + ny * (high + margin)), Point(px + nx * (low - margin), py + ny * (low - margin))))
+    return probes
+
+
+def _separate_parts(geometry: Any, minimum: float) -> int:
+    return sum(part.area >= minimum for part in _polygons(geometry))
+
+
+def _merge_through_passages(
+    rooms: list[Any], passages: list[Any], reach: float, reveals: Iterable[Any] = (),
+    fronts: list[list[tuple[Point, Point]]] | None = None, front_reach: float = 0.0, min_part: float = 0.0,
+) -> int:
     """Merge (in place; a merged-away entry becomes None) all rooms that touch the same passage opening.
 
     ``reveals`` reach from face to face of the host wall: rooms that only meet across one are joined by its floor.  Where the
-    passage itself already touches all of them nothing is added.
+    passage itself already touches all of them nothing is added.  With ``fronts`` (``passage_probes`` per passage) only rooms
+    within ``front_reach`` of a probe are joined.  With ``min_part`` two rooms are only joined when the joined room is one floor
+    (no part of at least ``min_part`` would stand apart): the result keeps one polygon per room, a separate part would be lost.
     """
     reveal_list = [reveal for reveal in reveals if not reveal.is_empty]
     merged = 0
-    for passage in passages:
+    for number, passage in enumerate(passages):
         if passage.is_empty:
             continue
         touching = [index for index, room in enumerate(rooms) if room is not None and room.distance(passage) <= reach]
@@ -510,8 +618,16 @@ def _merge_through_passages(rooms: list[Any], passages: list[Any], reach: float,
                 touching = meeting
             else:
                 across = []
+        if fronts is not None and number < len(fronts):
+            touching = [index for index in touching if any(rooms[index].distance(point) <= front_reach for pair in fronts[number] for point in pair)]
         for other in touching[1:]:
-            rooms[touching[0]] = unary_union([rooms[touching[0]], rooms[other], *across])
+            joined = unary_union([rooms[touching[0]], rooms[other], *across])
+            if min_part > 0.0:
+                bridge = unary_union([passage, *across])
+                parts = _separate_parts(unary_union([rooms[touching[0]], rooms[other], bridge]).buffer(reach, join_style=2), min_part)
+                if parts >= _separate_parts(rooms[touching[0]], min_part) + _separate_parts(rooms[other], min_part):
+                    continue  # the two rooms do not meet through this passage: joining them would drop one of them
+            rooms[touching[0]] = joined
             rooms[other] = None
             merged += 1
     return merged

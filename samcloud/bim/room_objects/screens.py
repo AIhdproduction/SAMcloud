@@ -421,6 +421,7 @@ def _rounded(values: Any) -> list[float]:
 
 def _make_screen(
     evidence: RoomEvidence, member: np.ndarray, walls: list[LineString], rooms: list[Polygon], settings: ScreenSettings,
+    wall_area: Any = None,
 ) -> tuple[Screen | None, str | None]:
     points = evidence.xyz[member]
     centre, normal, rms = fit_plane(points)
@@ -444,18 +445,24 @@ def _make_screen(
     if _dominant_instance(evidence, member, evidence.instance_ids(SCREEN_LABELS)) is None:
         if _term_share(evidence, front, u, v, normal, width, height) < settings.unlabelled_term_share:
             return None, "screen term on too little of the surface"
-    return _panel_screen(evidence, member, front, u, v, normal, width, height, walls, rooms, settings)
+    return _panel_screen(evidence, member, front, u, v, normal, width, height, walls, rooms, settings, wall_area=wall_area)
 
 
 def _panel_screen(
     evidence: RoomEvidence, member: np.ndarray, front: np.ndarray, u: np.ndarray, v: np.ndarray, normal: np.ndarray,
     width: float, height: float, walls: list[LineString], rooms: list[Polygon], settings: ScreenSettings,
-    photo: Frame | None = None,
+    photo: Frame | None = None, wall_area: Any = None,
 ) -> tuple[Screen | None, str | None]:
     """The screen of a measured rectangle: facing, what carries it, stand and name."""
     room = next((item for item in rooms if item.buffer(0.10).contains(Point(front[:2]))), None)
     if rooms and room is None:
         return None, "outside the rooms (seen through or reflected in a pane)"
+    if wall_area is not None and wall_area.buffer(-settings.wall_cross_m).contains(Point(front[:2])):
+        return None, "inside a wall"  # the front of a screen is in the room, never in the masonry behind the face
+    if _through_wall(front, u, width, walls, settings.wall_cross_m):
+        return None, "reaches through a wall"
+    if width < settings.small_screen_m and front[2] - 0.5 * height * float(v[2]) < settings.min_bottom_m:
+        return None, "at the floor"
     distance, wall = nearest_line(front[:2], walls)
     parallel = False
     if wall is not None:
@@ -515,6 +522,34 @@ def _panel_screen(
     ), None
 
 
+def _through_wall(front: np.ndarray, u: np.ndarray, width: float, walls: list[LineString], tolerance: float) -> bool:
+    """Whether the panel reaches more than ``tolerance`` through the face of a wall standing across it.
+
+    A screen stands on one side of a wall.  The wall it hangs on or stands at (within 15 degrees, as ``parallel`` in
+    :func:`_panel_screen`) is left to the room gate and the thickness clamp: a yaw error of the fit must not reject it.
+    """
+    along = np.asarray((float(u[0]), float(u[1])))
+    length = float(np.linalg.norm(along))
+    if length < 1e-9 or width <= 0:
+        return False
+    along /= length
+    ends = (front[:2] - 0.5 * width * along, front[:2] + 0.5 * width * along)
+    panel = LineString(ends)
+    for wall in walls:
+        if wall.is_empty or wall.length < 1e-9:
+            continue
+        direction = line_direction(wall)
+        if abs(float(direction @ along)) >= math.cos(math.radians(15.0)) or not panel.intersects(wall):
+            continue
+        across = np.asarray((-direction[1], direction[0]))
+        origin = np.asarray(wall.coords[0], dtype=float)
+        middle = float((front[:2] - origin) @ across)
+        side = 1.0 if middle >= 0 else -1.0
+        if max(-side * float((end - origin) @ across) for end in ends) > tolerance:
+            return True
+    return False
+
+
 def _photo_semantic(photo: Frame) -> str:
     precise = Counter(name for name in photo.labels if name != "screen")
     name = max(precise, key=lambda item: (precise[item], -SCREEN_LABELS.index(item))) if precise else "screen"
@@ -525,7 +560,7 @@ def _photo_semantic(photo: Frame) -> str:
 
 def _with_photo_frames(
     evidence: RoomEvidence, measured: list[Screen], walls: list[LineString], rooms: list[Polygon], settings: ScreenSettings,
-    frame_settings: ScreenFrameSettings, rejected: list[dict[str, Any]],
+    frame_settings: ScreenFrameSettings, rejected: list[dict[str, Any]], wall_area: Any = None,
 ) -> tuple[list[Screen], list[dict[str, Any]]]:
     """Add what several photos agree on; it replaces a smaller or offset fragment measured in the cloud."""
     frames, refused = fit_screen_frames(evidence.screen_views, rooms, frame_settings)
@@ -552,7 +587,7 @@ def _with_photo_frames(
         ]
         screen, problem = _panel_screen(
             evidence, member, photo.centre, photo.u, photo.v, photo.normal, photo.width, photo.height, walls, rooms, settings,
-            photo=photo,
+            photo=photo, wall_area=wall_area,
         )
         if screen is None:
             rejected.append({"centre": _rounded(photo.centre), "points": len(member), "reason": f"photo frame: {problem}"})
@@ -586,9 +621,12 @@ def _with_photo_frames(
 
 def detect_screens(
     evidence: RoomEvidence, *, rooms_m: list[Polygon], wall_lines_m: list[LineString], settings: ScreenSettings,
-    reflection: ReflectionSettings, frames: ScreenFrameSettings | None = None,
+    reflection: ReflectionSettings, frames: ScreenFrameSettings | None = None, wall_area_m: Any = None,
 ) -> tuple[list[Screen], dict[str, Any]]:
-    """All screens of one level, each once, and why the other candidates were rejected."""
+    """All screens of one level, each once, and why the other candidates were rejected.
+
+    ``wall_area_m`` (optional) are the wall bodies in plan metres: a panel whose front lies inside one is refused.
+    """
     rejected: list[dict[str, Any]] = []
     if not settings.enabled:
         return [], {"rejected": rejected}
@@ -597,7 +635,7 @@ def detect_screens(
     rooms = [room for room in rooms_m if not room.is_empty]
     screens: list[Screen] = []
     for member in groups:
-        screen, problem = _make_screen(evidence, member, wall_lines_m, rooms, settings)
+        screen, problem = _make_screen(evidence, member, wall_lines_m, rooms, settings, wall_area=wall_area_m)
         if screen is None:
             rejected.append({"centre": _rounded(evidence.xyz[member].mean(axis=0)), "points": len(member), "reason": problem})
         else:
@@ -605,7 +643,7 @@ def detect_screens(
     photo_report: list[dict[str, Any]] = []
     if evidence.screen_views:
         screens, photo_report = _with_photo_frames(
-            evidence, screens, wall_lines_m, rooms, settings, frames or ScreenFrameSettings(), rejected,
+            evidence, screens, wall_lines_m, rooms, settings, frames or ScreenFrameSettings(), rejected, wall_area=wall_area_m,
         )
     screens.sort(key=lambda item: -item.points)
     mirrored = reflection_of(

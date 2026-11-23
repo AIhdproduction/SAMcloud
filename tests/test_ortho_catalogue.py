@@ -108,7 +108,7 @@ def test_catalogue_blocks_have_standard_metric_dimensions_and_wall_origin(work_d
     assert {(e.width_m, e.depth_m) for e in CATALOGUE["KITCHEN_ISLAND"]} == {(1.80, 0.90), (2.40, 1.20)}
     assert all(e.depth_m == 0.60 for e in CATALOGUE["WARDROBE"])
     table = _block_box(reopened, "TABLE_DINING_1600X900")
-    assert table[2] - table[0] == pytest.approx(1.60) and table[3] - table[1] > 0.90  # table plus chair outlines
+    assert table[2] - table[0] == pytest.approx(1.60) and table[3] - table[1] == pytest.approx(0.90)  # top only, no stock chairs
     # Sanitary blocks carry real detail: tub drain circle, shower diagonal cross, basin ellipse.
     assert any(entity.dxftype() == "CIRCLE" for entity in reopened.blocks["BATHTUB_1700X750"])
     assert sum(entity.dxftype() == "LINE" for entity in reopened.blocks["SHOWER_900X900"]) == 2

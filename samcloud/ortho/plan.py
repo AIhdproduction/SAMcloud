@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import copy
 import hashlib
 import json
 import logging
@@ -59,6 +60,7 @@ from samcloud.ortho.vector.spots import SpotSettings, ground_grid_points, points
 from samcloud.ortho.vector.terrain import DtmSampler, drape_coordinates, drape_outline_heights
 from samcloud.ortho.vector.vegetation import HedgeSettings, hedge_entities
 from samcloud.ortho.vector.kitchen_run import KitchenRunSettings, appliance_insert, build_kitchen_run
+from samcloud.ortho.vector.kitchen_bar import BarTopSettings
 from samcloud.ortho.vector.kitchen_fronts import KitchenFrontSettings, load_kitchen_points
 from samcloud.ortho.vector.kitchen_layout import counter_lines, kitchen_cad_layout, kitchen_scan_bounds, tall_unit_entities
 from samcloud.ortho.vector.kitchen_legs import FrontLegSettings
@@ -84,7 +86,7 @@ from samcloud.ortho.vector.wall_lines import (
 )
 from samcloud.ortho.vector.wall_tidy import tidy_wall_entities
 from samcloud.ortho.vector.wall_directions import DirectionSettings, UnobservedEdgeSettings, close_corners_through_unobserved, drop_unobserved_edge_pieces, extend_rooms_into_unobserved, trim_rooms_to_faces
-from samcloud.ortho.vector.double_walls import DoubleWallSettings, TallUnitEvidence, WallEvidence, bound_rooms_by_walls, build_double_walls, update_opening_symbols
+from samcloud.ortho.vector.double_walls import DoubleWallSettings, TallUnitEvidence, WallEvidence, bound_rooms_by_walls, build_double_walls, measured_wall_share, measured_wall_stretches, update_opening_symbols
 from samcloud.ortho.vector.labels import class_display_name, label_entities, load_label_settings, resolve_label_overlaps
 from samcloud.ortho.vector.door_rooms import DoorRoomSettings, door_bounded_rooms
 from samcloud.ortho.vector.opening_bands import passage_reveals
@@ -142,6 +144,7 @@ class CleanPlanSettings:
     indoor_kitchen_run: KitchenRunSettings = KitchenRunSettings()
     indoor_kitchen_fronts: KitchenFrontSettings = KitchenFrontSettings()
     indoor_kitchen_front_legs: FrontLegSettings = FrontLegSettings()
+    indoor_kitchen_bar_top: BarTopSettings = BarTopSettings()
     indoor_furniture_solids: FurnitureSolidSettings = FurnitureSolidSettings()
     walls: DoubleWallSettings = DoubleWallSettings()
     indoor_wall_directions: DirectionSettings = DirectionSettings()
@@ -230,6 +233,7 @@ def load_clean_plan_settings(path: Path | str | None = None) -> CleanPlanSetting
         indoor_kitchen_run=section_of("indoor_kitchen_run", KitchenRunSettings),
         indoor_kitchen_fronts=section_of("indoor_kitchen_fronts", KitchenFrontSettings),
         indoor_kitchen_front_legs=section_of("indoor_kitchen_front_legs", FrontLegSettings),
+        indoor_kitchen_bar_top=section_of("indoor_kitchen_bar_top", BarTopSettings),
         indoor_furniture_solids=section_of("indoor_furniture_solids", FurnitureSolidSettings),
         walls=section_of("walls", DoubleWallSettings),
         indoor_wall_directions=DirectionSettings.from_mapping(data.get("indoor_wall_directions", {})),
@@ -967,7 +971,16 @@ def _generate_indoor_clean_plan(
     # lies in a wall): the walls seen from both sides are recorded first, the wall stage builds them on both faces.
     side_evidence = wall_side_evidence(vertical, grid, units_per_metre, plan_settings.indoor_vertical.bins)
     two_faced = two_faced_walls([face.line.coords for face in faces if face.kind == "line" and face.line is not None], side_evidence, wall_points)
-    snap_exterior_faces_to_flucht(faces, free_space | closed_floor, grid, units_per_metre)
+    # ... but never off its own wall: a face that is mostly measured wall where it was fitted is not taken to a line without one.
+    flucht_evidence = WallEvidence(wall_bits=vertical.wall_bits, all_bits=vertical.bitmask, bins=plan_settings.indoor_vertical.bins, storey_height=ceiling_height)
+    faces_kept_in_place = snap_exterior_faces_to_flucht(
+        faces, free_space | closed_floor, grid, units_per_metre,
+        wall_share=(lambda line, any_class: measured_wall_share(line, flucht_evidence, grid, units_per_metre, plan_settings.walls, any_class)) if vertical.wall_bits is not None else None,
+        min_wall_share=plan_settings.walls.face_min_share, rooms=rooms_data.polygons, room_reach=plan_settings.walls.room_gap_m * units_per_metre,
+        wall_stretches=(lambda line: measured_wall_stretches(line, flucht_evidence, grid, units_per_metre, plan_settings.walls, plan_settings.indoor_face_min_length)) if vertical.wall_bits is not None else None,
+    )
+    if faces_kept_in_place:
+        _LOGGER.info("clean plan: %d measured wall face(s) kept off the Flucht of their group: %s", len(faces_kept_in_place), faces_kept_in_place)
     structural_walls = face_buffer_polygons(faces, 0.015 * units_per_metre)
     door_codes = next((layer.codes for layer in indoor_layers if layer.name == "A-DOOR"), ())
     door_mask = np.isin(classes, door_codes)
@@ -1037,6 +1050,7 @@ def _generate_indoor_clean_plan(
     sanitary_codes = next((layer.codes for layer in furniture_layers if layer.name == "P-SANI"), ())
     fixtures_rejected: dict[str, int] = {}
     object_failures: dict[str, int] = {}  # per-object steps that failed (object skipped with a warning, plan continues)
+    plan_stage_failures: dict[str, int] = {}  # optional refinement stages that failed (plan kept from before the stage)
     catalogue_inserts: list[dict[str, object]] = []
     kitchen_islands = 0
     if instance_raster is not None and instance_labels:
@@ -1239,13 +1253,14 @@ def _generate_indoor_clean_plan(
                     continue
                 fit = FootprintFit("rect" if was_rectangle else fit.kind, refit, fit.dev90, fit.iou, fit.radius)
         metric_height = instance.height / max(metric_units_per_metre, 1e-9)
-        # A table with traced chairs keeps its own rectangle: the dining block would draw stock chairs instead.
+        # Furniture with a traced chair within 0.30 m keeps its measured outline (no catalogue block).  Tables never get a
+        # catalogue block at all (see _FURNITURE_KINDS): their detected chairs stay as their own outlines.
         own_chairs = any(chair.distance(fit.polygon) <= 0.30 * units_per_metre for chair in traced_chairs)
         furniture_kinds = _FURNITURE_KINDS.get(str(instance.label or "").strip().lower())
         furniture_insert = None
         if furniture_kinds is not None and fit.kind in {"rect", "rect_free"} and not clutter and not own_chairs:
             # a block of the wall-mounted kinds turns onto the wall: not for an object whose own rotation is clearly measured
-            turned = furniture_kinds != ("TABLE_DINING",) and _object_step(
+            turned = _object_step(
                 object_failures, "measured_rotation", display,
                 lambda: clear_rotation(_footprint_evidence(component, local_grid, units_per_metre), theta, units_per_metre),
             ) is not None
@@ -1307,7 +1322,7 @@ def _generate_indoor_clean_plan(
     footprint_metrics["kitchen_einb_from_fine"] = kitchen_einb_from_fine
     footprint_metrics["kitchen_islands"] = kitchen_islands
     footprint_metrics["object_step_failures"] = dict(object_failures)
-    _absorb_chairs_at_dining_tables(output_layers, units_per_metre)
+    # Detected chairs are never dropped next to a table insert: the table block draws no chairs (symbols._dining_table).
     furniture_polygons = [Polygon(entity["points"]) for entity in output_layers["A-FURN"] if entity.get("type") == "polyline" and entity.get("closed") and len(entity.get("points", [])) >= 3]
     counter_top = (height_map >= 0.70 * units_per_metre) & (height_map <= 1.05 * units_per_metre) & (vertical.full | vertical.counter)
     kitchen_names = {"sink", "stove", "refrigerator", "fridge", "kitchen", "washbasin", "toilet", "wc", "bathtub", "shower"}
@@ -1459,11 +1474,11 @@ def _generate_indoor_clean_plan(
                 footprint_metrics.update(cell_stats)
                 # Rooms go from door to door: the floor no wall cell encloses (hall, strips, pockets behind furniture) is
                 # handed to the room it is open to; only walls and door lines split the interior.
-                door_rooms, door_stats = door_bounded_rooms(
+                door_rooms, door_stats = _plan_stage(plan_stage_failures, "door_bounded_rooms", lambda: door_bounded_rooms(
                     list(sorted_rooms), double.closed_polygons, openings, free_space | closed_floor, grid, units_per_metre, plan_settings.indoor_door_rooms,
                     furniture=ceiling_furniture_mask | tall_mask, support=classes != 0, wall_pieces=double.pieces, theta=theta,
                     passage_reveals=passage_reveals(openings, double.opening_slabs, double.opening_hosted),
-                )
+                ), default=([], {}))
                 if door_rooms:
                     sorted_rooms = sorted(door_rooms, key=lambda item: (-item.representative_point().y, item.representative_point().x))
                 footprint_metrics.update(door_stats)
@@ -1520,13 +1535,16 @@ def _generate_indoor_clean_plan(
             kitchen_points = None if kitchen_bounds is None else load_kitchen_points(
                 point_source or _find_point_source(project, ortho.stats), frame, level.floor_z, kitchen_bounds,
             )
-            footprint_metrics.update(kitchen_cad_layout(
+            footprint_metrics.update(_plan_stage(plan_stage_failures, "kitchen_cad_layout", lambda: kitchen_cad_layout(
                 output_layers, kept_rooms, kitchen_walls, theta, units_per_metre, _height_sampler(height_map, grid),
                 _kitchen_appliance_points(fine_classes, fine_names, instance_raster, instance_labels, height_map, grid, units_per_metre),
                 scan_points=kitchen_points, front_settings=plan_settings.indoor_kitchen_fronts,
                 kitchen_labels=kitchen_labels, leg_settings=plan_settings.indoor_kitchen_front_legs,
-            ))
+                bar_settings=plan_settings.indoor_kitchen_bar_top,
+            ), default={}, layers=output_layers))
         footprint_metrics.update(place_object_labels(output_layers, kept_rooms, units_per_metre, theta, _insert_footprint, plan_settings.plan_polish))
+    if plan_stage_failures:
+        footprint_metrics["plan_stage_failures"] = dict(plan_stage_failures)
     if not double_walls_done:
         output_layers["A-WALL"], wall_tidy_stats = tidy_wall_entities(output_layers["A-WALL"], openings, units_per_metre)
         footprint_metrics.update(wall_tidy_stats)
@@ -1660,6 +1678,30 @@ def _object_step(failures: dict[str, int], stage: str, label: Any, call: Callabl
     except Exception:  # noqa: BLE001 - one degenerate object must never cost the whole plan
         _LOGGER.warning("indoor plan: %s failed for object %r; object skipped", stage, label, exc_info=True)
         failures[stage] = failures.get(stage, 0) + 1
+        return default
+
+
+def _plan_stage(failures: dict[str, int], stage: str, call: Callable[[], Any], default: Any = None, layers: dict[str, list[dict[str, Any]]] | None = None) -> Any:
+    """Run one optional refinement stage of the indoor plan; a failure keeps the plan as it was before the stage.
+
+    The stages that refine an already valid plan (rooms from door to door, the kitchen CAD layout) must never cost the whole
+    DXF / IFC job of a new recording: an unexpected error is logged with its traceback and counted, the layers the stage was
+    working on are put back (``layers``: every list keeps its identity and gets its entities from before the stage) and
+    ``default`` is returned.
+    """
+    backup = None if layers is None else {name: copy.deepcopy(entities) for name, entities in layers.items()}
+    try:
+        return call()
+    except (OrthoError, Cancelled, MemoryError):
+        raise
+    except Exception:  # noqa: BLE001 - a refinement must never cost the whole plan
+        _LOGGER.warning("indoor plan: stage %s failed; the plan keeps its state from before this stage", stage, exc_info=True)
+        failures[stage] = failures.get(stage, 0) + 1
+        if layers is not None and backup is not None:
+            for name in [name for name in layers if name not in backup]:
+                del layers[name]
+            for name, entities in backup.items():
+                layers.setdefault(name, [])[:] = entities
         return default
 
 
@@ -2924,9 +2966,12 @@ _FIXTURE_KINDS: dict[str, tuple[str, ...]] = {
     "STOVE": ("COOKTOP",), "SINK": ("KITCHEN_SINK",),
 }
 _APPLIANCE_TOLERANCE = 0.30
+# Tables are not in this list: a table is drawn from its measured outline (the export redraws it with the top extent of
+# the 3D reconstruction).  A standard dining-table size would invent its extent (a low table at a sofa matched 1.40 x 0.80
+# while its measured top is about 1.07 x 0.67), and a table with detected chairs keeps its measured top as well; its
+# chairs are drawn as their own outlines.  The TABLE_DINING block stays in the catalogue (top only, no chairs).
 _FURNITURE_KINDS: dict[str, tuple[str, ...]] = {
     "bed": ("BED_SINGLE", "BED_DOUBLE"), "sofa": ("SOFA",), "wardrobe": ("WARDROBE",),
-    "table": ("TABLE_DINING",), "dining table": ("TABLE_DINING",),
 }
 _FURNITURE_TOLERANCE = 0.15
 
@@ -2942,7 +2987,7 @@ def _catalogue_fixture(fixture: str, insert: dict[str, object], wall_lines: list
 
 
 def _furniture_catalogue_insert(label: str, fit: Any, wall_lines: list[LineString], units_per_metre: float) -> dict[str, object] | None:
-    """Catalogue block for a rectangular furniture footprint (bed, sofa, wardrobe, dining table) when it matches a standard size."""
+    """Catalogue block for a rectangular wall-standing furniture footprint (bed, sofa, wardrobe) when it matches a standard size."""
     kinds = _FURNITURE_KINDS.get(label)
     if kinds is None:
         return None
@@ -2956,8 +3001,6 @@ def _furniture_catalogue_insert(label: str, fit: Any, wall_lines: list[LineStrin
         "rotation": math.degrees(math.atan2(float(edges[long_index][1]), float(edges[long_index][0]))) % 180.0,
         "xscale": lengths[long_index], "yscale": lengths[1 - long_index], "attributes": {},
     }
-    if kinds == ("TABLE_DINING",):
-        return centred_catalogue_insert(measured, kinds, units_per_metre, tolerance=_FURNITURE_TOLERANCE, centred_origin=True)
     return snap_insert_to_wall(measured, kinds, wall_lines, units_per_metre, max_gap_m=0.15, tolerance=_FURNITURE_TOLERANCE)
 
 
@@ -3259,34 +3302,6 @@ def _emit_tall_units(layers: dict[str, list[dict[str, Any]]], units: list[tuple[
             meta["_height_m"] = measured
         layers["A-EINB"].extend(tall_unit_entities(shape, label, units_per_metre, **meta))
     return absorbed
-
-
-def _absorb_chairs_at_dining_tables(layers: dict[str, list[dict[str, Any]]], units_per_metre: float) -> None:
-    """Drop traced chairs that the TABLE_DINING block already draws around its table."""
-    zones = []
-    for entity in layers.get("A-FURN", []):
-        if entity.get("type") == "insert" and str(entity.get("name", "")).startswith("TABLE_DINING"):
-            footprint = _insert_footprint(entity)
-            if footprint is not None:
-                zones.append(footprint.buffer(0.30 * units_per_metre))
-    if not zones:
-        return
-    chair_labels = {"Stuhl", "Chair", "Sessel"}
-    dropped: list[list[float]] = []
-    kept: list[dict[str, Any]] = []
-    for entity in layers["A-FURN"]:
-        if entity.get("type") == "polyline" and entity.get("closed") and entity.get("_label") in chair_labels and len(entity.get("points", [])) >= 3:
-            centroid = Polygon(entity["points"]).centroid
-            if any(zone.contains(centroid) for zone in zones):
-                dropped.append([centroid.x, centroid.y])
-                continue
-        kept.append(entity)
-    layers["A-FURN"] = kept
-    if dropped:
-        layers["A-ANNO"] = [
-            entity for entity in layers["A-ANNO"]
-            if not (entity.get("type") == "text" and str(entity.get("text", "")).split(" h=")[0] in chair_labels and any(math.dist(entity["point"][:2], point) <= 0.05 * units_per_metre for point in dropped))
-        ]
 
 
 def _kitchen_runs(einb: list[dict[str, Any]]) -> list[Polygon]:

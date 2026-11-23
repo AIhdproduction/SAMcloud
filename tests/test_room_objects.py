@@ -423,6 +423,137 @@ def test_two_monitors_side_by_side_stay_two():
     assert len(_detect(cloud)[0]) == 2
 
 
+# a flat of two rooms side by side; the plan knows only the left one (x < 3.987), the right one is closed in by walls
+_KNOWN = box(0.013, 0.013, 3.987, 4.013)
+_RIGHT_WALLS = [
+    LineString(((4.113, 0.013), (6.987, 0.013))), LineString(((6.987, 0.013), (6.987, 4.013))),
+    LineString(((6.987, 4.013), (4.113, 4.013))),
+    # the partition: its faces stop at a doorway (y 1.507 .. 2.393) that leads into the known room
+    LineString(((3.987, 0.013), (3.987, 1.507))), LineString(((3.987, 2.393), (3.987, 4.013))),
+    LineString(((4.113, 0.013), (4.113, 1.507))), LineString(((4.113, 2.393), (4.113, 4.013))),
+]
+_LEFT_WALLS = [
+    LineString(((0.013, 0.013), (3.987, 0.013))), LineString(((3.987, 4.013), (0.013, 4.013))),
+    LineString(((0.013, 4.013), (0.013, 0.013))),
+]
+_EAST = (6.987, 0.013)  # start of the outer wall on the right
+# the wall bodies between the faces, as the plan model passes them
+_BODIES = box(-0.187, -0.187, 7.187, 4.213).difference(box(0.013, 0.013, 6.987, 4.013)).union(
+    box(3.987, 0.013, 4.113, 1.507)).union(box(3.987, 2.393, 4.113, 4.013))
+_OPEN_EAST = _BODIES.difference(box(6.9, 0.4, 7.3, 3.6))  # the outer wall on the right is missing
+_PARTITION = box(3.987, -0.187, 4.113, 1.507).union(box(3.987, 2.393, 4.113, 4.213))  # partition reaching the outer faces
+
+
+def _monitor_on_a_desk(cloud, x=5.213, y=3.607, width=0.613, bottom=0.883, height=0.357):
+    cloud.rect((x, y, bottom), (width, 0, 0), (0, 0, height), FURNITURE, term="computer monitor", instance=8, grey=40.0)
+    cloud.labels[8] = "monitor"
+    cloud.rect((x - 0.31, y - 0.53, 0.753), (width + 0.62, 0, 0), (0, 0.75, 0), FURNITURE, instance=3)
+
+
+def _screens(items):
+    return [item for item in items if (item.fit or {}).get("added") == "screen"]
+
+
+def test_monitor_in_a_room_the_plan_did_not_recognise_is_kept():
+    cloud = Cloud()
+    _monitor_on_a_desk(cloud)
+    items, _, report = _detect(cloud, rooms=[_KNOWN], walls=_LEFT_WALLS + _RIGHT_WALLS, wall_area=_BODIES)
+    screens = _screens(items)
+    assert len(screens) == 1 and screens[0].semantic_label == "monitor"
+    assert screens[0].fit["width_m"] == pytest.approx(0.613, abs=0.04)
+    centre = np.asarray(screens[0].fit["centre"])
+    assert centre[0] == pytest.approx(5.52, abs=0.03) and centre[1] == pytest.approx(3.607, abs=0.03)
+    # the space is only reported, no room is invented
+    (space,) = report["screen_spaces_without_room"]
+    assert space["area_m2"] == pytest.approx(2.874 * 4.0, rel=0.03) and space["centre"][0] == pytest.approx(5.55, abs=0.05)
+
+
+def test_monitor_beyond_an_open_side_stays_outside_the_rooms():
+    cloud = Cloud()
+    _monitor_on_a_desk(cloud)
+    walls = _LEFT_WALLS + [line for line in _RIGHT_WALLS if line.coords[0] != _EAST]  # no outer wall on the right
+    items, _, report = _detect(cloud, rooms=[_KNOWN], walls=walls, wall_area=_OPEN_EAST)
+    assert not _screens(items) and not report["screen_spaces_without_room"]
+    assert any("outside" in entry["reason"] for entry in report["screens_rejected"])
+
+
+def test_enclosed_spaces_ignore_slivers_pockets_and_gaps():
+    from samcloud.bim.room_objects.geometry import enclosed_spaces
+
+    def spaces(walls, rooms=(_KNOWN,), bodies=None):
+        return enclosed_spaces(list(rooms), walls, bodies, face_gap_m=0.05, min_area_m2=1.0, min_width_m=0.60)
+
+    assert len(spaces(_LEFT_WALLS + _RIGHT_WALLS, bodies=_BODIES)) == 1
+    no_east = [line for line in _RIGHT_WALLS if line.coords[0] != _EAST]
+    assert not spaces(_LEFT_WALLS + no_east, bodies=_OPEN_EAST)
+    # a 0.40 m strip (1.2 m2) between a room outline and a wall face is a sliver, not a room
+    strip = [
+        LineString(((0.013, 4.413), (3.987, 4.413))), LineString(((0.013, 4.013), (0.013, 4.413))),
+        LineString(((3.987, 4.013), (3.987, 4.413))),
+    ]
+    assert not spaces(_LEFT_WALLS + strip)
+    # a closed 0.7 x 0.9 m pocket is a shaft or a built-in cupboard
+    pocket = [
+        LineString(((3.987, 0.013), (4.687, 0.013))), LineString(((4.687, 0.013), (4.687, 0.913))),
+        LineString(((4.687, 0.913), (3.987, 0.913))),
+    ]
+    assert not spaces(_LEFT_WALLS + pocket)
+
+    def east_from(y):
+        return [line if line.coords[0] != _EAST else LineString(((6.987, y), (6.987, 4.013))) for line in _RIGHT_WALLS]
+
+    # faces that stop 0.08 m short of each other at a corner still close the space; a 0.40 m gap leaves it open
+    assert len(spaces(_LEFT_WALLS + east_from(0.093), bodies=_PARTITION)) == 1
+    assert not spaces(_LEFT_WALLS + east_from(0.413), bodies=_PARTITION)
+
+
+@pytest.mark.parametrize("end_x,kept", [(4.957, True), (5.263, False)])
+def test_panel_reaching_through_a_wall_across_it_is_refused(end_x, kept):
+    cloud = Cloud()
+    start = end_x - 0.553
+    cloud.rect((start, 2.013, 0.893), (0.553, 0, 0), (0, 0, 0.37), FURNITURE, term="computer monitor", instance=8, grey=40.0)
+    cloud.labels[8] = "monitor"
+    cloud.rect((start - 0.1, 1.713, 0.753), (4.97 - start + 0.1, 0, 0), (0, 0.55, 0), FURNITURE, instance=3)
+    items, _, report = _detect(cloud)
+    assert len(_screens(items)) == (1 if kept else 0)
+    if not kept:
+        assert any(entry["reason"] == "reaches through a wall" for entry in report["screens_rejected"])
+
+
+def test_wall_tv_with_a_small_yaw_error_is_still_kept():
+    cloud = Cloud()
+    yaw = math.radians(6.0)  # one end 0.13 m further from the wall: a fit error, not a panel through the wall
+    u = np.asarray((math.cos(yaw), math.sin(yaw), 0.0))
+    cloud.rect(np.asarray((1.013, 0.021, 0.91)), 1.22 * u, (0, 0, 0.69), FURNITURE, term="television", instance=5, grey=35.0)
+    cloud.labels[5] = "television"
+    items, _, _ = _detect(cloud)
+    assert len(items) == 1 and items[0].semantic_label == "television"
+
+
+def test_panel_inside_a_wall_body_is_refused_a_flush_tv_is_kept():
+    body = box(-0.187, -0.187, 5.187, 0.013)
+    inside = Cloud()
+    inside.rect((2.013, -0.061, 1.003), (0.47, 0, 0), (0, 0, 0.33), FURNITURE, term="screen", grey=40.0)
+    items, _, report = _detect(inside, wall_area=body)
+    assert not items and report["screens_rejected"][0]["reason"] == "inside a wall"
+    flush = Cloud()
+    _tv(flush)
+    assert len(_detect(flush, wall_area=body)[0]) == 1
+
+
+def test_small_panel_at_the_floor_is_refused_a_standing_tv_is_kept():
+    small = Cloud()
+    small.rect((2.013, 1.513, 0.131), (0.45, 0, 0), (0, 0, 0.39), FURNITURE, term="computer monitor", grey=40.0)
+    small.rect((1.9, 1.3, 0.05), (0.7, 0, 0), (0, 0.4, 0), FURNITURE)
+    items, _, report = _detect(small)
+    assert not items and any(entry["reason"] == "at the floor" for entry in report["screens_rejected"])
+    large = Cloud()
+    large.rect((1.513, 1.513, 0.153), (1.43, 0, 0), (0, 0, 0.81), FURNITURE, term="television", instance=5, grey=35.0)
+    large.labels[5] = "television"
+    found = _detect(large)[0]
+    assert len(found) == 1 and found[0].semantic_label == "television"  # a large television may stand low on its foot
+
+
 # --------------------------------------------------------------------------------------- ceiling
 
 
@@ -610,6 +741,34 @@ def test_real_lamps_in_twin_rooms_both_stay():
         cloud.disc(x, 2.017, CEILING_Z - 0.15, 0.25, EQUIPMENT, height=0.15, grey=250.0)
     rooms = [box(0.013, 0.013, 2.95, 4.013), box(3.05, 0.013, 4.987, 4.013)]
     assert len(_detect(cloud, rooms=rooms, walls=[*WALLS, LineString(((3.0, 0.013), (3.0, 4.013)))])[1]) == 2
+
+
+def _lamp_in_the_unrecognised_room():
+    cloud = Cloud()
+    cloud.ceiling()
+    cloud.rect((4.127, 0.031, CEILING_Z), (2.84, 0, 0), (0, 3.96, 0), CEILING, step=0.041)  # the right room's ceiling
+    cloud.disc(5.537, 2.019, CEILING_Z - 0.163, 0.247, EQUIPMENT, height=0.16, grey=252.0)
+    cloud.disc(1.213, 1.117, CEILING_Z - 0.163, 0.247, EQUIPMENT, height=0.16, grey=252.0)  # a lamp in the known room
+    return cloud
+
+
+def test_ceiling_lamp_in_a_room_the_plan_did_not_recognise_is_kept():
+    items, objects, report = _detect(
+        _lamp_in_the_unrecognised_room(), rooms=[_KNOWN], walls=_LEFT_WALLS + _RIGHT_WALLS, wall_area=_BODIES,
+    )
+    assert not items and _kinds(objects) == ["ceiling lamp", "ceiling lamp"]
+    right = max(objects, key=lambda item: np.asarray(item["footprint"])[:, 0].mean())
+    assert np.asarray(right["footprint"])[:, 0].mean() == pytest.approx(5.537, abs=0.03)
+    assert np.ptp(np.asarray(right["footprint"])[:, 0]) == pytest.approx(0.494, abs=0.06)
+    assert right["z_min"] == pytest.approx(CEILING_Z - 0.163, abs=0.03)
+    assert len(report["screen_spaces_without_room"]) == 1  # reported, no room written
+
+
+def test_ceiling_lamp_beyond_an_open_side_stays_outside_the_rooms():
+    walls = _LEFT_WALLS + [line for line in _RIGHT_WALLS if line.coords[0] != _EAST]
+    _, objects, report = _detect(_lamp_in_the_unrecognised_room(), rooms=[_KNOWN], walls=walls, wall_area=_OPEN_EAST)
+    assert _kinds(objects) == ["ceiling lamp"] and np.asarray(objects[0]["footprint"])[:, 0].mean() < 4.0
+    assert any(entry["reason"] == "outside the rooms" for entry in report["ceiling_rejected"])
 
 
 def test_depth_only_voxels_never_measure(tmp_path: Path):

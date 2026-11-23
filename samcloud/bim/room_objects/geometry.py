@@ -280,6 +280,40 @@ def line_direction(line: LineString) -> np.ndarray:
     return (end - start) / max(float(np.linalg.norm(end - start)), 1e-12)
 
 
+def enclosed_spaces(
+    rooms: list[Polygon], wall_lines: list[LineString], wall_area: Any, *, face_gap_m: float, min_area_m2: float,
+    min_width_m: float,
+) -> list[Polygon]:
+    """Floor areas that the measured walls and the known rooms close in on every side but no room covers.
+
+    That is a room the plan did not recognise: the space is inside the building although it has no name.  Nothing is
+    closed by guessing: only gaps up to ``2 * face_gap_m`` (wall faces that stop short of each other at a corner) are
+    bridged, so a doorway to the outside, a missing wall or a gap at a pane leaves the area open and it is not returned.
+    Pockets smaller than ``min_area_m2`` or narrower than ``min_width_m`` are shafts and slivers between a room outline and
+    its wall face, not rooms.
+    """
+    parts = [room.buffer(face_gap_m, join_style=2) for room in rooms if not room.is_empty]
+    parts += [line.buffer(face_gap_m) for line in wall_lines if not line.is_empty]
+    if wall_area is not None and not wall_area.is_empty:
+        parts.append(wall_area)
+    if not parts:
+        return []
+    barrier = unary_union(parts)
+    polygons = list(getattr(barrier, "geoms", [barrier]))
+    holes = [Polygon(ring) for polygon in polygons if isinstance(polygon, Polygon) for ring in polygon.interiors]
+    known = unary_union([room for room in rooms if not room.is_empty]) if rooms else Polygon()
+    spaces: list[Polygon] = []
+    for hole in holes:
+        if hole.area < min_area_m2 or hole.buffer(-0.5 * min_width_m).is_empty:
+            continue
+        # back to the wall faces (the barrier grew rooms and faces by ``face_gap_m`` into the space), never into a room
+        grown = hole.buffer(face_gap_m, join_style=2).difference(known)
+        pieces = [piece for piece in getattr(grown, "geoms", [grown]) if isinstance(piece, Polygon) and not piece.is_empty]
+        if pieces:
+            spaces.append(max(pieces, key=lambda piece: piece.area))
+    return spaces
+
+
 def reflection_of(candidates: list[dict[str, Any]], mirrors: list[Any], settings: Any) -> dict[int, int]:
     """{index of a reflection: index of the object it shows}.
 

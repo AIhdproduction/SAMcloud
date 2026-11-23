@@ -92,6 +92,22 @@ def test_panel_seen_through_a_pane_from_another_room_is_no_screen():
     assert not frames and any("another room" in entry["reason"] for entry in refused)
 
 
+def test_panel_in_a_space_without_a_room_counts_as_inside():
+    from samcloud.bim.room_objects.geometry import enclosed_spaces
+
+    # the plan only knows the room behind a partition (faces at y 1.813 / 1.913); the cameras and the screen are in front
+    known = box(0.013, 1.913, 4.991, 4.013)
+    walls = [*WALLS, LineString(((0.013, 1.813), (4.991, 1.813))), LineString(((0.013, 1.913), (4.991, 1.913)))]
+    eyes = [np.subtract(eye, (0.0, 1.2, 0.0)) for eye in EYES]
+    views = _views(_corners(), ("screen", "monitor"), eyes=eyes)
+    frames, refused = _fit(views, [known])
+    assert not frames and any("outside the rooms" in entry["reason"] for entry in refused)
+    spaces = enclosed_spaces([known], walls, None, face_gap_m=0.05, min_area_m2=1.0, min_width_m=0.60)
+    assert len(spaces) == 1 and spaces[0].area == pytest.approx(4.978 * 1.796, rel=0.03)
+    frames, _ = _fit(views, [known, *spaces])
+    assert len(frames) == 1 and frames[0].width == pytest.approx(0.613, abs=0.02)
+
+
 def test_cut_masks_never_give_a_size():
     views = _views(_corners(), ("screen", "monitor"))
     for view in views:

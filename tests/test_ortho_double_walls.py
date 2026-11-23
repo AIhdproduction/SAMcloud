@@ -852,3 +852,107 @@ def test_a_small_floor_cell_between_two_doors_is_kept_as_a_hall_a_dead_end_cell_
     assert name_halls([cell], decisions, two[:1], upm, RoomNameSettings())[0].keep is False
     tiny = affinity.scale(box(0.0, 0.0, 0.6, 0.6), upm, upm, origin=(0, 0))  # 0.36 m2 niche: never a room
     assert name_halls([tiny], [RoomName(None, 0.36, False, frozenset())], [((0.0, 0.3 * upm), math.pi / 2.0), ((0.6 * upm, 0.3 * upm), math.pi / 2.0)], upm, RoomNameSettings())[0].keep is False
+
+
+def test_a_rejected_span_is_not_filled_through_a_kept_passage() -> None:
+    """A span the refinement classified as no opening continues its host wall only up to the band of a kept passage; the part
+    beyond the passage (across it from the host) is not filled."""
+    from samcloud.ortho.vector.double_walls import _close_spans
+
+    def setup():
+        face = _Face(0, np.asarray((4.402, 0.0)), np.asarray((4.398, 3.503)), {"type": "polyline", "points": []}, side=-1)
+        return [face], [WallRun(0, 0.0, face.length, 0.203, "interior", "face")]
+
+    span = {"center": (4.5, 3.913), "axis_angle": math.pi / 2, "width": 0.81}
+    passage = Opening("passage", (5.52, 3.957), 2.43, 0.004, 0.207)
+    faces, runs = setup()
+    assert _close_spans([span], runs, faces, 1.0) == 1  # without kept openings: filled across the whole span
+    fill = [run for run in runs if run.evidence == "door-fill"]
+    assert len(fill) == 1 and faces[fill[0].face].end[1] > 4.3
+    faces, runs = setup()
+    _close_spans([span], runs, faces, 1.0, keep_open=[passage])
+    fills = [faces[run.face] for run in runs if run.evidence == "door-fill"]
+    assert fills, "the part on the host's side is still filled"
+    for face in fills:
+        top = max(face.start[1], face.end[1])
+        assert top <= 3.957 - 0.5 * 0.207 + 0.01  # stops at the passage slab
+    assert not any(min(face.start[1], face.end[1]) > 3.9 for face in fills)  # nothing beyond the passage
+    # a window bridge is never cut
+    faces, runs = setup()
+    _close_spans([{**span, "bridge": True}], runs, faces, 1.0, keep_open=[passage])
+    assert max(max(faces[run.face].start[1], faces[run.face].end[1]) for run in runs if run.evidence == "door-fill") > 4.3
+
+
+def test_a_rejected_span_beyond_a_door_in_the_same_wall_line_is_still_filled() -> None:
+    """A door in the filler's own wall line only interrupts it: the stub between the door and the corner is still closed."""
+    from samcloud.ortho.vector.double_walls import _close_spans
+
+    face = _Face(0, np.asarray((0.003, 0.0)), np.asarray((-0.002, 3.207)), {"type": "polyline", "points": []}, side=1)
+    runs = [WallRun(0, 0.0, face.length, 0.304, "exterior", "exterior")]
+    door = Opening("DOOR", (-0.148, 3.618), 0.82, math.pi / 2 + 0.003, 0.304)
+    span = {"center": (-0.149, 4.233), "axis_angle": math.pi / 2, "width": 0.41}
+    faces = [face]
+    assert _close_spans([span], runs, faces, 1.0, keep_open=[door]) == 1
+    fills = [faces[run.face] for run in runs if run.evidence == "door-fill"]
+    assert len(fills) == 1
+    ends = sorted((fills[0].start[1], fills[0].end[1]))
+    assert ends[0] == pytest.approx(4.028, abs=0.01) and ends[1] == pytest.approx(4.458, abs=0.01)
+
+
+def test_a_rejected_span_ending_at_the_wall_of_an_overshooting_door_is_filled_up_to_its_slab() -> None:
+    """The door in the crossing wall is detected a few cm wider than the room, past the stub: the stub is still closed."""
+    from samcloud.ortho.vector.double_walls import _close_spans
+
+    face = _Face(0, np.asarray((2.351, 2.06)), np.asarray((2.393, 5.237)), {"type": "polyline", "points": []}, side=1)
+    runs = [WallRun(0, 0.0, face.length, 0.192, "interior", "face")]
+    door = Opening("DOOR", (1.752, 6.541), 1.413, math.pi - 0.021, 0.303)
+    span = {"center": (2.33, 5.823), "axis_angle": 1.557, "width": 1.15}
+    faces = [face]
+    assert _close_spans([span], runs, faces, 1.0, keep_open=[door]) == 1
+    fills = [faces[run.face] for run in runs if run.evidence == "door-fill"]
+    assert len(fills) == 1
+    top = max(fills[0].start[1], fills[0].end[1])
+    assert 6.541 - 0.303 / 2.0 - 0.03 <= top <= 6.541 - 0.303 / 2.0 + 0.03
+
+
+
+def test_two_windows_of_one_facade_are_joined_by_the_pier_between_them_unless_a_door_stands_there() -> None:
+    """The pier between two windows of one exterior wall line is wall (1.48 m here, longer than the 1.0 m window bridge)."""
+    from samcloud.ortho.vector.double_walls import _close_spans
+
+    def setup():
+        face = _Face(0, np.asarray((0.0, 0.003)), np.asarray((2.497, 0.001)), {"type": "polyline", "points": []}, side=1)
+        return [face], [WallRun(0, 0.0, face.length, 0.21, "exterior", "exterior")]
+
+    spans = [
+        {"center": (3.384, 0.104), "axis_angle": 0.001, "width": 1.81, "bridge": True},
+        {"center": (6.603, 0.106), "axis_angle": 0.001, "width": 1.66, "bridge": True},
+    ]
+    faces, runs = setup()
+    _close_spans(list(spans), runs, faces, 1.0, keep_open=[])
+    fills = sorted((min(faces[r.face].start[0], faces[r.face].end[0]), max(faces[r.face].start[0], faces[r.face].end[0])) for r in runs if r.evidence == "door-fill")
+    assert len(fills) == 2
+    assert fills[1][0] <= fills[0][1] + 0.01  # the second window bridge reaches the first: no gap in the facade
+    # a door in the pier keeps it open
+    door = Opening("DOOR", (4.997, 0.105), 0.9, 0.001, 0.21)
+    faces, runs = setup()
+    _close_spans(list(spans), runs, faces, 1.0, keep_open=[door])
+    fills = sorted((min(faces[r.face].start[0], faces[r.face].end[0]), max(faces[r.face].start[0], faces[r.face].end[0])) for r in runs if r.evidence == "door-fill")
+    assert fills[1][0] > fills[0][1] + 0.5
+
+
+def test_a_door_beside_the_end_of_a_wall_is_hosted_in_that_walls_band() -> None:
+    """A door detected on the outer face, 9 cm off the centreline of the wall it continues: the door-host piece takes the band of
+    that wall (no 9 cm step between the wall and the door's host)."""
+    from samcloud.ortho.vector.double_walls import _enforce_door_spans, _run_centre
+
+    face = _Face(0, np.asarray((0.0, -0.105)), np.asarray((3.012, -0.098)), {"type": "polyline", "points": []}, side=1)
+    runs = [WallRun(0, 0.0, face.length, 0.21, "exterior", "exterior")]
+    faces = [face]
+    door = Opening("DOOR", (3.751, 0.093), 0.92, 0.002, 0.21)
+    _enforce_door_spans(runs, faces, [door], 1.0, SETTINGS)
+    host = [r for r in runs if r.evidence == "door-host"]
+    assert len(host) == 1
+    centre = _run_centre(host[0], faces[host[0].face], host[0].start + 0.3)
+    wall_line_y = 0.0 + (centre[0] / 3.012) * 0.007  # the wall's centreline continued
+    assert abs(centre[1] - wall_line_y) <= 0.01

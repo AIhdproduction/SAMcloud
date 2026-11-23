@@ -52,6 +52,14 @@ screens:
   small_screen_m: 0.85          # narrower and standing on furniture: never called a television ...
   monitor_term_share: 0.05      # ... but a monitor when this share of its points says so, else a screen
   body_row_share: 0.50          # lines narrower than this share of the width are the foot, not the panel
+  wall_cross_m: 0.05            # a panel may touch a wall face this deep (face fit noise); deeper it is in or through the wall
+  min_bottom_m: 0.25            # a panel narrower than small_screen_m this low is a box or bag at the floor (desks carry monitors)
+  # A screen (and a ceiling object) must be inside the building: in a room, or in a space the walls and rooms close in on
+  # every side that the plan left without a room (a room it did not recognise).  Outside both it is seen through a pane
+  # or in a mirror.  These space_* settings serve the screens and the ceiling objects alike.
+  space_face_gap_m: 0.05        # wall faces fitted from the scan stop up to 2 x this short of each other at a corner (fit noise)
+  space_min_area_m2: 1.0        # smaller enclosed pockets are shafts or built-in cupboards; the smallest WC is about 1.2 m2
+  space_min_width_m: 0.60       # narrower enclosed strips are slivers between a room outline and its wall face, not a room
 
 ceiling:
   enabled: true

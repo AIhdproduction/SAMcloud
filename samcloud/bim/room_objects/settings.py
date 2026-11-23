@@ -56,6 +56,11 @@ class ScreenSettings:
     monitor_term_share: float = 0.05
     stand_gap_m: float = 0.25
     unlabelled_term_share: float = 0.08
+    wall_cross_m: float = 0.05
+    min_bottom_m: float = 0.25
+    space_face_gap_m: float = 0.05
+    space_min_area_m2: float = 1.0
+    space_min_width_m: float = 0.60
 
 
 @dataclass(frozen=True, slots=True)

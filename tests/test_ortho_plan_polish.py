@@ -236,6 +236,16 @@ def test_plausible_label_renames_oversized_soft_items() -> None:
     assert plausible_label("Tisch", 4.0, 0.76) == "Tisch"
 
 
+def test_plausible_label_renames_a_bed_nobody_can_lie_on() -> None:
+    # a seat in front of a desk that the photo labels took for a bed (0.86 x 0.51 m outline, 0.71 m high)
+    assert plausible_label("Bett", 0.31, 0.71) == "Möbel"
+    # a cot (1.22 x 0.63 m) and a single bed traced with a ragged edge (1.93 x 0.88 m) stay beds
+    assert plausible_label("Bett", 0.77, 0.83) == "Bett"
+    assert plausible_label("Bett", 1.62, 0.52) == "Bett"
+    # other small objects keep their names
+    assert plausible_label("Nachttisch", 0.17, 0.48) == "Nachttisch"
+
+
 # ---------------------------------------------------------------- regularize_furniture
 
 def _furn(points: Polygon, label: str, furn_id: int, **extra: object) -> dict:
@@ -591,3 +601,23 @@ def test_a_single_kitchen_item_does_not_turn_a_bedroom_into_a_kitchen() -> None:
     kitchen = name_rooms([room], [((1.0, 3.0), "kitchen"), ((2.0, 3.0), "kitchen")], 1.0)[0]
     assert kitchen.name == "Küche"
     assert name_rooms([room], [((1.0, 3.0), "kitchen")], 1.0)[0].name == "Küche"  # without a bed a single kitchen item still names the room
+
+
+
+def test_a_narrow_slot_between_two_wall_bodies_closes_the_wall_cell() -> None:
+    """A 9 cm slot between a closing piece and the measured partition beside it is no way through: the cell is closed.  A 0.6 m
+    gap (a doorway width) and a short notch stay open."""
+    from samcloud.ortho.vector.plan_polish import close_wall_slots, enclosed_cells
+
+    ring = box(-0.2, -0.2, 6.2, 4.2).difference(box(0.0, 0.0, 6.0, 4.0))
+    # partition x 3.0 .. 3.2 from y 0 to 2.61 and an offset piece x 3.29 .. 3.49 from y 2.30 to 4.0: a 9 cm slot, 0.32 m long
+    partition = [box(3.0, 0.0, 3.2, 2.613), box(3.291, 2.297, 3.49, 4.0)]
+    walls = unary_union([ring, *partition])
+    assert len(enclosed_cells(walls, 1.0, 1.0)) == 1  # one open interior through the slot
+    sealed = close_wall_slots(walls, 0.06, 0.30)
+    cells = sorted(cell.area for cell in enclosed_cells(sealed, 1.0, 1.0))
+    assert len(cells) == 2 and cells[0] > 10.5
+    wide = unary_union([ring, box(3.0, 0.0, 3.2, 2.613), box(3.0, 3.21, 3.2, 4.0)])  # a 0.6 m gap in the partition
+    assert len(enclosed_cells(close_wall_slots(wide, 0.06, 0.30), 1.0, 1.0)) == 1
+    notch = unary_union([ring, box(2.0, 0.0, 2.2, 0.5), box(2.29, 0.0, 2.49, 0.18)])  # 9 cm notch only 0.18 m long
+    assert close_wall_slots(notch, 0.06, 0.30).area == pytest.approx(notch.area, abs=1e-9)

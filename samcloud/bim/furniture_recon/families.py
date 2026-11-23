@@ -9,6 +9,8 @@ _FAMILY_NAMES: dict[str, tuple[str, ...]] = {
     "bed": ("bed", "bett", "bed_double", "bed_single", "mattress", "matratze"),
     "kitchen_base": ("kitchen_base", "unterschrank"),
     "worktop": ("worktop", "arbeitsplatte"),
+    # the raised bar top of a peninsula: measured by the kitchen layout (board, underside, support), kept as measured
+    "bar_top": ("bar_top", "bar top", "theke"),
     "kitchen_insert": ("kitchen_sink", "cooktop", "spüle", "spuele", "herd", "hob"),
     "toilet": ("toilet", "wc", "wc_wall", "wc_floor"),
     "mesh": (
@@ -35,7 +37,7 @@ STANDING_FAMILIES = frozenset({"table", "chair", "sofa", "bed", "kitchen_base", 
 # reconstruction windows of the settings keyed by family
 WINDOW_KEY = {
     "table": "table", "chair": "chair", "sofa": "sofa", "bed": "bed", "kitchen_base": "kitchen", "worktop": "kitchen",
-    "kitchen_insert": "kitchen", "counter": "kitchen", "toilet": "toilet", "mesh": "mesh", "box": "box", "auto": "box",
+    "kitchen_insert": "kitchen", "counter": "kitchen", "bar_top": "kitchen", "toilet": "toilet", "mesh": "mesh", "box": "box", "auto": "box",
 }
 # storage, lamps and plants may contain open bands (shelf boards, lamp pole); sanitary fixtures do not
 TALL_GAP_FAMILIES = frozenset({"box", "auto"})
@@ -53,7 +55,7 @@ def _normal(text: object) -> str:
 
 
 def family_of(label: str | None, semantic_label: str | None, catalogue_kind: str | None) -> str:
-    """Reconstruction family: table | chair | sofa | bed | kitchen_base | worktop | kitchen_insert | toilet | mesh | box | auto."""
+    """Reconstruction family: table | chair | sofa | bed | kitchen_base | worktop | bar_top | kitchen_insert | toilet | mesh | box | auto."""
     for text in (catalogue_kind, semantic_label, label):
         hit = _LOOKUP.get(_normal(text))
         if hit is not None:

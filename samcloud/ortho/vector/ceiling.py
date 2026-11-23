@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
-from typing import Iterable
+from typing import Callable, Iterable
 
 import cv2
 import numpy as np
 from scipy import ndimage
 from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 from skimage.segmentation import watershed
 
 from .footprints import _regularised, wall_axis_rectangle
@@ -133,7 +134,16 @@ def ceiling_wall_pieces(rooms: Iterable[Polygon], measured_faces: Iterable[WallF
     return deduplicated, stats
 
 
-def snap_exterior_faces_to_flucht(faces: list[WallFace], free_floor: np.ndarray, grid: RasterGrid, units_per_metre: float) -> None:
+# A face with wall-height evidence over at least this share of its length is mostly measured wall.
+_MEASURED_FACE_SHARE = 0.5
+
+
+def snap_exterior_faces_to_flucht(
+    faces: list[WallFace], free_floor: np.ndarray, grid: RasterGrid, units_per_metre: float,
+    wall_share: Callable[[LineString, bool], float] | None = None, min_wall_share: float = 0.25,
+    wall_stretches: Callable[[LineString], list[tuple[float, float]]] | None = None,
+    rooms: Iterable[Polygon] = (), room_reach: float = 0.0,
+) -> list[dict[str, object]]:
     """Put physically joined parallel exterior faces on the longest face's Flucht.
 
     Ceiling completion can discover a separated portion of an already measured
@@ -142,7 +152,40 @@ def snap_exterior_faces_to_flucht(faces: list[WallFace], free_floor: np.ndarray,
     between the infinite face lines is the conservative separator: it preserves
     genuinely distinct parallel walls while merging two observations of one
     solid wall.
+
+    The join limit (0.25 m) is the thickest wall whose two faces count as one
+    wall line.  The groups are chains (each face within the limit of the next),
+    and fixtures along a wall hide the floor that would separate two faces, so a
+    group can reach across a real step of the building (the wall above an
+    installation ledge, the ledge front, the next wall along the facade) and
+    carry a face 0.5 m away to a line where nothing stands.  A wall is where its
+    points are: with ``wall_share(line, any_class)`` (share of a line along
+    which wall points - or, with ``any_class``, a floor-to-ceiling plane of any
+    class, as the wall-face test accepts it - stand over wall height; 0 where
+    there is no data) a face that would be carried FARTHER than the join limit
+    stays where it was fitted when wall points make it mostly wall there
+    (``_MEASURED_FACE_SHARE``; a parked curtain is no measured wall) and the
+    group line would not even pass the wall-face test (``min_wall_share``;
+    a door leaf joins the wall line it closes).  Such a face
+    that is not mostly wall (a ledge front that runs on as the full-height wall
+    behind a bathtub) keeps its measured wall stretches in place as faces of
+    their own (``wall_stretches``: (start, end) along the line, each at least
+    the minimum face length); the rest of it goes to the group line as before.
+    Within the limit nothing changes: both faces of one wall, a closed door leaf
+    in its wall line or a tall cabinet front at its wall join as before.
+    A wall of the interior bounds a room: with ``rooms`` (the ceiling rooms) a
+    face or stretch only stays where the ceiling of a room reaches it (within
+    ``room_reach`` over at least half of its length); a plane seen through a
+    window (balcony, the house next door) goes with its group as before.
+    Returns the faces and stretches kept in place.
     """
+    kept_in_place: list[dict[str, object]] = []
+    room_parts = [room.buffer(room_reach, join_style=2) for room in rooms if not room.is_empty]
+    room_zone = unary_union(room_parts) if room_parts else None
+
+    def bounds_a_room(line: LineString) -> bool:
+        return room_zone is None or line.intersection(room_zone).length >= 0.5 * line.length
+
     candidates = [face for face in faces if face.kind == "line" and face.line is not None and face.line.length > 1e-9]
     neighbours: dict[int, set[int]] = {index: set() for index in range(len(candidates))}
     limit = 0.25 * units_per_metre
@@ -178,7 +221,40 @@ def snap_exterior_faces_to_flucht(faces: list[WallFace], free_floor: np.ndarray,
         for index in group:
             face = candidates[index]
             values = [float(np.dot(np.asarray(point, dtype=float) - origin, axis)) for point in face.line.coords]
-            face.line = LineString([tuple(origin + axis * value) for value in values])
+            moved = LineString([tuple(origin + axis * value) for value in values])
+            if wall_share is not None and face is not reference and moved.distance(face.line) > limit:
+                own, there = float(wall_share(face.line, False)), float(wall_share(moved, True))
+                if there < min_wall_share:
+                    if own >= _MEASURED_FACE_SHARE and bounds_a_room(face.line):
+                        kept_in_place.append({"line": [[float(x), float(y)] for x, y in face.line.coords], "wall_share": round(own, 2), "wall_share_on_flucht": round(there, 2)})
+                        continue
+                    stretches = sorted(wall_stretches(face.line)) if wall_stretches is not None and own < _MEASURED_FACE_SHARE else []
+                    stretches = [(start, end) for start, end in stretches if bounds_a_room(LineString([face.line.interpolate(start), face.line.interpolate(end)]))]
+                    if stretches:
+                        line, length = face.line, face.line.length
+                        rest: list[tuple[float, float]] = []
+                        cursor = 0.0
+                        for start, end in stretches:
+                            if start - cursor >= grid.pixel_size:
+                                rest.append((cursor, start))
+                            piece = LineString([line.interpolate(start), line.interpolate(end)])
+                            faces.append(replace(face, line=piece))
+                            kept_in_place.append({"line": [[float(x), float(y)] for x, y in piece.coords], "wall_share": 1.0, "wall_share_on_flucht": round(there, 2), "stretch_of": [[float(x), float(y)] for x, y in line.coords]})
+                            cursor = end
+                        if length - cursor >= grid.pixel_size:
+                            rest.append((cursor, length))
+                        for number, (start, end) in enumerate(rest):
+                            ends = [line.interpolate(start), line.interpolate(end)]
+                            shifted = LineString([tuple(origin + axis * float(np.dot(np.asarray((point.x, point.y)) - origin, axis))) for point in ends])
+                            if number == 0:
+                                face.line = shifted
+                            else:
+                                faces.append(replace(face, line=shifted))
+                        if not rest:
+                            faces[:] = [item for item in faces if item is not face]  # the whole face is one measured stretch (now a face of its own)
+                        continue
+            face.line = moved
+    return kept_in_place
 
 
 def _floor_separates_faces(first: LineString, second: LineString, free_floor: np.ndarray, grid: RasterGrid) -> bool:

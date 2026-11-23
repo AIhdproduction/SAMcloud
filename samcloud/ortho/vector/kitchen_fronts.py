@@ -19,7 +19,7 @@ thresholds are metric and scaled by ``units_per_metre``.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Any
@@ -62,6 +62,8 @@ class KitchenFrontSettings:
     upper_trim: bool = True
     upper_trim_min_m: float = 0.15
     upper_min_length_m: float = 0.40
+    near_front_m: float = 1.00  # the straight front beside a diagonal unit: about two 0.45-0.60 m units
+    band_agree_deg: float = 4.0  # height bands of one unit agree within this; two groups split by a gap above half of it (band spread v10-v12: 1.3-3.5 deg, largest gap 1.3)
 
 
 @dataclass(slots=True)
@@ -184,6 +186,23 @@ def _cell_medians(along: np.ndarray, across: np.ndarray, bins: np.ndarray, step:
     return np.asarray([np.median(along[part]) for part in parts]), np.asarray([np.median(across[part]) for part in parts])
 
 
+def _rear_envelope(along: np.ndarray, across: np.ndarray, step: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per station the rear-most of its (station, height bin) samples: (median along, smallest across).
+
+    ``across`` grows into the room.  A towel on a handle, a door standing ajar or a bin in front of a cabinet stands in
+    FRONT of the cabinet plane, never behind it, so the rear-most sample of each station lies on the cabinet itself
+    wherever any height of it is seen.  The scan noise of the minimum is about the same at every station: it moves the
+    envelope back, but does not bend it.
+    """
+    if not len(along):
+        return along, across
+    _, index = np.unique(np.floor(along / step).astype(np.int64), return_inverse=True)
+    rear = np.full(int(index.max()) + 1, np.inf)
+    np.minimum.at(rear, index, across)
+    middle = np.asarray([np.median(along[index == station]) for station in range(len(rear))])
+    return middle, rear
+
+
 def _front_offset(along: np.ndarray, across: np.ndarray, bins: np.ndarray, start: float, stop: float, settings: KitchenFrontSettings, upm: float) -> tuple[float, float]:
     """(offset of a straight front from the fitted edge, share of the stretch that shows it)."""
     step = settings.station_m * upm
@@ -206,6 +225,21 @@ def _front_offset(along: np.ndarray, across: np.ndarray, bins: np.ndarray, start
     offset = float(np.clip(offset, -shift, shift))
     face = np.abs(across - offset) <= tolerance
     return offset, _share(along[face], bins[face], start, stop, step, settings)
+
+
+def _near_front_offset(along: np.ndarray, across: np.ndarray, bins: np.ndarray, start: float, stop: float, settings: KitchenFrontSettings, upm: float) -> tuple[float, float]:
+    """``_front_offset`` of the straight front beside a diagonal unit, judged next to the diagonal when the whole leg is not.
+
+    Farther along, a leg may meet a peninsula, a tall unit or an open end, where it has no front of its own; the front that
+    meets the diagonal is the one beside it (``near_front_m``: one or two units).  A leg whose whole front is observed
+    keeps the offset of its whole front.
+    """
+    offset, share = _front_offset(along, across, bins, start, stop, settings, upm)
+    near = start + settings.near_front_m * upm
+    if share >= settings.front_observed_share or near >= stop:
+        return offset, share
+    near_offset, near_share = _front_offset(along, across, bins, start, near, settings, upm)
+    return (near_offset, near_share) if near_share >= settings.front_observed_share else (offset, share)
 
 
 # --------------------------------------------------------------------------------------------- corners
@@ -247,13 +281,20 @@ def _inner_corners(legs: Sequence[Any], obstacles: Any, room: Any, settings: Kit
     return found
 
 
-def _fit_diagonal(a: np.ndarray, b: np.ndarray, bins: np.ndarray, la: float, lb: float, settings: KitchenFrontSettings, upm: float) -> tuple[np.ndarray, float] | None:
-    """(unit normal, distance) of the best supported straight face across the corner (a, b >= 0 is the room)."""
+def _fit_diagonal(
+    a: np.ndarray, b: np.ndarray, bins: np.ndarray, la: float, lb: float, settings: KitchenFrontSettings, upm: float,
+) -> tuple[np.ndarray, float, tuple[int, ...] | None] | None:
+    """(unit normal, distance, height bins of the unit or None = all) of the best supported straight face across the corner.
+
+    a, b >= 0 is the room.  When the height bands disagree because something stands in front of part of the unit, only
+    the rear bands carry the unit (``_rear_band_line``) and their bins are returned.
+    """
     step, tolerance = settings.station_m * upm, settings.line_tolerance_m * upm
     inner = (a > tolerance) & (b > tolerance) & (a <= la) & (b <= lb)
     a, b, bins = a[inner], b[inner], bins[inner]
     if len(a) < 12:
         return None
+    raw, raw_bins = np.column_stack((a, b)), bins
     # one sample per 2 cm cell and height bin
     cells = np.column_stack((np.floor(a / (0.02 * upm)), np.floor(b / (0.02 * upm)), bins)).astype(np.int64)
     first = np.sort(np.unique(cells, axis=0, return_index=True)[1])
@@ -304,7 +345,75 @@ def _fit_diagonal(a: np.ndarray, b: np.ndarray, bins: np.ndarray, la: float, lb:
         if not (steep <= normal[0] <= flat and steep <= normal[1] <= flat):
             return None
         distance = float(mean @ normal)
+    rear = _rear_band_line(raw, raw_bins, normal, distance, settings, upm)
+    return rear if rear is not None else (normal, distance, None)
+
+
+def _band_line(xy: np.ndarray, normal: np.ndarray, distance: float, tolerance: float) -> tuple[np.ndarray, float] | None:
+    """The densest straight face of ``xy`` near the line (normal, distance): total least squares on a shrinking window."""
+    for width in (1.5 * tolerance, tolerance, 0.7 * tolerance, 0.35 * tolerance, 0.35 * tolerance):
+        near = xy[np.abs(xy @ normal - distance) <= width]
+        if len(near) < 12:
+            return None
+        mean = near.mean(axis=0)
+        normal = np.linalg.svd(near - mean, full_matrices=False)[2][1]
+        if normal[0] < 0.0:
+            normal = -normal
+        distance = float(mean @ normal)
     return normal, distance
+
+
+def _rear_band_line(
+    xy: np.ndarray, bins: np.ndarray, normal: np.ndarray, distance: float, settings: KitchenFrontSettings, upm: float,
+) -> tuple[np.ndarray, float, tuple[int, ...]] | None:
+    """(normal, distance, bins) of the face of the rear height bands when the bands disagree; None = keep the fitted line.
+
+    The doors, drawers and plinth of one corner unit lie in one plane: fitted band by band they agree within
+    ``band_agree_deg``.  A door standing ajar or a cloth hanging over part of the height is a second, slanted face IN FRONT
+    of that plane; then the bands split into groups and the rear group (at least two bands) is the unit.
+    """
+    tolerance = settings.line_tolerance_m * upm
+    tangent = np.asarray((-normal[1], normal[0]))
+    start, stop = -distance / normal[0] * normal[1], distance / normal[1] * normal[0]
+    trim = min(0.04 * upm, 0.15 * (stop - start))
+    along, across = xy @ tangent, xy @ normal - distance
+    window = (along >= start + trim) & (along <= stop - trim) & (np.abs(across) <= 1.5 * tolerance)
+    middle = (start + stop) / 2.0 * tangent + distance * normal  # the middle of the fitted face
+    bands: list[tuple[int, float, float]] = []  # (bin, angle against the fitted line in degrees, offset at its middle)
+    for index in range(settings.band_bins):
+        use = window & (bins == index)
+        if use.sum() < 12 or np.ptp(along[use]) < 0.5 * (stop - start - 2.0 * trim):
+            continue
+        line = _band_line(xy[use], normal, distance, tolerance)
+        if line is None:
+            continue
+        angle = math.degrees(math.atan2(float(line[0] @ tangent), float(line[0] @ normal)))
+        bands.append((index, angle, line[1] - float(middle @ line[0])))  # > 0: the band face stands in front of the line
+    if len(bands) < 3 or max(item[1] for item in bands) - min(item[1] for item in bands) <= settings.band_agree_deg:
+        return None
+    # groups of bands with neighbouring angles; the rear-most group of at least two bands is the cabinet plane
+    ordered = sorted(bands, key=lambda item: item[1])
+    groups: list[list[tuple[int, float, float]]] = [[ordered[0]]]
+    for item in ordered[1:]:
+        if item[1] - groups[-1][-1][1] <= 0.5 * settings.band_agree_deg:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    groups = [group for group in groups if len(group) >= 2]
+    if len(groups) < 2:
+        return None
+    offsets = [float(np.mean([item[2] for item in group])) for group in groups]
+    rear = groups[int(np.argmin(offsets))]
+    if sorted(offsets)[1] - min(offsets) < 0.3 * tolerance:
+        return None  # no group stands clearly in front of another: not an object in front, keep the common fit
+    use = window & np.isin(bins, [item[0] for item in rear])
+    line = _band_line(xy[use], normal, distance, tolerance)
+    if line is None:
+        return None
+    steep, flat = math.sin(math.radians(settings.corner_min_angle_deg)), math.cos(math.radians(settings.corner_min_angle_deg))
+    if not (steep <= line[0][0] <= flat and steep <= line[0][1] <= flat):
+        return None
+    return line[0], line[1], tuple(sorted(item[0] for item in rear))
 
 
 def _density_ridge(a: np.ndarray, b: np.ndarray, normal: np.ndarray, distance: float, settings: KitchenFrontSettings, upm: float) -> tuple[np.ndarray, float] | None:
@@ -380,14 +489,22 @@ def _judge_corner(
     reach = settings.corner_max_cut_m * upm
     la, lb = min(corner.run_a - oa, reach) + tolerance, min(corner.run_b - ob, reach) + tolerance
     fitted = _fit_diagonal(a - oa, b - ob, bins, la, lb, settings, upm)
-    if fitted is not None and ridge:
-        fitted = _density_ridge(a - oa, b - ob, *fitted, settings, upm)
     if fitted is None:
         return None, observed
-    normal, distance = fitted
+    normal, distance, unit_bins = fitted
+    # the height bins that show the unit itself (all of them unless something stands in front of part of it)
+    unit = np.ones(len(a), dtype=bool) if unit_bins is None else np.isin(bins, unit_bins)
+    judge = settings if unit_bins is None else replace(
+        settings, station_min_bins=max(2, math.ceil(settings.station_min_bins * len(unit_bins) / settings.band_bins)),
+    )
+    if ridge:
+        ridged = _density_ridge((a - oa)[unit], (b - ob)[unit], normal, distance, settings, upm)
+        if ridged is None:
+            return None, observed
+        normal, distance = ridged
     cut_a, cut_b = oa + distance / normal[0], ob + distance / normal[1]
-    shift_b, share_b = _front_offset(a, b, bins, cut_a, corner.run_a, settings, upm)
-    shift_a, share_a = _front_offset(b, a, bins, cut_b, corner.run_b, settings, upm)
+    shift_b, share_b = _near_front_offset(a, b, bins, cut_a, corner.run_a, settings, upm)
+    shift_a, share_a = _near_front_offset(b, a, bins, cut_b, corner.run_b, settings, upm)
     joins = []
     for along, across, cut, run, shift in ((a, b, cut_a, corner.run_a, shift_b), (b, a, cut_b, corner.run_b, shift_a)):
         if run - cut < 0.10 * upm:
@@ -407,11 +524,11 @@ def _judge_corner(
     along, across = -a * normal[1] + b * normal[0], a * normal[0] + b * normal[1] - distance
     start, stop = -cut_a * normal[1], cut_b * normal[0]
     trim = min(0.04 * upm, 0.15 * (stop - start))
-    on = (along >= start + trim) & (along <= stop - trim)
+    on = unit & (along >= start + trim) & (along <= stop - trim)
     face, wide = on & (np.abs(across) <= tolerance), on & (np.abs(across) <= 0.10 * upm)
     if face.sum() < 8:
         return None, observed
-    coverage = _share(along[face], bins[face], start + trim, stop - trim, step, settings)
+    coverage = _share(along[face], bins[face], start + trim, stop - trim, step, judge)
     occupied = _cover(along[face], bins[face], start + trim, stop - trim, step, settings.band_bins)
     top_coverage = float(np.mean(occupied[:, -2:].any(axis=1)))  # the two highest bins, just below the worktop
     residual = float(np.median(np.abs(across[face])))
@@ -419,8 +536,10 @@ def _judge_corner(
         return None, observed
     if residual > settings.corner_max_residual_m * upm or face.sum() < settings.corner_min_inlier_share * wide.sum():
         return None, observed
-    # straight, not a round object standing in the corner
+    # straight, not a round object standing in the corner: judged on the rear-most sample of each station, because a round
+    # object is round there too, while a towel or a door ajar in front of a straight unit is not
     s, r = _cell_medians(along[wide], across[wide], bins[wide], step, settings.band_bins)
+    s, r = _rear_envelope(s, r, step)
     if len(s) >= 6:
         half = (stop - start) / 2.0
         curve = np.polyfit((s - (start + stop) / 2.0) / half, r, 2)
@@ -659,13 +778,34 @@ def seen_through_ends(unit: Any, band_m: tuple[float, float], points: ScanPoints
         return None
     first, last = int(solid[0]), int(solid[-1]) + 2
     start, stop = along0, along1
-
+    # An end that is mostly open up to the first solid front is cut there.  Otherwise a front with holes in the scan lies
+    # between the open stretch and the solid front (its stations show neither the wall nor enough front): then the open
+    # stretch runs to the last station where the wall behind is seen, and on over stations that show no front (points in a
+    # single height bin are a stray point, a handle, a hook); the unit starts with the first station that shows a front over
+    # two height bins.  So the cut does not depend on whether a station of such a front reaches the front share by a hair.
+    open_stations = np.flatnonzero(free)
+    leading, trailing = open_stations[open_stations < first], open_stations[open_stations >= last]
+    shown = front >= 2.0 / settings.band_bins - 1e-9
     if first * size >= settings.upper_trim_min_m * upm and free[:first].mean() >= 0.6:
         start = along0 + first * size
+    elif len(leading):
+        cut = int(leading[-1]) + 1
+        if cut * size >= settings.upper_trim_min_m * upm and free[:cut].mean() >= 0.6:
+            while cut < first and not shown[cut]:
+                cut += 1
+            start = along0 + cut * size
     if (stations - last) * size >= settings.upper_trim_min_m * upm and free[last:].mean() >= 0.6:
         stop = along0 + last * size
-    # what is left must still be most of the detected unit: otherwise the detection, not its end, is in question
-    if (start, stop) == (along0, along1) or stop - start < max(settings.upper_min_length_m * upm, 0.5 * (along1 - along0)):
+    elif len(trailing):
+        cut = int(trailing[0])
+        if (stations - cut) * size >= settings.upper_trim_min_m * upm and free[cut:].mean() >= 0.6:
+            while cut > last and not shown[cut - 1]:
+                cut -= 1
+            stop = along0 + cut * size
+    # what is left must still be a unit (the narrowest wall cabinet): otherwise the detection, not its end, is in question.
+    # No share of the detected length is asked for: an outline traced over a cabinet and the open wall beside it in equal parts
+    # would sit exactly on such a limit and flip with a millimetre.
+    if (start, stop) == (along0, along1) or stop - start < settings.upper_min_length_m * upm:
         return None
     return start, stop
 

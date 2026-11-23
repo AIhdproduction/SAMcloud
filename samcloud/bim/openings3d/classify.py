@@ -311,6 +311,14 @@ def _dropped_item(record: RefinedOpening, line: WallLine, reason: str, features:
     }
 
 
+def _narrow_item(record: RefinedOpening, line: WallLine | None, minimum: float) -> dict[str, Any]:
+    return {
+        "center": record.center, "width_m": record.width_m, "axis_angle": record.axis_angle, "wall_thickness_m": record.wall_thickness_m, "host_wall_id": record.host_wall_id,
+        "line": line.id if line is not None else record.line, "u": [record.u0, record.u1], "plan_seed": record.plan_seed,
+        "reason": f"{record.width_m:.2f} m wide: narrower than any doorway ({minimum:.2f} m)", "features": {}, "was": record.kind,
+    }
+
+
 def resolve_overlaps(
     measured: list[tuple[RefinedOpening, WallLine, FrameFeatures, str, str]], evidence_points: PointEvidence, plan: BuildingPlan, config: Settings,
 ) -> tuple[list[RefinedOpening], list[dict[str, Any]]]:
@@ -404,8 +412,14 @@ def classify_openings(
     kept: list[RefinedOpening] = []
     dropped: list[dict[str, Any]] = []
     measured: list[tuple[RefinedOpening, WallLine, FrameFeatures, str, str]] = []
+    minimum_width = float(getattr(config.classify, "min_door_width_m", 0.0) or 0.0)
     for record in openings:
         line = by_line.get(record.line or "")
+        if record.kind in ("door", "passage") and float(record.width_m) < minimum_width:
+            # No doorway is that narrow (the narrowest standard leaf leaves about 0.55 m clear): a span clipped by a line end or
+            # squeezed between two other openings, never a door.  It is reported, not built.
+            dropped.append(_narrow_item(record, line, minimum_width))
+            continue
         if record.kind not in ("door", "passage") or line is None or "any" not in evidence_points.grids.get(line.id, {}):
             kept.append(record)
             continue

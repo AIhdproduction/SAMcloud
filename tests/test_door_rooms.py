@@ -447,3 +447,95 @@ def test_a_corner_hidden_behind_a_tall_unit_is_closed_to_the_wall_faces(upm: flo
     assert len(rooms) == 1
     assert rooms[0].area / (upm * upm) == pytest.approx(54.0, rel=0.01)
     assert rooms[0].contains(Point(8.9 * upm, 0.1 * upm))  # the pocket itself
+
+
+def _passage_over_a_crossing_wall(upm: float):
+    """9 x 6 m interior: a hosted passage wall at y 3.9 .. 4.1 (closed body, as the wall stage hosts the passage), a crossing
+    partition x 4.41 .. 4.61 below it between room A (left) and room B (right), room C above.  The passage span (detected on the
+    lower face, x 4.23 .. 6.77) overshoots the crossing partition by about 0.2 m into room A."""
+    ring = box(-0.2, -0.2, 9.2, 6.2).difference(box(0.0, 0.0, 9.0, 6.0))
+    bodies = [ring, box(0.0, 3.9, 9.0, 4.1), box(4.41, 0.0, 4.61, 3.9)]
+    cores = [box(0.05, 0.05, 4.41, 3.9), box(4.61, 0.05, 8.95, 3.9), box(0.05, 4.1, 8.95, 5.95)]
+    passage = _opening("passage", (5.503, 3.853), 0.003, 2.54, 0.21, upm)
+    return [_s(item, upm) for item in bodies], [_s(item, upm) for item in cores], passage
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_a_passage_span_overshooting_a_crossing_wall_does_not_swallow_the_room_behind_it(upm: float) -> None:
+    """Only the rooms in front of a passage are joined by it; joining room A (touched by the span's end) to room B would leave
+    two separate parts, and one of them (a whole room) was dropped."""
+    grid = _grid(upm)
+    walls, cores, passage = _passage_over_a_crossing_wall(upm)
+    floor = _floor([box(0, 0, 4.41, 3.9), box(4.61, 0, 9, 3.9), box(0, 4.1, 9, 6)], [], upm, grid)
+    rooms, stats = door_bounded_rooms(cores, walls, [passage], floor, grid, upm)
+    assert len(rooms) == 3, [room.bounds for room in rooms]
+    left = [room for room in rooms if room.contains(Point(2.0 * upm, 2.0 * upm))]
+    assert len(left) == 1 and left[0].area / (upm * upm) == pytest.approx(4.36 * 3.85, rel=0.03)
+    assert not left[0].intersects(Point(7.0 * upm, 2.0 * upm))
+    assert sum(room.area for room in rooms) / (upm * upm) >= 0.97 * (4.36 * 3.85 + 4.34 * 3.85 + 8.9 * 1.85)
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_rooms_in_front_of_an_open_passage_are_still_one_room(upm: float) -> None:
+    """The same layout with the passage wall open over the passage (no host body there): the room below and the room above are one."""
+    grid = _grid(upm)
+    walls, cores, passage = _passage_over_a_crossing_wall(upm)
+    walls = [walls[0], _s(box(0.0, 3.9, 4.75, 4.1), upm), _s(box(6.73, 3.9, 9.0, 4.1), upm), walls[2]]
+    passage = _opening("passage", (5.74, 3.997), 0.003, 1.98, 0.21, upm)
+    floor = _floor([box(0, 0, 4.41, 3.9), box(4.61, 0, 9, 3.9), box(0, 4.1, 9, 6)], [], upm, grid)
+    rooms, _ = door_bounded_rooms(cores, walls, [passage], floor, grid, upm)
+    assert len(rooms) == 2, [room.bounds for room in rooms]
+    joined = max(rooms, key=lambda room: room.area)
+    assert joined.contains(Point(7.0 * upm, 2.0 * upm)) and joined.contains(Point(7.0 * upm, 5.0 * upm))
+    assert not joined.intersects(Point(2.0 * upm, 2.0 * upm))
+
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_windows_detected_on_the_inner_face_never_cut_the_room_back_from_the_wall(upm: float) -> None:
+    """Two windows of one exterior wall, each detected on the INNER face (centre half a wall into the room): the room still ends
+    at the inner wall face, with no wall strip between the windows inside the room."""
+    grid = _grid(upm)
+    ring = box(-0.21, -0.21, 9.21, 6.21).difference(box(0.0, 0.0, 9.0, 6.0))
+    walls = [_s(ring, upm)]
+    windows = [_opening("WINDOW", (2.003, 0.103), 0.002, 1.62, 0.21, upm), _opening("WINDOW", (5.497, 0.107), 0.002, 1.48, 0.21, upm)]
+    core = box(0.05, 0.05, 8.95, 5.95)
+    floor = _floor([box(0, 0, 9, 6)], [], upm, grid)
+    rooms, _ = door_bounded_rooms([_s(core, upm)], walls, windows, floor, grid, upm)
+    assert len(rooms) == 1
+    room = rooms[0]
+    for x in (2.0, 3.6, 5.5, 7.5):  # in front of both windows and the pier between them
+        assert room.contains(Point(x * upm, 0.03 * upm)), x
+    assert room.area / (upm * upm) == pytest.approx(9.0 * 6.0, rel=0.01)
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_a_corner_pocket_open_to_unseen_space_is_not_closed_into_the_room(upm: float) -> None:
+    """A pocket between two wall stubs beside a room: closed into the room when a wall also closes it on the far side (a corner
+    hidden behind furniture), left out when its far side is open to unseen space (no wall there)."""
+    grid = _grid(upm)
+    outer = box(-0.2, -0.2, 9.2, 6.4).difference(box(0.0, 0.0, 9.0, 6.2))
+    stubs = [box(7.39, 5.31, 7.6, 6.2), box(8.61, 5.29, 8.8, 6.2)]  # the pocket x 7.6 .. 8.61, y 5.3 .. 6.2 lies between them
+    core = box(0.05, 0.05, 8.95, 6.15).difference(box(7.39, 5.27, 8.8, 6.2))
+    floor = _floor([box(0, 0, 9, 5.25)], [], upm, grid)
+    closed_walls = [_s(outer, upm), *(_s(stub, upm) for stub in stubs)]
+    rooms, _ = door_bounded_rooms([_s(core, upm)], closed_walls, [], floor, grid, upm)
+    assert any(room.contains(Point(8.1 * upm, 5.9 * upm)) for room in rooms)
+    open_outer = outer.difference(box(7.5, 6.1, 8.7, 6.5))  # the wall beyond the pocket is missing: unseen space behind it
+    open_walls = [_s(open_outer, upm), *(_s(stub, upm) for stub in stubs)]
+    rooms, _ = door_bounded_rooms([_s(core, upm)], open_walls, [], floor, grid, upm)
+    assert not any(room.contains(Point(8.1 * upm, 5.9 * upm)) for room in rooms)
+
+
+@pytest.mark.parametrize("upm", UPMS)
+def test_a_corner_pocket_with_a_crack_in_its_far_wall_is_still_closed_into_the_room(upm: float) -> None:
+    """A furniture-hidden corner whose far wall has a 12 cm crack (wall ends a few cm short) is enclosed all the same: it is room."""
+    grid = _grid(upm)
+    outer = box(-0.2, -0.2, 9.2, 6.4).difference(box(0.0, 0.0, 9.0, 6.2))
+    stubs = [box(7.39, 5.31, 7.6, 6.2), box(8.61, 5.29, 8.8, 6.2)]
+    core = box(0.05, 0.05, 8.95, 6.15).difference(box(7.39, 5.27, 8.8, 6.2))
+    floor = _floor([box(0, 0, 9, 5.25)], [], upm, grid)
+    cracked = outer.difference(box(8.03, 6.17, 8.15, 6.5))  # a 12 cm crack in the far wall
+    walls = [_s(cracked, upm), *(_s(stub, upm) for stub in stubs)]
+    rooms, _ = door_bounded_rooms([_s(core, upm)], walls, [], floor, grid, upm)
+    assert any(room.contains(Point(8.3 * upm, 5.9 * upm)) for room in rooms)

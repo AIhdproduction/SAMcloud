@@ -44,6 +44,8 @@ class PlanPolishSettings:
     wall_crack_cell_max_m2: float = 12.0  # a cell that exists only after the crack closing is accepted as a room up to this area (bath / WC, not a whole flat)
     wall_crack_m: float = 0.02  # hairline gaps (up to 2x this = 4 cm) beside a door/window span are closed before small cells are found
     barrier_bridge_m: float = 0.30  # two door/window spans closer than this are one opening with a wall stub between them (narrower than any passage)
+    wall_slot_m: float = 0.06  # a slot up to 2x this (12 cm) between two wall bodies is closed before the wall cells are found: nobody passes 12 cm (the narrowest door leaves ~0.55 m), it is one wall seen twice (two pieces offset by a few cm of placement noise)
+    wall_slot_min_m: float = 0.30  # ... when the slot runs at least this long beside both bodies (a short notch is a corner, not a slot)
     room_step_m: float = 0.30
     # Furniture: rectangle when it covers the footprint well, else a rectilinear outline along the wall axes.
     furniture: bool = True
@@ -84,6 +86,10 @@ _PLAUSIBLE_SIZE: dict[str, tuple[float | None, float | None]] = {
     "Kissen": (0.8, 1.2), "Decke": (2.5, 1.2), "Kleidung": (1.2, None), "Pflanze": (1.2, None),
     "Stehlampe": (0.5, None), "Stuhl": (0.8, 1.3), "Bett": (None, 1.3), "Nachttisch": (0.6, 1.0),
 }
+# Labels whose object cannot be this small.  A bed is something a person lies on: the smallest mattress (a cot) is
+# 1.20 x 0.60 m = 0.72 m2; with the tracing loss at the edges an outline below 0.6 m2 is no bed (a seat, a cushion, a
+# bag that the photo labels took for one).  It keeps its outline but gets the generic name, so it names no bedroom.
+_PLAUSIBLE_MIN_AREA: dict[str, float] = {"Bett": 0.6}
 _GENERIC_FURNITURE = "Möbel"
 _HEIGHT_PATTERN = re.compile(r"\s+h=([0-9.]+)\s*$")
 
@@ -168,6 +174,28 @@ def close_wall_cracks(walls: Any, tolerance: float, barriers: Any = None) -> Any
     return unary_union([walls, filled]) if not filled.is_empty else walls
 
 
+def close_wall_slots(walls: Any, half_width: float, min_length: float) -> Any:
+    """``walls`` with the long narrow slots (at most 2 x ``half_width`` wide, at least ``min_length`` long) between bodies filled.
+
+    A morphological closing fills every gap up to twice ``half_width``; only filled pieces that are slots (their minimum rotated
+    rectangle at most that wide and at least ``min_length`` long) are kept, so corners and wider openings stay as they are.
+    """
+    if walls is None or walls.is_empty or half_width <= 0.0:
+        return walls
+    closed = walls.buffer(half_width, join_style=2).buffer(-half_width, join_style=2)
+    if closed.is_empty:
+        return walls
+    slots = []
+    for piece in _parts(closed.difference(walls)):
+        if not isinstance(piece, Polygon) or piece.area <= 0.0:
+            continue
+        corners = list(piece.minimum_rotated_rectangle.exterior.coords)
+        sides = sorted(float(np.hypot(corners[k + 1][0] - corners[k][0], corners[k + 1][1] - corners[k][1])) for k in range(2))
+        if sides[0] <= 2.0 * half_width * 1.05 and sides[1] >= min_length:
+            slots.append(piece)
+    return unary_union([walls, *slots]) if slots else walls
+
+
 def rooms_from_wall_cells(
     rooms: list[Polygon],
     wall_bodies: Iterable[Polygon],
@@ -193,6 +221,8 @@ def rooms_from_wall_cells(
     if not body_list:
         return list(rooms), stats
     walls = unary_union(body_list + barrier_list)
+    if settings.wall_slot_m > 0.0:
+        walls = close_wall_slots(walls, settings.wall_slot_m * upm, settings.wall_slot_min_m * upm)
     output: list[Polygon] = []
     used: set[int] = set()
     cell_candidates = enclosed_cells(walls, upm, settings.room_min_area_m2)
@@ -571,7 +601,10 @@ def _height_of(text: str) -> float | None:
 
 
 def plausible_label(label: str, area_m2: float, height_m: float | None) -> str:
-    """Generic name for an object far too large or tall for its semantic label (e.g. a 4 m² "Kissen")."""
+    """Generic name for an object far too large or tall for its semantic label (e.g. a 4 m² "Kissen"), or far too small
+    for it (a 0.3 m² "Bett")."""
+    if area_m2 < _PLAUSIBLE_MIN_AREA.get(label, 0.0):
+        return _GENERIC_FURNITURE
     limits = _PLAUSIBLE_SIZE.get(label)
     if limits is None:
         return label

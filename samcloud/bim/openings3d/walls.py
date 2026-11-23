@@ -141,6 +141,8 @@ def _extend_to_seed_gaps(lines: list[WallLine], plan: BuildingPlan, config: Sett
     A door in the last stretch of a wall (the plan wall ends at the jamb, the gap runs on to the crossing wall) has no wall line
     around it, so the door would be measured on whatever other wall passes nearby.  The collinear line is continued to the far edge
     of the gap (at most ``walls.seed_extend_max_m``) and the continuation counts as padding (an artificial end, like a bridged gap).
+    A seed whose centre lies on the line but whose span runs on beyond the line end by more than ``walls.seed_overhang_tolerance_m``
+    continues the line the same way: otherwise the grid stops inside the opening and the opening is clipped to a sliver.
     """
     cfg = config.walls
     upm = plan.units_per_metre
@@ -149,19 +151,36 @@ def _extend_to_seed_gaps(lines: list[WallLine], plan: BuildingPlan, config: Sett
     # A plan window in the last stretch of a wall (the wall piece ends at its jamb, the window runs on to the corner) is continued
     # the same way; without a wall line over it the window has no wall-plane grid and is lost in the points-only refinement.
     window_reach = float(getattr(cfg, "seed_extend_window_max_m", 0.0) or 0.0) * upm
+    settings = {
+        "tolerance": float(getattr(cfg, "seed_overhang_tolerance_m", 0.0) or 0.0) * upm,
+        "bridge": float(getattr(cfg, "seed_extend_window_bridge_m", 0.0) or 0.0) * upm,
+        # A window continuation runs this far beyond the window's far plan edge, so a window rectangle that ends at that edge is not
+        # taken for one cut by the artificial line end (``windows.pad_edge_margin_m``) and dropped.
+        "window_margin": (float(getattr(config.windows, "pad_edge_margin_m", 0.0) or 0.0) + float(config.grid.cell_m)) * upm if window_reach > 0.0 else 0.0,
+    }
     result = list(lines)
     seeds = sorted((o for o in plan.openings if o.kind in ("door", "passage") or (o.kind == "window" and window_reach > 0.0)), key=lambda o: o.id)
     # Windows side by side in the last stretch of a wall extend the line one after the other: repeat until nothing changes.
     for _ in range(max(1, len(seeds))):
-        if not _extend_once(result, seeds, upm, sin_limit, door_reach, window_reach, cfg):
+        if not _extend_once(result, seeds, upm, sin_limit, door_reach, window_reach, cfg, settings):
             break
     return result
 
 
-def _extend_once(result: list[WallLine], seeds: list[Any], upm: float, sin_limit: float, door_reach: float, window_reach: float, cfg: Settings) -> bool:
+def _extended(line: WallLine, start: float, end: float, upm: float) -> WallLine:
+    """``line`` continued by ``start`` before u = 0 and ``end`` after its end (plan units); the continuation is padding."""
+    length = line.length + start + end
+    return replace(line, a=line.a - line.d * start, length=length, length_m=length / upm, pad_start_m=line.pad_start_m + start / upm, pad_end_m=line.pad_end_m + end / upm)
+
+
+def _extend_once(result: list[WallLine], seeds: list[Any], upm: float, sin_limit: float, door_reach: float, window_reach: float, cfg: Settings, settings: dict[str, float] | None = None) -> bool:
+    options = settings or {}
+    tolerance = float(options.get("tolerance", 0.0))
     changed = False
     for opening in seeds:
-        reach = window_reach if opening.kind == "window" else door_reach
+        window = opening.kind == "window"
+        reach = window_reach if window else door_reach
+        margin = float(options.get("window_margin", 0.0)) if window else 0.0
         axis = np.array([math.cos(opening.axis_angle), math.sin(opening.axis_angle)])
         centre = np.asarray(opening.center, float)
         half = float(opening.width_m) * upm / 2.0
@@ -176,10 +195,22 @@ def _extend_once(result: list[WallLine], seeds: list[Any], upm: float, sin_limit
             u = float(relative @ line.d)
             if -half * 0.5 <= u <= line.length + half * 0.5:
                 covered = True
+                if tolerance > 0.0:
+                    # The seed lies on this line, but its span runs on beyond a line end (a door between the end of a wall piece and the
+                    # crossing wall): the grid has to reach the seed's far edge, else the opening is clipped at the line end.
+                    before, after = half - u, u + half - line.length
+                    if tolerance < before and before + margin <= reach:
+                        result[index] = _extended(line, before + margin, 0.0, upm)
+                        changed = True
+                    elif tolerance < after and after + margin <= reach:
+                        result[index] = _extended(line, 0.0, after + margin, upm)
+                        changed = True
                 break
             gap = -u if u < 0 else u - line.length
-            slack = 0.10 * upm if opening.kind == "window" else 1e-9  # the window edge and the snapped wall end differ by a few cm
-            if gap <= half + slack and gap + half <= reach:
+            # The window edge and the snapped wall end differ by a few cm; a plan window may also stand beyond a short unmeasured
+            # stretch of its wall (a pier the 2D plan did not draw as wall) of at most ``walls.seed_extend_window_bridge_m``.
+            slack = max(0.10 * upm, float(options.get("bridge", 0.0))) if window else 1e-9
+            if gap <= half + slack and gap + half + margin <= reach:
                 candidates.append((gap, index, u))
         if covered or not candidates:
             continue
@@ -187,11 +218,9 @@ def _extend_once(result: list[WallLine], seeds: list[Any], upm: float, sin_limit
         line = result[index]
         changed = True
         if u < 0:
-            extra = -(u - half)
-            result[index] = replace(line, a=line.a + line.d * (u - half), length=line.length + extra, length_m=(line.length + extra) / upm, pad_start_m=line.pad_start_m + extra / upm)
+            result[index] = _extended(line, -(u - half) + margin, 0.0, upm)
         else:
-            extra = (u + half) - line.length
-            result[index] = replace(line, length=line.length + extra, length_m=(line.length + extra) / upm, pad_end_m=line.pad_end_m + extra / upm)
+            result[index] = _extended(line, 0.0, (u + half) - line.length + margin, upm)
     return changed
 
 

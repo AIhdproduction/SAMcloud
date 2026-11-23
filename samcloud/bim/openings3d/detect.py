@@ -184,6 +184,43 @@ def _window_points_refine(ev: LineEvidence, band: dict[str, Any], config: Settin
     return sill, head
 
 
+def _measured_head_below_photo(ev: LineEvidence, band: dict[str, Any], points_head: float | None, config: Settings) -> float | None:
+    """Head of a window that the points measure clearly below the photographed rectangle, else None.
+
+    The photograph rectangle of a window often runs on over a blind box, a curtain rail or the shadow under the lintel.  The
+    points decide when they disagree with it by ``windows.photo_points_agree_m`` or more (closer than that the two are
+    blended as before):
+    - wall points fill the window width from ``points_head`` on (three rows of ``points_row_fill``): there is wall, not window;
+    - or the glazing ends: window points fill the width up to a row, hardly any stand above it (every row below half the
+      fill) and wall points do (half the fill on average between that row and the photographed head), so the rows above
+      are observed and are not glass.
+    """
+    cfg = config.windows
+    cell = config.grid.cell_m
+    photo = band["y1"] * cell
+    limit = photo - float(cfg.photo_points_agree_m) + 1e-9
+    if points_head is not None and points_head <= limit:
+        return float(points_head)
+    c0, c1 = band["x0"] + 2, band["x1"] - 2
+    top = min(int(round(band["y1"])), ev.nv)
+    # the glazing may end up to the search distance below the level from which the two count as disagreeing
+    low = max(int(round((photo - float(cfg.photo_points_agree_m) - float(cfg.points_search_m)) / cell)), int(round(band["y0"])) + 1, 0)
+    if c1 <= c0 or top - low < 2:
+        return None
+    glass = (ev.grids["win"][:, c0:c1] > 0).mean(1)
+    solid = ev.solid[:, c0:c1].mean(1)
+    fill = float(cfg.points_row_fill)
+    for row in range(top - 1, low - 1, -1):
+        if glass[row] < fill:
+            continue
+        head = (row + 1) * cell  # the top of the highest row the glazing fills
+        above = slice(row + 1, top)
+        if head <= limit and row + 1 < top and glass[above].max() < 0.5 * fill and solid[above].mean() >= 0.5 * fill:
+            return float(head)
+        return None
+    return None
+
+
 def _window_edges_refine(ev: LineEvidence, band: dict[str, Any], config: Settings) -> tuple[float | None, float | None]:
     """Left/right edge (m) from the columns where wall points resume beside the photographed window rectangle."""
     cfg = config.windows
@@ -206,6 +243,29 @@ def _window_edges_refine(ev: LineEvidence, band: dict[str, Any], config: Setting
     if left is not None and right is not None and right - left < cfg.min_width_m:
         return None, None
     return left, right
+
+
+def glazing_reaches_floor(ev: LineEvidence, band: dict[str, Any], config: Settings) -> bool:
+    """True when a photographed window that starts low above the floor is really glazing down to the floor (a French window / glazed door).
+
+    The photograph rectangle of floor-length glazing often starts some centimetres above the floor (the threshold, the bottom frame and
+    things standing in front blur the lowest rows).  The points decide: the window starts below ``windows.interior_min_sill_m`` (lower than
+    any parapet), no row of wall points closes the opening between the floor and the rectangle (no parapet), and window-class points (the
+    bottom frame / glazing) stand in the floor rows over at least ``windows.floor_glazing_min_cover`` of the window columns.
+    """
+    cfg = config.windows
+    cell = config.grid.cell_m
+    cover = float(getattr(cfg, "floor_glazing_min_cover", 0.0) or 0.0)
+    if cover <= 0.0 or band["y0"] * cell >= float(cfg.interior_min_sill_m):
+        return False
+    c0, c1 = band["x0"] + 2, band["x1"] - 2
+    if c1 <= c0:
+        return False
+    top = max(int(round(band["y0"])), 1)
+    if float(ev.solid[:top, c0:c1].mean(1).max()) >= float(cfg.points_row_fill):
+        return False  # a row of wall points below the rectangle: a parapet, the sill is above it
+    floor_rows = slice(0, max(int(round(float(config.frames.floor_rows_m[1]) / cell)), 1))
+    return float((ev.grids["win"][floor_rows, c0:c1].sum(0) >= 1).mean()) >= cover
 
 
 def mullion_positions(ev: LineEvidence, band: dict[str, Any], v0: float, v1: float, config: Settings) -> list[tuple[float, list[str]]]:
@@ -289,9 +349,16 @@ def detect_windows(ev: LineEvidence, config: Settings, rejected: list[dict[str, 
 
         sill, source0 = combine(photo0, points0)
         head, source1 = combine(photo1, points1)
+        measured_head = _measured_head_below_photo(ev, band, points1, config)
+        if measured_head is not None:
+            # only the height changes: whether wall points frame the rectangle (source) is judged by the blend above, so a
+            # rectangle seen on photographs only is still one for the plausibility rules
+            head = round(measured_head, 3)
         source = "photo+points" if "photo+points" in (source0, source1) else "photo"
         if photo0 < cfg.floor_sill_m:
             sill = 0.0
+        elif points0 is None and glazing_reaches_floor(ev, band, config):
+            sill, source = 0.0, "photo+points"
         bars = mullion_positions(ev, band, sill if sill > 0 else 0.05, head, config)
         photo_u0, photo_u1 = band["x0"] * cell, band["x1"] * cell
         edge0, edge1 = _window_edges_refine(ev, band, config)
@@ -522,6 +589,21 @@ def rooms_on_both_sides(line: WallLine, u0: float, u1: float, rooms: list[Any], 
     return all(sides)
 
 
+def narrow_floor_window(item: dict[str, Any], config: Settings) -> bool:
+    """True for a photographed window rectangle that reaches the floor, is narrower than a glazed door and has no wall-point support.
+
+    Glazing that reaches the floor is a glazed door (at least ``windows.glazed_door_min_width_m`` wide) or floor-to-ceiling glazing; a
+    narrower floor-reaching rectangle that only the photograph votes show (``src`` "photo": the wall points do not frame it) is glass
+    in front of the wall (a shower screen, a mirror, a glass partition) or a reflection, not an opening in the wall.  A narrow
+    rectangle with wall points around it stays.
+    """
+    cfg = config.windows
+    return bool(
+        not item.get("curtain_extended") and item["v0"] < cfg.floor_sill_m and item["u1"] - item["u0"] < cfg.glazed_door_min_width_m
+        and item.get("src") == "photo"
+    )
+
+
 def classify_glazing_and_split(evidence: dict[str, LineEvidence], config: Settings, rejected: list[dict[str, Any]], plan: BuildingPlan | None = None) -> None:
     """Interior-wall window plausibility; doors with window evidence become glazed; windows split around doors."""
     cell = config.grid.cell_m
@@ -538,6 +620,9 @@ def classify_glazing_and_split(evidence: dict[str, LineEvidence], config: Settin
                     continue
                 if ev.line.kind == "exterior" and rooms_on_both_sides(ev.line, item["u0"], item["u1"], rooms, float(win_cfg.interior_probe_m), upm) and (item["v0"] < win_cfg.interior_min_sill_m or item["mw"] < win_cfg.interior_min_prob):
                     rejected.append({"line": line_id, "what": "window", "u": [round(item["u0"], 2), round(item["u1"], 2)], "reason": "window on a wall with a room on both sides (interior wall, line merged with an exterior wall) with low sill / weak probability: likely door leaf/frame"})
+                    continue
+                if narrow_floor_window(item, config):
+                    rejected.append({"line": line_id, "what": "window", "u": [round(item["u0"], 2), round(item["u1"], 2)], "reason": f"glazing down to the floor only {item['u1'] - item['u0']:.2f} m wide (narrower than a glazed door) seen on photographs only, no wall points around it: no window"})
                     continue
             kept.append(item)
         ev.items = kept

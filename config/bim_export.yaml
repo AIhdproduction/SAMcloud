@@ -165,3 +165,9 @@ kitchen_rows:
   # A row piece shorter than min_unit_m next to a fridge is absorbed by it.
   min_unit_m: 0.30
   min_top_points: 8
+  # No wall behind a front face (a thin partition hidden between two rows of cabinets is never scanned): the row is as deep as its own scanned
+  # end face. A cabinet body is end_face_min_m (shelf unit) to max_depth_m deep; the end face starts at an end of the front, at the front line,
+  # within end_face_join_m (two cells plus the scan noise of a face). A front without wall and without end face has no measured depth: no row.
+  end_face: true
+  end_face_min_m: 0.30
+  end_face_join_m: 0.15

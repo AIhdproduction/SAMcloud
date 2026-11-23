@@ -445,6 +445,8 @@ plan_polish:
   wall_crack_cell_max_m2: 12.0      # a cell that exists only after that closing counts as a room up to this area (bath / WC, not a whole flat)
   wall_crack_m: 0.02                # hairline gaps (<= 2x = 4 cm) beside a door/window span are closed before small cells are found (0 = off)
   barrier_bridge_m: 0.30            # two door/window spans closer than this get the wall stub between them (0 = off)
+  wall_slot_m: 0.06                 # slots up to 2x this (12 cm) between two wall bodies close before wall cells are found: nobody passes 12 cm, it is one wall seen twice (0 = off)
+  wall_slot_min_m: 0.30             # ... only slots at least this long (a short notch is a corner)
   room_step_m: 0.30
   # Furniture: rectangle along the wall axes when it covers the footprint (IoU), else a rectilinear outline
   # with steps >= furniture_step_m and at most furniture_max_vertices corners; clipped out of the walls.
@@ -512,6 +514,8 @@ indoor_door_rooms:
   pocket_min_contact_m: 0.25
   wall_pocket_max_m2: 1.0           # a corner pocket bounded by walls and ONE room is closed over the walls up to this area, so rooms reach the wall faces (0 = off)
   wall_face_reach_m: 0.60           # a pocket between rooms reaches the wall faces within this distance even where the measured support ends (floor hidden behind furniture)
+  passage_front_reach_m: 0.15       # a passage joins only the rooms in front of it (this close to probes just beyond both wall faces at its middle half); a span overshooting past a crossing wall does not reach the room behind it
+  pocket_open_share: 0.20          # a corner pocket outside every measured room is closed only when at most this share of its outline is open towards unseen space (furniture-hidden corners are enclosed)
 
 # Semantic room names; rooms below min_room_area_m2 without sanitary fixtures are dropped.
 indoor_room_names:
@@ -547,6 +551,7 @@ indoor_kitchen_fronts:
   corner_min_angle_deg: 15.0        # flatter than this is the straight front itself
   corner_min_coverage: 0.75         # share of the diagonal seen over the front height
   corner_max_residual_m: 0.02       # median distance of its points to the line
+  near_front_m: 1.00                # the straight front beside a diagonal unit is judged over about two units when the whole leg is not seen (a peninsula, a tall unit or an open end has no front)
   recess: true
   recess_min_depth_m: 0.12
   recess_min_length_m: 0.40
@@ -563,6 +568,24 @@ indoor_kitchen_front_legs:
   min_label_share: 0.60             # a table or sideboard along the second wall carries no kitchen labels
   min_depth_m: 0.45                 # wall behind the front
   max_depth_m: 0.80
+  refit_free: true                  # a free-standing raster leg (peninsula) takes its body measured in the scan (front, worktop, back face)
+  refit_min_overlap: 0.50           # the measured body is the raster leg itself: they share half of the smaller one
+
+# Raised bar top of a peninsula, measured in the scan (samcloud/ortho/vector/kitchen_bar.py): its own solid in the 3D model, the 2D
+# band at its measured depth. No bar top without the evidence; the surface-model band of plan_polish stays the fallback without scan points.
+indoor_kitchen_bar_top:
+  enabled: true
+  above_m: 0.08                     # at least this far above the worktop (below: the upstand of the worktop)
+  max_level_m: 1.30                 # standing-bar height
+  level_tolerance_m: 0.03           # scan noise of a board plus the 1 cm level bins
+  edge_share: 0.40                  # the free edge is seen along this share of the leg (a stool or chair back is 0.35-0.45 m wide)
+  inside_share: 0.25                # inside the strip the top or what stands on it is seen this often (four scans: 0.29-0.81 inside, 0.04-0.21 beside)
+  min_depth_m: 0.15                 # narrower is a rail or an upstand
+  max_depth_m: 0.90                 # deeper is a table
+  min_carry_m: 0.05                 # it lies this far over the body of the leg
+  max_cover_share: 0.80             # of the leg depth; more is the counter itself at that level
+  min_length_share: 0.50            # of the leg
+  thickness_m: 0.04                 # board whose edge face is not seen
 
 # Outdoor surveyor / DGM site-plan standard (metres).
 outdoor_trunk:

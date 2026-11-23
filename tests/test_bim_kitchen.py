@@ -116,14 +116,16 @@ def test_ifc_carries_the_kitchen_with_types_and_heights(upm: float, tmp_path) ->
     assert (sink.is_a(), sink.PredefinedType) == ("IfcSanitaryTerminal", "SINK")
     hob = by_name["Herd 01"]
     assert (hob.is_a(), hob.PredefinedType) == ("IfcElectricAppliance", "ELECTRICCOOKER")
-    tall = by_name["tall_unit 01"]
+    tall = by_name["Hochschrank 01"]  # readable names, the kind stays in the object type
     assert (tall.is_a(), tall.ObjectType) == ("IfcFurniture", "TallUnit")
-    names = ("Unterschrank 01", "Arbeitsplatte 01", "Spüle 01", "Herd 01", "tall_unit 01", "upper_cabinet 01", "upper_cabinet 02")
+    assert by_name["Oberschrank 01"].ObjectType == "WallCabinet"
+    assert not any(name.split(" ")[0] in ("tall_unit", "upper_cabinet", "builtin_front") for name in by_name)
+    names = ("Unterschrank 01", "Arbeitsplatte 01", "Spüle 01", "Herd 01", "Hochschrank 01", "Oberschrank 01", "Oberschrank 02")
     heights = {name: _bbox(by_name[name])[:, 2] for name in names}
     assert heights["Unterschrank 01"] == pytest.approx((FLOOR, FLOOR + 0.86), abs=1e-6)
     assert heights["Arbeitsplatte 01"] == pytest.approx((FLOOR + 0.86, FLOOR + 0.90), abs=1e-6)  # base + worktop = 0.90 m
     assert heights["Spüle 01"] == pytest.approx((FLOOR + 0.80, FLOOR + 0.90), abs=1e-6)
     assert heights["Herd 01"] == pytest.approx((FLOOR + 0.90, FLOOR + 0.93), abs=1e-6)
-    assert heights["tall_unit 01"] == pytest.approx((FLOOR, FLOOR + 1.85), abs=1e-6)
-    assert heights["upper_cabinet 01"] == pytest.approx((FLOOR + 1.40, FLOOR + 2.20), abs=1e-6)  # measured from the instance
-    assert heights["upper_cabinet 02"] == pytest.approx((FLOOR + 1.45, FLOOR + 2.15), abs=1e-6)  # default
+    assert heights["Hochschrank 01"] == pytest.approx((FLOOR, FLOOR + 1.85), abs=1e-6)
+    assert heights["Oberschrank 01"] == pytest.approx((FLOOR + 1.40, FLOOR + 2.20), abs=1e-6)  # measured from the instance
+    assert heights["Oberschrank 02"] == pytest.approx((FLOOR + 1.45, FLOOR + 2.15), abs=1e-6)  # default

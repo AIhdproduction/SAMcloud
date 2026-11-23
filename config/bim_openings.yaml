@@ -14,6 +14,10 @@ walls:                            # plan walls -> collinear wall lines (gaps = o
   min_piece_length_m: 0.1
   seed_extend_max_m: 1.0          # a wall line continues over a plan door/passage gap that lies beyond its end (door at the end of a wall) up to this far
   seed_extend_window_max_m: 3.2   # ... and over a plan window beyond its end (window in the last stretch of a wall) up to this far
+  seed_extend_window_bridge_m: 1.0  # ... also when an unmeasured stretch of at most this length (a pier between two window units the 2D plan
+                                   # did not draw as wall; facade piers between the units of one room are rarely wider) lies between line end and window
+  seed_overhang_tolerance_m: 0.10  # a seed whose span runs on beyond a line end by more than this (2 grid cells: plan wall ends and plan opening
+                                   # edges both come from the 5 cm raster) continues the line to its far edge (else the opening is clipped to a sliver)
   end_pad_m: 3.0                  # a line continues up to this far into the gap to the next collinear line (not bridged: gap > max_gap_m)
 
 selection:                        # which photographs look at which wall face
@@ -87,6 +91,8 @@ windows:
   glazed_door_min_width_m: 0.7
   interior_min_sill_m: 0.3
   interior_min_prob: 0.7
+  floor_glazing_min_cover: 0.5      # a window starting below interior_min_sill_m with no wall-point row under it and window-class points in the floor rows
+                                    # over this share of its columns is glazing down to the floor (French window): sill 0 (the photo rectangle misses the frame rows)
   interior_probe_m: 0.30          # a window span with a room this far beyond the wall face on BOTH sides is on an interior wall (also when its wall line is merged with an exterior wall)
   confidence_points_bonus: 0.2
   curtain_extended_confidence: 0.3
@@ -232,6 +238,7 @@ classify:                         # door / passage / none from the frame measure
   host_min_stretch_m: 0.2         # shorter stretches of the host wall beside a door are jamb stubs and are not continued
   leaf_shadow_distance_m: 0.45    # a candidate without any casing strip this close to the measured open leaf of a door on another wall line is that leaf, not an opening (the frame decides where a door is)
   min_head_m: 1.8                 # a measured head below this is not a door head (furniture, closed leaf): the detected head stays
+  min_door_width_m: 0.5           # a door / passage narrower than this is dropped: the narrowest standard leaf (0.625 m) leaves ~0.55 m clear, minus 5 cm measuring noise
 
 scan:                             # door frames on wall lines without opening (entrances, scan.py)
   col_rows_m: [0.1, 1.9]

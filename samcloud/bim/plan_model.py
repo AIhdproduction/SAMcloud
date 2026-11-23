@@ -427,6 +427,9 @@ def load_instance_hulls(instances_path: Path | str | None, frame: Any) -> list[d
 _TALL_COLUMN_LABELS = frozenset({"chest of drawers", "dresser", "cupboard"})
 _UPPER_LABELS = frozenset({"kitchen cabinet", "cabinet", "kitchen counter", "shelf", "bookcase"})
 _TALL_LABELS = frozenset({"refrigerator", "fridge", "kitchen cabinet", "cabinet", "wardrobe", "oven", "microwave oven"})
+# Display name of a built-in unit that the plan draws without a text (the kind stays in ``catalogue_kind`` and in the
+# semantic label; the name is what the IFC element, the 3D DXF and the reports show).
+_EINB_DISPLAY_NAMES = {"tall_unit": "Hochschrank", "upper_cabinet": "Oberschrank", "builtin_front": "Einbauschrank"}
 _WALL_MOUNTED_KINDS = frozenset({"upper_cabinet", "washbasin", "lavabo", "wall shelf", "hood", "wall tv", "mirror cabinet"})
 
 
@@ -665,6 +668,10 @@ def _furniture(
                             id=f"F{len(result) + 1:03d}", instance_id=None, label="Arbeitsplatte", semantic_label="worktop", catalogue_kind="worktop",
                             layer=layer, footprint=ring, default_z_m=[base, top],
                         ))
+                for bar in entity.get("_run_bars") or []:
+                    item = _bar_top_item(bar, f"F{len(result) + 1:03d}", layer, floor_z, upm, seen_runs)
+                    if item is not None:
+                        result.append(item)
                 if emitted:
                     continue
             kind_name: str | None = None
@@ -686,8 +693,8 @@ def _furniture(
                     if footprint.is_empty or footprint.geom_type != "Polygon":
                         continue
                 einb_kind = entity.get("_einb_kind") or ("upper_cabinet" if entity.get("_upper_cabinet") else None)
-                label = str(entity.get("_label") or einb_kind or layer)
-                semantic = str(entity.get("_semantic_label") or label)
+                label = str(entity.get("_label") or _EINB_DISPLAY_NAMES.get(str(einb_kind)) or einb_kind or layer)
+                semantic = str(entity.get("_semantic_label") or entity.get("_label") or einb_kind or layer)
                 kind_name = einb_kind
                 if entity.get("_instance_id") is not None:
                     instance_id = int(entity["_instance_id"])
@@ -787,6 +794,63 @@ def _furniture(
     if depth is not None:
         result = _apply_depth_rules(result, depth, upm, floor_z, depth_report)
     return result
+
+
+def _bar_top_item(
+    bar: dict[str, Any], identifier: str, layer: str, floor_z: float, upm: float, seen: set[tuple[tuple[float, float], ...]],
+) -> PlanFurniture | None:
+    """The raised bar top of a kitchen run (``_run_bars`` of the kitchen layout) as its own item.
+
+    A board at its measured level with its measured underside; where it lies over the body a support carries it down to the
+    worktop.  ``mounting`` "resting": it rests on the run, is never pulled to the floor and the reconstruction leaves it as measured.
+    """
+    outline = bar.get("outline") or []
+    if len(outline) < 3:
+        return None
+    key = tuple((round(float(x), 3), round(float(y), 3)) for x, y in outline)
+    if key in seen:
+        return None
+    seen.add(key)
+    ring = _points(outline)
+    level, bottom, worktop = (floor_z + float(bar[name]) * upm for name in ("level_m", "bottom_m", "worktop_m"))
+    if level - bottom < 0.005 * upm:
+        return None
+    solids: list[dict[str, Any]] = [{"type": "extrusion", "role": "top", "part_source": "measured", "outline": ring, "z_min": bottom, "z_max": level}]
+    support = bar.get("support") or []
+    if len(support) >= 3 and bottom - worktop >= 0.005 * upm:
+        solids.append({"type": "extrusion", "role": "support", "part_source": "measured", "outline": _points(support), "z_min": worktop, "z_max": bottom})
+    return PlanFurniture(
+        id=identifier, instance_id=None, label="Theke", semantic_label="bar top", catalogue_kind="bar_top", layer=layer, footprint=ring,
+        z_min=min(solid["z_min"] for solid in solids), z_max=level, z_source="points", floor_contact=False, solids=solids,
+        shape_source="parametric", mounting="resting",
+        fit={"family": "bar_top", "level_m": round(float(bar["level_m"]), 3), "bottom_m": round(float(bar["bottom_m"]), 3), "worktop_m": round(float(bar["worktop_m"]), 3)},
+    )
+
+
+def _seat_bar_tops(items: list[PlanFurniture], upm: float) -> None:
+    """The support of a bar top starts on the worktop below it as the plan finally has it (the reconstruction measures the worktop
+    level after the bar was read); a support thinner than 5 mm is left out."""
+    worktops = [(item, polygon) for item in items if item.catalogue_kind == "worktop" and item.z_max is not None
+                for polygon in [_footprint_polygon(item)] if polygon is not None]
+    for item in items:
+        if item.catalogue_kind != "bar_top" or not item.solids:
+            continue
+        polygon = _footprint_polygon(item)
+        below = [(polygon.intersection(shape).area, worktop) for worktop, shape in worktops] if polygon is not None else []
+        below = [entry for entry in below if entry[0] > 0.0]
+        if not below:
+            continue
+        top = float(max(below, key=lambda entry: entry[0])[1].z_max)
+        board = next((solid for solid in item.solids if solid.get("role") == "top"), None)
+        kept: list[dict[str, Any]] = []
+        for solid in item.solids:
+            if solid.get("role") == "support":
+                solid = {**solid, "z_min": top, "z_max": float(board["z_min"]) if board is not None else float(solid["z_max"])}
+                if solid["z_max"] - solid["z_min"] < 0.005 * upm:
+                    continue
+            kept.append(solid)
+        item.solids = kept
+        item.z_min = min(float(solid["z_min"]) for solid in kept)
 
 
 def _assign_back_walls(items: list[PlanFurniture], walls: list[PlanWall], upm: float) -> None:
@@ -900,7 +964,7 @@ def _apply_tall_rows(
         if polygon is not None:
             hob_legs.extend(leg for leg in legs if leg.distance(polygon) <= 0.05 * upm)
     hob_area = unary_union(hob_legs) if hob_legs else None
-    protected = {"kitchen_base", "worktop", "KITCHEN_SINK", "COOKTOP", "upper_cabinet"}
+    protected = {"kitchen_base", "worktop", "bar_top", "KITCHEN_SINK", "COOKTOP", "upper_cabinet"}
     next_number = max([int(item.id[1:]) for item in items if item.id[1:].isdigit()] or [0]) + 1
     oven_assigned = False
     produced: list[dict[str, Any]] = []
@@ -925,11 +989,17 @@ def _apply_tall_rows(
         units = split_row(row.polygon, [polygon for _, polygon in usable], upm, settings.min_unit_m)
         top = floor_z + row.top_m * upm
         unit_ids: list[str] = []
+        kept: list[dict[str, Any]] = []
         for polygon, index in units:
             ring = _points(list(polygon.exterior.coords)[:-1])
             if index is not None:
-                usable[index][0].footprint = ring
-                unit_ids.append(usable[index][0].id)
+                fixed_item = usable[index][0]
+                kept.append({"id": fixed_item.id, "label": fixed_item.label, "instance_id": fixed_item.instance_id, "footprint": fixed_item.footprint})
+                fixed_item.footprint = ring
+                if fixed_item.z_source == "instance_bbox" and fixed_item.z_max is not None and fixed_item.z_max > top:
+                    # a loose instance box (its highest stray point) never stands above the robust measured top of its row
+                    fixed_item.z_max = top
+                unit_ids.append(fixed_item.id)
                 continue
             oven = False
             if hob_area is not None and not oven_assigned and polygon.distance(hob_area) <= 0.15 * upm:
@@ -944,7 +1014,10 @@ def _apply_tall_rows(
             unit_ids.append(item.id)
         produced.append({
             "units": unit_ids, "bbox_m": [round(float(v) / upm, 3) for v in row.polygon.bounds], "top_m": round(row.top_m, 3), "front": row.front,
-            "replaced": [{"id": item.id, "label": item.label, "instance_id": item.instance_id} for item in owned],
+            # (the footprint: the 2D plan takes the outline of a replaced item out again, samcloud.bim.furniture_recon.dxf_outline)
+            "replaced": [{"id": item.id, "label": item.label, "instance_id": item.instance_id, "footprint": item.footprint} for item in owned],
+            # a fridge that keeps its item: the outline it had before it took the depth and the along-range of the row
+            "kept": kept,
         })
     new_ids = {unit for entry in produced for unit in entry["units"]}
     row_union = unary_union([row.polygon for row in rows])
@@ -1247,6 +1320,7 @@ def build_plan_model(
             _window_lines(openings), objects_report,
         )
     recon_report = _reconstruct_furniture(furniture, frame, level, upm, instances_path)
+    _seat_bar_tops(furniture, upm)
     extra = {**(source_extra or {}), **({"furniture_recon": recon_report} if recon_report else {})}
     if depth_report:
         extra["depth_furniture"] = depth_report

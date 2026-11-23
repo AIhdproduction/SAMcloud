@@ -93,6 +93,12 @@ SYMBOLS: dict[str, SymbolDef] = {
 # perpendicular into free space.  Snapping to a wall therefore only rotates and
 # places the block.  TABLE_DINING and KITCHEN_ISLAND are free-standing and
 # centred on (0, 0).
+#
+# A block draws only the object it stands for and its fixed parts (bowl, tap,
+# burners, sofa arms, wardrobe doors).  It never draws separate objects that sit
+# next to or on it (chairs around a table, pillows or a blanket on a bed): the
+# plan shows such an object only where it was detected as an object of its own,
+# with its own outline at its measured position.
 # ---------------------------------------------------------------------------
 
 
@@ -222,27 +228,17 @@ def _kitchen_island(width: float, depth: float) -> tuple[dict[str, object], ...]
 
 
 def _bed(width: float, depth: float) -> tuple[dict[str, object], ...]:
+    """Bed frame with its head board at the wall edge.  Pillows and the blanket are separate objects: a pillow the
+    scan detected is drawn from its own outline, so the block never adds stock pillows or a blanket fold."""
     half = width / 2.0
-    count = 1 if width < 1.3 else 2
-    pillow = (width - 0.20 - 0.05 * (count - 1)) / count
-    entities: list[dict[str, object]] = [_rect(-half, 0.0, half, depth), _rect(-half, 0.0, half, 0.06)]
-    for index in range(count):
-        left = -half + 0.10 + index * (pillow + 0.05)
-        entities.append(_rrect(left, 0.14, left + pillow, 0.46, 0.05))
-    entities.append(_line(-half, depth * 0.45, half, depth * 0.45))
-    return tuple(entities)
+    return (_rect(-half, 0.0, half, depth), _rect(-half, 0.0, half, 0.06))
 
 
 def _dining_table(width: float, depth: float) -> tuple[dict[str, object], ...]:
+    """Table top only.  Chairs are drawn only where they were detected (own outline at the measured position), never
+    as stock seats around the block: a coffee table or a desk matching a table size has no chairs."""
     half_w, half_d = width / 2.0, depth / 2.0
-    seats = max(2, int(width // 0.60))
-    pitch = width / seats
-    entities: list[dict[str, object]] = [_rect(-half_w, -half_d, half_w, half_d)]
-    for index in range(seats):
-        x = -half_w + pitch * (index + 0.5)
-        entities.append(_rrect(x - 0.21, half_d - 0.12, x + 0.21, half_d + 0.30, 0.04))
-        entities.append(_rrect(x - 0.21, -half_d - 0.30, x + 0.21, -half_d + 0.12, 0.04))
-    return tuple(entities)
+    return (_rect(-half_w, -half_d, half_w, half_d),)
 
 
 def _sofa(width: float, depth: float) -> tuple[dict[str, object], ...]:

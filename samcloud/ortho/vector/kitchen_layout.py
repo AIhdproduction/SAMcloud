@@ -6,7 +6,9 @@ heights and the appliance labels it
 * extends a wall-backed leg along its wall only as far as counter-height surfaces (``counter_min_m`` ..
   ``counter_max_m``) are really measured in the front part of the leg (never into a wall or out of the room);
 * finds a raised bar on a free-standing leg (peninsula): a band beside it standing above the counter top up to
-  ``bar_max_m`` along most of its length becomes part of the counter, the step is drawn as an inner line;
+  ``bar_max_m`` along most of its length becomes part of the counter, the step is drawn as an inner line; with scan
+  points the bar top itself is measured (``kitchen_bar``: board, level, underside) and drawn at its measured depth,
+  ``_run_bars`` carries it to the 3D model as its own solid;
 * re-mounts the cooktop and the sink ON the counter at the position of their labels at counter height (a block
   centred in the counter depth and lying fully inside it, square to the leg; with ``appliance_on_chamfer`` a sink in a
   chamfered inner corner may sit on the diagonal);
@@ -39,8 +41,9 @@ from shapely.geometry import GeometryCollection, LineString, MultiLineString, Po
 from shapely.ops import linemerge, unary_union
 
 from .indoor import _uniform_insert
+from .kitchen_bar import BarTop, BarTopSettings, measure_bar_top
 from .kitchen_fronts import CornerFront, KitchenFrontSettings, ScanPoints, measure_corner_fronts, measure_recesses, seen_through_ends, split_run
-from .kitchen_legs import FrontLegSettings, recover_front_legs
+from .kitchen_legs import FrontLegSettings, recover_front_legs, refit_free_legs
 from .measured_rotation import clear_point_rotation
 from .plan_polish import _LegBox, _closed_polyline, _furniture_off_counter, _largest, _points, _room_of
 from .symbols import CATALOGUE, SINK_BASINS
@@ -94,6 +97,7 @@ def kitchen_cad_layout(
     front_settings: KitchenFrontSettings = KitchenFrontSettings(),
     kitchen_labels: np.ndarray | None = None,
     leg_settings: FrontLegSettings = FrontLegSettings(),
+    bar_settings: BarTopSettings = BarTopSettings(),
 ) -> dict[str, Any]:
     """Turn the fitted run(s) on A-EINB into a CAD kitchen (see the module docstring); returns statistics.
 
@@ -106,13 +110,14 @@ def kitchen_cad_layout(
     stats: dict[str, Any] = {"kitchen_legs_extended_m": 0.0, "kitchen_bars": 0, "kitchen_bar_depth_m": None, "kitchen_appliances_mounted": [],
                              "kitchen_tall_units": 0, "kitchen_upper_crosses": 0, "kitchen_layout_absorbed": 0,
                              "kitchen_corner_fronts": [], "kitchen_base_recesses": [], "kitchen_uppers_trimmed": [],
-                             "kitchen_legs_from_fronts": []}
+                             "kitchen_legs_from_fronts": [], "kitchen_free_legs_measured": [], "kitchen_bar_tops": []}
     if not settings.enabled:
         return stats
     scan = ScanPoints.of(scan_points, theta, upm) if front_settings.enabled and scan_points is not None and len(scan_points) else None
     appliances = appliances or {}
     local_walls = affinity.rotate(walls, -theta, origin=(0.0, 0.0), use_radians=True) if walls is not None and not walls.is_empty else None
     counters: list[Polygon] = []
+    shapes_of_runs: list[str] = []
     for entity in layers.get("A-EINB", []):
         if not _closed_polyline(entity) or not entity.get("_run_legs"):
             continue
@@ -142,17 +147,30 @@ def kitchen_cad_layout(
             if kitchen_labels is not None and len(kitchen_labels):
                 known = len(legs)
                 labels = ScanPoints.of(np.column_stack((kitchen_labels, np.zeros(len(kitchen_labels)))), theta, upm).uv
+                # a free-standing raster leg (peninsula) takes its measured body before anything is read from it
+                stats["kitchen_free_legs_measured"] += refit_free_legs(legs, scan, labels, local_walls, local_room, front_settings, upm, top / upm, leg_settings)
                 stats["kitchen_legs_from_fronts"] += recover_front_legs(legs, scan, labels, local_walls, local_room, front_settings, upm, top / upm, leg_settings)
                 if len(legs) > known:
                     entity["_kitchen_run"] = {1: "straight", 2: "L", 3: "U"}.get(len(legs), "U+")
                     _drop_retraced_segments(layers, [leg.polygon(theta) for leg in legs[known:]], 0.15 * upm)
             # the scanned fronts: diagonal units, and the straight fronts that meet them
             corners, square = measure_corner_fronts(legs, scan, local_walls, local_room, front_settings, upm, top / upm)
+        shapes_of_runs.append(_run_shape(legs, upm))
+        entity["_kitchen_run"] = shapes_of_runs[-1]
         bars: list[tuple[Polygon, LineString]] = []
-        if height_of is not None:
-            for leg in legs:
-                if leg.back is None:
-                    bars.extend(_bars_of(leg, legs, local_walls, local_room, frame, top, settings, upm))
+        bar_tops: list[BarTop] = []
+        for leg in legs:
+            if leg.back is not None:
+                continue
+            # the bar top measured in the scan (board, level, underside); without it the raised band of the surface model as before
+            measured = measure_bar_top(leg, scan, top / upm, upm, bar_settings) if scan is not None else None
+            if measured is not None and not _bar_blocked(measured, local_walls, local_room):
+                bar_tops.append(measured)
+                bars.append((box(measured.u0, measured.v0, measured.u1, measured.v1), MultiLineString([list(step) for step in measured.steps]) if measured.steps else LineString()))
+                if height_of is not None:  # the surface beyond a free end, as without a measured board
+                    bars.extend(_bars_of(leg, legs, local_walls, local_room, frame, top, settings, upm, measured))
+            elif height_of is not None:
+                bars.extend(_bars_of(leg, legs, local_walls, local_room, frame, top, settings, upm))
         # a chamfer of the label raster stays only where the scan cannot judge the corner; a measured front replaces it
         judged = [(float(item.corner[0]), float(item.corner[1])) for item in corners] + square
         chamfers = [Polygon(points) for points in entity.get("_chamfers", []) if len(points) >= 3]
@@ -179,6 +197,14 @@ def kitchen_cad_layout(
              "base": [_points(affinity.rotate(piece, theta, origin=(0.0, 0.0), use_radians=True)) for piece in bases]}
             for tops, bases in split_run(legs, local_chamfers, recesses, upm)
         ]
+        # the bar tops for the 3D model: board outline, its level and underside, and where it stands on the body
+        entity["_run_bars"] = [
+            {"outline": _points(affinity.rotate(box(item.u0, item.v0, item.u1, item.v1), theta, origin=(0.0, 0.0), use_radians=True)),
+             "level_m": item.level_m, "bottom_m": item.bottom_m, "worktop_m": item.worktop_m,
+             "support": None if item.support is None else _points(affinity.rotate(box(*item.support), theta, origin=(0.0, 0.0), use_radians=True))}
+            for item in bar_tops
+        ]
+        stats["kitchen_bar_tops"] += [item.evidence for item in bar_tops]
         stats["kitchen_corner_fronts"] += [
             {"angle_deg": round(item.angle_deg, 2), "length_m": round(float(np.hypot(*(item.second - item.first))) / upm, 3),
              "coverage": round(item.coverage, 3), "residual_m": round(item.residual_m, 4)}
@@ -201,10 +227,15 @@ def kitchen_cad_layout(
         layers["A-EINB"] = _mount_appliances(layers["A-EINB"], entity, legs, shape, chamfers, corners, appliances, theta, settings, upm, stats)
         if height_of is not None:
             _tall_units(layers, legs, local_walls, local_room, frame, appliances, theta, settings, upm, stats)
+    if shapes_of_runs:
+        # the raster run names its shape before the legs reach their measured ends (a corner under upper cabinets is not
+        # seen by the surface model, so two legs can start apart): the final legs decide
+        stats["kitchen_run_shape"] = shapes_of_runs[0] if len(shapes_of_runs) == 1 else "multi"
     if counters:
         stats["kitchen_layout_absorbed"] = _furniture_off_counter(layers, unary_union(counters), theta, upm)
     if scan is not None:
         stats["kitchen_uppers_trimmed"] = _trim_uppers(layers, local_walls, scan, theta, settings, front_settings, upm)
+    stats.update(_tidy_uppers(layers, theta, upm, settings.tall_snap_m))
     # upper cabinets: dashed outline with a diagonal cross (A-OBEN)
     crosses: list[dict[str, Any]] = []
     for entity in layers.get("A-OBEN", []):
@@ -250,6 +281,22 @@ def _drop_retraced_segments(layers: dict[str, list[dict[str, Any]]], shapes: lis
     layers["A-EINB"][:] = kept
 
 
+def _run_shape(legs: list[_LegBox], upm: float) -> str:
+    """straight / L / U / U+ for legs that join into one run (within 5 cm: a joint, not a gap), else multi."""
+    joined = unary_union([box(leg.u0, leg.v0, leg.u1, leg.v1).buffer(0.025 * upm, join_style=2) for leg in legs])
+    if not isinstance(joined, Polygon):
+        return "multi"
+    return {1: "straight", 2: "L", 3: "U"}.get(len(legs), "U+")
+
+
+def _bar_blocked(bar: BarTop, local_walls: Any, local_room: Any) -> bool:
+    """A measured bar top that would stand in a wall or outside the room of its run is not drawn."""
+    shape = box(bar.u0, bar.v0, bar.u1, bar.v1)
+    if local_walls is not None and shape.intersection(local_walls).area >= 0.10 * shape.area:
+        return True
+    return local_room is not None and shape.intersection(local_room).area < 0.90 * shape.area
+
+
 def _judged(chamfer: Polygon, judged: list[tuple[float, float]], theta: float, reach: float) -> bool:
     local = affinity.rotate(chamfer, -theta, origin=(0.0, 0.0), use_radians=True)
     return any(local.distance(Point(point)) <= reach for point in judged)
@@ -289,6 +336,115 @@ def _trim_uppers(
         entity["points"] = _points(shape.simplify(0.002 * upm, preserve_topology=True))
         trimmed.append({"from_m": round(length / upm, 3), "to_m": round((ends[1] - ends[0]) / upm, 3)})
     return trimmed
+
+
+# Two upper-cabinet outlines are one unit seen twice when they share this much of the smaller one (the band detector and the point
+# detector, or the same unit found from two run pieces); an outline lying this much inside a tall unit is the top of that unit: a
+# hanging unit and a floor-standing one cannot fill the same place.
+_UPPER_SAME_SHARE = 0.50
+# Two outlines of one row (same direction, depths overlapping by half of the shallower one, height bands overlapping) cannot
+# overlap along the wall either: more than two scan cells of overlap is one run found in two pieces (merged), less is two units
+# that touch (the shorter one is cut back to the end of the longer one, so no two outlines ever share a place).
+_UPPER_TOUCH_M = 0.05
+
+
+def _tidy_uppers(layers: dict[str, list[dict[str, Any]]], theta: float, upm: float, tall_snap_m: float = 0.30) -> dict[str, int]:
+    """One outline per hanging unit: drop the top of a tall unit taken for an upper cabinet, merge outlines of the same unit.
+
+    Merged outlines keep the wall-frame rectangle around both and the measured height band of the longer one.  An upper cabinet
+    that ends within ``tall_snap_m`` of the side of a tall unit reaches it, like the counter below it (the units of a kitchen abut;
+    the outline was found over the label raster's leg, whose end is rough).
+    """
+    stats = {"kitchen_uppers_in_tall_units": 0, "kitchen_uppers_merged": 0, "kitchen_uppers_to_tall_units": 0}
+    entities = layers.get("A-OBEN", [])
+    uppers = [entity for entity in entities if _closed_polyline(entity) and entity.get("_upper_cabinet")]
+    if not uppers:
+        return stats
+    tall = [Polygon(item["points"]).buffer(0) for item in layers.get("A-EINB", []) if _closed_polyline(item) and item.get("_einb_kind") == "tall_unit"]
+    tall_area = unary_union(tall) if tall else None
+    dropped: list[int] = []
+    boxes: dict[int, _LegBox] = {}
+    for entity in uppers:
+        shape = Polygon(entity["points"]).buffer(0)
+        if shape.is_empty or shape.area <= 0.0:
+            continue
+        if tall_area is not None and shape.intersection(tall_area).area >= _UPPER_SAME_SHARE * shape.area:
+            dropped.append(id(entity))
+            stats["kitchen_uppers_in_tall_units"] += 1
+            continue
+        unit = _LegBox.of(shape, theta)
+        if unit is not None:
+            boxes[id(entity)] = unit
+    kept = [entity for entity in uppers if id(entity) in boxes]
+    kept.sort(key=lambda entity: -max(boxes[id(entity)].u1 - boxes[id(entity)].u0, boxes[id(entity)].v1 - boxes[id(entity)].v0))
+
+    def row_overlap(first: dict[str, Any], second: dict[str, Any]) -> float | None:
+        """Overlap along the wall of two outlines of one row; None when they are not in one row."""
+        a, b = boxes[id(first)], boxes[id(second)]
+        if a.horizontal != b.horizontal:
+            return None
+        across = (min(a.v1, b.v1) - max(a.v0, b.v0)) if a.horizontal else (min(a.u1, b.u1) - max(a.u0, b.u0))
+        if across < 0.5 * min(a.depth, b.depth):
+            return None
+        bands = [entity.get("_z_range_m") for entity in (first, second)]
+        if all(bands) and min(bands[0][1], bands[1][1]) <= max(bands[0][0], bands[1][0]):
+            return None  # one above the other
+        return (min(a.u1, b.u1) - max(a.u0, b.u0)) if a.horizontal else (min(a.v1, b.v1) - max(a.v0, b.v0))
+
+    merged = True
+    while merged:
+        merged = False
+        for first in kept:
+            a = boxes[id(first)]
+            for second in kept:
+                if second is first:
+                    continue
+                b = boxes[id(second)]
+                overlap = max(0.0, min(a.u1, b.u1) - max(a.u0, b.u0)) * max(0.0, min(a.v1, b.v1) - max(a.v0, b.v0))
+                smaller = min((a.u1 - a.u0) * (a.v1 - a.v0), (b.u1 - b.u0) * (b.v1 - b.v0))
+                along = row_overlap(first, second)
+                if a.horizontal != b.horizontal or smaller <= 0.0 or (overlap < _UPPER_SAME_SHARE * smaller and (along is None or along <= _UPPER_TOUCH_M * upm)):
+                    continue
+                a.u0, a.u1, a.v0, a.v1 = min(a.u0, b.u0), max(a.u1, b.u1), min(a.v0, b.v0), max(a.v1, b.v1)
+                first["points"] = _points(a.polygon(theta))
+                kept.remove(second)
+                dropped.append(id(second))
+                stats["kitchen_uppers_merged"] += 1
+                merged = True
+                break
+            if merged:
+                break
+    # what still overlaps along the wall (at most _UPPER_TOUCH_M) are two units that touch: the shorter one ends at the longer one
+    for index, first in enumerate(kept):
+        for second in kept[index + 1:]:
+            along = row_overlap(first, second)
+            if along is None or along <= 0.0:
+                continue
+            a, b = boxes[id(first)], boxes[id(second)]  # ``kept`` is sorted by length: ``second`` is the shorter one
+            if a.horizontal:
+                if (b.u0 + b.u1) / 2.0 >= (a.u0 + a.u1) / 2.0:
+                    b.u0 = a.u1
+                else:
+                    b.u1 = a.u0
+            elif (b.v0 + b.v1) / 2.0 >= (a.v0 + a.v1) / 2.0:
+                b.v0 = a.v1
+            else:
+                b.v1 = a.v0
+            second["points"] = _points(b.polygon(theta))
+            stats["kitchen_uppers_abutted"] = stats.get("kitchen_uppers_abutted", 0) + 1
+    if tall:
+        local_tall = affinity.rotate(unary_union(tall), -theta, origin=(0.0, 0.0), use_radians=True)
+        for entity in kept:
+            unit = boxes[id(entity)]
+            before = (unit.u0, unit.u1, unit.v0, unit.v1)
+            unit.snap_ends(local_tall, tall_snap_m * upm)
+            if (unit.u0, unit.u1, unit.v0, unit.v1) != before:
+                entity["points"] = _points(unit.polygon(theta))
+                stats["kitchen_uppers_to_tall_units"] += 1
+    if dropped:
+        gone = set(dropped)
+        layers["A-OBEN"] = [entity for entity in entities if id(entity) not in gone]
+    return stats
 
 
 def counter_lines(layers: dict[str, list[dict[str, Any]]], walls: Any, units_per_metre: float) -> int:
@@ -442,13 +598,26 @@ def _counter_top(legs: list[_LegBox], frame: _Frame, settings: KitchenLayoutSett
     return float(np.median(finite)) if finite.size else 0.90 * upm
 
 
-def _bars_of(leg: _LegBox, legs: list[_LegBox], local_walls: Any, local_room: Any, frame: _Frame, top: float, settings: KitchenLayoutSettings, upm: float) -> list[tuple[Polygon, LineString]]:
-    """Raised bar bands beside the long sides and the free ends of a free-standing leg (peninsula)."""
+def _bars_of(
+    leg: _LegBox, legs: list[_LegBox], local_walls: Any, local_room: Any, frame: _Frame, top: float, settings: KitchenLayoutSettings, upm: float,
+    measured: BarTop | None = None,
+) -> list[tuple[Polygon, LineString]]:
+    """Raised bar bands beside the long sides and the free ends of a free-standing leg (peninsula).
+
+    With a ``measured`` bar top the side bands are that board (drawn by the caller); only the free ends are looked at here,
+    across the leg and the board.
+    """
     low_h, high_h = top + settings.bar_above_m * upm, settings.bar_max_m * upm
     step = settings.sample_m * upm
     output: list[tuple[Polygon, LineString]] = []
     long_sides = (("v0", -1.0), ("v1", 1.0)) if leg.horizontal else (("u0", -1.0), ("u1", 1.0))
     extent = [leg.u0, leg.u1, leg.v0, leg.v1]
+    if measured is not None:
+        long_sides = ()
+        if leg.horizontal:
+            extent[2], extent[3] = min(extent[2], measured.v0), max(extent[3], measured.v1)
+        else:
+            extent[0], extent[1] = min(extent[0], measured.u0), max(extent[1], measured.u1)
     for name, sign in long_sides:
         found = _raised_band(frame, leg, name, sign, (leg.u0, leg.u1) if leg.horizontal else (leg.v0, leg.v1), low_h, high_h, local_walls, local_room, settings, upm)
         if found is None:

@@ -872,6 +872,176 @@ def test_exterior_wall_faces_merged_to_one_flucht() -> None:
     assert abs(separated[2].line.coords[0][0] - separated[0].line.coords[0][0]) >= 0.05
 
 
+def _flucht_scene(wall_above: bool = True) -> tuple[RasterGrid, object, list[list[tuple[float, float]]]]:
+    """Facade wall (long face) with a second observation 0.13 m off; beyond a step of the building the front of a half-height
+    installation ledge 0.21 m behind that and the wall above the ledge another 0.24 m behind; both faces of a thin partition.
+    Wall points in 16 height bins of a 2.5 m storey (1 cm raster, 2 cm thick point bands).  ``wall_above`` False: the wall above
+    the ledge was not scanned (no points on face 3)."""
+    from samcloud.ortho.vector.double_walls import WallEvidence
+
+    grid = RasterGrid(0.0, 6.0, 0.01, 1000, 600)
+    wall_bits = np.zeros((600, 1000), dtype=np.uint32)
+    random = np.random.default_rng(11)
+
+    def points(line: list[tuple[float, float]], low: float, high: float) -> None:
+        (x0, y0), (x1, y1) = line
+        count = int(4000 * math.dist(line[0], line[1]))
+        t, z = random.uniform(0.0, 1.0, count), random.uniform(low, high, count)
+        x, y = x0 + t * (x1 - x0), y0 + t * (y1 - y0) + random.normal(0.0, 0.004, count)
+        rows, cols = np.round((grid.max_y - y) / grid.pixel_size - 0.5).astype(int), np.round((x - grid.min_x) / grid.pixel_size - 0.5).astype(int)
+        np.bitwise_or.at(wall_bits, (rows, cols), (np.uint32(1) << np.floor(z / (2.5 / 16)).astype(np.uint32)))
+
+    lines = [
+        [(0.512, 1.003), (4.806, 1.017)],   # 0 the longest face: the Flucht of the group
+        [(1.794, 1.137), (4.953, 1.149)],   # 1 joined to it (0.13 m): a second observation
+        [(6.021, 1.352), (8.713, 1.361)],   # 2 ledge front (points up to 1.2 m only): joined to face 1
+        [(6.018, 1.597), (8.004, 1.604)],   # 3 the wall above the ledge (1.2 m to the ceiling): joined to the ledge front
+        [(2.013, 3.502), (5.541, 3.511)],   # 4 one face of a thin partition
+        [(2.207, 3.663), (5.118, 3.671)],   # 5 its other face, 0.16 m away
+        [(4.953, 0.807), (5.931, 0.811)],   # 6 a closed door leaf beyond the end of the facade face, 0.21 m off its line
+    ]
+    for line, (low, high) in zip(lines, [(0.05, 2.45), (0.05, 2.45), (0.05, 1.19), (1.21, 2.45), (0.05, 2.45), (0.05, 2.45), (0.05, 2.45)], strict=True):
+        if wall_above or line is not lines[3]:
+            points(line, low, high)
+    return grid, WallEvidence(wall_bits=wall_bits, all_bits=wall_bits.copy(), bins=16, storey_height=2.5), lines
+
+
+def _plane_bits(bits: np.ndarray, grid: RasterGrid, line: list[tuple[float, float]], low: float, high: float, seed: int) -> None:
+    """Points of a vertical plane over ``line`` from ``low`` to ``high`` into a 16-bin height raster of a 2.5 m storey."""
+    random = np.random.default_rng(seed)
+    (x0, y0), (x1, y1) = line
+    count = int(12000 * math.dist(line[0], line[1]))
+    t, z = random.uniform(0.0, 1.0, count), random.uniform(low, high, count)
+    x, y = x0 + t * (x1 - x0), y0 + t * (y1 - y0) + random.normal(0.0, 0.002, count)
+    rows, cols = np.round((grid.max_y - y) / grid.pixel_size - 0.5).astype(int), np.round((x - grid.min_x) / grid.pixel_size - 0.5).astype(int)
+    np.bitwise_or.at(bits, (rows, cols), (np.uint32(1) << np.floor(z / (2.5 / 16)).astype(np.uint32)))
+
+
+def test_flucht_snap_never_takes_a_measured_wall_face_to_a_line_without_wall() -> None:
+    from samcloud.ortho.vector.double_walls import DoubleWallSettings, measured_wall_share
+
+    grid, evidence, lines = _flucht_scene()
+    settings = DoubleWallSettings()
+    # a curtain parked 0.36 m in front of the facade line (floor to ceiling, no wall points): joined to the group through face 1
+    lines.append([(2.012, 1.371), (3.047, 1.376)])
+    _plane_bits(evidence.all_bits, grid, lines[-1], 0.02, 2.45, seed=17)
+
+    bath = box(5.93, -0.52, 8.74, 1.51)  # the ceiling of the room with the ledge ends 9 cm short of the wall above it
+
+    def snapped(guard: bool, rooms: tuple[Polygon, ...] = (bath,)) -> tuple[list[float], list[dict[str, object]]]:
+        faces = [WallFace("line", np.empty((0, 2)), line=LineString(line)) for line in lines]
+        kept = snap_exterior_faces_to_flucht(
+            faces, np.zeros((600, 1000), dtype=bool), grid, 1.0,
+            wall_share=(lambda line, any_class: measured_wall_share(line, evidence, grid, 1.0, settings, any_class)) if guard else None, min_wall_share=settings.face_min_share,
+            rooms=rooms, room_reach=settings.room_gap_m,
+        )
+        return [max(math.dist(after, before) for after, before in zip(face.line.coords, line, strict=True)) for face, line in zip(faces, lines, strict=True)], kept
+
+    moved, kept = snapped(guard=True)
+    assert moved[0] <= 1e-9 and 0.10 <= moved[1] <= 0.16          # the second observation joins the facade line
+    assert moved[3] <= 1e-9                                         # the wall above the ledge stays where its points are
+    assert moved[2] <= 1e-9                                         # the ledge front too: a stepped wall measured on both planes
+    assert len(kept) == 2 and all(item["wall_share"] >= 0.6 and item["wall_share_on_flucht"] <= 0.05 for item in kept)
+    assert 0.14 <= max(moved[4], moved[5]) <= 0.18 and min(moved[4], moved[5]) <= 1e-9  # both faces of the thin wall still join
+    assert 0.19 <= moved[6] <= 0.23                                # within the join limit nothing changes (the door leaf joins its wall line)
+    assert 0.33 <= moved[7] <= 0.39                                # a curtain is no measured wall: it goes with its group as before
+    # without the measure the chain takes the wall above the ledge 0.58 m off its points (the behaviour the guard removes)
+    moved, kept = snapped(guard=False)
+    assert moved[3] >= 0.5 and kept == []
+    # the same planes with no room in front of them (seen through a window, 0.4 m beyond the ceiling of the room): as before
+    moved, kept = snapped(guard=True, rooms=(box(5.93, -0.52, 8.74, 0.95),))
+    assert moved[3] >= 0.5 and moved[2] >= 0.3 and kept == []
+    # a half-height front without the wall above it measured is no wall face: nothing is kept, as before
+    _, bare, _ = _flucht_scene(wall_above=False)
+    faces = [WallFace("line", np.empty((0, 2)), line=LineString(line)) for line in lines[:7]]
+    kept = snap_exterior_faces_to_flucht(
+        faces, np.zeros((600, 1000), dtype=bool), grid, 1.0,
+        wall_share=lambda line, any_class: measured_wall_share(line, bare, grid, 1.0, settings, any_class), min_wall_share=settings.face_min_share,
+        rooms=(bath,), room_reach=settings.room_gap_m,
+    )
+    assert kept == [] and 0.30 <= math.dist(faces[2].line.coords[0], lines[2][0]) <= 0.40
+
+
+def test_flucht_snap_keeps_the_measured_wall_stretch_of_a_face_in_place() -> None:
+    """A half-height front (the wall above it was not scanned) runs on as the full-height wall behind a bathtub (the last 0.7 m of
+    the face): that stretch is a wall where it was measured and stays there as a face of its own; the rest goes to the group
+    line as before."""
+    from samcloud.ortho.vector.double_walls import DoubleWallSettings, measured_wall_share, measured_wall_stretches
+
+    grid, evidence, lines = _flucht_scene(wall_above=False)
+    settings = DoubleWallSettings()
+    random = np.random.default_rng(3)
+    x = random.uniform(8.013, 8.713, 4000)
+    y = 1.352 + (x - 6.021) / (8.713 - 6.021) * 0.009 + random.normal(0.0, 0.004, len(x))
+    z = random.uniform(1.19, 2.45, len(x))
+    rows, cols = np.round((grid.max_y - y) / grid.pixel_size - 0.5).astype(int), np.round((x - grid.min_x) / grid.pixel_size - 0.5).astype(int)
+    np.bitwise_or.at(evidence.wall_bits, (rows, cols), (np.uint32(1) << np.floor(z / (2.5 / 16)).astype(np.uint32)))
+    evidence.all_bits[:] = evidence.wall_bits
+    faces = [WallFace("line", np.empty((0, 2)), line=LineString(line)) for line in lines]
+    ledge = faces[2]
+    kept = snap_exterior_faces_to_flucht(
+        faces, np.zeros((600, 1000), dtype=bool), grid, 1.0,
+        wall_share=lambda line, any_class: measured_wall_share(line, evidence, grid, 1.0, settings, any_class), min_wall_share=settings.face_min_share,
+        wall_stretches=lambda line: measured_wall_stretches(line, evidence, grid, 1.0, settings, 0.30),
+        rooms=(box(5.93, -0.52, 8.02, 1.51), box(8.02, -0.52, 8.74, 1.31)), room_reach=settings.room_gap_m,
+    )
+    assert len(faces) == len(lines) + 1 and len(kept) == 1      # the stretch behind the tub
+    stretch = faces[-1].line
+    assert LineString(lines[2]).distance(stretch) <= 1e-6 and 0.6 <= stretch.length <= 0.8
+    assert min(point[0] for point in stretch.coords) == pytest.approx(8.01, abs=0.06)
+    assert max(point[0] for point in ledge.line.coords) == pytest.approx(8.01, abs=0.06)   # the rest of the ledge front ...
+    origin = np.asarray(lines[0][0])
+    axis = (np.asarray(lines[0][1]) - origin) / math.dist(lines[0][0], lines[0][1])
+    offsets = [abs(float(axis[0] * (point[1] - origin[1]) - axis[1] * (point[0] - origin[0]))) for point in ledge.line.coords]
+    assert max(offsets) <= 0.005                                                              # ... lies on the group line
+
+
+def test_measured_wall_share_counts_missing_data_as_no_wall() -> None:
+    from samcloud.ortho.vector.double_walls import DoubleWallSettings, measured_wall_share
+
+    grid, evidence, lines = _flucht_scene()
+    settings = DoubleWallSettings()
+    assert measured_wall_share(LineString(lines[0]), evidence, grid, 1.0, settings) >= 0.9
+    _, bare, _ = _flucht_scene(wall_above=False)
+    assert measured_wall_share(LineString(lines[2]), bare, grid, 1.0, settings) <= 0.05        # 1.2 m high and nothing above: no wall face
+    assert measured_wall_share(LineString([(6.02, 2.31), (8.01, 2.32)]), evidence, grid, 1.0, settings) == 0.0  # nothing there
+    half = LineString([(4.806 - 1.0, 1.0137), (4.806 + 1.0, 1.0203)])  # one metre on the facade wall, one metre beyond its end
+    assert 0.4 <= measured_wall_share(half, evidence, grid, 1.0, settings) <= 0.6
+    # a parked curtain: a floor-to-ceiling plane of another class is no measured wall (the face filter still accepts it)
+    curtain = [(1.03, 4.512), (2.41, 4.517)]
+    _plane_bits(evidence.all_bits, grid, curtain, 0.02, 2.45, seed=5)
+    assert measured_wall_share(LineString(curtain), evidence, grid, 1.0, settings) == 0.0
+    assert measured_wall_share(LineString(curtain), evidence, grid, 1.0, settings, any_class=True) >= 0.9
+
+
+def test_ledge_front_is_a_wall_face_only_when_both_planes_of_the_stepped_wall_are_measured() -> None:
+    from dataclasses import replace
+
+    from samcloud.ortho.vector.double_walls import DoubleWallSettings, measured_wall_share
+
+    grid, evidence, lines = _flucht_scene()
+    settings = DoubleWallSettings()
+    ledge = LineString(lines[2])
+    # the front (points to 1.19 m) with the wall going on above it 0.24 m behind: a wall face where both are measured (6.02..8.00 of 6.02..8.71)
+    assert 0.65 <= measured_wall_share(ledge, evidence, grid, 1.0, settings) <= 0.80
+    assert measured_wall_share(ledge, evidence, grid, 1.0, replace(settings, ledge_front=False)) <= 0.05
+    # a kitchen counter front labelled wall (to 0.9 m) with the wall seen above the worktop 0.6 m behind it: no ledge
+    counter = [(1.012, 4.903), (3.017, 4.911)]
+    _plane_bits(evidence.wall_bits, grid, counter, 0.05, 0.90, seed=23)
+    _plane_bits(evidence.wall_bits, grid, [(1.012, 5.503), (3.017, 5.511)], 0.92, 2.45, seed=24)
+    assert measured_wall_share(LineString(counter), evidence, grid, 1.0, settings) == 0.0
+    # a low partition 0.25 m in front of a wall that is seen behind it from the floor up: two walls, no ledge
+    low_wall = [(5.021, 4.902), (7.013, 4.907)]
+    _plane_bits(evidence.wall_bits, grid, low_wall, 0.05, 1.15, seed=25)
+    _plane_bits(evidence.wall_bits, grid, [(5.021, 5.152), (7.013, 5.157)], 0.05, 2.45, seed=26)
+    assert measured_wall_share(LineString(low_wall), evidence, grid, 1.0, settings) == 0.0
+    # a front that starts only at 0.75 m (the top of something hanging on the wall, an upper cabinet labelled wall): no ledge
+    hanging = [(8.012, 3.103), (9.517, 3.108)]
+    _plane_bits(evidence.wall_bits, grid, hanging, 0.75, 1.40, seed=27)
+    _plane_bits(evidence.wall_bits, grid, [(8.012, 3.353), (9.517, 3.358)], 1.42, 2.45, seed=28)
+    assert measured_wall_share(LineString(hanging), evidence, grid, 1.0, settings) == 0.0
+
+
 def test_exterior_gap_without_door_evidence_not_door() -> None:
     grid = RasterGrid(0.0, 3.0, 0.05, 60, 60)
     opening = Opening("DOOR", (1.5, 1.5), 0.80, 0.0, 0.25)

@@ -106,6 +106,15 @@ class DoubleWallSettings:
     face_min_height_m: float = 1.0
     face_reach_m: float = 1.7
     face_min_share: float = 0.25
+    # The front of a wall ledge (installation ledge behind washbasin and WC) is a wall face although it ends below
+    # face_reach_m: wall points stand on it from below ledge_front_from_m over at least ledge_front_min_m, it ends below
+    # ledge_max_top_m, and the wall goes on above it at most ledge_max_depth_m behind (hidden below the ledge top, as a
+    # ledge is solid).  Installation ledges are 0.15-0.25 m deep and 0.85-1.30 m high; a kitchen counter is 0.6 m deep.
+    ledge_front: bool = True
+    ledge_front_from_m: float = 0.60
+    ledge_front_min_m: float = 0.50
+    ledge_max_top_m: float = 1.50
+    ledge_max_depth_m: float = 0.35
     visibility_test: bool = True
     visibility_max_m: float = 12.0
     visibility_min_share: float = 0.15
@@ -447,7 +456,7 @@ def build_double_walls(
             {"center": tuple(opening.center), "axis_angle": float(opening.axis_angle), "width": float(opening.width), "bridge": True}
             for opening in openings if str(getattr(opening, "kind", "")) == "WINDOW"
         )
-    close_stats = _close_spans(spans, runs, faces, upm)
+    close_stats = _close_spans(spans, runs, faces, upm, keep_open=[opening for opening in openings if str(getattr(opening, "kind", "")).upper() in {"DOOR", "PASSAGE", "WINDOW"}])
     if close_stats:
         stats["double_wall_spans_closed"] = close_stats
     if evidence is not None and settings.door_detect and not settings.refined_openings:
@@ -905,6 +914,56 @@ def _face_height_share(face: _Face, evidence: WallEvidence, grid: RasterGrid, up
     10 cm in front of or behind the fitted face.  A sample with data that does neither
     (a counter, an upper cabinet, a sideboard front) counts against the face.
     """
+    passed, has_data = _wall_height_samples(face, evidence, grid, upm, settings)
+    judged = int(np.count_nonzero(has_data | passed))
+    if judged < 0.30 * len(passed):
+        return 1.0
+    return float(np.count_nonzero(passed)) / max(judged, 1)
+
+
+def measured_wall_share(
+    line: LineString, evidence: WallEvidence, grid: RasterGrid, units_per_metre: float, settings: DoubleWallSettings = DoubleWallSettings(),
+    any_class: bool = False,
+) -> float:
+    """Share of ``line`` along which wall points stand over wall height (the height test of the wall faces).
+
+    Unlike the face filter this counts over the whole length (a stretch without any data is no measured wall) and, unless
+    ``any_class``, wall-class points only: a parked curtain or a glazed front is a floor-to-ceiling plane too, but not
+    a wall that was measured.  0.0 without evidence rasters.
+    """
+    if evidence.wall_bits is None or evidence.storey_height <= 0.0 or line.is_empty or line.length <= 1e-9:
+        return 0.0
+    coordinates = np.asarray(line.coords, dtype=float)
+    face = _Face(0, coordinates[0, :2], coordinates[-1, :2], {})
+    passed, _has_data = _wall_height_samples(face, evidence if any_class else replace(evidence, all_bits=None), grid, max(float(units_per_metre), 1e-9), settings)
+    return float(np.mean(passed)) if len(passed) else 0.0
+
+
+def measured_wall_stretches(
+    line: LineString, evidence: WallEvidence, grid: RasterGrid, units_per_metre: float, settings: DoubleWallSettings = DoubleWallSettings(),
+    minimum_m: float = 0.30,
+) -> list[tuple[float, float]]:
+    """(start, end) along ``line`` (plan units) of its stretches where wall points stand over wall height, each at least ``minimum_m``."""
+    if evidence.wall_bits is None or evidence.storey_height <= 0.0 or line.is_empty or line.length <= 1e-9:
+        return []
+    upm = max(float(units_per_metre), 1e-9)
+    coordinates = np.asarray(line.coords, dtype=float)
+    face = _Face(0, coordinates[0, :2], coordinates[-1, :2], {})
+    passed, _has_data = _wall_height_samples(face, replace(evidence, all_bits=None), grid, upm, settings)
+    positions = _sample_positions(face, 0.05 * upm, min(0.03 * upm, face.length / 4.0))
+    if len(positions) < 2:
+        return []
+    half = 0.5 * float(positions[1] - positions[0])
+    stretches: list[tuple[float, float]] = []
+    for first, last in _flag_runs(passed, 1):  # a single 5 cm hole in the scan does not end a wall
+        start, end = max(float(positions[first]) - half, 0.0), min(float(positions[last]) + half, face.length)
+        if end - start >= minimum_m * upm:
+            stretches.append((start, end))
+    return stretches
+
+
+def _wall_height_samples(face: _Face, evidence: WallEvidence, grid: RasterGrid, upm: float, settings: DoubleWallSettings) -> tuple[np.ndarray, np.ndarray]:
+    """Per 5 cm sample along the face: (the data forms a wall of wall height, there is any data)."""
     along = _sample_positions(face, 0.05 * upm, min(0.03 * upm, face.length / 4.0))
     offsets = np.linspace(-0.10, 0.10, 11)
     wall = np.zeros(len(along), dtype=np.uint32)
@@ -922,11 +981,46 @@ def _face_height_share(face: _Face, evidence: WallEvidence, grid: RasterGrid, up
             passed |= ((here & np.uint32(0b11)) > 0) & (top >= settings.face_reach_m * upm) & (covered >= 0.7 * top)
     covered, top = _bit_heights(wall, evidence.bins, evidence.storey_height)
     passed |= (covered >= settings.face_min_height_m * upm) & (top >= settings.face_reach_m * upm)
-    has_data = (wall | any_class) > 0
-    judged = int(np.count_nonzero(has_data | passed))
-    if judged < 0.30 * len(along):
-        return 1.0
-    return float(np.count_nonzero(passed)) / max(judged, 1)
+    if settings.ledge_front:
+        passed |= _ledge_front_samples(face, along, wall, evidence, grid, upm, settings)
+    return passed, (wall | any_class) > 0
+
+
+def _ledge_front_samples(face: _Face, along: np.ndarray, wall: np.ndarray, evidence: WallEvidence, grid: RasterGrid, upm: float, settings: DoubleWallSettings) -> np.ndarray:
+    """Samples where the face is the front of a wall ledge: a stepped wall, measured on both of its planes.
+
+    ``wall``: height-bin bits of the wall points on the face.  The front must be measured itself (wall points from below
+    ``ledge_front_from_m`` over ``ledge_front_min_m``, ending below ``ledge_max_top_m``); the wall above it must be measured
+    within ``ledge_max_depth_m`` behind it, start at the ledge top (no wall point of that plane lower: the ledge hides it)
+    and reach ``face_reach_m``; both planes together cover ``face_min_height_m``.  Nothing is assumed without points.
+    """
+    bins = int(evidence.bins)
+    step = evidence.storey_height / max(bins, 1)
+    index = np.arange(bins, dtype=np.uint32)
+    occupied = ((wall[:, None] >> index[None, :]) & np.uint32(1)).astype(bool)
+    measured = occupied.any(axis=1)
+    lowest = np.where(measured, np.argmax(occupied, axis=1), bins)
+    top = np.where(measured, bins - np.argmax(occupied[:, ::-1], axis=1), 0)  # one past the highest bin with wall points
+    front = (
+        measured & (lowest * step <= settings.ledge_front_from_m * upm) & (occupied.sum(axis=1) * step >= settings.ledge_front_min_m * upm)
+        & (top * step <= settings.ledge_max_top_m * upm)
+    )
+    result = np.zeros(len(along), dtype=bool)
+    if not front.any():
+        return result
+    for side in (1.0, -1.0):
+        behind = np.zeros(len(along), dtype=np.uint32)
+        for offset in np.arange(0.12 * upm, settings.ledge_max_depth_m * upm + 1e-9, min(grid.pixel_size, 0.02 * upm)):  # every raster row behind the face
+            points = face.start[None, :] + along[:, None] * face.direction[None, :] + side * offset * face.normal[None, :]
+            behind |= _lookup(evidence.wall_bits, grid, points, 0).astype(np.uint32)
+        plane = ((behind[:, None] >> index[None, :]) & np.uint32(1)).astype(bool)
+        from_top = index[None, :].astype(np.int64) >= (top[:, None] - 1)
+        hidden_below = ~(plane & ~from_top).any(axis=1)
+        above = plane & from_top
+        reach = np.where(above.any(axis=1), bins - np.argmax(above[:, ::-1], axis=1), 0) * step
+        covered = (occupied | above).sum(axis=1) * step
+        result |= front & hidden_below & (reach >= settings.face_reach_m * upm) & (covered >= settings.face_min_height_m * upm)
+    return result
 
 
 def _visible_share(face: _Face, index: int, lines: np.ndarray, cameras: np.ndarray, upm: float, settings: DoubleWallSettings) -> float:
@@ -1171,11 +1265,24 @@ def _reorient_door_leaves(openings: list[Any], faces: list[_Face], evidence: Wal
 
 
 WINDOW_BRIDGE_M = 1.0  # a wall gap this short between a window span and the next collinear wall piece is closed with the window
+# Between two windows of one exterior wall line the facade is wall (a door or passage there would be an opening of its own): a
+# pier up to this long is closed (the reach of the exterior-gap bridging of the rooms, indoor_door_rooms.exterior_gap_max_m).
+WINDOW_PIER_M = 3.2
 
 
-def _bridge_to_neighbours(runs: list[WallRun], face_of: dict[int, _Face], face: _Face, host: WallRun, low: float, high: float, reach: float) -> tuple[float, float]:
-    """Extend ``[low, high]`` (positions along ``face``) to the nearest collinear wall piece on each side when it is within ``reach``."""
+def _bridge_to_neighbours(
+    runs: list[WallRun], face_of: dict[int, _Face], face: _Face, host: WallRun, low: float, high: float, reach: float,
+    pier_reach: float = 0.0, blocked: Iterable[tuple[float, float]] = (),
+) -> tuple[float, float]:
+    """Extend ``[low, high]`` (positions along ``face``) to the nearest collinear wall piece on each side when it is within ``reach``.
+
+    Beyond ``reach``, a neighbouring window bridge (another window of the same wall line) is reached within ``pier_reach`` when the
+    pier between them is empty (no other wall piece of the line in it) and no ``blocked`` interval (a kept door / passage span in
+    this line, positions along ``face``) lies in between.
+    """
+    blocked = list(blocked)
     below, above = low, high
+    pieces: list[tuple[float, float, bool]] = []
     for run in runs:
         other = face_of[run.face]
         if run.thickness <= 0.0:
@@ -1187,19 +1294,34 @@ def _bridge_to_neighbours(runs: list[WallRun], face_of: dict[int, _Face], face: 
         a = float(np.dot(other.point(run.start) - face.start, face.direction))
         b = float(np.dot(other.point(run.end) - face.start, face.direction))
         start, end = min(a, b), max(a, b)
+        pieces.append((start, end, other.entity.get("_source") == "window_bridge"))
         if end <= low and low - end <= reach:
             below = min(below, end)
         elif start >= high and start - high <= reach:
             above = max(above, start)
+    if pier_reach > reach:
+        def empty(first: float, last: float) -> bool:
+            return not any(start < last and end > first for start, end, _ in pieces) and not any(lo < last and hi > first for lo, hi in blocked)
+
+        if below == low:
+            ends = [end for start, end, bridge in pieces if bridge and end <= low and reach < low - end <= pier_reach]
+            if ends and empty(max(ends), low):
+                below = max(ends)
+        if above == high:
+            starts = [start for start, end, bridge in pieces if bridge and start >= high and reach < start - high <= pier_reach]
+            if starts and empty(high, min(starts)):
+                above = min(starts)
     return below, above
 
 
-def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_Face], upm: float, reach_m: float = 1.5) -> int:
+def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_Face], upm: float, reach_m: float = 1.5, keep_open: Iterable[Any] = ()) -> int:
     """Continue the host wall across spans that are no opening (a gap between the measured faces); returns how many were closed.
 
     The host is the nearest wall run parallel to the span and standing in its line.  A span the runs already cover (at least
-    80 %, e.g. by an invented room-edge wall) is left alone.
+    80 %, e.g. by an invented room-edge wall) is left alone.  ``keep_open`` are the kept openings (doors, passages, windows):
+    a filler never runs through their spans (see ``_fill_outside_openings``); window bridges (``bridge``) are not cut.
     """
+    keep_open = list(keep_open)
     face_of = {face.index: face for face in faces}
     reach = reach_m * upm
     closed = 0
@@ -1230,15 +1352,91 @@ def _close_spans(spans: list[dict[str, Any]], runs: list[WallRun], faces: list[_
         if distance > reach:
             continue
         low, high = low - 0.02 * upm, high + 0.02 * upm
+        source = "door_fill"
         if span.get("bridge"):
-            low, high = _bridge_to_neighbours(runs, face_of, face, run, low, high, WINDOW_BRIDGE_M * upm)
-        filler = _Face(len(faces), face.point(low), face.point(high), {"type": "polyline", "points": [], "closed": False, "_source": "door_fill"}, side=face.side)
-        filler.start, filler.end = face.start + face.direction * low, face.start + face.direction * high
-        faces.append(filler)
-        face_of[filler.index] = filler
-        runs.append(WallRun(filler.index, 0.0, filler.length, run.thickness, run.kind, "door-fill", group=run.group))
-        closed += 1
+            blocked = _along_spans(face, [opening for opening in keep_open if str(getattr(opening, "kind", "")).upper() in {"DOOR", "PASSAGE"}], run.thickness, upm)
+            low, high = _bridge_to_neighbours(runs, face_of, face, run, low, high, WINDOW_BRIDGE_M * upm, WINDOW_PIER_M * upm, blocked)
+            pieces = [(low, high)]
+            source = "window_bridge"
+        else:
+            # A span the refinement rejected never closes a kept opening: the filler stays out of every kept door / passage /
+            # window span and only the part on the host's side of such a span continues the host wall.
+            pieces = _fill_outside_openings(face, run, low, high, keep_open, upm)
+        for piece_low, piece_high in pieces:
+            filler = _Face(len(faces), face.point(piece_low), face.point(piece_high), {"type": "polyline", "points": [], "closed": False, "_source": source}, side=face.side)
+            filler.start, filler.end = face.start + face.direction * piece_low, face.start + face.direction * piece_high
+            faces.append(filler)
+            face_of[filler.index] = filler
+            runs.append(WallRun(filler.index, 0.0, filler.length, run.thickness, run.kind, "door-fill", group=run.group))
+        closed += 1 if pieces else 0
     return closed
+
+
+def _along_spans(face: _Face, openings: list[Any], thickness: float, upm: float) -> list[tuple[float, float]]:
+    """Positions along ``face`` covered by the spans of ``openings`` standing in its wall line (centre within the wall band)."""
+    spans: list[tuple[float, float]] = []
+    for opening in openings:
+        axis = np.asarray((math.cos(float(getattr(opening, "axis_angle"))), math.sin(float(getattr(opening, "axis_angle")))))
+        if abs(float(np.dot(axis, face.direction))) < math.cos(math.radians(10.0)):
+            continue
+        centre = np.asarray(getattr(opening, "center"), dtype=float)[:2]
+        across = float(np.dot(centre - face.start, face.solid_normal))
+        if not -0.10 * upm <= across <= thickness + 0.10 * upm:
+            continue
+        along = float(np.dot(centre - face.start, face.direction))
+        half = float(getattr(opening, "width")) / 2.0
+        spans.append((along - half, along + half))
+    return spans
+
+
+def _fill_outside_openings(face: _Face, run: WallRun, low: float, high: float, keep_open: Iterable[Any], upm: float) -> list[tuple[float, float]]:
+    """Parts of the filler ``[low, high]`` (positions along ``face``) outside the slab of every kept opening.
+
+    The slab of an opening is its width along its axis and its wall thickness across.  An opening that crosses the filler (axes
+    more than 45 deg apart: the opening stands in another wall) also ends it: only parts on the host run's side of such a cut are
+    kept, a part beyond it does not continue the host wall (a filler running THROUGH a passage).  A filler that only reaches the
+    slab (a stub ending at the wall of a door whose detected span overshoots the stub) keeps everything up to the slab.  An opening
+    in the filler's own wall line only interrupts it.  Parts shorter than 5 cm (face position noise) are dropped.
+    """
+    cuts: list[tuple[float, float]] = []
+    crossing: list[tuple[float, float]] = []
+    middle = run.thickness / 2.0
+    centre_line = LineString([tuple(face.point(low, middle)), tuple(face.point(high, middle))])
+    for opening in keep_open:
+        axis = np.asarray((math.cos(float(getattr(opening, "axis_angle"))), math.sin(float(getattr(opening, "axis_angle")))))
+        normal = np.asarray((-axis[1], axis[0]))
+        centre = np.asarray(getattr(opening, "center"), dtype=float)[:2]
+        half = float(getattr(opening, "width")) / 2.0
+        thickness = max(float(getattr(opening, "wall_thickness", 0.0) or 0.0), 0.05 * upm)
+        across = 0.5 * thickness
+        band = Polygon([tuple(centre + axis * a + normal * b) for a, b in ((-half, -across), (half, -across), (half, across), (-half, across))])
+        hit = centre_line.intersection(band)
+        for part in getattr(hit, "geoms", [hit]):
+            if part.is_empty or part.geom_type != "LineString" or part.length <= 1e-9:
+                continue
+            values = [float(np.dot(np.asarray(point) - face.start, face.direction)) for point in part.coords]
+            cuts.append((min(values), max(values)))
+            if abs(float(np.dot(axis, face.direction))) < math.cos(math.radians(45.0)):
+                crossing.append((min(values), max(values)))
+    if not cuts:
+        return [(low, high)]
+    pieces: list[tuple[float, float]] = []
+    position = low
+    for cut_low, cut_high in sorted(cuts):
+        if cut_low > position:
+            pieces.append((position, min(cut_low, high)))
+        position = max(position, cut_high)
+    if position < high:
+        pieces.append((position, high))
+    kept: list[tuple[float, float]] = []
+    for piece_low, piece_high in pieces:
+        if piece_high - piece_low < 0.05 * upm:
+            continue
+        gap = (piece_high, run.start) if piece_high <= run.start else (run.end, piece_low) if piece_low >= run.end else None
+        if gap is not None and any(cut_low < gap[1] and cut_high > gap[0] for cut_low, cut_high in crossing):
+            continue
+        kept.append((piece_low, piece_high))
+    return kept
 
 
 def _run_centre(run: WallRun, face: _Face, along: float) -> np.ndarray:
@@ -1321,6 +1519,14 @@ def _enforce_door_spans(runs: list[WallRun], faces: list[_Face], openings: list[
                     nearest = (gap, run)
             thickness = nearest[1].thickness if nearest is not None else max(float(getattr(opening, "wall_thickness", 0.0)), 0.15 * upm)
             kind = nearest[1].kind if nearest is not None else "interior"
+            if nearest is not None:
+                # A door standing in the line of the nearest wall (its centre within that wall's band, the detected door lies on one
+                # face) is hosted in that wall: the host piece continues the wall's band, not a band shifted by the detection.
+                near_face = face_of[nearest[1].face]
+                near_left = np.asarray((-near_face.direction[1], near_face.direction[0]))
+                line_offset = float(np.dot(centre - _run_centre(nearest[1], near_face, nearest[1].start), near_left))
+                if abs(line_offset) <= nearest[1].thickness / 2.0 + 0.05 * upm:
+                    centre = centre - near_left * line_offset
             start = centre - axis * (half + 0.02 * upm) - normal * thickness / 2.0
             end = centre + axis * (half + 0.02 * upm) - normal * thickness / 2.0
             filler = _Face(len(faces), start, end, {"type": "polyline", "points": [], "closed": False, "_source": "door_host"}, side=1)
