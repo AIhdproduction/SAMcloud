@@ -8,6 +8,10 @@ from pathlib import Path
 from nicegui import ui
 
 from samcloud.app.i18n import current_language, t, translate_or
+from samcloud.app.components.workflow_display import (
+    KIND_COMPLETED,
+    apriltag_step_display,
+)
 from samcloud.app.dxf_time import dxf_ifc_created, dxf_ifc_seconds
 from samcloud.app.layout import render_page
 from samcloud.app.processing import (
@@ -17,6 +21,7 @@ from samcloud.app.processing import (
     settings_use_flurseg,
 )
 from samcloud.app.state import state
+from samcloud.core.project_manager import apriltags_enabled
 from samcloud.share.ui import render_project_share_button
 
 
@@ -33,6 +38,8 @@ _WORKFLOW = (
     ("Export LAS / PLY", "export"),
     ("DXF/IFC export", "dxf"),
 )
+
+_WORKFLOW_INDEX = {key: index for index, (_, key) in enumerate(_WORKFLOW, start=1)}
 
 _PHASE_RANGES = {
     "acquisition": (0.0, 5.0),
@@ -356,6 +363,73 @@ def _control_points_status_text(project: dict | None, status: str) -> str:
     return _status_text(status)
 
 
+def _run_started_epoch(project: dict | None) -> float | None:
+    """Start time (epoch seconds) of the run the project's ``processing.started_at`` belongs to."""
+    started = ((project or {}).get("processing") or {}).get("started_at")
+    if isinstance(started, (int, float)):
+        return float(started)
+    if isinstance(started, str) and started:
+        try:
+            parsed = datetime.fromisoformat(started)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
+def _control_points_display(project: dict | None, status: str, progress: dict | None = None) -> tuple[str, str | None]:
+    """Status text and display kind (None, "active", "completed", "neutral") of the control-point step.
+
+    Without control points the AprilTag search result replaces "skipped (no control points)"; the
+    pipeline, its files and the stored workflow are not touched by this display.
+    """
+    text = _control_points_status_text(project, status)
+    if (
+        project is None
+        or status not in {"skipped", "not_started", "not started"}
+        or not _auto_without_control_points(project)
+    ):
+        return text, None
+    progress = progress or {}
+    try:
+        percent = float(progress.get("percent") or 0.0)
+    except (TypeError, ValueError):
+        percent = 0.0
+    past_search = percent >= 57.0 or _phase_of_stage(progress.get("stage_key"), progress) in {
+        "dense_cloud", "classification", "refinement",
+    }
+    try:
+        found = apriltag_step_display(
+            state.active_project_directory,
+            enabled=apriltags_enabled(project),
+            alignment_running=project.get("workflow", {}).get("alignment") == "running",
+            past_search=past_search,
+            run_started_at=_run_started_epoch(project),
+        )
+    except Exception as error:  # display only: never break the page
+        LOGGER.warning("AprilTag step status unavailable: %s", error)
+        found = None
+    return found if found is not None else (text, None)
+
+
+def _step_class(index: int, key: str | None, status: str, project: dict | None, kind: str | None = None) -> str:
+    """CSS classes of one workflow step from its (live) status."""
+    step_class = "sam-workflow-step"
+    if index == 1 and project is None:
+        step_class += " is-active"
+    elif kind == KIND_COMPLETED:
+        step_class += " is-complete"
+    elif kind is not None:
+        pass  # neutral display text: no highlight
+    elif status == "completed":
+        step_class += " is-complete"
+    elif status == "running" or (status == "ready" and key != "dxf"):
+        step_class += " is-active"
+    return step_class
+
+
 def _live_workflow(project: dict | None, snapshot: dict | None = None) -> dict:
     """Overlay live pipeline progress onto persisted workflow statuses, then skip the idle GCP step in auto mode.
 
@@ -402,6 +476,13 @@ def _overlay_live_progress(project: dict | None, snapshot: dict | None = None) -
                 if statuses.get(phase) not in {"skipped", "waiting"}:
                     statuses[phase] = "completed"
             statuses[running_phase] = "running"
+            if running_phase == "acquisition" and statuses.get("alignment") == "running":
+                statuses["alignment"] = "queued"  # the highlight moves to step 2 once the images are prepared
+            return statuses
+        if _prepare_pending(project, snapshot):
+            statuses["acquisition"] = "running"
+            if statuses.get("alignment") == "running":
+                statuses["alignment"] = "queued"
             return statuses
         if percent >= 57:
             statuses["alignment"] = "completed"
@@ -416,6 +497,18 @@ def _overlay_live_progress(project: dict | None, snapshot: dict | None = None) -
 def _has_prepare_stage(progress: dict) -> bool:
     """Whether the run has an image-preparation stage (only then step 1 gets a bar)."""
     return any(item.get("key") == "prepare_images" for item in progress.get("stages", []))
+
+
+def _prepare_pending(project: dict | None, progress: dict) -> bool:
+    """Whether a freshly started full run has not reported its image preparation yet (no progress file so far).
+
+    Resume, reclassify and refine runs and old progress files without a prepare stage never count.
+    """
+    if project is None or project.get("workflow", {}).get("alignment") != "running":
+        return False
+    if _has_prepare_stage(progress) or progress.get("stages"):
+        return False
+    return str(progress.get("stage") or "Preparing images") == "Preparing images"
 
 
 def _phase_of_stage(stage_key, progress: dict | None = None) -> str | None:
@@ -475,6 +568,11 @@ def _phase_eta(stage: str, statuses: dict, progress: dict) -> float | None:
     return remaining if found else None
 
 
+def _nobreak_parts(text: str) -> str:
+    """Display form of a phase text: a value never wraps in the middle, lines break only at the " · " separators."""
+    return " · ".join(part.replace(" ", " ") for part in text.split(" · "))
+
+
 def _phase_text(stage: str, statuses: dict, progress: dict) -> str:
     percent = _phase_percent(stage, statuses, progress)
     # A remaining time only belongs to a phase of a run that is actually going on.
@@ -519,12 +617,24 @@ def _load_progress_file(path: Path) -> dict | None:
     return dict(data)
 
 
+def _progress_file_is_stale(file_progress: dict, project: dict) -> bool:
+    """Whether a progress file was started before the current run (its tracker starts after the app stores started_at)."""
+    run_started = _run_started_epoch(project)
+    file_started = file_progress.get("started_at")
+    if run_started is None or not isinstance(file_started, (int, float)):
+        return False
+    return float(file_started) < run_started - 2.0
+
+
 def _read_progress(project: dict, project_directory: Path | None) -> dict:
     """Read pipeline progress, with a stage-based fallback for older runs."""
     processing = project.get("processing", {})
     progress = dict(processing.get("progress", {}))
     if project_directory is not None:
-        progress.update(_load_progress_file(project_directory / "reports" / "progress.json") or {})
+        file_progress = _load_progress_file(project_directory / "reports" / "progress.json") or {}
+        if progress.get("stage") == "Preparing images" and _progress_file_is_stale(file_progress, project):
+            file_progress = {}  # left over from an earlier run: the run just started has not written its own yet
+        progress.update(file_progress)
 
     workflow = project.get("workflow", {})
     if project_directory is not None and not progress.get("stage"):
@@ -656,6 +766,7 @@ def _render_workflow(project: dict | None) -> None:
     ui.add_head_html(
         "<style>"
         ".sam-processing-time { margin-top:14px; padding-top:12px; border-top:1px solid var(--sam-line); }"
+        ".sam-workflow-step.is-active { padding-right:8px; }"
         ".sam-processing-total { font-size:15px; font-weight:600; color:var(--sam-text); margin-bottom:6px; }"
         "</style>"
     )
@@ -665,6 +776,7 @@ def _render_workflow(project: dict | None) -> None:
     phase_bars = {}
     phase_labels = {}
     status_labels = {}
+    step_elements = {}
     dxf_reason = _dxf_unavailable_reason(project)
     dxf_step = _dxf_ifc_step(state.active_project_directory) if project is not None else {"status": "ready", "percent": 0.0}
     dxf_bar = None
@@ -678,21 +790,21 @@ def _render_workflow(project: dict | None) -> None:
                 else "ready" if key is None and project is not None
                 else statuses.get(key, "not started")
             )
-        step_class = "sam-workflow-step"
-        if index == 1 and project is None:
-            step_class += " is-active"
-        elif status == "completed":
-            step_class += " is-complete"
-        elif status == "running" or (status == "ready" and key != "dxf"):
-            step_class += " is-active"
-        with ui.element("div").classes(step_class):
+        control_points_kind = None
+        control_points_text = ""
+        if key == "control_points":
+            control_points_text, control_points_kind = _control_points_display(project, status, progress)
+        step_class = _step_class(index, key, status, project, control_points_kind)
+        with ui.element("div").classes(step_class) as step_element:
+            if key != "dxf":
+                step_elements[key] = step_element
             ui.label(str(index)).classes("sam-step-number")
             ui.label(translate_or(f"workflow.step.{key}", label)).classes("sam-step-label")
             if key == "dxf" and project is not None and dxf_step["status"] == "ready" and dxf_reason is not None:
                 status_label = ui.label(status.replace("_", " ")).classes("sam-step-status")
                 status_label.style("text-transform:none").mark("home-dxf-status")
             else:
-                status_text = _control_points_status_text(project, status) if key == "control_points" else _status_text(status)
+                status_text = control_points_text if key == "control_points" else _status_text(status)
                 status_label = ui.label(status_text).classes("sam-step-status")
                 if current_language() != "en":
                     # Translated statuses are already cased correctly; CSS capitalize would capitalize every word.
@@ -714,7 +826,7 @@ def _render_workflow(project: dict | None) -> None:
                         dxf_bar = ui.linear_progress(value=dxf_step["percent"] / 100.0, show_value=False).classes("flex-1").mark("home-dxf-bar")
             show_bar = key in _PHASE_RANGES and project is not None
             if key == "acquisition" and show_bar:
-                show_bar = _has_prepare_stage(progress)
+                show_bar = _has_prepare_stage(progress) or _prepare_pending(project, progress)
             if show_bar:
                 phase_percent = _phase_percent(key, statuses, progress)
                 with ui.row().classes("items-center gap-2 w-full q-mt-xs"):
@@ -722,7 +834,9 @@ def _render_workflow(project: dict | None) -> None:
                         value=phase_percent / 100.0,
                         show_value=False,
                     ).classes("flex-1")
-                    phase_label = ui.label(_phase_text(key, statuses, progress)).classes("text-xs sam-muted")
+                    phase_label = ui.label(_nobreak_parts(_phase_text(key, statuses, progress))).classes("text-xs sam-muted").style(
+                        "min-width:0; overflow-wrap:anywhere"
+                    )
                 phase_bars[key] = phase_bar
                 phase_labels[key] = phase_label
 
@@ -788,13 +902,20 @@ def _render_workflow(project: dict | None) -> None:
             for stage, bar in phase_bars.items():
                 value = _phase_percent(stage, current_statuses, current_progress)
                 bar.set_value(value / 100.0)
-                phase_labels[stage].set_text(_phase_text(stage, current_statuses, current_progress))
+                phase_labels[stage].set_text(_nobreak_parts(_phase_text(stage, current_statuses, current_progress)))
             for stage, label in status_labels.items():
                 if stage in current_statuses:
                     value = str(current_statuses[stage])
-                    label.set_text(
-                        _control_points_status_text(current_project, value) if stage == "control_points" else _status_text(value)
-                    )
+                    kind = None
+                    if stage == "control_points":
+                        text, kind = _control_points_display(current_project, value, current_progress)
+                    else:
+                        text = _status_text(value)
+                    label.set_text(text)
+                    if stage in step_elements:
+                        step_elements[stage].classes(
+                            replace=_step_class(_WORKFLOW_INDEX[stage], stage, value, current_project, kind)
+                        )
             current_dxf_step = _dxf_ifc_step(state.active_project_directory)
             project_share_became_available = (
                 current_dxf_step["status"] == "completed" and previous_dxf_status != "completed"

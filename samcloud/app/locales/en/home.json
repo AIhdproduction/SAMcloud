@@ -65,6 +65,15 @@
     "waiting": "waiting",
     "ready": "ready"
   },
+  "apriltag": {
+    "pending": "AprilTag search pending",
+    "found_one": "1 AprilTag found",
+    "found_many": "{count} AprilTags found",
+    "scale_set": "scale set",
+    "georeferenced": "georeferenced",
+    "no_scale": "no scale",
+    "rejected": "({count} rejected)"
+  },
   "workflow": {
     "title": "Project workflow",
     "open_dxf": "Open DXF/IFC",

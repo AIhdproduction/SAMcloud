@@ -65,6 +65,15 @@
     "waiting": "Wartet",
     "ready": "Bereit"
   },
+  "apriltag": {
+    "pending": "AprilTag-Suche folgt",
+    "found_one": "1 AprilTag gefunden",
+    "found_many": "{count} AprilTags gefunden",
+    "scale_set": "Massstab gesetzt",
+    "georeferenced": "georeferenziert",
+    "no_scale": "ohne Massstab",
+    "rejected": "({count} verworfen)"
+  },
   "workflow": {
     "title": "Projektablauf",
     "open_dxf": "DXF/IFC öffnen",
