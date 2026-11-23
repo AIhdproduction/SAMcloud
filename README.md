@@ -16,7 +16,7 @@ Worked examples per capture type, each on its own page:
 
 | Capture type | Example | Status |
 |---|---|---|
-| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v12_tag`, from input to DXF and IFC |
+| 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v13_tag`, from input to DXF and IFC - [open the result online](https://pub-c77fc3c3582246af9ffef1b9e877a798.r2.dev/share/indoor-360-example/index.html) |
 | 360 degree camera, outdoor | [360 degree outdoor](docs/examples/outdoor_360.md) | capture guide; example results follow |
 | Drone GPS/RTK | [Drone photos](docs/examples/drone.md) | capture guide; example results follow |
 | Standard camera | [Phone and handheld photos](docs/examples/phone.md) | capture guide; example results follow |
@@ -100,13 +100,16 @@ Main features:
   orthophoto, per storey (indoor) or as a site plan (outdoor). Indoor clean
   plans have double-line walls with measured or learned thickness, rooms
   bounded by the walls with name and area, slanted walls, and regularised
-  furniture. A 3D DXF is written next to the 2D plan, see
+  furniture; kitchens get their measured diagonal corner, U shape, peninsula
+  and bar. A 3D DXF is written next to the 2D plan, see
   [DXF export](#dxf-export) and [docs/ortho_plan.md](docs/ortho_plan.md).
 - **IFC4 building model (indoor):** the same button that makes the DXF also
   writes an IFC4 file from the same building model (`plan_model.json`), so
   walls, rooms, doors and windows match the DXF. Windows and doors are
   measured on the wall planes from the photos and the cloud (sill, head,
-  mullions). Furniture gets a 3D shape from its points; screens, ceiling
+  mullions; implausible slivers and glass partitions are not taken as
+  windows). Furniture gets a 3D shape from its points; screens (TV and
+  monitors from the SAM3 masks), ceiling
   objects, columns, beams, straight stairs and measured wall and ceiling
   heights are added where the scan gives evidence. An IFC viewer on the DXF
   page shows the result, see [IFC export](#ifc-export) and
@@ -569,7 +572,9 @@ exterior thickness), so it still runs straight and parallel. Door and window
 openings are cut through both faces. Rooms (`A-AREA` with name and area) are
 the floor between the walls, split only by walls and door lines (each room
 goes to the middle of its doors, a passage without a door does not split), so
-their outlines follow the inner wall faces and never stop at furniture; an
+their outlines follow the inner wall faces and never stop at furniture; rooms
+never overlap, a measured wall ledge ends a room, and a small "bed" outline
+names no bedroom; an
 open-plan space with no wall or door between its parts is one room (for
 example "Wohnen / Küche"). Furniture outlines are regularised to rectangles
 or rectilinear shapes along the wall axes, cut back at walls and overlaps,
@@ -582,8 +587,11 @@ Indoor clean plans also contain, where the scan gives evidence for it:
 - **slanted walls** next to the two main wall directions, and walls placed on
   both scanned faces; the wall above an opening has the faces of its wall;
 - **kitchens** with a diagonal corner unit at its measured angle, a sink turned
-  with it, and a base that steps back under its worktop;
+  with it, a base that steps back under its worktop, a U shape, a peninsula
+  with a bar top, a tall row and upper cabinets (one piece per row);
 - **columns** (`A-COLS`) and **beams** (`S-BEAM`, dashed);
+- **furniture symbols** that draw chairs, pillows and sets only where they
+  were detected, and tables at their measured size;
 - **objects on the ceiling** (`A-CLNG-OBJ`, dashed) and furniture outlines
   taken from the 3D reconstruction. These two are written at export, so they
   are in the DXF file but not in the preview on the page.
@@ -668,9 +676,15 @@ lists as "Custom 82": rename that class to **Road marking** in Cyclone 3DR once.
 - Objects and structure are modelled only with evidence from the points:
   small dark monitors, small ceiling fixtures and columns close to a wall can
   be missing, and only straight stairs are detected.
-- The indoor rules were tried on real data of one flat and one recording
-  (processed several times), plus a [synthetic bench](#synthetic-indoor-bench).
-  Other buildings may need other thresholds.
+- Where a wall has almost no points, an opening in it can be modelled wrong:
+  in the example the passage between hall and bedroom is about 0.7 m too wide.
+  A few continuation walls can sit 3 to 5.5 cm off the scanned face, and a
+  window head can be 5 to 9 cm off (evidence grid 5 cm).
+- The indoor rules were developed on earlier recordings of one flat. The newest
+  recording of that flat is the first independent test (see the
+  [example](docs/examples/indoor_360.md)); there are no real data of other
+  buildings yet, only a [synthetic bench](#synthetic-indoor-bench). Other
+  buildings may need other thresholds.
 - Door swing arcs are off by default.
 - COLMAP reconstructions without GPS or control points have no metric scale;
   set the scale before generating plans.
@@ -696,6 +710,11 @@ walls, rooms, doors and windows are identical in the files.
   room), measured wall heights, columns, beams, straight stairs, furniture,
   screens and ceiling objects, and is checked against an IDS file with a QA
   report. It is written to `products/bim/<level id>/`.
+- **Openings** pass plausibility rules (no slivers, no glass partitions as
+  windows); a window head comes from the points when they clearly disagree with
+  the photo.
+- **Screens** (TV and monitors) are built from SAM3 masks and points; built-in
+  units get readable names (*Hochschrank*, *Oberschrank*, *Einbauschrank*).
 - **Furniture** is reconstructed from its points: parts such as table top and
   legs, seat and back, a compact mesh, or the footprint body when the evidence
   is weak (`config/furniture_recon.yaml`). Wall-hung and resting objects keep
@@ -717,7 +736,7 @@ The UI is built with NiceGUI and opens at `http://127.0.0.1:8080`.
 
 | Page | Purpose |
 |---|---|
-| Overview | project dashboard: start processing, progress per stage, manual LAS export, **Share project** by QR code |
+| Overview | project dashboard: start processing, progress per stage (live frame progress in step 1, AprilTag count in step 3), manual LAS export, **Share project** by QR code |
 | Projects | create, reopen, or delete projects; select images or 360 degree sources; image count and storage check before creation |
 | Sparse cloud | inspect the aligned sparse model (cleaned for display only, `viewer.sparse_cleaning`), cameras, and the control point review workspace (marker table, photo strip, pixel viewer, **Optimize**, **Continue processing**) |
 | Control points | import and mark ground control points in the images; AprilTag print dialog, surveyed tag coordinates (table, CSV import) and the AprilTag report |
@@ -735,7 +754,7 @@ video does not fit. The numbers are estimates calibrated on one 360 degree and
 one drone project (`samcloud/acquisition/preflight.py`); the check never
 blocks creation.
 
-<img src="assets/project_preflight.jpg" alt="Image count and storage check in the create-project form" width="800">
+<img src="assets/project_preflight.png" alt="Image count and storage check in the create-project form" width="800">
 
 **Language.** The interface is available in German (default) and English.
 The default comes from `application.language` in `config/defaults.yml`; the
@@ -779,6 +798,9 @@ SAMcloud can publish a read-only web view and show a QR code and a link for it:
 |---|---|---|---|
 | **Share (QR)** | Dense cloud | step 6 is finished | classified point cloud |
 | **Share project** | Overview | classified cloud, a clean DXF export and an IFC model exist | one link with plan (DXF, top view), point cloud and IFC model, with all exported levels |
+
+A project share of the indoor example is online:
+[point cloud, DXF plan and IFC model](https://pub-c77fc3c3582246af9ffef1b9e877a798.r2.dev/share/indoor-360-example/index.html).
 
 The files are uploaded to your own Cloudflare R2 bucket; a setup guide in the
 app asks for the five values it needs and stores them outside the repository
@@ -1035,7 +1057,7 @@ committed.
 
 ## Tests
 
-`tests/` holds 3,785 tests (3,778 passed, 7 skipped on 2026-11-22) covering, among other things:
+`tests/` holds 4,019 tests (4,012 passed, 7 skipped on 2026-11-23) covering, among other things:
 
 - project persistence, storage compaction, and 360 degree acquisition
 - control points, automatic target detection, GCP adjustment, and the review API
