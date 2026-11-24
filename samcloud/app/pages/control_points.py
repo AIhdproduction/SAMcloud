@@ -9,6 +9,7 @@ from urllib.parse import quote
 import pandas as pd
 from nicegui import events, ui
 
+from samcloud.app.components.protocol_panel import render_protocol_panel
 from samcloud.app.i18n import t
 from samcloud.app.layout import render_page
 from samcloud.app.gcp_review import has_apriltag_review_data
@@ -362,6 +363,7 @@ def render() -> None:
                 suffix = t("control_points.check.leave_one_out", value=f"{leave_one_out:.3f}") if leave_one_out is not None else ""
                 ui.label(t("control_points.check.point", name=point["name"], residual=f"{point['residual_m']:.3f}") + f"{suffix}{warning}").classes("text-red-4" if warning else "sam-muted")
         import_table(); table(); workspace(); preview_panel()
+        render_protocol_panel(project_directory, project)
     render_page(t("control_points.page_title"), content, current_path="/control-points", wide=True)
 
 

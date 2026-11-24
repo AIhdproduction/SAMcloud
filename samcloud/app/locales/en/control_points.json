@@ -81,5 +81,25 @@
     "warning": "warning",
     "local_crs_gps": "Local coordinates are only possible for AprilTag projects without GPS"
   },
-  "started": "Control-point georeferencing and processing started."
+  "started": "Control-point georeferencing and processing started.",
+  "protocol": {
+    "title": "Processing report",
+    "description": "Processing report as PDF: key figures, control-point evaluation, charts and classes.",
+    "without_control_points": "Project without control points – the report contains no control-point evaluation.",
+    "class_details": "Class details",
+    "camera_list": "Camera list per image",
+    "create": "Create report (PDF)",
+    "missing_control_points": "Control-point evaluation is missing",
+    "missing_step6": "Step 6 (Refine & filter) is not finished",
+    "phase_collect": "Collecting data",
+    "phase_charts": "Creating charts",
+    "phase_pdf": "Generating PDF",
+    "working": "Creating report …",
+    "error": "Report failed: {error}",
+    "done": "Report created: {name}",
+    "done_notify": "Report created.",
+    "download": "Download PDF",
+    "existing": "Existing reports",
+    "none": "No report created yet"
+  }
 }

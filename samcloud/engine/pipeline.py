@@ -2089,6 +2089,14 @@ def _fuse_dense(
     profile = dense_profile(dense_config, capture_type)
     run(stereo_fusion_command(colmap, dense_dir, dense_dir / "fused.ply", profile["fusion"]),
         summary=summary, stage="Dense fusion")
+    try:  # remembered for reports/processing_metrics.json: fused.ply is compressed away before the run ends
+        from samcloud.report.metrics import ply_vertex_count
+
+        fused_points = ply_vertex_count(dense_dir / "fused.ply")
+        if fused_points:
+            summary.dense_points_fused = fused_points
+    except Exception as error:  # noqa: BLE001 - optional protocol metric
+        print(f"WARNING: dense point count not recorded: {error}", flush=True)
     if not keep_depth_maps:
         _release_fusion_cache(dense_dir, summary)
 

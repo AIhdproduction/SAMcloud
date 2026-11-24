@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
@@ -495,7 +496,14 @@ class ProcessingManager:
             raise
 
     def _watch_pipeline(self, project_directory: Path, mode: str, process: subprocess.Popen[str]) -> None:
+        launched_at = time.time()
         return_code = process.wait()
+        try:  # per-run copy of pipeline.log for the processing protocol (never overwrites, never raises)
+            from samcloud.report.run_metrics_writer import archive_pipeline_log
+
+            archive_pipeline_log(project_directory, not_before=launched_at - 5)
+        except Exception:  # noqa: BLE001
+            pass
         project = self._state.projects.load(project_directory)
         workflow = project.setdefault("workflow", {})
         if return_code == 0 and mode == "refine":

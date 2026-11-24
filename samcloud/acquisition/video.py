@@ -124,6 +124,9 @@ def expected_frame_count(videos: Iterable[Path], interval_seconds: float) -> int
 
 # ---------------------------------------------------------------------------------------- extraction
 
+# Upper bound of the "discarded" entries kept in the manifest (long videos would otherwise bloat it).
+MAX_DISCARDED_IN_MANIFEST = 20000
+
 
 def frame_sharpness(frame: Any) -> float:
     """Variance of the Laplacian of the grayscale frame, downscaled to a long side of at most 640 px."""
@@ -147,13 +150,16 @@ def extract_frames(
     frame_check: Callable[[Any], None] | None = None,
     progress_callback: ProgressCallback | None = None,
     label: str = "Video",
+    discarded: list[dict[str, Any]] | None = None,
 ) -> list[ExtractedFrame]:
     """Write one frame per interval window of every video, numbered continuously.
 
     ``pick="first"`` keeps the first frame of each window, ``pick="sharpest"`` the sharpest one (ties:
     earliest). ``frame_check(frame)`` may raise ``CaptureValidationError`` for an unsuitable frame.
     ``progress_callback(kept, expected, detail)`` counts over all videos; ``expected`` is 0 when no video
-    reports its frame count. Callback errors are ignored.
+    reports its frame count. Callback errors are ignored. With ``pick="sharpest"`` and a ``discarded`` list,
+    every considered frame that lost against a sharper one of its window is appended as
+    ``{kept_frame, source_path, time_seconds, sharpness, kept_sharpness}``.
     """
     if pick not in ("first", "sharpest"):
         raise ValueError("pick must be 'first' or 'sharpest'")
@@ -195,6 +201,21 @@ def extract_frames(
             best: Any = None
             best_score = -1.0
             best_index = 0
+            window_scores: list[tuple[int, float]] = []
+
+            def note_discarded() -> None:
+                if discarded is None:
+                    return
+                kept_name = f"frame_{len(extracted):06d}.jpg"
+                for other_index, other_score in window_scores:
+                    if other_index != best_index:
+                        discarded.append({
+                            "kept_frame": kept_name, "source_path": str(video),
+                            "time_seconds": round(other_index / fps, 6), "sharpness": round(other_score, 3),
+                            "kept_sharpness": round(best_score, 3),
+                        })
+                window_scores.clear()
+
             while True:
                 success, frame = capture.read()
                 if not success:
@@ -204,13 +225,16 @@ def extract_frames(
                         write(frame, video, frame_index, fps)
                 else:
                     if frame_index % window == 0 and best is not None:
+                        note_discarded()
                         write(best, video, best_index, fps)
                         best = None
                     score = frame_sharpness(frame)
+                    window_scores.append((frame_index, score))
                     if best is None or score > best_score:
                         best, best_score, best_index = frame.copy(), score, frame_index
                 frame_index += 1
             if best is not None:
+                note_discarded()
                 write(best, video, best_index, fps)
         finally:
             capture.release()
@@ -247,8 +271,10 @@ def prepare_camera_video_frames(
     for stale in frames_directory.iterdir():
         if stale.is_file() and _STALE_FRAME_PATTERN.match(stale.name):
             stale.unlink()
+    discarded: list[dict[str, Any]] = []
     frames = extract_frames(
         videos, frames_directory, interval_seconds, pick="sharpest", progress_callback=progress_callback,
+        discarded=discarded,
     )
     manifest_path = frames_directory.parent / VIDEO_FRAMES_MANIFEST_NAME
     manifest_path.write_text(
@@ -264,6 +290,8 @@ def prepare_camera_video_frames(
                     }
                     for frame in frames
                 ],
+                "discarded": discarded[:MAX_DISCARDED_IN_MANIFEST],
+                "discarded_count": len(discarded),
             },
             indent=2,
         ),

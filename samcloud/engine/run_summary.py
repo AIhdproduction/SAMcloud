@@ -96,7 +96,19 @@ class RunSummary:
         report_path = self.report_dir / "run_summary.txt"
         report_path.write_text(report_text, encoding="utf-8")
         (self.report_dir / f"run_summary_{run_suffix}.txt").write_text(report_text, encoding="utf-8")
+        if status == "Completed":
+            self._write_processing_metrics(metrics)
         return report_path
+
+    def _write_processing_metrics(self, metrics: dict[str, Any]) -> None:
+        """Protocol data (reports/processing_metrics.json); a failure only prints a WARNING line."""
+        try:
+            from samcloud.report.run_metrics_writer import write_processing_metrics
+
+            write_processing_metrics(self.outdir.parent, metrics["run_id"], metrics,
+                                     dense_points_fused=getattr(self, "dense_points_fused", None))
+        except Exception as error:  # noqa: BLE001 - never break a finished run
+            print(f"WARNING: processing_metrics.json konnte nicht geschrieben werden: {error}", flush=True)
 
     def _collect_metrics(self, status: str, note: str) -> dict[str, Any]:
         classified_path = Path(self.settings["classified_output"])

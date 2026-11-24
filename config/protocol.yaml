@@ -1,0 +1,19 @@
+# Processing protocol (Verarbeitungsprotokoll) settings.
+# Traffic-light thresholds: a value is green up to "green", yellow up to "yellow", red above.
+# For registered_pct the direction is reversed (green at or above "green", yellow at or above "yellow").
+thresholds:
+  control_rms_cm: {green: 2.0, yellow: 5.0}      # RMS of control points (independent check points), cm
+  pass_rms_cm: {green: 2.0, yellow: 5.0}         # RMS of pass points (used in the adjustment), cm
+  reprojection_px: {green: 1.0, yellow: 2.0}     # mean reprojection error, pixels
+  registered_pct: {green: 95, yellow: 80}        # share of registered images, percent
+  apriltag_deviation_pct: {green: 0.5, yellow: 1.5}  # AprilTag edge length deviation, percent
+
+overlap:
+  max_cells: 120       # longest side of the image overlap grid, cells
+
+density:
+  cell_m: 0.25         # grid cell edge for the occupied-area estimate of the dense cloud, metres
+
+sections:
+  camera_list: false   # appendix: per-image camera list
+  class_details: true  # classification: per-class detail table

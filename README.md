@@ -52,6 +52,7 @@ Further documentation in [`docs/`](docs/):
 - [IFC export](docs/ifc_export.md): IFC4 model, 3D opening refinement, IFC viewer
 - [Cyclone 3DR classes](docs/cyclone_classes.md): LAS codes and DXF layers
 - [UI language](docs/i18n.md): German/English interface, translation files
+- [Processing report](docs/protocol.md): per-project PDF with key figures, control-point accuracy and runtimes
 
 ## Overview
 

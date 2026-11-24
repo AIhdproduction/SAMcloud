@@ -81,5 +81,25 @@
     "warning": "Warnung",
     "local_crs_gps": "Lokale Koordinaten sind nur für AprilTag-Projekte ohne GPS möglich"
   },
-  "started": "Georeferenzierung mit Passpunkten und Verarbeitung gestartet."
+  "started": "Georeferenzierung mit Passpunkten und Verarbeitung gestartet.",
+  "protocol": {
+    "title": "Protokoll",
+    "description": "Verarbeitungsprotokoll als PDF: Kennzahlen, Passpunkt-Auswertung, Diagramme und Klassen.",
+    "without_control_points": "Projekt ohne Passpunkte – das Protokoll enthält keine Passpunkt-Auswertung.",
+    "class_details": "Klassen-Details",
+    "camera_list": "Kamera-Liste pro Bild",
+    "create": "Protokoll erstellen (PDF)",
+    "missing_control_points": "Passpunkt-Auswertung fehlt",
+    "missing_step6": "Schritt 6 (Verbessern & Filtern) ist nicht fertig",
+    "phase_collect": "Daten sammeln",
+    "phase_charts": "Diagramme erstellen",
+    "phase_pdf": "PDF erzeugen",
+    "working": "Protokoll wird erstellt …",
+    "error": "Protokoll fehlgeschlagen: {error}",
+    "done": "Protokoll erstellt: {name}",
+    "done_notify": "Protokoll erstellt.",
+    "download": "PDF herunterladen",
+    "existing": "Vorhandene Protokolle",
+    "none": "Noch kein Protokoll erstellt"
+  }
 }
