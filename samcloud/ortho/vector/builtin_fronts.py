@@ -65,6 +65,13 @@ class BuiltinFrontSettings:
     room_reach_m: float = 0.5
     run_end_fraction: float = 0.5
     bridge_reach_m: float = 3.0  # how far beyond a resolved unit its continuation (across a gap <= bridge_gap_m) is looked for
+    # A wall stub behind the unit that is NOT beside the measured front (the rest of the wall behind the unit was never seen: one
+    # room scanned from the inside) still is its back wall: the unit's tall run is followed along the front up to this far (across
+    # gaps <= bridge_gap_m) to meet the stub.  0 = off (the back wall must stand beside the measured front).
+    stub_bridge_m: float = 3.0
+    stub_max_length_m: float = 1.5  # ... and the back wall counts as a stub only up to this length (a longer wall stands beside the unit or is another wall)
+    # A side wall that stops short of the unit's front (up to this far) continues to the back wall of a bridged unit.
+    stub_side_reach_m: float = 0.60
 
 
 @dataclass(slots=True)
@@ -163,10 +170,16 @@ def resolve_builtin_fronts(
             if not runs:
                 continue
             done = False
+            # only the longest wall behind the unit can be bridged to (a short step of the unit's own front is no back wall)
+            longest = max(candidates, key=lambda item: _wall_extent(item[0], front.unit)[1] - _wall_extent(item[0], front.unit)[0])[0]
             for back, depth in candidates:
                 for run in runs:
+                    stub_bridged = False
                     if _extent_gap(front, back, run) > settings.adjacency_m * upm:
-                        continue
+                        bridged = _bridge_run_to_stub(front, back, side, run, expand, grid, upm, settings) if back is longest else None
+                        if bridged is None:
+                            continue
+                        run, stub_bridged = bridged, True
                     # A front that carries on beyond the unit is a real wall (the unit sits in a recess behind it).
                     measured_start, measured_end = front.measured_extent
                     if run[0] - measured_start > settings.overshoot_m * upm or measured_end - run[1] > settings.overshoot_m * upm:
@@ -186,10 +199,11 @@ def resolve_builtin_fronts(
                     if room["free"] < settings.room_free_fraction or room["free"] < fill["free"] + 0.30:
                         continue
                     fill["room_free"] = room["free"]
-                    _apply_strip(layers, stats, front, back, side, run, depth, strip, fine_classes, fine_names, grid, upm, settings)
+                    _apply_strip(layers, stats, front, back, side, run, depth, strip, fine_classes, fine_names, grid, upm, settings, side_reach=settings.stub_side_reach_m * upm if stub_bridged else None, free_floor=free)
                     accepted.append(strip)
                     stats["builtin_fronts"] += 1
-                    stats["builtin_strips"].append({"depth_m": depth / upm, "length_m": (run[1] - run[0]) / upm, **fill, "bounds": [float(value) for value in strip.bounds]})
+                    stats["builtin_stub_bridged"] = int(stats.get("builtin_stub_bridged", 0)) + int(stub_bridged)
+                    stats["builtin_strips"].append({"depth_m": depth / upm, "length_m": (run[1] - run[0]) / upm, **fill, "bounds": [float(value) for value in strip.bounds], **({"stub_bridged": True} if stub_bridged else {})})
                     resolved.append((front, back, side, run, depth))
                     done = True
                     break
@@ -396,6 +410,41 @@ def _tall_runs(front: _Chain, side: float, tall: np.ndarray, grid: RasterGrid, u
     return trimmed
 
 
+def _wall_extent(chain: _Chain, unit: np.ndarray) -> tuple[float, float]:
+    """Extent along ``unit`` of the measured wall members of ``chain`` (room-outline members are no wall evidence); (0, 0) without any."""
+    projections = [float(unit @ np.asarray(point)) for member in chain.members if member.source == "wall" for point in (member.line.coords[0], member.line.coords[-1])]
+    return (min(projections), max(projections)) if projections else (0.0, 0.0)
+
+
+def _bridge_run_to_stub(front: _Chain, back: _Chain, side: float, run: tuple[float, float], tall: np.ndarray, grid: RasterGrid, upm: float, settings: BuiltinFrontSettings) -> tuple[float, float] | None:
+    """The unit's run stretched along the front until it meets a back wall that stands beyond the measured front, else None.
+
+    One room scanned from the inside often sees the front of a built-in wardrobe along its whole length but the wall behind it
+    only as a stub at the end of the unit.  The run is followed along the front (across tall gaps up to ``bridge_gap_m``) and
+    joins the stub when the tall evidence reaches the stub's extent; the stub must be short (a wall stub, not a whole wall).
+    """
+    back_low, back_high = _wall_extent(back, front.unit)
+    if settings.stub_bridge_m <= 0.0 or not back_high > back_low or back_high - back_low > settings.stub_max_length_m * upm:
+        return None
+    gap = max(0.0, back_low - run[1], run[0] - back_high)
+    if gap > settings.stub_bridge_m * upm:
+        return None
+    sampled = replace(front, start=min(front.start, back_low, run[0]), end=max(front.end, back_high, run[1]))
+    candidates = _tall_runs(sampled, side, tall, grid, upm, settings)
+    low, high = run
+    changed = True
+    while changed:
+        changed = False
+        for other in candidates:
+            if other[0] < low - 1e-9 or other[1] > high + 1e-9:
+                if max(0.0, other[0] - high, low - other[1]) <= settings.bridge_gap_m * upm:
+                    low, high = min(low, other[0]), max(high, other[1])
+                    changed = True
+    if max(0.0, back_low - high, low - back_high) > settings.adjacency_m * upm:
+        return None
+    return (low, high) if (low, high) != run else None
+
+
 def _extend_run_to_side_walls(walls: list[dict[str, Any]], front: _Chain, side: float, run: tuple[float, float], depth: float, upm: float, settings: BuiltinFrontSettings) -> tuple[float, float]:
     """Stretch the run to the perpendicular walls that close the unit at its ends."""
     reach = settings.side_wall_reach_m * upm
@@ -486,11 +535,11 @@ def _fill_fractions(strip: Polygon, tall: np.ndarray, free_floor: np.ndarray, gr
 def _apply_strip(
     layers: dict[str, list[dict[str, Any]]], stats: dict[str, Any], front: _Chain, back: _Chain | None, side: float, run: tuple[float, float],
     depth: float, strip: Polygon, fine_classes: np.ndarray, fine_names: list[str], grid: RasterGrid, upm: float, settings: BuiltinFrontSettings,
-    *, kind: str = "builtin_front", label: str | None = None, identifier: int | None = None,
+    *, kind: str = "builtin_front", label: str | None = None, identifier: int | None = None, side_reach: float | None = None, free_floor: np.ndarray | None = None,
 ) -> None:
     """Rewrite the walls around ``strip``.  ``back`` is None for a niche whose back line is ``depth`` itself."""
     tolerance = 0.06 * upm
-    connect = 0.15 * upm
+    connect = max(0.15 * upm, side_reach or 0.0)
     walls = layers["A-WALL"]
     unit, normal = front.unit, front.normal
 
@@ -542,7 +591,11 @@ def _apply_strip(
                 other_t = t1 if end == 0 else t0
                 near_end = min(abs(s - run[0]), abs(s - run[1])) <= connect
                 if near_end and abs(t) <= connect and other_t < t - 0.05 * upm:
-                    extensions.append((entity, end, world(s, depth)))
+                    target = world(s, depth)
+                    # A wall that ends at an open floor (a passage beside the unit) is no side wall of it: never closed over measured floor.
+                    if side_reach is not None and free_floor is not None and _floor_share(points[end], target, free_floor, grid, upm) > 0.25:
+                        continue
+                    extensions.append((entity, end, target))
                     break
         kept.append(entity)
     for entity, end, target in extensions:
@@ -585,6 +638,24 @@ def _apply_strip(
     layers["A-EINB"].append({"type": "text", "_einb_owner": identifier, "text": label, "point": list(strip.representative_point().coords[0]), "height": 0.10 * upm, "rotation": 0.0})
     absorbed = _absorb_furniture(layers, strip, reach_polygon)
     stats["builtin_furniture_absorbed"] += absorbed
+
+
+def _floor_share(start: Iterable[float], end: Iterable[float], free_floor: np.ndarray, grid: RasterGrid, upm: float) -> float:
+    """Share of the segment (and 0.10 m to both sides) that lies on measured free floor."""
+    a, b = np.asarray(tuple(start), dtype=float), np.asarray(tuple(end), dtype=float)
+    length = float(np.linalg.norm(b - a))
+    if length <= 1e-9:
+        return 0.0
+    direction = (b - a) / length
+    normal = np.asarray((-direction[1], direction[0]))
+    along = np.linspace(0.05 * upm, max(length - 0.05 * upm, 0.05 * upm), max(3, int(length / (0.05 * upm))))
+    points = np.concatenate([a[None, :] + along[:, None] * direction[None, :] + offset * upm * normal[None, :] for offset in (-0.10, 0.0, 0.10)])
+    rows = np.floor((grid.max_y - points[:, 1]) / grid.pixel_size).astype(int)
+    cols = np.floor((points[:, 0] - grid.min_x) / grid.pixel_size).astype(int)
+    valid = (rows >= 0) & (rows < grid.height) & (cols >= 0) & (cols < grid.width)
+    hit = np.zeros(len(points), dtype=bool)
+    hit[valid] = np.asarray(free_floor, dtype=bool)[rows[valid], cols[valid]]
+    return float(hit.mean())
 
 
 def _strip_label(strip: Polygon, fine_classes: np.ndarray, fine_names: list[str], grid: RasterGrid) -> str:

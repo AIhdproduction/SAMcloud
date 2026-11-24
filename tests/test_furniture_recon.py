@@ -207,6 +207,25 @@ def test_bed_with_headboard() -> None:
     assert head[0].sx == pytest.approx(1.6, abs=0.08)
 
 
+def test_bed_outline_swallowing_a_low_neighbour_is_cut_back_to_the_sleeping_surface() -> None:
+    # The plan outline of the bed also holds a 0.45 m high bench along its long side (it joined the mask): 0.5 m deeper than the bed.
+    rng = np.random.default_rng(11)
+    points = scan(rng, box_points(rng, -1.0, 1.0, -0.9, 0.9, 0.0, 0.55), box_points(rng, -1.0, 0.0, 0.9, 1.4, 0.0, 0.25))
+    outline = shapely_box(-1.0, -0.9, 1.0, 1.4)
+    solids = fit_bed(points, outline, SETTINGS, (0.0, 1.6))
+    assert solids is not None
+    base = next(s for s in solids if s.role == "base_mattress")
+    _x0, y0, _x1, y1 = base.outline().bounds
+    assert y1 - y0 == pytest.approx(1.8, abs=0.12)  # the bed's own depth, not 2.3 m
+    assert y1 == pytest.approx(0.93, abs=0.06) and y0 == pytest.approx(-0.9, abs=0.06)
+    # a bed measured over its whole outline keeps it (no trimming without a gap of more than bed_trim_gap_m)
+    rng = np.random.default_rng(12)
+    whole = scan(rng, box_points(rng, -1.0, 1.0, -0.8, 0.8, 0.0, 0.50))
+    base = next(s for s in fit_bed(whole, shapely_box(-1.0, -0.8, 1.0, 0.8), SETTINGS, (0.0, 1.6)) if s.role == "base_mattress")
+    _x0, y0, _x1, y1 = base.outline().bounds
+    assert y1 - y0 == pytest.approx(1.6, abs=0.01)
+
+
 def test_surface_level_finds_the_top_not_the_faces_below() -> None:
     rng = np.random.default_rng(10)
     points = scan(rng, box_points(rng, -0.5, 0.5, -0.3, 0.3, 0.0, 0.74))

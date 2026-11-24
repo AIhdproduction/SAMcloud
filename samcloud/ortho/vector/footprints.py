@@ -63,6 +63,23 @@ class FurnitureSolidSettings:
     min_level_z_m: float = 0.20
 
 
+@dataclass(frozen=True, slots=True)
+class LabelSizeSettings:
+    """Size plausibility of an object label (metres, long side of the footprint).
+
+    The point-cloud instance vote can name a large object after a small one that stands next to or on it (a double bed
+    named after the bedside table that touches it).  A label that cannot be as large as the footprint it would name is
+    replaced by the next plausible label of the fine-label votes inside that footprint.
+    """
+
+    enabled: bool = True
+    nightstand_max_m: float = 0.80  # a bedside table / nightstand: up to about 0.8 m on its long side
+    # soft bedding (blanket, cushion, pillow, mattress) on a footprint this large is the bed it lies on
+    bed_min_long_m: float = 1.60
+    bed_min_short_m: float = 0.80
+    min_vote_share: float = 0.05  # a replacement label needs at least this share of the footprint's fine-label votes
+
+
 def object_instances(
     dsm: np.ndarray,
     floor_z: float,
@@ -79,6 +96,7 @@ def object_instances(
     view_count: np.ndarray | None = None,
     instance_raster: np.ndarray | None = None,
     instance_labels: dict[int, str] | None = None,
+    label_size: LabelSizeSettings = LabelSizeSettings(),
 ) -> tuple[list[ObjectInstance], dict[str, Any], np.ndarray]:
     """Extract object instances from the median-filtered height map.
 
@@ -209,6 +227,7 @@ def object_instances(
             result.append(instance)
     metrics["instance_labels_applied"] = _apply_instance_labels(result, instance_labels)
     result = _apply_fine_label_semantics(result, classes, hm, grid, units_per_metre, metrics)
+    metrics["labels_size_corrected"] = reconcile_label_sizes(result, fine_classes, fine_confidence, fine_names, grid, units_per_metre, label_size)
     return result, metrics, hm
 
 
@@ -248,6 +267,62 @@ def _canonical_instance_label(name: str) -> str:
     """Bedding terms are part of the bed; mattress is the bed itself."""
     key = str(name).strip().lower()
     return _INSTANCE_LABEL_ALIASES.get(key, name)
+
+
+_SOFT_BED_LABELS = frozenset({"blanket", "cushion", "pillow", "duvet", "mattress", "bed"})
+
+
+def _footprint_extent_m(mask: np.ndarray, grid: RasterGrid, units_per_metre: float) -> tuple[float, float]:
+    """(long side, short side) in metres of the minimum rotated rectangle of the mask's largest region."""
+    polygons = mask_to_polygons(np.asarray(mask, dtype=bool), grid)
+    if not polygons:
+        return 0.0, 0.0
+    corners = list(max(polygons, key=lambda item: item.area).minimum_rotated_rectangle.exterior.coords)
+    first, second = math.dist(corners[0], corners[1]), math.dist(corners[1], corners[2])
+    return max(first, second) / max(units_per_metre, 1e-9), min(first, second) / max(units_per_metre, 1e-9)
+
+
+def reconcile_label_sizes(
+    instances: list[ObjectInstance], fine_classes: np.ndarray, fine_confidence: np.ndarray, fine_names: list[str],
+    grid: RasterGrid, units_per_metre: float, settings: LabelSizeSettings = LabelSizeSettings(),
+) -> int:
+    """Replace a label that is too small for its footprint (a bed named "nightstand") by the next plausible fine-label vote.
+
+    Candidates are the fine labels voted inside the footprint (share >= ``min_vote_share``); soft bedding (blanket, cushion,
+    pillow, mattress) counts as "bed" when the footprint can hold one.  Without a plausible candidate the footprint is left
+    unlabelled (generic furniture) rather than keeping a wrong name.  Returns the number of corrected instances.
+    """
+    if not settings.enabled:
+        return 0
+    limits = {"nightstand": settings.nightstand_max_m}
+    corrected = 0
+    for instance in instances:
+        label = str(instance.label or "").strip().lower()
+        limit = limits.get(label)
+        if limit is None:
+            continue
+        long_side, short_side = _footprint_extent_m(instance.mask, grid, units_per_metre)
+        if long_side <= limit:
+            continue
+        votes = fine_classes[instance.mask & (fine_confidence >= 0.4)]
+        votes = votes[(votes > 0) & (votes <= len(fine_names))]
+        holds_bed = long_side >= settings.bed_min_long_m and short_side >= settings.bed_min_short_m
+        tally: dict[str, int] = {}
+        for fine_id, count in zip(*np.unique(votes, return_counts=True), strict=True):
+            name = str(_canonical_instance_label(fine_names[int(fine_id) - 1])).strip().lower()
+            if name in _SOFT_BED_LABELS:
+                name = "bed"
+            if name == label or (name in limits and long_side > limits[name]) or (name == "bed" and not holds_bed) or name == "clothes":
+                continue
+            tally[name] = tally.get(name, 0) + int(count)
+        total = int(len(votes))
+        best = max(tally.items(), key=lambda item: item[1]) if tally else None
+        if best is not None and total > 0 and best[1] >= settings.min_vote_share * total:
+            instance.label, instance.has_fine_label = best[0], True
+        else:
+            instance.label, instance.has_fine_label = None, False
+        corrected += 1
+    return corrected
 
 
 def _apply_fine_label_semantics(

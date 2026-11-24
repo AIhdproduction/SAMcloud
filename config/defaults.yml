@@ -79,6 +79,9 @@ classification:
     debug_ply: false
 
 acquisition:
+  video:
+    # Camera video: one frame (the sharpest of each interval window) every N seconds.
+    frame_interval_seconds: 1.0
   panorama:
     frame_interval_seconds: 1.0
     # Cubemap face side in px. 1232 = between 1024 and native 1440 (5760 px video):

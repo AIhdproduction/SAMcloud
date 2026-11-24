@@ -17,7 +17,10 @@ from samcloud.acquisition import preflight
 from samcloud.app.i18n import current_language, t
 
 DEBOUNCE_SECONDS = 0.5
-_WARNING_NOTES = {"video_not_mp4", "video_not_2to1", "photos_not_2to1"}
+_WARNING_NOTES = {
+    "video_not_mp4", "video_not_2to1", "photos_not_2to1", "video_format", "videos_unreadable",
+    "camera_photos_and_video",
+}
 
 
 @dataclass(frozen=True)
@@ -29,15 +32,18 @@ class PreflightInputs:
     interval: float
     storage: tuple[tuple[str, bool], ...]
     projects_directory: str
+    video_path: str = ""
 
 
 def compute(inputs: PreflightInputs, cache: dict) -> preflight.PreflightResult:
     """Blocking part (disk access); the source probe is reused while the paths stay the same."""
-    key = (inputs.capture_type, inputs.image_directory, inputs.panorama_video_path, inputs.panorama_image_directory)
+    key = (inputs.capture_type, inputs.image_directory, inputs.panorama_video_path, inputs.panorama_image_directory,
+           inputs.video_path)
     probe = cache.get("probe") if cache.get("key") == key else None
     if probe is None:
         probe = preflight.probe_sources(
             inputs.capture_type, inputs.image_directory, inputs.panorama_video_path, inputs.panorama_image_directory,
+            inputs.video_path,
         )
         cache["key"], cache["probe"] = key, probe
     free, drive = preflight.free_space(inputs.projects_directory)
@@ -68,9 +74,11 @@ class PreflightPanel:
         frame_interval: Any,
         storage_switches: dict[str, Any],
         projects_directory: Callable[[], Path | str],
+        video_path: Any = None,
     ) -> None:
         self._capture_type = capture_type
         self._image_directory = image_directory
+        self._camera_video = video_path
         self._video = panorama_video_path
         self._photos = panorama_image_directory
         self._interval = frame_interval
@@ -80,7 +88,7 @@ class PreflightPanel:
         self._cache: dict = {}
         self._build()
         for control in (capture_type, image_directory, panorama_video_path, panorama_image_directory, frame_interval,
-                        *storage_switches.values()):
+                        *([video_path] if video_path is not None else []), *storage_switches.values()):
             control.on_value_change(lambda _event: self.schedule())
         self._render_empty()
 
@@ -132,6 +140,7 @@ class PreflightPanel:
             interval=interval,
             storage=tuple((key, bool(control.value)) for key, control in self._storage.items()),
             projects_directory=str(self._projects_directory()),
+            video_path=(self._camera_video.value or "").strip() if self._camera_video is not None else "",
         )
 
     def schedule(self) -> None:
@@ -208,7 +217,13 @@ class PreflightPanel:
             self.headline.text = t("projects.preflight.headline_images", images=count(r.images), size=typical)
         self.headline.classes(add="font-medium", remove="sam-muted")
         parts: list[str] = []
-        if r.video is not None and r.video.status == "ok":
+        if r.video is not None and r.video.status == "ok" and r.video_count > 1:
+            parts.append(t(
+                "projects.preflight.detail_videos", videos=count(r.video_count),
+                duration=preflight.format_duration(r.video_duration),
+                width=count(r.video.width), height=count(r.video.height),
+                interval=preflight.format_interval(r.interval), count=count(r.video_panoramas)))
+        elif r.video is not None and r.video.status == "ok":
             parts.append(t(
                 "projects.preflight.detail_video", duration=preflight.format_duration(r.video.duration),
                 width=count(r.video.width), height=count(r.video.height),

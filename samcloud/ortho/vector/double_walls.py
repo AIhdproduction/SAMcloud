@@ -51,6 +51,10 @@ class DoubleWallSettings:
     min_thickness_m: float = 0.06
     max_thickness_m: float = 0.45
     exterior_thickness_m: float = 0.30
+    # A storey without ANY measured thickness evidence (no face pair, no room-edge distance: a single room scanned from the
+    # inside) has no basis for the exterior default (0.30) or the interior one (0.12): both are extremes.  Every wall of
+    # such a storey takes this typical thickness (measured flats learn 0.20-0.21 m); 0 = keep the two defaults.
+    unmeasured_thickness_m: float = 0.20
     # Without a measured outer face, the exterior thickness is estimated from window reveals (jamb wall points from the
     # inner face to the frame): thickness = 2 x (reveal depth + reveal_frame_m / 2) - the frame is assumed in the wall middle.
     # OFF by default: DEV exterior error 0.041 -> 0.032 m, but on VAL l_kitchen_212 the changed exterior thickness lost a hidden wall.
@@ -426,7 +430,7 @@ def build_double_walls(
             exterior_value = reveal_value
             stats["double_wall_exterior_thickness_m"] = round(exterior_value / upm, 3)
             stats["double_wall_exterior_source"] = "window-reveal"
-    _assign_thickness(runs, faces, samples, groups, interior_clusters, exterior_value, upm, settings, pairs)
+    _assign_thickness(runs, faces, samples, groups, interior_clusters, exterior_value, upm, settings, None if learn_stats.get("double_wall_thickness_prior") else pairs)
     if reveal_value is not None:
         for run in runs:
             if run.evidence == "exterior":
@@ -468,7 +472,7 @@ def build_double_walls(
 
     # after the door detection: every opening, also the ones found in the wall bodies, is judged
     if settings.door_spans:
-        stats["double_wall_door_spans"] = _enforce_door_spans(runs, faces, openings, upm, settings)
+        stats["double_wall_door_spans"] = _enforce_door_spans(runs, faces, openings, upm, settings, host_default=exterior_value if learn_stats.get("double_wall_thickness_prior") else None)
     if settings.close_walls:
         stats["double_wall_jogs_merged"] = _merge_jogs(runs, faces, upm, settings)
         stats["double_wall_closing_pieces"] = _close_free_ends(runs, faces, openings, upm, settings)
@@ -1476,7 +1480,7 @@ def _drop_leaf_runs(runs: list[WallRun], faces: list[_Face], openings: list[Any]
     return dropped
 
 
-def _enforce_door_spans(runs: list[WallRun], faces: list[_Face], openings: list[Any], upm: float, settings: DoubleWallSettings) -> dict[str, int]:
+def _enforce_door_spans(runs: list[WallRun], faces: list[_Face], openings: list[Any], upm: float, settings: DoubleWallSettings, host_default: float | None = None) -> dict[str, int]:
     """A door is never a wall: every door / passage has exactly one host wall run and nothing else stands in its span.
 
     Per opening: the host is the parallel run whose centreline passes the opening centre (smallest offset, then longest cover of the span).
@@ -1517,7 +1521,7 @@ def _enforce_door_spans(runs: list[WallRun], faces: list[_Face], openings: list[
                 gap = float(LineString([tuple(_run_centre(run, face, run.start)), tuple(_run_centre(run, face, run.end))]).distance(Point(float(centre[0]), float(centre[1]))))
                 if gap <= settings.door_fill_reach_m * upm and (nearest is None or gap < nearest[0]):
                     nearest = (gap, run)
-            thickness = nearest[1].thickness if nearest is not None else max(float(getattr(opening, "wall_thickness", 0.0)), 0.15 * upm)
+            thickness = nearest[1].thickness if nearest is not None else (host_default if host_default is not None else max(float(getattr(opening, "wall_thickness", 0.0)), 0.15 * upm))
             kind = nearest[1].kind if nearest is not None else "interior"
             if nearest is not None:
                 # A door standing in the line of the nearest wall (its centre within that wall's band, the detected door lies on one
@@ -2210,6 +2214,7 @@ def _learn_thickness(runs: list[WallRun], samples: list[_Samples], pairs: dict[i
     low, high = settings.min_thickness_m * upm, settings.max_thickness_m * upm
     interior_pairs: list[float] = []
     exterior_pairs: list[float] = []
+    weak_pairs: list[float] = []  # opposite faces seen only beside a face (a window plane beside its reveal): never alone a thickness
     room_values: list[float] = []
     step = settings.sample_step_m * upm
     for run in runs:
@@ -2224,7 +2229,7 @@ def _learn_thickness(runs: list[WallRun], samples: list[_Samples], pairs: dict[i
         elif run.kind == "exterior":
             exterior_pairs.extend(values)
             if not values and weak:
-                exterior_pairs.extend([float(np.median(weak))] * max(1, int((run.end - run.start) / max(step, 1e-9))))
+                weak_pairs.extend([float(np.median(weak))] * max(1, int((run.end - run.start) / max(step, 1e-9))))
     gap = settings.cluster_gap_m * upm
     interior = _clusters(interior_pairs, gap) if interior_pairs else []
     minimum = max(3, int(round(0.5 / max(settings.sample_step_m, 1e-9))))
@@ -2232,9 +2237,15 @@ def _learn_thickness(runs: list[WallRun], samples: list[_Samples], pairs: dict[i
         if count >= minimum and all(abs(value - existing) > gap for existing, _ in interior):
             interior.append((value, count))
     interior.sort()
-    measured = len(exterior_pairs) >= minimum
+    prior = settings.unmeasured_thickness_m > 0.0 and not interior and not exterior_pairs and not interior_pairs
+    exterior_pairs.extend(weak_pairs)
+    measured = len(exterior_pairs) >= minimum and not prior
     exterior_value = float(np.median(exterior_pairs)) if measured else settings.exterior_thickness_m * upm
+    if prior:
+        exterior_value = settings.unmeasured_thickness_m * upm
+        interior = [(exterior_value, 0)]
     stats = {
+        "double_wall_thickness_prior": bool(prior),
         "double_wall_interior_classes_m": [[round(value / upm, 3), count] for value, count in interior],
         "double_wall_exterior_thickness_m": round(exterior_value / upm, 3),
         "double_wall_exterior_measured": measured,

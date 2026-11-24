@@ -70,10 +70,10 @@ from samcloud.bim.furniture_footprint import TightFootprintSettings, instance_po
 from samcloud.ortho.vector.upper_points import UpperPointSettings, detect_upper_cabinets_from_points, load_class_points, measured_z_band
 from samcloud.bim.depth_evidence.plan_use import PlanDepth, open_plan_depth, plan_depth_fingerprint
 from samcloud.ortho.vector.room_names import RoomNameSettings, name_halls, name_rooms, room_label_text, tag_for_name
-from samcloud.ortho.vector.builtin_fronts import _absorb_einb, _absorb_furniture, resolve_builtin_fronts, tall_furniture_mask
+from samcloud.ortho.vector.builtin_fronts import BuiltinFrontSettings, _absorb_einb, _absorb_furniture, resolve_builtin_fronts, tall_furniture_mask
 from samcloud.ortho.vector.niche import NicheSettings, content_mask, resolve_recessed_niches
 from samcloud.ortho.vector.door_zones import DoorZoneSettings, drop_misplaced_builtins
-from samcloud.ortho.vector.footprints import _NON_FOOTPRINT_INSTANCE_LABELS, ISLAND_LABELS, FootprintFit, FurnitureSolidSettings, IslandSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, furniture_solid_parts, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
+from samcloud.ortho.vector.footprints import _NON_FOOTPRINT_INSTANCE_LABELS, ISLAND_LABELS, FootprintFit, FurnitureSolidSettings, IslandSettings, LabelSizeSettings, clutter_rectangle, detect_kitchen_island, fit_footprint, furniture_solid_parts, height_step_details, object_instances, clip_to_room, refine_dining_instances, refit_clipped, wall_axis_rectangle, wall_band_of
 from samcloud.ortho.vector.wall_sides import two_faced_walls, wall_side_evidence
 from samcloud.ortho.vector.wall_lines import (
     WallFace,
@@ -136,6 +136,7 @@ class CleanPlanSettings:
     indoor_ceiling: CeilingSettings = CeilingSettings()
     indoor_island: IslandSettings = IslandSettings()
     indoor_niche: NicheSettings = NicheSettings()
+    indoor_builtin_fronts: BuiltinFrontSettings = BuiltinFrontSettings()
     indoor_door_zone: DoorZoneSettings = DoorZoneSettings()
     indoor_upper_cabinets: UpperCabinetSettings = UpperCabinetSettings()
     indoor_upper_points: UpperPointSettings = UpperPointSettings()
@@ -146,6 +147,7 @@ class CleanPlanSettings:
     indoor_kitchen_front_legs: FrontLegSettings = FrontLegSettings()
     indoor_kitchen_bar_top: BarTopSettings = BarTopSettings()
     indoor_furniture_solids: FurnitureSolidSettings = FurnitureSolidSettings()
+    indoor_label_size: LabelSizeSettings = LabelSizeSettings()
     walls: DoubleWallSettings = DoubleWallSettings()
     indoor_wall_directions: DirectionSettings = DirectionSettings()
     indoor_unobserved_edges: UnobservedEdgeSettings = UnobservedEdgeSettings()
@@ -225,6 +227,7 @@ def load_clean_plan_settings(path: Path | str | None = None) -> CleanPlanSetting
         indoor_ceiling=ceiling,
         indoor_island=section_of("indoor_island", IslandSettings),
         indoor_niche=section_of("indoor_niche", NicheSettings),
+        indoor_builtin_fronts=section_of("indoor_builtin_fronts", BuiltinFrontSettings),
         indoor_door_zone=section_of("indoor_door_zone", DoorZoneSettings),
         indoor_upper_cabinets=section_of("indoor_upper_cabinets", UpperCabinetSettings),
         indoor_upper_points=section_of("indoor_upper_points", UpperPointSettings),
@@ -235,6 +238,7 @@ def load_clean_plan_settings(path: Path | str | None = None) -> CleanPlanSetting
         indoor_kitchen_front_legs=section_of("indoor_kitchen_front_legs", FrontLegSettings),
         indoor_kitchen_bar_top=section_of("indoor_kitchen_bar_top", BarTopSettings),
         indoor_furniture_solids=section_of("indoor_furniture_solids", FurnitureSolidSettings),
+        indoor_label_size=section_of("indoor_label_size", LabelSizeSettings),
         walls=section_of("walls", DoubleWallSettings),
         indoor_wall_directions=DirectionSettings.from_mapping(data.get("indoor_wall_directions", {})),
         indoor_unobserved_edges=UnobservedEdgeSettings.from_mapping(data.get("indoor_unobserved_edges", {})),
@@ -1021,7 +1025,7 @@ def _generate_indoor_clean_plan(
     sorted_rooms = sorted(rooms_data.polygons, key=lambda item: (-item.representative_point().y, item.representative_point().x))
     face_geometry_for_metrics = unary_union([face.geometry() for face in faces]) if faces else LineString()
     wall_evidence_coverage = float(np.mean([face_geometry_for_metrics.distance(Point(point[:2])) <= 0.05 * units_per_metre for point in wall_points])) if len(wall_points) else 0.0
-    opening_symbols = opening_entities(openings, free_space, grid=grid)
+    opening_symbols = opening_entities(openings, free_space, grid=grid, **_opening_label_scales(units_per_metre, metric_units_per_metre))
     for entity in opening_symbols:
         if (entity.get("type") == "insert" and entity.get("name") == "WINDOW") or entity.get("_opening_kind") == "WINDOW":
             entity["_on_face"] = True
@@ -1125,7 +1129,7 @@ def _generate_indoor_clean_plan(
             objects_dsm[unmeasured] = (depth_top[unmeasured] + level.floor_z).astype(np.float32)
     instances, footprint_metrics, height_map = object_instances(
         objects_dsm, level.floor_z, classes, fine_classes, fine_confidence, fine_names, grid, units_per_metre, ceiling_height, wall_lines,
-        free_space | closed_floor, outer_band | wall_evidence, view_count, instance_raster, instance_labels,
+        free_space | closed_floor, outer_band | wall_evidence, view_count, instance_raster, instance_labels, plan_settings.indoor_label_size,
     )
     footprint_metrics["depth_in_plan"] = plan_depth is not None
     footprint_metrics["depth_height_cells_filled"] = depth_filled_cells
@@ -1364,9 +1368,10 @@ def _generate_indoor_clean_plan(
         output_layers, rooms_data.polygons,
         tall=tall_mask,
         free_floor=free_space | closed_floor, fine_classes=fine_classes, fine_names=fine_names, grid=grid, units_per_metre=units_per_metre,
-        exclude=niche_stats["strips"],
+        exclude=niche_stats["strips"], settings=plan_settings.indoor_builtin_fronts,
     )
     footprint_metrics["builtin_fronts"] = builtin_front_stats["builtin_fronts"]
+    footprint_metrics["builtin_stub_bridged"] = int(builtin_front_stats.get("builtin_stub_bridged", 0))
     # Upper cabinets: hanging units in the 1.80-2.20 m band above a kitchen run stay dashed on A-OBEN.
     upper_settings = plan_settings.indoor_upper_cabinets
     upper_polygons = detect_upper_cabinets(
@@ -1452,7 +1457,7 @@ def _generate_indoor_clean_plan(
         output_layers["A-WALL"] = double.entities
         output_layers["A-WALL-PATT"] = double.hatches
         footprint_metrics.update(double.stats)
-        footprint_metrics["double_wall_openings_changed"] = _apply_opening_changes(output_layers, double.openings_changed, free_space, grid)
+        footprint_metrics["double_wall_openings_changed"] = _apply_opening_changes(output_layers, double.openings_changed, free_space, grid, **_opening_label_scales(units_per_metre, metric_units_per_metre))
         openings = list(double.openings)
         footprint_metrics["double_wall_symbols_updated"] = update_opening_symbols(output_layers, openings, double.opening_slabs, units_per_metre, double.opening_hosted)
         if plan_settings.walls.bound_rooms:
@@ -1901,7 +1906,15 @@ def _level_camera_centres(project: Path, stats: dict[str, Any], frame: Frame, le
     return np.unique(np.round(centres[keep, :2], 3), axis=0)
 
 
-def _apply_opening_changes(layers: dict[str, list[dict[str, Any]]], changes: list[tuple[Any, Any]], free_space: np.ndarray, grid: RasterGrid) -> int:
+def _opening_label_scales(detector_units: float, metric_units: float) -> dict[str, float]:
+    """``opening_entities`` keywords: label widths (plan units) and heights (detector metres) printed in true metres."""
+    metric = max(float(metric_units), 1e-9)
+    return {"width_scale": 1.0 / metric, "height_scale": float(detector_units) / metric}
+
+
+def _apply_opening_changes(
+    layers: dict[str, list[dict[str, Any]]], changes: list[tuple[Any, Any]], free_space: np.ndarray, grid: RasterGrid, *, width_scale: float = 1.0, height_scale: float = 1.0,
+) -> int:
     """Redraw the symbols of openings the wall builder corrected, removed or added."""
     count = 0
     for old, new in changes:
@@ -1913,7 +1926,7 @@ def _apply_opening_changes(layers: dict[str, list[dict[str, Any]]], changes: lis
                     if entity.get("_opening_center") is None or float(np.linalg.norm(np.asarray(entity["_opening_center"][:2], dtype=float) - centre)) > 1e-6
                 ]
         if new is not None:
-            for entity in opening_entities([new], free_space, grid=grid):
+            for entity in opening_entities([new], free_space, grid=grid, width_scale=width_scale, height_scale=height_scale):
                 entity["_on_face"] = True
                 layers["A-WIND" if (entity.get("type") == "insert" and entity.get("name") == "WINDOW") or entity.get("_opening_kind") == "WINDOW" else "A-DOOR"].append(entity)
         count += 1

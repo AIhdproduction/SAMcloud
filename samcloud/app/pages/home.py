@@ -258,7 +258,11 @@ def _render_project_workspace(project: dict | None) -> None:
         source = (
             sources.get("panorama_image_directory") or sources.get("panorama_video_path")
             if capture_type == "panorama_360"
-            else sources.get("image_directory", "")
+            else (
+                sources.get("video_path") or sources.get("image_directory", "")
+                if capture_type == "camera"
+                else sources.get("image_directory", "")
+            )
         )
         ui.icon("folder_open")
         ui.label(t("home.workspace.ready")).classes("sam-dropzone-title")

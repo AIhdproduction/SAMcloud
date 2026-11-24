@@ -49,6 +49,7 @@ class ProjectManager:
         custom_classes: dict | None = None,
         panorama_image_directory: str = "",
         panorama_video_path: str = "",
+        video_path: str = "",
         frame_interval_seconds: float | None = None,
         rtk_enabled: bool = False,
         control_points_mode: str = "auto",
@@ -81,6 +82,7 @@ class ProjectManager:
             custom_classes=custom_classes,
             panorama_image_directory=panorama_image_directory,
             panorama_video_path=panorama_video_path,
+            video_path=video_path,
             frame_interval_seconds=frame_interval_seconds,
             rtk_enabled=rtk_enabled,
             control_points_mode=control_points_mode,
@@ -161,11 +163,17 @@ class ProjectManager:
         storage: dict | None = None,
         apriltags_enabled: bool | None = None,
         auto_dxf: bool = True,
+        video_path: str = "",
     ) -> dict[str, Any]:
         defaults = deepcopy(load_global_config("defaults.yml"))
         panorama_defaults = defaults.get("acquisition", {}).get("panorama", {})
+        video_defaults = defaults.get("acquisition", {}).get("video", {})
         if frame_interval_seconds is None:
-            frame_interval_seconds = float(panorama_defaults.get("frame_interval_seconds", 1.0))
+            frame_interval_seconds = float(
+                (video_defaults if capture_type == "camera" and video_path else panorama_defaults).get(
+                    "frame_interval_seconds", 1.0
+                )
+            )
         if class_set not in {"outdoor", "indoor"}:
             raise ValueError("Select the indoor or outdoor semantic class set")
         if control_points_mode not in {"none", "after_alignment", "automatic", "auto"}:
@@ -176,6 +184,7 @@ class ProjectManager:
             panorama_image_directory=panorama_image_directory,
             panorama_video_path=panorama_video_path,
             frame_interval_seconds=frame_interval_seconds,
+            video_path=video_path,
         )
         if classification_engine not in {"sam3", "flurseg"}:
             raise ValueError("Select a supported classification model")
@@ -218,6 +227,11 @@ class ProjectManager:
                     "image_directory": image_directory,
                     "panorama_image_directory": panorama_image_directory,
                     "panorama_video_path": panorama_video_path,
+                    "video_path": video_path,
+                },
+                "video": {
+                    "frame_interval_seconds": float(frame_interval_seconds),
+                    "frame_directory": "inputs/video_frames",
                 },
                 "panorama": {
                     "frame_interval_seconds": frame_interval_seconds,

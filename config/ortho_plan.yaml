@@ -172,6 +172,15 @@ indoor_niche:
   beyond_reach_m: 0.60
   require_panel: true
 
+# Built-in fronts (floor-to-ceiling wardrobe in front of a wall). Only the keys named here differ from the code defaults.
+# One room scanned from the inside often sees the unit's front along its whole length but the wall behind it only as a stub at
+# the end of the unit: the tall run is followed along the front (up to stub_bridge_m) to that stub, which then is the back wall
+# along the whole unit (the room reaches the wall face, the unit becomes a built-in strip). 0 = the back wall must stand beside the front.
+indoor_builtin_fronts:
+  stub_bridge_m: 3.0
+  stub_max_length_m: 1.5  # the back wall counts as a stub up to this length (a longer wall is another wall)
+  stub_side_reach_m: 0.60  # a side wall stopping this close to the unit's front continues to the back wall
+
 indoor_upper_cabinets:
   band_min_m: 1.80
   band_max_m: 2.20
@@ -233,6 +242,15 @@ indoor_furniture_solids:
   max_parts: 4
   # A height level below this (metres) is floor noise, not a part: its cells join the next level up.
   min_level_z_m: 0.20
+
+# A label never names a footprint larger than the object can be: the point-cloud instance vote can name a double bed after the
+# bedside table next to it. Long side of the footprint in metres; a bigger footprint takes the next plausible fine-label vote.
+indoor_label_size:
+  enabled: true
+  nightstand_max_m: 0.80  # a bedside table is up to about 0.8 m long
+  bed_min_long_m: 1.60  # soft bedding (blanket, cushion, pillow, mattress) on a footprint this large is the bed it lies on
+  bed_min_short_m: 0.80
+  min_vote_share: 0.05
 
 # Double-line indoor walls (both faces of every wall, default). false = the single measured face lines.
 # Thicknesses in metres, scaled by the project units per metre. Interior thickness classes are
@@ -332,6 +350,10 @@ walls:
   min_thickness_m: 0.06
   max_thickness_m: 0.45
   exterior_thickness_m: 0.30
+  # A storey with NO measured thickness evidence at all (no face pair, no room-edge distance: one room scanned from the inside)
+  # has no basis for the 0.30 exterior / 0.12 interior defaults; every wall of it takes this typical thickness instead
+  # (flats with measured walls learn 0.20-0.21 m). 0 = always use the two defaults.
+  unmeasured_thickness_m: 0.20
   # Without a measured outer face (pairs), the exterior thickness comes from window reveals: wall points of both jambs from the
   # inner face to the frame (depth d >= reveal_min_depth_m) give 2 x (d + reveal_frame_m / 2) - frame assumed in the wall middle.
   # Pieces then carry evidence "exterior-reveal"; without reveals the 0.30 default ("exterior") stays.

@@ -35,6 +35,8 @@ REST_BYTES_PER_PHOTO_PIXEL = (75.7e9 - STEREO_BYTES_PER_PIXEL * 291 * 2900 * 217
 AFTER_PRODUCTS_BYTES_PER_FACE_PIXEL = 2.87 * GIB / (2136 * 1232 ** 2)
 AFTER_INPUTS_BYTES_PER_FACE_PIXEL = 1.27 * GIB / (2136 * 1232 ** 2)
 AFTER_BYTES_PER_PHOTO_PIXEL = 9.89 * GIB / (291 * 2900 * 2175)
+# Extracted camera video frames stay inside the project (cv2 JPEG quality 95, typical 0.2-0.4 B/px; estimate).
+VIDEO_FRAME_JPEG_BYTES_PER_PIXEL = 0.3
 
 # Status thresholds: ok = free >= upper bound + 10 %, tight = free >= typical, otherwise short.
 UPPER_BOUND_MARGIN = 0.10
@@ -88,8 +90,12 @@ class SourceProbe:
     """What was found on disk; independent of interval and storage switches."""
 
     capture_type: str
-    video: VideoInfo | None = None
+    video: VideoInfo | None = None  # the single video, or the first readable video of a folder
     folder: FolderInfo | None = None  # panorama photos (360) or image folder (drone/camera)
+    videos: tuple[VideoInfo, ...] = ()  # every video found (one for a file, several for a folder)
+    video_folder: bool = False  # the video source is a folder
+    video_folder_empty: bool = False  # ... and it holds no matching video
+    photos_and_video: bool = False  # camera: a photo folder AND a video were given
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,10 @@ class PreflightResult:
     interval: float = 0.0
     video: VideoInfo | None = None
     folder: FolderInfo | None = None
+    video_count: int = 0  # readable videos used for the estimate
+    videos_unreadable: int = 0
+    video_duration: float = 0.0  # total over the readable videos
+    frames_bytes: int = 0  # extracted camera video frames kept in the project
     source_bytes: int = 0
     dense_size: int = 0
     peak_typical: int = 0
@@ -133,14 +143,14 @@ def kept_frame_count(frame_count: int, fps: float, interval: float) -> int:
     return int((int(frame_count) - 1) // interval_frames) + 1
 
 
-def read_video_info(path: str) -> VideoInfo:
-    """Read the header of a video; never raises."""
+def read_video_info(path: str, extensions: tuple[str, ...] = VIDEO_EXTENSIONS) -> VideoInfo:
+    """Read the header of a video; never raises. ``is_mp4`` tells whether the suffix is in ``extensions``."""
     try:
         file = Path(path)
         if not file.is_file():
             return VideoInfo(path, "not_found")
         size = file.stat().st_size
-        is_mp4 = file.suffix.lower() in VIDEO_EXTENSIONS
+        is_mp4 = file.suffix.lower() in {e.lower() for e in extensions}
         import cv2
 
         capture = cv2.VideoCapture(str(file))
@@ -203,17 +213,48 @@ def scan_folder(path: str, extensions: tuple[str, ...], *, count_ignored: bool =
         return FolderInfo(path, "unreadable")
 
 
+def _read_video(path: str, extensions: tuple[str, ...]) -> VideoInfo:
+    return read_video_info(path) if tuple(extensions) == VIDEO_EXTENSIONS else read_video_info(path, extensions)
+
+
+def _probe_video_source(path: str, extensions: tuple[str, ...]) -> tuple[tuple[VideoInfo, ...], bool, bool]:
+    """(videos, is_folder, folder_is_empty) of a video file or a folder of videos; never raises."""
+    try:
+        location = Path(path)
+        if location.is_dir():
+            from samcloud.acquisition.video import find_videos
+
+            found = find_videos(location, extensions)
+            return tuple(_read_video(str(item), extensions) for item in found), True, not found
+    except Exception:  # noqa: BLE001
+        return (VideoInfo(path, "unreadable"),), False, False
+    return (_read_video(path, extensions),), False, False
+
+
 def probe_sources(
     capture_type: str, image_directory: str = "", panorama_video_path: str = "", panorama_image_directory: str = "",
+    video_path: str = "",
 ) -> SourceProbe:
     """Look at the sources the form currently names (blocking disk access: call from a worker thread)."""
     if capture_type == "panorama_360":
-        video = read_video_info(panorama_video_path.strip()) if (panorama_video_path or "").strip() else None
+        videos: tuple[VideoInfo, ...] = ()
+        is_folder = is_empty = False
+        if (panorama_video_path or "").strip():
+            videos, is_folder, is_empty = _probe_video_source(panorama_video_path.strip(), VIDEO_EXTENSIONS)
+        video = next((v for v in videos if v.status == "ok"), videos[0] if videos else None)
         folder = (
             scan_folder(panorama_image_directory.strip(), PANORAMA_PHOTO_EXTENSIONS)
             if (panorama_image_directory or "").strip() else None
         )
-        return SourceProbe(capture_type, video, folder)
+        return SourceProbe(capture_type, video, folder, videos, is_folder, is_empty)
+    if capture_type == "camera" and (video_path or "").strip():
+        if (image_directory or "").strip():
+            return SourceProbe(capture_type, photos_and_video=True)
+        from samcloud.acquisition.video import CAMERA_VIDEO_EXTENSIONS
+
+        videos, is_folder, is_empty = _probe_video_source(video_path.strip(), CAMERA_VIDEO_EXTENSIONS)
+        video = next((v for v in videos if v.status == "ok"), videos[0] if videos else None)
+        return SourceProbe(capture_type, video, None, videos, is_folder, is_empty)
     folder = scan_folder(image_directory.strip(), PHOTO_FOLDER_EXTENSIONS) if (image_directory or "").strip() else None
     return SourceProbe(capture_type, None, folder)
 
@@ -309,23 +350,45 @@ def estimate(
     is_360 = capture_type == "panorama_360"
     video, folder = probe.video, probe.folder
 
-    if video is None and folder is None:
+    if probe.photos_and_video:
+        return PreflightResult("unknown", (Note("camera_photos_and_video"),), capture_type)
+    if video is None and folder is None and not probe.video_folder_empty:
         return PreflightResult("empty", (), capture_type)
 
+    videos = probe.videos or ((video,) if video is not None else ())
+    usable = [v for v in videos if v.status == "ok"]
+    camera_video = not is_360 and bool(videos or probe.video_folder_empty)
     video_panoramas = 0
-    if video is not None:
-        if video.status == "not_found":
+    unreadable = 0
+    if probe.video_folder_empty:
+        notes.append(Note("video_folder_empty"))
+    elif videos:
+        if probe.video_folder:
+            unreadable = len(videos) - len(usable)
+            if unreadable:
+                notes.append(Note("videos_unreadable", {"count": unreadable}))
+        elif videos[0].status == "not_found":
             notes.append(Note("video_not_found"))
-        elif video.status != "ok":
+        elif videos[0].status != "ok":
             notes.append(Note("video_unreadable"))
-        else:
-            if not video.is_mp4:
-                notes.append(Note("video_not_mp4"))
-            if not video.is_2to1:
-                notes.append(Note("video_not_2to1", {"width": video.width, "height": video.height}))
-            video_panoramas = kept_frame_count(video.frame_count, video.fps, interval) if interval > 0 else 0
-            if interval <= 0:
-                notes.append(Note("interval_invalid"))
+        if usable:
+            first = usable[0]
+            if camera_video:
+                if not first.is_mp4:
+                    from samcloud.acquisition.video import CAMERA_VIDEO_EXTENSIONS
+
+                    notes.append(Note("video_format", {"extensions": ", ".join(CAMERA_VIDEO_EXTENSIONS)}))
+                    usable = []  # the format is rejected, nothing is counted
+            else:
+                if not first.is_mp4:
+                    notes.append(Note("video_not_mp4"))
+                if not first.is_2to1:
+                    notes.append(Note("video_not_2to1", {"width": first.width, "height": first.height}))
+            if usable:
+                if interval <= 0:
+                    notes.append(Note("interval_invalid"))
+                else:
+                    video_panoramas = sum(kept_frame_count(v.frame_count, v.fps, interval) for v in usable)
     photos = 0
     if folder is not None:
         if folder.status == "not_found":
@@ -346,16 +409,22 @@ def estimate(
         return PreflightResult("unknown", tuple(notes), capture_type, video=video, folder=folder, interval=interval)
 
     # Long side and aspect of the images COLMAP will see.
+    frames_bytes = 0
     if is_360:
         width = 0
         if folder is not None and folder.status == "ok" and folder.first_size:
             width = folder.first_size[0]
-        elif video is not None and video.status == "ok":
-            width = video.width
+        elif usable:
+            width = usable[0].width
         if width <= 0:
             return PreflightResult("unknown", (*notes, Note("size_unknown")), capture_type, video=video, folder=folder)
         long_side, aspect = _face_size(width, int(requested_face_size or 0)), 1.0
         images = sources * PANORAMA_FACES
+    elif camera_video:
+        w, h = usable[0].width, usable[0].height
+        long_side, aspect = max(w, h), min(w, h) / max(w, h)
+        images = video_panoramas
+        frames_bytes = int(images * w * h * VIDEO_FRAME_JPEG_BYTES_PER_PIXEL)
     else:
         if not folder or not folder.first_size:
             return PreflightResult("unknown", (*notes, Note("size_unknown")), capture_type, video=video, folder=folder)
@@ -366,18 +435,21 @@ def estimate(
     typical, upper, after = _estimate_bytes(
         is_360=is_360, images=images, dense_size=dense, aspect=aspect, storage=storage,
     )
+    typical, upper, after = typical + frames_bytes, upper + frames_bytes, after + frames_bytes
     status = storage_status(free_bytes, typical, upper)
-    source_bytes = (folder.size_bytes if folder and folder.status == "ok" else 0) + (
-        video.size_bytes if video is not None and video.status == "ok" else 0
+    source_bytes = (folder.size_bytes if folder and folder.status == "ok" else 0) + sum(
+        v.size_bytes for v in usable
     )
     result = PreflightResult(
         "ready", tuple(notes), capture_type,
         panoramas=sources if is_360 else 0, faces=images if is_360 else 0, images=images,
         video_panoramas=video_panoramas, photo_count=photos, interval=interval, video=video, folder=folder,
+        video_count=len(usable), videos_unreadable=unreadable, video_duration=sum(v.duration for v in usable),
+        frames_bytes=frames_bytes,
         source_bytes=source_bytes, dense_size=dense, peak_typical=typical, peak_upper=upper, after=after,
         free=free_bytes, free_drive=free_drive, status=status,
     )
-    if _search_advice and status == "short" and video is not None and video.status == "ok":
+    if _search_advice and status == "short" and usable:
         return replace(result, advice_interval=_advice_interval(
             probe, interval=interval, storage=storage, free_bytes=free_bytes, free_drive=free_drive,
             dense_config=dense_config, requested_face_size=requested_face_size,

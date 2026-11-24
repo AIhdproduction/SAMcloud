@@ -19,7 +19,7 @@ Worked examples per capture type, each on its own page:
 | 360 degree camera, indoor | [360 degree indoor](docs/examples/indoor_360.md) | complete: apartment `test_home_v13_tag`, from input to DXF and IFC - [open the result online](https://pub-c77fc3c3582246af9ffef1b9e877a798.r2.dev/share/indoor-360-example/index.html) |
 | 360 degree camera, outdoor | [360 degree outdoor](docs/examples/outdoor_360.md) | capture guide; example results follow |
 | Drone GPS/RTK | [Drone photos](docs/examples/drone.md) | capture guide; example results follow |
-| Standard camera | [Phone and handheld photos](docs/examples/phone.md) | capture guide; example results follow |
+| Standard camera | [Phone video and handheld photos](docs/examples/phone.md) | complete: bedroom `test_handy_video_1tag_v2` (phone video, one AprilTag), from input to DXF and IFC - [open the result online](https://pub-c77fc3c3582246af9ffef1b9e877a798.r2.dev/share/phone-video-example/index.html) |
 
 Each page shows the full workflow for that capture type, from input to classified point cloud and DXF plan.
 
@@ -822,9 +822,15 @@ allowed to publish.
 - **Drone GPS/RTK:** image GPS tags are used for the ENU alignment. This is the
   only type that is georeferenced automatically, so it is the only type that
   receives the geometric refinement without control points.
-- **Standard camera:** reconstruction starts in `LOCAL`; three or more marked
-  GCPs georeference it and enable geometric refinement for `Outdoor` projects.
-  `Indoor` projects are georeferenced but not geometrically refined.
+- **Standard camera:** the input is either photos or a video (one file or a folder
+  of videos; the sharpest frame of each interval window is extracted, default 1 s).
+  Reconstruction starts in `LOCAL`. `Indoor` projects without control points are
+  levelled automatically from the camera up vectors and the floor plane, and the
+  scale comes from AprilTags; `Outdoor` projects need control points for level and
+  scale. Three or more marked GCPs georeference the model and enable geometric
+  refinement for `Outdoor` projects. `Indoor` projects are georeferenced but not
+  geometrically refined. If the mapper splits into several models, the largest one
+  is used.
 - **360 degree camera / Insta360:** export the footage from Insta360 Studio
   first. SAMcloud accepts stitched 2:1 equirectangular `.mp4` videos and `.jpg`
   panoramas, or both together; raw `.insv` files are not supported.

@@ -43,6 +43,8 @@ class ReconSettings:
     grow_extent_margin_m: float = 0.10
     grow_max_volume_factor: float = 1.25
     grow_min_coverage_gain: float = 0.05
+    bed_trim_gap_m: float = 0.12
+    bed_surface_share: float = 0.6
     discover_instances: bool = True
     windows: dict[str, tuple[float, float | None]] = field(default_factory=lambda: dict(_DEFAULT_WINDOWS))
 

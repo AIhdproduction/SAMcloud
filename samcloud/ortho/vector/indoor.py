@@ -270,32 +270,39 @@ def _default_heights() -> tuple[float, float, float]:
     return float(defaults["window_sill_m"]), float(defaults["window_head_m"]), float(defaults["door_head_m"])
 
 
-def _head_suffix(opening: Opening) -> str:
-    return f" H {opening.head_m:.2f}" if opening.head_m is not None else ""
+def _head_suffix(opening: Opening, height_scale: float = 1.0) -> str:
+    return f" H {float(opening.head_m) * height_scale:.2f}" if opening.head_m is not None else ""
 
 
-def _window_attributes(opening: Opening) -> dict[str, str]:
-    """LABEL plus BRH (sill) / STH (head) in metres and MULLIONS; unmeasured windows carry the BIM defaults."""
+def _window_attributes(opening: Opening, width_scale: float = 1.0, height_scale: float = 1.0) -> dict[str, str]:
+    """LABEL plus BRH (sill) / STH (head) in metres and MULLIONS; unmeasured windows carry the BIM defaults.
+
+    ``width_scale`` converts plan units to metres, ``height_scale`` converts the measured detector-metre heights to metres.
+    """
     default_sill, default_head, _ = _default_heights()
-    sill = default_sill if opening.sill_m is None else float(opening.sill_m)
-    head = default_head if opening.head_m is None else float(opening.head_m)
-    return {"LABEL": f"Window {opening.width:.2f} m", "BRH": f"{sill:.2f}", "STH": f"{head:.2f}", "MULLIONS": str(len(opening.mullion_u))}
+    sill = default_sill if opening.sill_m is None else float(opening.sill_m) * height_scale
+    head = default_head if opening.head_m is None else float(opening.head_m) * height_scale
+    return {"LABEL": f"Window {opening.width * width_scale:.2f} m", "BRH": f"{sill:.2f}", "STH": f"{head:.2f}", "MULLIONS": str(len(opening.mullion_u))}
 
 
-def _door_attributes(opening: Opening) -> dict[str, str]:
+def _door_attributes(opening: Opening, width_scale: float = 1.0, height_scale: float = 1.0) -> dict[str, str]:
     """LABEL plus H (head height, m) and GLAZED=1 for doors with a glass leaf."""
     _, _, default_head = _default_heights()
-    head = default_head if opening.head_m is None else float(opening.head_m)
-    attributes = {"LABEL": f"Door {opening.width:.2f} m", "H": f"{head:.2f}"}
+    head = default_head if opening.head_m is None else float(opening.head_m) * height_scale
+    attributes = {"LABEL": f"Door {opening.width * width_scale:.2f} m", "H": f"{head:.2f}"}
     if opening.glazed:
         attributes["GLAZED"] = "1"
     return attributes
 
 
 def opening_entities(
-    openings: list[Opening], free_space_mask: np.ndarray | None = None, *, grid: RasterGrid | None = None
+    openings: list[Opening], free_space_mask: np.ndarray | None = None, *, grid: RasterGrid | None = None,
+    width_scale: float = 1.0, height_scale: float = 1.0,
 ) -> list[dict[str, object]]:
     """Create opening geometry, drawing a door symbol only for observed leaves.
+
+    The label texts print true metres: ``width_scale`` (1 / metric units per metre) converts the plan-unit width and
+    ``height_scale`` (metric / detector units) the sill / head heights, which the detectors measure in detector metres.
 
     The DOOR block has its closed leaf along positive x and open leaf along
     positive y.  Its x scale therefore always points from the hinge to the
@@ -320,7 +327,7 @@ def opening_entities(
                 entities.extend([
                     {"type": "line", "start": (np.asarray(opening.center) - half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) - half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
                     {"type": "line", "start": (np.asarray(opening.center) + half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) + half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
-                    {"type": "text", "text": f"{'Tür' if opening.kind == 'DOOR' else 'Durchgang'} {opening.width:.2f} m" + _head_suffix(opening), "point": (np.asarray(opening.center) + normal * 0.15 * max(opening.wall_thickness / 0.25, 1.0)).tolist(), "height": 0.10, "rotation": math.degrees(opening.axis_angle), "_opening_label": True, "_opening_center": centre_marker},
+                    {"type": "text", "text": f"{'Tür' if opening.kind == 'DOOR' else 'Durchgang'} {opening.width * width_scale:.2f} m" + _head_suffix(opening, height_scale), "point": (np.asarray(opening.center) + normal * 0.15 * max(opening.wall_thickness / 0.25, 1.0)).tolist(), "height": 0.10, "rotation": math.degrees(opening.axis_angle), "_opening_label": True, "_opening_center": centre_marker},
                 ])
                 continue
             hinge_side = opening.hinge_side or "left"
@@ -335,7 +342,7 @@ def opening_entities(
             half = axis * (opening.width / 2.0)
             thickness = max(opening.wall_thickness, 0.01)
             centre_marker = [float(opening.center[0]), float(opening.center[1])]
-            entities.append({"type": "insert", "name": "DOOR", "point": hinge.tolist(), "rotation": math.degrees(math.atan2(direction[1], direction[0])), "xscale": opening.width, "yscale": float(swing_side) * opening.width * (1.0 if hinge_side == "left" else -1.0), "attributes": _door_attributes(opening), "_leaf_angle_deg": opening.leaf_angle_deg, "_leaf_mode": opening.leaf_mode, "_hinge_side": hinge_side, "_swing_side": swing_side, "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
+            entities.append({"type": "insert", "name": "DOOR", "point": hinge.tolist(), "rotation": math.degrees(math.atan2(direction[1], direction[0])), "xscale": opening.width, "yscale": float(swing_side) * opening.width * (1.0 if hinge_side == "left" else -1.0), "attributes": _door_attributes(opening, width_scale, height_scale), "_leaf_angle_deg": opening.leaf_angle_deg, "_leaf_mode": opening.leaf_mode, "_hinge_side": hinge_side, "_swing_side": swing_side, "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
             # The opening's jambs stay drawn beside the swing symbol (CAD convention: the wall ends at the opening are marked).
             entities.extend([
                 {"type": "line", "start": (np.asarray(opening.center) - half - normal * thickness / 2.0).tolist(), "end": (np.asarray(opening.center) - half + normal * thickness / 2.0).tolist(), "_jamb": True, "_opening_center": centre_marker},
@@ -348,7 +355,7 @@ def opening_entities(
                 positive, negative = _free_space_by_normal(opening, np.asarray(free_space_mask, dtype=bool), grid)
                 exterior_sign = -1.0 if positive >= negative else 1.0
             origin = np.asarray((opening.center[0] - opening.width / 2.0 * axis[0], opening.center[1] - opening.width / 2.0 * axis[1]))
-            entities.append({"type": "insert", "name": "WINDOW", "point": origin.tolist(), "rotation": math.degrees(opening.axis_angle), "xscale": opening.width, "yscale": exterior_sign * opening.wall_thickness, "attributes": _window_attributes(opening), "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
+            entities.append({"type": "insert", "name": "WINDOW", "point": origin.tolist(), "rotation": math.degrees(opening.axis_angle), "xscale": opening.width, "yscale": exterior_sign * opening.wall_thickness, "attributes": _window_attributes(opening, width_scale, height_scale), "_opening_center": list(opening.center), "_opening_kind": opening.kind, "_opening_evidence": opening.evidence})
             # Mullion bars (3D refinement): a line across the wall thickness at every measured position, drawn in the window layer.
             for position in opening.mullion_u:
                 start = origin + axis * float(position)

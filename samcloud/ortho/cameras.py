@@ -66,6 +66,7 @@ def _project_image_roots(resolved_project_dir: str) -> tuple[Path, ...]:
         _safe_get(document, "settings", "paths", "image_directory"),
         _safe_get(document, "settings", "acquisition", "sources", "image_directory"),
         _safe_get(document, "settings", "acquisition", "image_directory"),
+        _safe_get(document, "acquisition", "video", "frame_directory"),
     ]
 
     roots: list[Path] = []
@@ -81,7 +82,7 @@ def _project_image_roots(resolved_project_dir: str) -> tuple[Path, ...]:
                     seen.add(resolved)
                     roots.append(resolved)
 
-    for fallback in (project_dir / "inputs" / "cubemap", project_dir / "inputs" / "images", project_dir / "inputs"):
+    for fallback in (project_dir / "inputs" / "cubemap", project_dir / "inputs" / "video_frames", project_dir / "inputs" / "images", project_dir / "inputs"):
         resolved_fallback = fallback.resolve()
         if resolved_fallback not in seen:
             seen.add(resolved_fallback)

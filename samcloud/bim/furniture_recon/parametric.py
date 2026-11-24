@@ -17,7 +17,7 @@ from scipy import ndimage
 from shapely.geometry import MultiPoint, Polygon
 from shapely.geometry.polygon import orient
 
-from samcloud.bim.furniture_recon.geometry import Solid, box, cylinder, extrusion
+from samcloud.bim.furniture_recon.geometry import Solid, box, cylinder, extrusion, robust_union
 from samcloud.bim.furniture_recon.settings import ReconSettings
 
 
@@ -84,8 +84,15 @@ def occupancy_polygon(xy: np.ndarray, cell: float = 0.02) -> Polygon | None:
 
 
 def _iou(a: Polygon, b: Polygon) -> float:
-    union = a.union(b).area
-    return float(a.intersection(b).area / union) if union > 0 else 0.0
+    from shapely.errors import GEOSException
+
+    try:
+        union = a.union(b).area
+        return float(a.intersection(b).area / union) if union > 0 else 0.0
+    except GEOSException:
+        a, b = a.buffer(0), b.buffer(0)
+        union = robust_union([a, b]).area
+        return float(a.buffer(1e-9).intersection(b.buffer(1e-9)).area / union) if union > 0 else 0.0
 
 
 def top_outline(xy: np.ndarray, footprint: Polygon) -> tuple[str, Any]:
@@ -417,7 +424,7 @@ def fit_sofa(points: np.ndarray, footprint: Polygon, settings: ReconSettings, wi
     # arms: the remaining edges, measured without the back's points (the back corner would lift them to its height)
     import shapely
 
-    back_area = shapely.union_all([solid.outline().buffer(0.02) for solid in solids[1:]])
+    back_area = robust_union([solid.outline().buffer(0.02) for solid in solids[1:]])
     free = high[~shapely.contains_xy(back_area, high[:, 0], high[:, 1])]
     back_edges = {strip.edge for strip in backs}
     for strip in raised_strips(free, footprint, depth_max):
@@ -427,11 +434,41 @@ def fit_sofa(points: np.ndarray, footprint: Polygon, settings: ReconSettings, wi
     return solids
 
 
+def _trim_to_sleeping_surface(points: np.ndarray, footprint: Polygon, top: float, settings: ReconSettings) -> Polygon:
+    """The bed's base outline without a low neighbour the plan outline swallowed (a bench, draped blanket, bedside piece).
+
+    The outline of a bed comes from the plan's height map, where a low object touching the bed joins its mask.  The sleeping
+    surface itself is where points stand at mattress / bedding height (>= ``bed_surface_share`` of the surface level): a side of the outline
+    that reaches more than ``bed_trim_gap_m`` beyond those points is cut back to them (+ the footprint margin).  Only the box of the
+    outline is cut, and only when at least 60 % of its area remains; a bed measured over its whole outline keeps it.
+    """
+    raised = points[points[:, 2] >= settings.bed_surface_share * top]
+    if len(raised) < max(50, int(0.3 * len(points))):
+        return footprint
+    margin = settings.footprint_margin_m
+    bounds = list(footprint.bounds)  # minx, miny, maxx, maxy
+    for axis in (0, 1):
+        low, high = (float(v) for v in np.percentile(raised[:, axis], [0.5, 99.5]))
+        if low - bounds[axis] > settings.bed_trim_gap_m:
+            bounds[axis] = low - margin
+        if bounds[axis + 2] - high > settings.bed_trim_gap_m:
+            bounds[axis + 2] = high + margin
+    if tuple(bounds) == tuple(footprint.bounds):
+        return footprint
+    from shapely.geometry import box as _box
+
+    trimmed = footprint.intersection(_box(*bounds))
+    if isinstance(trimmed, Polygon) and not trimmed.is_empty and trimmed.area >= 0.6 * footprint.area:
+        return trimmed
+    return footprint
+
+
 def fit_bed(points: np.ndarray, footprint: Polygon, settings: ReconSettings, window: tuple[float, float]) -> list[Solid] | None:
     level = surface_level(points, 0.20, min(0.90, window[1]))
     if not _real_surface(points, level, footprint):
         return None
     top = level.top
+    footprint = _trim_to_sleeping_surface(points, footprint, top, settings)
     solids = [extrusion("base_mattress", footprint, 0.0, top)]
     high = points[points[:, 2] > top + 0.12]
     minx, miny, maxx, maxy = footprint.bounds

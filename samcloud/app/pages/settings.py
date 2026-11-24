@@ -19,6 +19,7 @@ from samcloud.app.i18n import (
     t,
     user_language,
 )
+from samcloud.app.components.native_dialogs import attach_file_button, attach_folder_button
 from samcloud.app.layout import render_page
 from samcloud.app.pages.projects import (
     CAPTURE_TYPE_OPTIONS,
@@ -179,6 +180,7 @@ def render() -> None:
         )
         sources = acquisition.setdefault("sources", {})
         panorama = acquisition.setdefault("panorama", {})
+        video_settings = acquisition.setdefault("video", {"frame_interval_seconds": 1.0})
         georeferencing = acquisition.setdefault("georeferencing", {})
         capture_type = acquisition.get("type", "drone_gps")
         acquisition_locked = bool(acquisition.get("locked", False))
@@ -200,6 +202,7 @@ def render() -> None:
                     t("settings.capture.image_directory"), value=sources.get("image_directory", "")
                 ).classes("w-full")
                 image_directory.set_enabled(not acquisition_locked)
+                attach_folder_button(image_directory, t("projects.create.select_directory"))
                 rtk_enabled = ui.switch(
                     t("settings.capture.rtk"), value=bool(georeferencing.get("rtk_enabled", False))
                 )
@@ -208,14 +211,40 @@ def render() -> None:
                 panorama_video_path = None
                 panorama_image_directory = None
                 frame_interval_seconds = None
+                video_path = None
+                video_interval = None
+                if capture_type == "camera":
+                    video_path = ui.input(
+                        t("settings.capture.camera_video"), value=sources.get("video_path", "")
+                    ).classes("w-full").mark("camera-video-input")
+                    attach_file_button(
+                        video_path, t("projects.create.select_video_file"),
+                        [("Video", "*.mp4 *.mov *.m4v *.avi *.mkv"), ("All files", "*.*")],
+                    )
+                    attach_folder_button(video_path, t("projects.create.select_video_folder"), "video_library")
+                    ui.label(t("projects.create.camera_video_hint")).classes("sam-muted text-sm")
+                    video_interval = ui.number(
+                        t("settings.capture.frame_interval"),
+                        value=video_settings.get("frame_interval_seconds", 1.0),
+                        min=0.1,
+                        step=0.1,
+                    ).classes("w-full").mark("frame-interval-input")
+                    video_interval.bind_visibility_from(video_path, "value", lambda value: bool((value or "").strip()))
+                    for element in (video_path, video_interval):
+                        element.set_enabled(not acquisition_locked)
             else:
                 panorama_video_path = ui.input(
                     t("settings.capture.panorama_video"), value=sources.get("panorama_video_path", "")
                 ).classes("w-full")
+                attach_file_button(
+                    panorama_video_path, t("projects.create.select_video_file"), [("MP4", "*.mp4"), ("All files", "*.*")]
+                )
+                attach_folder_button(panorama_video_path, t("projects.create.select_video_folder"), "video_library")
                 panorama_image_directory = ui.input(
                     t("settings.capture.panorama_directory"),
                     value=sources.get("panorama_image_directory", ""),
                 ).classes("w-full")
+                attach_folder_button(panorama_image_directory, t("projects.create.select_photo_folder"))
                 frame_interval_seconds = ui.number(
                     t("settings.capture.frame_interval"),
                     value=panorama.get("frame_interval_seconds", 1.0),
@@ -226,6 +255,8 @@ def render() -> None:
                     element.set_enabled(not acquisition_locked)
                 image_directory = None
                 rtk_enabled = None
+                video_path = None
+                video_interval = None
         with ui.card().classes("w-full"):
             ui.label(t("settings.coordinates.title")).classes("text-lg font-medium")
             input_crs = ui.input(t("settings.coordinates.input"), value=coordinates["input_crs"])
@@ -341,6 +372,8 @@ def render() -> None:
             "panorama_video_path": panorama_video_path,
             "panorama_image_directory": panorama_image_directory,
             "frame_interval_seconds": frame_interval_seconds,
+            "video_path": video_path,
+            "video_interval": video_interval,
             "input_crs": input_crs,
             "working_crs": working_crs,
             "export_crs": export_crs,
@@ -379,6 +412,9 @@ def render() -> None:
                         sources["image_directory"] = image_directory.value or ""
                         project["paths"]["image_directory"] = sources["image_directory"]
                         georeferencing["rtk_enabled"] = bool(rtk_enabled.value)
+                        if video_path is not None:
+                            sources["video_path"] = (video_path.value or "").strip()
+                            video_settings["frame_interval_seconds"] = float(video_interval.value or 0)
                     else:
                         sources["panorama_video_path"] = panorama_video_path.value or ""
                         sources["panorama_image_directory"] = panorama_image_directory.value or ""
@@ -388,7 +424,10 @@ def render() -> None:
                         image_directory=sources.get("image_directory", ""),
                         panorama_image_directory=sources.get("panorama_image_directory", ""),
                         panorama_video_path=sources.get("panorama_video_path", ""),
-                        frame_interval_seconds=float(panorama.get("frame_interval_seconds", 1.0)),
+                        frame_interval_seconds=float(
+                            (video_settings if capture_type == "camera" else panorama).get("frame_interval_seconds", 1.0)
+                        ),
+                        video_path=sources.get("video_path", "") if capture_type == "camera" else "",
                     )
                 coordinates["input_crs"] = input_crs.value
                 coordinates["working_crs"] = working_crs.value

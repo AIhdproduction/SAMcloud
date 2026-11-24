@@ -64,3 +64,8 @@ windows:
   box: [0.0, null]
   mesh: [0.0, null]
   toilet: [0.0, 1.30]
+# A bed's base outline comes from the plan height map, where a low neighbour touching the bed (bench, draped blanket, bedside
+# piece) joins its mask. The sleeping surface is where points stand at >= bed_surface_share of the surface level; a side of the
+# outline reaching more than bed_trim_gap_m beyond those points is cut back to them (only when >= 60 % of the area remains).
+bed_trim_gap_m: 0.12
+bed_surface_share: 0.6

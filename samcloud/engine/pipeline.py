@@ -38,7 +38,7 @@ from samcloud.colmap.alignment import (
     write_pose_priors_from_gps_ref,
 )
 from samcloud.colmap.camera_groups import assign_camera_groups
-from samcloud.colmap.gravity import align_sparse_model
+from samcloud.colmap.gravity import align_camera_model, align_sparse_model
 from samcloud.colmap.plane_fill import fill_classified_cloud
 from samcloud.core.configuration import load_global_config
 from samcloud.core.project_manager import ProjectManager
@@ -263,11 +263,18 @@ def _panorama_source_width(args) -> int | None:
         try:
             import cv2
 
-            capture = cv2.VideoCapture(str(args.panorama_video))
-            try:
-                width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) if capture.isOpened() else 0
-            finally:
-                capture.release()
+            from samcloud.acquisition.video import PANORAMA_VIDEO_EXTENSIONS, find_videos
+
+            first_video = next(iter(find_videos(args.panorama_video, PANORAMA_VIDEO_EXTENSIONS)), None)
+            if first_video is None and not Path(args.panorama_video).is_dir():
+                first_video = Path(args.panorama_video)
+            width = 0
+            if first_video is not None:
+                capture = cv2.VideoCapture(str(first_video))
+                try:
+                    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) if capture.isOpened() else 0
+                finally:
+                    capture.release()
             if width > 0:
                 return width
         except Exception:  # noqa: BLE001 - only an estimate
@@ -286,6 +293,26 @@ def _expected_input_long_side(args) -> int | None:
             native = native_face_size(width)
             return native if requested <= 0 else min(requested, native)
         return requested if requested > 0 else None
+    if getattr(args, "video", None):
+        # the frames folder is empty before extraction: the video header tells the frame size
+        try:
+            import cv2
+
+            from samcloud.acquisition.video import CAMERA_VIDEO_EXTENSIONS, find_videos
+
+            first_video = next(iter(find_videos(args.video, CAMERA_VIDEO_EXTENSIONS)), None)
+            if first_video is None:
+                return None
+            capture = cv2.VideoCapture(str(first_video))
+            try:
+                if not capture.isOpened():
+                    return None
+                longest = int(max(capture.get(cv2.CAP_PROP_FRAME_WIDTH), capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            finally:
+                capture.release()
+            return longest if longest > 0 else None
+        except Exception:  # noqa: BLE001 - only an estimate
+            return None
     if not getattr(args, "images", None):
         return None
     try:
@@ -755,6 +782,22 @@ def _align_panorama_gravity(sparse_dir: Path, model0: Path, report_dir: Path) ->
     return aligned_model, report
 
 
+def _align_camera_gravity(sparse_dir: Path, model0: Path, report_dir: Path) -> tuple[Path, dict[str, object]]:
+    """Level an indoor camera model (floor horizontal); same outputs as the panorama gravity step."""
+    aligned_model = sparse_dir / "0_gravity"
+    report = align_camera_model(model0, aligned_model)
+    report_path = report_dir / "gravity_alignment.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    for warning in report.get("warnings") or []:
+        print(f"WARNING: {warning}")
+    print(
+        f"Camera gravity alignment ({report['method']}): {report['image_count']} images, "
+        f"tilt corrected {float(report['tilt_corrected_deg']):.2f} degrees."
+    )
+    return aligned_model, report
+
+
 def _transform_tag_report_to_gravity(report_path: Path, gravity_report: dict[str, object]) -> None:
     """Bring a scale-only AprilTag report into the gravity-aligned frame of the final model."""
     report_path = Path(report_path)
@@ -827,6 +870,50 @@ def _model_registered_image_count(model_path: Path) -> int | None:
         return int.from_bytes(raw, "little") if len(raw) == 8 else None
     except OSError:
         return None
+
+
+def _promote_largest_sparse_model(sparse_dir: Path) -> dict[str, object]:
+    """Make the sparse model with the most registered images "sparse/0".
+
+    COLMAP's mapper numbers models in creation order, not by size, so a small
+    side model can be "0". The largest model (ties: more points) is swapped
+    into "0"; the old "0" takes the largest model's former number.
+    """
+    models: list[dict[str, object]] = []
+    if sparse_dir.is_dir():
+        for child in sparse_dir.iterdir():
+            if not (child.is_dir() and child.name.isdigit()):
+                continue
+            registered = _model_registered_image_count(child)
+            if registered is None:
+                continue
+            models.append({
+                "index_original": int(child.name),
+                "registered_images": registered,
+                "points": _model_point_count(child) or 0,
+            })
+    models.sort(key=lambda m: int(m["index_original"]))
+    info: dict[str, object] = {"models": models, "promoted_from": None}
+    if len(models) < 2:
+        return info
+    best = max(models, key=lambda m: (int(m["registered_images"]), int(m["points"]), -int(m["index_original"])))
+    counts = ", ".join(str(m["registered_images"]) for m in models)
+    best_index = int(best["index_original"])
+    if best_index == 0:
+        print(f"Sparse models: {len(models)} (registered {counts}); sparse/0 is already the largest.")
+        return info
+    print(
+        f"Sparse models: {len(models)} (registered {counts}); "
+        f"using the largest ({best['registered_images']} images) as sparse/0."
+    )
+    first = sparse_dir / "0"
+    other = sparse_dir / str(best_index)
+    temp = sparse_dir / f"_swap_{uuid.uuid4().hex[:8]}"
+    first.rename(temp)
+    other.rename(first)
+    temp.rename(other)
+    info["promoted_from"] = best_index
+    return info
 
 
 def _require_usable_sparse_model(model_path: Path, input_image_count: int) -> None:
@@ -981,11 +1068,26 @@ def _estimate_prepare_work(args) -> tuple[int, int]:
                 pass
         if args.panorama_video:
             try:
-                sources += expected_video_frame_count(Path(args.panorama_video), args.frame_interval) or 0
+                if Path(args.panorama_video).is_dir():
+                    from samcloud.acquisition.video import PANORAMA_VIDEO_EXTENSIONS, find_videos
+
+                    for video in find_videos(args.panorama_video, PANORAMA_VIDEO_EXTENSIONS):
+                        sources += expected_video_frame_count(video, args.frame_interval) or 0
+                else:
+                    sources += expected_video_frame_count(Path(args.panorama_video), args.frame_interval) or 0
             except (OSError, ValueError, TypeError):
                 pass
         sources = max(sources, 1)
         return sources, 6 * sources
+    if getattr(args, "video", None):
+        try:
+            from samcloud.acquisition.video import CAMERA_VIDEO_EXTENSIONS, expected_frame_count, find_videos
+
+            sources = expected_frame_count(find_videos(args.video, CAMERA_VIDEO_EXTENSIONS), args.frame_interval) or 0
+        except (OSError, ValueError, TypeError):
+            sources = 0
+        sources = max(sources, 1)
+        return sources, sources
     try:
         if args.images:
             extensions = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
@@ -1004,6 +1106,20 @@ def resolve_input_images(
         if not args.images:
             parser.error("--images is required for drone_gps and camera capture types")
         images_dir = Path(args.images).resolve()
+        if getattr(args, "video", None):
+            from samcloud.acquisition.video import prepare_camera_video_frames
+
+            try:
+                prepared_video = prepare_camera_video_frames(
+                    args.video, images_dir, args.frame_interval, progress_callback,
+                )
+            except CaptureValidationError as error:
+                parser.error(str(error))
+            print(
+                f"Prepared camera video frames: {prepared_video.frame_count} frames "
+                f"from {prepared_video.video_count} video(s) in {prepared_video.frames_directory}"
+            )
+            return prepared_video.frames_directory, False, None
         if not images_dir.is_dir():
             parser.error(f"Image directory was not found: {images_dir}")
         return images_dir, False, None
@@ -2648,7 +2764,8 @@ def main():
     ap.add_argument("--capture-type", choices=("drone_gps", "camera", "panorama_360"), default="drone_gps")
     ap.add_argument("--images", help="folder with normal drone or camera photos")
     ap.add_argument("--panorama-images", help="folder with exported 2:1 JPG panoramas")
-    ap.add_argument("--panorama-video", help="exported 2:1 MP4 panorama video")
+    ap.add_argument("--video", help="camera video file or folder of videos; frames are extracted into --images")
+    ap.add_argument("--panorama-video", help="2:1 MP4 panorama video or folder of such videos")
     ap.add_argument("--panorama-workdir", help="project-owned directory for frames, cubemaps, and manifest")
     ap.add_argument("--frame-interval", type=float, default=1.0,
                     help="fixed 360 degree video frame interval in seconds")
@@ -2763,6 +2880,8 @@ def main():
         help="after a successful run, create the DXF/IFC export as a separate final stage",
     )
     args = ap.parse_args()
+    if args.video and args.capture_type != "camera":
+        ap.error("--video is only supported with --capture-type camera")
     _request_auto_dxf(args)
 
     if args.control_points_mode == "after_alignment":
@@ -3104,6 +3223,8 @@ def main():
     if progress:
         progress.update(52, "Aligning cameras")
 
+    sparse_models_info = _promote_largest_sparse_model(sparse_dir)
+    summary.settings["sparse_models"] = sparse_models_info["models"]
     model0 = sparse_dir / "0"
     if not model0.exists():
         sys.exit("colmap mapper did not produce a reconstruction (sparse/0 missing). Check image overlap/quality.")
@@ -3230,6 +3351,17 @@ def main():
         model0, gravity_report = _align_panorama_gravity(sparse_dir, model0, report_dir)
         summary.settings["gravity_alignment"] = gravity_report
         _transform_tag_report_to_gravity(report_dir / "apriltag_report.json", gravity_report)
+    elif (
+        args.capture_type == "camera" and getattr(args, "class_set", None) == "indoor"
+        and bool(alignment_config.get("gravity_align_camera_indoor", True))
+        and not tag_georeferenced and not georeferenced and not automatic_model_used
+    ):
+        try:
+            model0, gravity_report = _align_camera_gravity(sparse_dir, model0, report_dir)
+            summary.settings["gravity_alignment"] = gravity_report
+            _transform_tag_report_to_gravity(report_dir / "apriltag_report.json", gravity_report)
+        except Exception as error:  # noqa: BLE001 - an unlevelled model is still usable
+            print(f"WARNING: Camera gravity alignment failed, the model keeps its orientation: {error}")
     _write_final_model(sparse_dir, model0)
 
     # 4) Undistort for dense stereo, this also writes a PINHOLE sparse model

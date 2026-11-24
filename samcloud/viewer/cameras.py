@@ -257,7 +257,7 @@ def _camera_source(project_directory: Path, image_name: str, panorama_sources: d
 
 
 def _source_roots(project_directory: Path) -> list[Path]:
-    roots = [project_directory / "inputs" / "images", project_directory / "inputs", project_directory / "inputs" / "panorama_frames"]
+    roots = [project_directory / "inputs" / "images", project_directory / "inputs", project_directory / "inputs" / "panorama_frames", project_directory / "inputs" / "video_frames"]
     try:
         project = yaml.safe_load((project_directory / "project.samcloud.yml").read_text(encoding="utf-8")) or {}
         if not isinstance(project, dict):
@@ -269,12 +269,15 @@ def _source_roots(project_directory: Path) -> list[Path]:
             sources = {}
         if not isinstance(paths, dict):
             paths = {}
+        video = acquisition.get("video", {}) if isinstance(acquisition, dict) else {}
+        video_frames = video.get("frame_directory") if isinstance(video, dict) else None
         for value in (
             sources.get("image_directory") or paths.get("image_directory"),
             sources.get("panorama_image_directory"),
+            video_frames,
         ):
             if isinstance(value, str) and value:
-                roots.append(Path(value))
+                roots.append(project_directory / value)
     except (OSError, TypeError, ValueError):
         pass
     return [path.resolve() for path in roots if path.is_dir()]

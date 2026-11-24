@@ -22,7 +22,7 @@ from samcloud.bim.furniture_recon.cloud import (
 )
 from samcloud.bim.furniture_recon.families import STANDING_FAMILIES, WINDOW_KEY, allows_tall_gaps, family_of, is_low_piece, may_hang
 from samcloud.bim.furniture_recon.geometry import (
-    ItemFrame, Mesh, Solid, extrusion, frame_for_footprint, mesh_to_plan, outline_to_plan, projected_outline, solid_to_plan,
+    ItemFrame, Mesh, Solid, extrusion, frame_for_footprint, mesh_to_plan, outline_to_plan, projected_outline, robust_union, solid_to_plan,
 )
 from samcloud.bim.furniture_recon.mesh import fit_mesh
 from samcloud.bim.furniture_recon.metrics import FitMetrics, evaluate
@@ -353,7 +353,7 @@ def reconstruct_items(
                 grown_xy = work.frame.to_item(cloud.xyz[grown])[:, :2]
                 hull = MultiPoint([tuple(p) for p in np.unique(np.round(grown_xy, 2), axis=0)]).convex_hull
                 gap = settings.footprint_margin_m + 0.02  # the grown points start beyond the selection margin
-                merged = footprint_item.union(hull).buffer(gap).buffer(-gap) if isinstance(hull, Polygon) else footprint_item
+                merged = robust_union([footprint_item, hull]).buffer(gap).buffer(-gap) if isinstance(hull, Polygon) else footprint_item
                 # growth is evidence that the outline was cut short, not licence to swallow a neighbour: at most max_grow_ratio x the outline
                 if isinstance(merged, Polygon) and footprint_item.area * 1.05 < merged.area <= footprint_item.area * (1.0 + settings.max_grow_ratio):
                     footprint_fit = Polygon(merged.exterior).simplify(0.01)

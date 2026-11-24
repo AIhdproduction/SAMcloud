@@ -16,7 +16,8 @@
     "rtk": "Images use RTK GPS",
     "panorama_video": "360 degree MP4 video",
     "panorama_directory": "360 degree JPG panorama directory",
-    "frame_interval": "Video frame interval in seconds"
+    "frame_interval": "Video frame interval in seconds",
+    "camera_video": "Video or folder of videos (instead of photos)"
   },
   "coordinates": {
     "title": "Coordinate systems",

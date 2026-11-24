@@ -647,10 +647,11 @@ def test_room_edge_drops_a_stub_left_beside_a_window_span() -> None:
     # Window span x 1.13..3.87 leaves 0.13 m beside it at both ends, far below room_edge_min_length (0.3 m): no stub block.
     room, grid, free, valid, entities = _hidden_north_wall_scene()
     window = Opening("WINDOW", (2.5, 3.8), 2.7, 0.0, 0.3)
-    result = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, SETTINGS)
+    result = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, replace(SETTINGS, unmeasured_thickness_m=0.0))
     body = _body(result)
     assert not body.contains(Point(1.08, 3.55)) and not body.contains(Point(3.93, 3.55)) and not body.contains(Point(2.5, 3.55))
-    off = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, replace(SETTINGS, room_edge_opening_reach_m=0.0))
+    # (the geometry below assumes the 0.30 m exterior default: this scene has no measured thickness, so the prior is switched off)
+    off = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, replace(SETTINGS, room_edge_opening_reach_m=0.0, unmeasured_thickness_m=0.0))
     assert _body(off).contains(Point(2.5, 3.55)) and _body(off).contains(Point(3.93, 3.55))
 
 
@@ -956,3 +957,66 @@ def test_a_door_beside_the_end_of_a_wall_is_hosted_in_that_walls_band() -> None:
     centre = _run_centre(host[0], faces[host[0].face], host[0].start + 0.3)
     wall_line_y = 0.0 + (centre[0] / 3.012) * 0.007  # the wall's centreline continued
     assert abs(centre[1] - wall_line_y) <= 0.01
+
+
+# -- thickness without any measured evidence (one room scanned from the inside) ------------------------------
+
+def _single_room(upm: float = 1.0):
+    s = upm
+    room = box(0.0, 0.0, 4.0 * s, 3.0 * s)
+    grid = _grid((-1.0 * s, -1.0 * s, 5.0 * s, 4.0 * s), 0.02 * s)
+    free = _mask(grid, [room])
+    valid = _mask(grid, [room.buffer(0.05 * s, join_style=2)])
+    return _rect_faces(0.0, 0.0, 4.0 * s, 3.0 * s), [room], free, valid, grid
+
+
+@pytest.mark.parametrize("upm", [1.0, 0.8157])
+def test_storey_without_measured_thickness_takes_the_prior_for_every_wall(upm: float) -> None:
+    entities, rooms, free, valid, grid = _single_room(upm)
+    result = build_double_walls(entities, [], rooms, free, valid, grid, upm, SETTINGS)
+    assert result.stats["double_wall_thickness_prior"] is True
+    assert result.stats["double_wall_exterior_measured"] is False
+    assert result.pieces and all(abs(piece["thickness"] - 0.20) <= 1e-6 for piece in result.pieces)
+    # off: the exterior default of old
+    legacy = build_double_walls(entities, [], rooms, free, valid, grid, upm, replace(SETTINGS, unmeasured_thickness_m=0.0))
+    assert legacy.stats["double_wall_thickness_prior"] is False
+    assert all(abs(piece["thickness"] - 0.30) <= 1e-6 for piece in legacy.pieces)
+
+
+def test_a_measured_pair_switches_the_prior_off() -> None:
+    entities, rooms, free, valid, grid = _two_rooms()
+    result = build_double_walls(entities, [], rooms, free, valid, grid, 1.0, SETTINGS)
+    assert result.stats["double_wall_thickness_prior"] is False
+    assert any(abs(piece["thickness"] - 0.30) <= 1e-6 for piece in result.pieces if piece["kind"] == "exterior")  # exterior default as before
+
+
+def test_a_face_seen_only_beside_a_face_is_no_thickness_measurement() -> None:
+    # An exterior run whose only evidence is a weak pair (the opposite face seen only beside it: a window plane 0.25 m behind
+    # the inner face) must not set the thickness of every wall of the storey; with the prior off it still does (as before).
+    from samcloud.ortho.vector.double_walls import _Samples, _learn_thickness
+
+    along = np.arange(0.0, 3.0, 0.05)
+    nothing = np.full(len(along), np.nan)
+    samples = [_Samples(along, nothing, nothing, np.zeros(len(along), dtype=bool))]
+    runs = [WallRun(0, 0.0, 3.0, 0.0, "exterior", "pending")]
+    weak = {0: [(0.0, 3.0, 0.25, 1, False)]}
+    _interior, value, stats = _learn_thickness(runs, samples, weak, 1.0, SETTINGS)
+    assert stats["double_wall_thickness_prior"] is True and stats["double_wall_exterior_measured"] is False and value == pytest.approx(0.20)
+    _interior, value, stats = _learn_thickness(runs, samples, weak, 1.0, replace(SETTINGS, unmeasured_thickness_m=0.0))
+    assert stats["double_wall_thickness_prior"] is False and stats["double_wall_exterior_measured"] is True and value == pytest.approx(0.25)
+    # a strong (overlapping) pair is a measurement: no prior
+    strong = np.full(len(along), 0.22)
+    runs = [WallRun(0, 0.0, 3.0, 0.0, "exterior", "pending")]
+    _interior, value, stats = _learn_thickness(runs, [_Samples(along, strong, nothing, np.zeros(len(along), dtype=bool))], {}, 1.0, SETTINGS)
+    assert stats["double_wall_thickness_prior"] is False and value == pytest.approx(0.22)
+
+
+def test_hostless_door_host_takes_the_prior_thickness_only_with_the_prior() -> None:
+    door = Opening("DOOR", (0.0, 0.0), 0.9, 0.0, 0.05, leaf_detected=False)
+    for host_default, expected in ((0.20, 0.20), (None, 0.15)):
+        runs: list[WallRun] = []
+        faces: list[_Face] = []
+        from samcloud.ortho.vector.double_walls import _enforce_door_spans
+
+        counts = _enforce_door_spans(runs, faces, [door], 1.0, SETTINGS, host_default=host_default)
+        assert counts["hosts_built"] == 1 and runs[0].thickness == pytest.approx(expected)

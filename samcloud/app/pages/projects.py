@@ -4,12 +4,12 @@ import tempfile
 from datetime import datetime
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from tkinter import TclError, Tk, filedialog
 from typing import Any
 
 from nicegui import events, ui
 
 from samcloud.app.i18n import catalogue, current_language, t, translate_or
+from samcloud.app.components.native_dialogs import attach_file_button, attach_folder_button
 from samcloud.app.components.preflight import PreflightPanel
 from samcloud.app.layout import render_page
 from samcloud.app.pages.control_points import crs_options, local_crs_hint
@@ -191,6 +191,16 @@ def render() -> None:
                 lambda event: setattr(class_set, "value", "indoor") if event.value == "panorama_360" else None
             )
             class_set.on_value_change(lambda event: setattr(apriltag_switch, "value", event.value == "indoor"))
+            camera_outdoor_hint = ui.label(t("projects.create.camera_outdoor_hint")).classes(
+                "sam-muted text-sm").mark("camera-outdoor-hint")
+
+            def update_camera_outdoor_hint() -> None:
+                """Outdoor camera projects need control points; only indoor levels the floor automatically."""
+                camera_outdoor_hint.set_visibility(capture_type.value == "camera" and class_set.value == "outdoor")
+
+            capture_type.on_value_change(lambda _: update_camera_outdoor_hint())
+            class_set.on_value_change(lambda _: update_camera_outdoor_hint())
+            update_camera_outdoor_hint()
             tag_upload: dict[str, str | None] = {"path": None}
             with ui.column().classes("w-full gap-2"):
                 with ui.column().classes("w-full gap-2").bind_visibility_from(apriltag_switch, "value"):
@@ -241,42 +251,23 @@ def render() -> None:
                     for key, label in STORAGE_OPTIONS.items()
                 }
 
+            video_defaults = load_global_config("defaults.yml").get("acquisition", {}).get("video", {})
+            camera_video_filetypes = [("Video", "*.mp4 *.mov *.m4v *.avi *.mkv"), ("All files", "*.*")]
+
+            def add_folder_button(field: Any, title_key: str, icon: str = "folder_open") -> None:
+                attach_folder_button(field, t(title_key), icon)
+
+            def add_video_file_button(field: Any, title_key: str, filetypes: list[tuple[str, str]]) -> None:
+                attach_file_button(field, t(title_key), filetypes)
+
             with ui.column().classes("w-full gap-3").bind_visibility_from(
                 capture_type, "value", lambda value: value in {"drone_gps", "camera"}
             ):
                 image_directory = ui.input(
                     t("projects.create.image_directory"), placeholder="D:\\data\\camera-images"
                 ).classes("w-full").mark("image-directory-input")
+                add_folder_button(image_directory, "projects.create.select_directory")
                 rtk_enabled = ui.switch(t("projects.create.rtk"), value=True)
-
-                def choose_image_directory() -> None:
-                    """Open the native Windows folder dialog for the image source."""
-                    dialog_root = None
-                    try:
-                        dialog_root = Tk()
-                        dialog_root.withdraw()
-                        dialog_root.attributes("-topmost", True)
-                        current_directory = Path(image_directory.value or "")
-                        selected_directory = filedialog.askdirectory(
-                            initialdir=current_directory if current_directory.is_dir() else None,
-                            parent=dialog_root,
-                            title=t("projects.create.select_directory"),
-                            mustexist=True,
-                        )
-                    except TclError as error:
-                        ui.notify(t("projects.create.dialog_failed", error=error), type="negative")
-                        return
-                    finally:
-                        if dialog_root is not None:
-                            dialog_root.destroy()
-                    if selected_directory:
-                        image_directory.value = selected_directory
-
-                with image_directory.add_slot("append"):
-                    ui.button(
-                        icon="folder_open",
-                        on_click=choose_image_directory,
-                    ).props(f"flat round dense aria-label='{t('projects.create.select_directory')}'")
 
                 def update_rtk_option() -> None:
                     is_rtk_capture = capture_type.value == "drone_gps"
@@ -286,6 +277,16 @@ def render() -> None:
                 capture_type.on_value_change(lambda _: update_rtk_option())
                 update_rtk_option()
 
+                with ui.column().classes("w-full gap-1").bind_visibility_from(
+                    capture_type, "value", lambda value: value == "camera"
+                ):
+                    video_path = ui.input(
+                        t("projects.create.camera_video"), placeholder="D:\\data\\clip.mp4"
+                    ).classes("w-full").mark("camera-video-input")
+                    add_video_file_button(video_path, "projects.create.select_video_file", camera_video_filetypes)
+                    add_folder_button(video_path, "projects.create.select_video_folder", "video_library")
+                    ui.label(t("projects.create.camera_video_hint")).classes("sam-muted text-sm")
+
             with ui.column().classes("w-full gap-3").bind_visibility_from(
                 capture_type, "value", lambda value: value == "panorama_360"
             ):
@@ -293,16 +294,41 @@ def render() -> None:
                 panorama_video_path = ui.input(
                     t("projects.create.panorama_video"), placeholder="D:\\data\\tour.mp4"
                 ).classes("w-full").mark("panorama-video-input")
+                add_video_file_button(
+                    panorama_video_path, "projects.create.select_video_file",
+                    [("MP4", "*.mp4"), ("All files", "*.*")],
+                )
+                add_folder_button(panorama_video_path, "projects.create.select_video_folder", "video_library")
                 panorama_image_directory = ui.input(
                     t("projects.create.panorama_directory"),
                     placeholder="D:\\data\\insta360-photos",
                 ).classes("w-full").mark("panorama-directory-input")
-                frame_interval_seconds = ui.number(
-                    t("projects.create.frame_interval"),
-                    value=panorama_defaults.get("frame_interval_seconds", 1.0),
-                    min=0.1,
-                    step=0.1,
-                ).classes("w-full").mark("frame-interval-input")
+                add_folder_button(panorama_image_directory, "projects.create.select_photo_folder")
+
+            frame_interval_seconds = ui.number(
+                t("projects.create.frame_interval"),
+                value=panorama_defaults.get("frame_interval_seconds", 1.0),
+                min=0.1,
+                step=0.1,
+            ).classes("w-full").mark("frame-interval-input")
+
+            def update_frame_interval() -> None:
+                """One interval field for 360 videos and camera videos; the default follows the capture type."""
+                frame_interval_seconds.set_visibility(
+                    capture_type.value == "panorama_360"
+                    or (capture_type.value == "camera" and bool((video_path.value or "").strip()))
+                )
+
+            def set_interval_default(event: Any) -> None:
+                if event.value == "panorama_360":
+                    frame_interval_seconds.value = panorama_defaults.get("frame_interval_seconds", 1.0)
+                elif event.value == "camera":
+                    frame_interval_seconds.value = video_defaults.get("frame_interval_seconds", 1.0)
+
+            capture_type.on_value_change(set_interval_default)
+            capture_type.on_value_change(lambda _: update_frame_interval())
+            video_path.on_value_change(lambda _: update_frame_interval())
+            update_frame_interval()
 
             PreflightPanel(
                 capture_type=capture_type,
@@ -312,6 +338,7 @@ def render() -> None:
                 frame_interval=frame_interval_seconds,
                 storage_switches=storage_switches,
                 projects_directory=lambda: state.projects.projects_directory,
+                video_path=video_path,
             )
 
             def create_project() -> None:
@@ -323,15 +350,17 @@ def render() -> None:
                     engine_value, auto_dxf_value = creation_engine_and_auto_dxf(
                         class_set.value, classification_engine.value, bool(auto_dxf.value)
                     )
+                    is_camera = capture_type.value == "camera"
                     project_directory = state.projects.create_project(
                         name.value,
-                        image_directory.value or "",
+                        "" if capture_type.value == "panorama_360" else (image_directory.value or ""),
                         capture_type=capture_type.value,
                         class_set=class_set.value,
                         classification_engine=engine_value,
                         custom_classes=class_editor.customization(),
                         panorama_image_directory=panorama_image_directory.value or "",
                         panorama_video_path=panorama_video_path.value or "",
+                        video_path=(video_path.value or "").strip() if is_camera else "",
                         frame_interval_seconds=float(frame_interval_seconds.value or 0),
                         rtk_enabled=rtk_enabled.value,
                         control_points_mode=control_points_mode.value,

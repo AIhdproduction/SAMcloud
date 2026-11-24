@@ -103,7 +103,11 @@ stored as `source.scale_source` in `plan_model.json`.
   detail lines (`A-FURN-DETL`) and a text label such as "Sofa h=0.85";
   built-in fronts that are really a unit's face go to `A-EINB`
   (`builtin_fronts.py`, `vertical.py`);
-- instance labels name furniture and fixtures (Regal, Tisch, Stuhl, Schrank).
+  a wardrobe whose back wall was only seen as a short stub at the unit's end (one room scanned
+  from the inside) is followed along its front up to `indoor_builtin_fronts.stub_bridge_m` to
+  that stub, so the wall runs behind the whole unit;
+- instance labels name furniture and fixtures (Regal, Tisch, Stuhl, Schrank); a label that cannot be that
+  large (a "nightstand" on a 2 x 1.8 m footprint, `indoor_label_size`) is replaced by the next plausible vote (bed).
 
 ### Double-line walls
 
@@ -132,6 +136,11 @@ measured faces. The steps below decide the other walls.
    or `exterior_thickness_m`. Collinear faces of one wall line share the measured
    thickness and are aligned on one line, so a face seen only in part still gets a
    straight, consistent second face.
+   A storey with no measured thickness evidence at all (no face pair, no room-edge
+   distance, only weak pairs such as a window plane beside its reveal: one room scanned
+   from the inside) has no basis for either default; all its walls take
+   `unmeasured_thickness_m` (0.20 m, `0` = keep the two defaults) and the door hosts
+   built for it use the same value.
    Above a door with a measured head two scanned planes replace such an assumed
    thickness of wall and lintel (`lintel_band`); a measured face never moves.
 5. **Wall bodies.** Every face run becomes a band on its solid side; ends are

@@ -18,6 +18,29 @@ from shapely.ops import unary_union
 CYLINDER_SEGMENTS = 24
 
 
+def robust_union(geoms: Any) -> Any:
+    """``unary_union`` that survives GEOS non-noded intersections of touching / collinear outlines."""
+    import shapely
+    from shapely.errors import GEOSException
+    from shapely.validation import make_valid
+
+    geoms = [g for g in geoms if g is not None and not g.is_empty]
+    if not geoms:
+        return Polygon()
+    try:
+        return unary_union(geoms)
+    except GEOSException:
+        pass
+    try:
+        return unary_union([shapely.set_precision(g, 1e-6) for g in geoms])
+    except GEOSException:
+        pass
+    try:
+        return unary_union([make_valid(g) for g in geoms])
+    except GEOSException:
+        return unary_union([g.buffer(0) for g in geoms])
+
+
 @dataclass(frozen=True, slots=True)
 class ItemFrame:
     """Plan-local <-> item metric frame."""
@@ -147,7 +170,7 @@ def _mesh_outline(mesh: Mesh) -> Polygon:
             polygons.append(polygon)
     if not polygons:
         return MultiPoint([tuple(p) for p in mesh.vertices[:, :2]]).convex_hull
-    union = unary_union(polygons).buffer(0.002).buffer(-0.002)
+    union = robust_union(polygons).buffer(0.002).buffer(-0.002)
     if union.geom_type == "MultiPolygon":
         union = max(union.geoms, key=lambda item: item.area)
     return Polygon(union.exterior) if isinstance(union, Polygon) else MultiPoint([tuple(p) for p in mesh.vertices[:, :2]]).convex_hull
@@ -236,7 +259,10 @@ def shape_volume(solids: list[Solid], mesh: Mesh | None, cell: float = 0.02) -> 
 
     lows = [s.z0 for s in solids]
     highs = [s.z1 for s in solids]
-    bounds = unary_union([s.outline() for s in solids]).bounds
+    boxes = [s.outline().bounds for s in solids if not s.outline().is_empty]
+    if not boxes:
+        return float(sum(s.volume() for s in solids))
+    bounds = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
     xs = np.arange(bounds[0] + cell / 2, bounds[2], cell)
     ys = np.arange(bounds[1] + cell / 2, bounds[3], cell)
     zs = np.arange(min(lows) + cell / 2, max(highs), cell)
@@ -301,7 +327,7 @@ def projected_outline(solids: list[Solid], mesh: Mesh | None) -> Polygon | None:
     pieces = [p if p.is_valid else p.buffer(0) for p in pieces if not p.is_empty]
     if not pieces:
         return None
-    union = unary_union(pieces).buffer(0.005).buffer(-0.005)
+    union = robust_union(pieces).buffer(0.005).buffer(-0.005)
     if union.geom_type == "MultiPolygon":
         # disjoint legs under a top are inside the top's projection; separate pieces are joined by their hull
         union = union.convex_hull if union.convex_hull.area < 1.3 * sum(g.area for g in union.geoms) else max(union.geoms, key=lambda g: g.area)

@@ -122,6 +122,19 @@ def test_door_symbol_has_head_and_glazed_flag() -> None:
     assert "H 2.13" in text["text"]
 
 
+def test_opening_labels_print_true_metres_when_units_differ() -> None:
+    scales = {"width_scale": 1.0 / 0.8, "height_scale": 0.9 / 0.8}  # plan units 0.8 per metre, detector metre = 0.9 plan units
+    passage = Opening("passage", (1.0, 0.0), 1.0, 0.0, 0.25, head_m=2.0)
+    text = next(e for e in opening_entities([passage], **scales) if e.get("type") == "text")
+    assert text["text"] == "Durchgang 1.25 m H 2.25"
+    door = Opening("DOOR", (1.0, 0.0), 0.8, 0.0, 0.25, leaf_detected=True, hinge_side="left", swing_side=1, head_m=2.0)
+    attributes = next(e for e in opening_entities([door], **scales) if e.get("type") == "insert")["attributes"]
+    assert attributes["LABEL"] == "Door 1.00 m" and attributes["H"] == "2.25"
+    window = _window_opening()
+    attributes = next(e for e in opening_entities([window], **scales) if e.get("type") == "insert")["attributes"]
+    assert (attributes["BRH"], attributes["STH"]) == ("1.18", "2.25")  # 1.05 * 1.125 = 1.18125
+
+
 def test_unmeasured_windows_carry_the_bim_default_heights() -> None:
     attributes = next(e for e in opening_entities([Opening("WINDOW", (2.0, 0.0), 1.2, 0.0, 0.25)]) if e.get("type") == "insert")["attributes"]
     assert (attributes["BRH"], attributes["STH"], attributes["MULLIONS"]) == ("0.90", "2.10", "0")

@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import yaml
 
+from samcloud.acquisition.video import effective_image_directory
 from samcloud.control_points.apriltags import load_tag_detections
 from samcloud.control_points.repository import load_detections
 
@@ -286,9 +287,9 @@ def _image_roots(project_directory: Path, source: str) -> list[Path]:
     project_path = project_directory / "project.samcloud.yml"
     try:
         project = yaml.safe_load(project_path.read_text(encoding="utf-8")) or {}
-        configured = project.get("acquisition", {}).get("sources", {}).get("image_directory") or project.get("paths", {}).get("image_directory")
-        if isinstance(configured, str) and configured:
-            roots.insert(0, Path(configured))
+        configured = effective_image_directory(project_directory, project)
+        if configured is not None:
+            roots.insert(0, configured)
     except (OSError, ValueError, TypeError):
         pass
     return [root.resolve() for root in roots if root.exists() and root.is_dir()]

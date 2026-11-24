@@ -256,7 +256,7 @@ def test_oblique_exterior_corner_gets_a_mitre_joint() -> None:
     grid = RasterGrid(-1.0, 5.0, 0.02, 400, 300)
     free = _mask(grid, [room])
     valid = _mask(grid, [room.buffer(0.05, join_style=2)])
-    result = build_double_walls(entities, [], [room], free, valid, grid, 1.0, replace(DoubleWallSettings(double_line=True), exterior_thickness_m=0.30))
+    result = build_double_walls(entities, [], [room], free, valid, grid, 1.0, replace(DoubleWallSettings(double_line=True), exterior_thickness_m=0.30, unmeasured_thickness_m=0.0))
     from shapely.ops import unary_union
 
     body = unary_union(result.polygons)
@@ -318,7 +318,9 @@ def test_thin_axis_wall_without_the_option_keeps_todays_learned_thickness(work_d
     scene = SCENES["thin_axis_partition"]()
     project = work_dir / "thin_axis_default"
     level = write_scene(scene, project)
-    metrics = evaluate_plan(scene, generate_clean_plan(project, level=level, mode="indoor"))
+    legacy = load_clean_plan_settings()  # the scene has no measured thickness; its walls are the 0.30 m default of old
+    legacy = replace(legacy, walls=replace(legacy.walls, unmeasured_thickness_m=0.0))
+    metrics = evaluate_plan(scene, generate_clean_plan(project, level=level, mode="indoor", settings=legacy))
     # Default: one face of the 0.10 m wall survives the 0.15 m suppression (the option above measures both).
     assert metrics["room_count"] == 2 and metrics["thickness_error_max"] <= 0.03
 
@@ -398,7 +400,7 @@ def test_exterior_thickness_from_window_reveals_without_outer_face() -> None:
     wall_bits = _bits_raster(grid, [*jambs, room.exterior.buffer(0.02)], tuple(range(2, 15)))
     evidence = WallEvidence(wall_bits=wall_bits, all_bits=wall_bits, bins=16, storey_height=2.5, section=None, low=None, floor=free, door=None, cameras=None, depth_points=None)
     window = Opening("WINDOW", (6.0, 2.0), 1.8, math.pi / 2.0, 0.04)
-    settings = replace(DoubleWallSettings(double_line=True), face_test=False, visibility_test=False, exterior_from_reveals=True)
+    settings = replace(DoubleWallSettings(double_line=True), face_test=False, visibility_test=False, exterior_from_reveals=True, unmeasured_thickness_m=0.0)
     result = build_double_walls(entities, [window], [room], free, valid, grid, 1.0, settings, evidence=evidence)
     assert result.stats.get("double_wall_exterior_source") == "window-reveal"
     assert abs(result.stats["double_wall_exterior_thickness_m"] - 0.40) <= 0.03

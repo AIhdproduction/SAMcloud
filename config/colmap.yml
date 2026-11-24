@@ -12,6 +12,8 @@ features:
 
 alignment:
   gravity_align_panorama: true
+  # Indoor camera captures without georeferencing: level the floor from the camera ups and a sparse floor plane.
+  gravity_align_camera_indoor: true
   matching_strategy: auto
   spatial_max_num_neighbors: 50
   spatial_max_distance_m: 200

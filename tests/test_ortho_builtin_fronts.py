@@ -379,3 +379,89 @@ def test_bridged_wardrobe_stops_at_cross_wall(upm: float, angle: float) -> None:
     ends = [max(((x / upm - 1.0) * cosine + (y / upm - 1.0) * sine) for x, y in Polygon(entity["points"]).exterior.coords)
             for entity in scene.layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed")]
     assert ends and max(ends) <= 3.0 + 0.06
+
+
+# -- a back wall that is only a stub at the end of the unit -----------------------------------------------------
+
+def _stub_scene(upm: float, angle: float, *, unit_x: tuple[float, float] = (0.6, 3.6)) -> Scene:
+    """A wardrobe along the back wall; the wall behind it is measured only as a stub beyond the unit's right end.
+
+    The front was measured over the unit's first 1.2 m only; the tall evidence carries on to its end.
+    """
+    depth = 0.45
+    scene = _scene(upm, angle, unit=(unit_x[0], unit_x[1], ROOM_DEPTH - depth, ROOM_DEPTH, "wardrobe", 2.3), front_wall=False)
+    del scene.layers["A-WALL"][3]  # the back wall piece left of the unit: only the stub on its right is measured
+    # the ceiling room stops in front of the unit (nothing above it was seen): its outline is no evidence of the back wall
+    scene.room = Polygon([scene.transform(x, y) for x, y in _rect(0.0, ROOM_WIDTH, 0.0, ROOM_DEPTH - 0.9)])
+    x0 = unit_x[0]
+    scene.layers["A-WALL"].append(_wall(scene.transform, np.random.default_rng(5), upm, (x0, ROOM_DEPTH - depth), (x0 + 1.2, ROOM_DEPTH - depth)))
+    return scene
+
+
+def _back_coverage(scene: Scene, x0: float, x1: float) -> float:
+    upm = scene.upm
+    walls = _wall_lines(scene)
+    back = [line for line in walls if max(scene.back_line.distance(Point(point)) for point in line.coords) <= 0.05 * upm]
+    unit_back = LineString([scene.transform(x0, ROOM_DEPTH), scene.transform(x1, ROOM_DEPTH)])
+    return _covered_length(back, unit_back, 0.03 * upm) / unit_back.length
+
+
+@pytest.mark.parametrize("upm,angle", CASES)
+def test_stub_of_the_back_wall_at_the_unit_end_becomes_the_back_wall_of_the_whole_unit(upm: float, angle: float) -> None:
+    scene = _stub_scene(upm, angle)
+    stats = _resolve(scene)
+    assert stats["builtin_fronts"] == 1 and stats["builtin_stub_bridged"] == 1
+    assert _back_coverage(scene, 0.6, 3.6) >= 0.95  # the wall now runs behind the whole unit, up to the stub
+    rectangles = [Polygon(entity["points"]) for entity in scene.layers["A-EINB"] if entity.get("type") == "polyline" and entity.get("closed")]
+    assert len(rectangles) == 1 and rectangles[0].intersection(scene.strip).area >= 0.92 * scene.strip.area
+    assert not any(line.intersects(scene.strip.buffer(-0.05 * upm)) for line in _wall_lines(scene))
+
+
+@pytest.mark.parametrize("upm,angle", [(1.0, 0.0), (0.8157, 3.0)])
+def test_stub_bridging_is_off_with_zero_reach_and_stays_within_its_limits(upm: float, angle: float) -> None:
+    from samcloud.ortho.vector.builtin_fronts import BuiltinFrontSettings
+
+    def resolve(scene: Scene, settings: BuiltinFrontSettings) -> dict[str, Any]:
+        tall = tall_furniture_mask(scene.fine, FINE_NAMES, scene.classes, scene.height, (100,), scene.grid, scene.upm)
+        return resolve_builtin_fronts(
+            scene.layers, [scene.room], tall=tall, free_floor=scene.free, fine_classes=scene.fine, fine_names=FINE_NAMES,
+            grid=scene.grid, units_per_metre=scene.upm, settings=settings,
+        )
+
+    # off: the wall behind the unit must stand beside the measured front (the old rule)
+    scene = _stub_scene(upm, angle)
+    before = [list(map(list, entity["points"])) for entity in scene.layers["A-WALL"]]
+    assert resolve(scene, BuiltinFrontSettings(stub_bridge_m=0.0))["builtin_fronts"] == 0
+    assert [list(map(list, entity["points"])) for entity in scene.layers["A-WALL"]] == before
+    # the gap between the measured front and the stub is longer than the reach
+    assert resolve(_stub_scene(upm, angle), BuiltinFrontSettings(stub_bridge_m=1.0))["builtin_fronts"] == 0
+    # a back wall longer than a stub is another wall, not the unit's back wall
+    assert resolve(_stub_scene(upm, angle), BuiltinFrontSettings(stub_max_length_m=1.0))["builtin_fronts"] == 0
+
+
+@pytest.mark.parametrize("upm,angle", [(1.0, 0.0), (0.8157, 3.0)])
+def test_side_wall_stopping_short_of_a_bridged_unit_continues_to_its_back_wall(upm: float, angle: float) -> None:
+    # The left room wall stops 0.4 m in front of the unit's front line; the corner behind it was never scanned.
+    def build() -> Scene:
+        scene = _stub_scene(upm, angle, unit_x=(0.3, 3.6))
+        left = scene.layers["A-WALL"][1]
+        start = scene.transform(0.0, 0.0)
+        left["points"] = [list(start), list(scene.transform(0.0, ROOM_DEPTH - 0.45 - 0.4))]
+        # unscanned corner: nothing was measured beside the unit's left end
+        mask = _fill(scene.classes, scene.grid, _rect(-0.3, 0.3, ROOM_DEPTH - 1.2, ROOM_DEPTH + 0.3), scene.transform, 0)
+        scene.fine[mask] = 0
+        scene.free = scene.classes == 102
+        return scene
+
+    scene = build()
+    stats = _resolve(scene)
+    assert stats["builtin_fronts"] == 1
+    left = scene.layers["A-WALL"][1]
+    assert Point(left["points"][1]).distance(Point(scene.transform(0.0, ROOM_DEPTH))) <= 0.05 * upm  # reaches the back line
+
+    # the same wall ending at measured free floor is no side wall of the unit: it stays where it ends
+    blocked = build()
+    blocked.free = blocked.free | _fill(np.zeros_like(blocked.classes), blocked.grid, _rect(-0.1, 0.1, ROOM_DEPTH - 1.0, ROOM_DEPTH - 0.1), blocked.transform, 1).astype(bool)
+    stats = _resolve(blocked)
+    left = blocked.layers["A-WALL"][1]
+    assert Point(left["points"][1]).distance(Point(blocked.transform(0.0, ROOM_DEPTH - 0.45 - 0.4))) <= 0.05 * upm

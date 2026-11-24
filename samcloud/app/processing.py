@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any
 
+from samcloud.acquisition.video import effective_image_directory
 from samcloud.app.i18n import catalogue, t
 from samcloud.classification.custom import project_classes_path
 from samcloud.core.configuration import load_global_config
@@ -53,13 +54,13 @@ def optimize_control_points(project_directory: Path, project: dict[str, Any]) ->
     for key in ("crs", "min_points", "min_observations_per_point"):
         if key in project_control:
             control_settings[key] = project_control[key]
-    configured_images = project.get("acquisition", {}).get("sources", {}).get("image_directory") or project.get("paths", {}).get("image_directory")
+    configured_images = effective_image_directory(project_directory, project)
     cubemap_directory = project_directory / "inputs" / "cubemap"
     capture_type = project.get("acquisition", {}).get("capture_type") or project.get("acquisition", {}).get("type")
     if capture_type == "panorama_360" and cubemap_directory.is_dir():
         image_directory = cubemap_directory
     else:
-        image_directory = Path(configured_images) if configured_images else project_directory / "inputs" / "images"
+        image_directory = configured_images if configured_images else project_directory / "inputs" / "images"
     if not image_directory.is_dir():
         raise ValueError("The original project image directory is unavailable")
     result = _rerun_control_points(
@@ -454,8 +455,18 @@ class ProcessingManager:
                 str(acquisition.get("panorama", {}).get("cubemap_face_size", 0) or 0),
             ])
         else:
-            image_directory = sources.get("image_directory") or project.get("paths", {}).get("image_directory", "")
+            video_source = sources.get("video_path") if capture_type == "camera" else ""
+            if video_source:
+                image_directory = str(effective_image_directory(project_directory, project))
+            else:
+                image_directory = sources.get("image_directory") or project.get("paths", {}).get("image_directory", "")
             command.extend(["--images", image_directory])
+            if video_source:
+                command.extend([
+                    "--video", video_source,
+                    "--frame-interval",
+                    str(acquisition.get("video", {}).get("frame_interval_seconds", 1.0)),
+                ])
             if acquisition.get("georeferencing", {}).get("rtk_enabled", False):
                 command.append("--rtk")
         if apriltags_enabled(project):

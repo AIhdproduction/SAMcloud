@@ -157,11 +157,11 @@ def test_plan_prefers_point_fine_labels(work_dir: Path) -> None:
     split = columns[0] + int(round(0.68 * (columns[-1] - columns[0] + 1)))
     fine = np.zeros_like(classes)
     fine[table & (np.arange(width)[None, :] < split)] = 1  # bed
-    fine[table & (np.arange(width)[None, :] >= split)] = 2  # nightstand
+    fine[table & (np.arange(width)[None, :] >= split)] = 2  # shelf
     assert np.count_nonzero(fine == 1) > 0 and np.count_nonzero(fine == 2) > 0
     np.save(ortho_dir / "fine_pc.npy", fine)
     np.save(ortho_dir / "fine_pc_conf.npy", np.where(fine > 0, 0.95, 0.0).astype(np.float16))
-    (ortho_dir / "fine_pc_labels.json").write_text(json.dumps({"labels": ["bed", "nightstand"], "aliases": {}, "schema": 1}), encoding="utf-8")
+    (ortho_dir / "fine_pc_labels.json").write_text(json.dumps({"labels": ["bed", "shelf"], "aliases": {}, "schema": 1}), encoding="utf-8")
     # The old ortho-SAM raster says "toilet": it must be ignored while point labels exist.
     np.save(ortho_dir / "fine_class.npy", np.where(table, 1, 0).astype(np.uint8))
     np.save(ortho_dir / "fine_conf.npy", np.where(table, 0.95, 0.0).astype(np.float16))
@@ -174,7 +174,7 @@ def test_plan_prefers_point_fine_labels(work_dir: Path) -> None:
         str(entity.get("_label")) for entity in result.layers["A-FURN"]
         if entity.get("type") == "polyline" and entity.get("_label") and table.contains(Polygon(entity["points"]).centroid)
     )
-    assert labels == ["Bett", "Nachttisch"]
+    assert labels == ["Bett", "Regal"]  # (a 1.0 m deep "nightstand" would be implausible: the size rule drops that label)
     assert indoor_metric(result)["fine_label_source"] == "pointcloud"
     assert result.fingerprint_inputs["fine_label_source"] == "pointcloud"
 

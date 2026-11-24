@@ -5,57 +5,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 
 import cv2
 import numpy as np
 
+from samcloud.acquisition.video import (
+    CAMERA_VIDEO_EXTENSIONS,
+    PANORAMA_VIDEO_EXTENSIONS,
+    CaptureValidationError,
+    ProgressCallback,
+    expected_frame_count,
+    extract_frames,
+    find_videos,
+    notify_progress as _notify,
+)
 
 CAPTURE_TYPES = ("drone_gps", "camera", "panorama_360")
 PANORAMA_IMAGE_EXTENSIONS = (".jpg", ".jpeg")
-PANORAMA_VIDEO_EXTENSIONS = (".mp4",)
 CUBEMAP_FACE_NAMES = ("front", "right", "back", "left", "up", "down")
 CUBEMAP_LAYOUT_VERSION = 2
 
 
-class CaptureValidationError(ValueError):
-    """Raised when a capture source cannot be processed safely."""
-
-
-ProgressCallback = Callable[[int, int, str], None]
-
-
-def _notify(callback: ProgressCallback | None, done: int, total: int, detail: str) -> None:
-    """Call a progress callback; a failing callback must never break the preparation."""
-    if callback is None:
-        return
-    try:
-        callback(int(done), int(total), detail)
-    except Exception:
-        pass
-
-
 def expected_video_frame_count(video_path: Path, interval_seconds: float) -> int | None:
     """Number of frames ``extract_video_frames`` will keep, or None when the video does not tell."""
-    capture = cv2.VideoCapture(str(video_path))
-    try:
-        if not capture.isOpened():
-            return None
-        frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-        frames_per_second = capture.get(cv2.CAP_PROP_FPS)
-    finally:
-        capture.release()
-    try:
-        frame_count = float(frame_count)
-        frames_per_second = float(frames_per_second)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(frame_count) or not np.isfinite(frames_per_second):
-        return None
-    if frame_count <= 0 or frames_per_second <= 0:
-        return None
-    interval_frames = max(1, round(frames_per_second * interval_seconds))
-    return int((int(frame_count) - 1) // interval_frames) + 1
+    return expected_frame_count([Path(video_path)], interval_seconds)
 
 
 @dataclass(frozen=True)
@@ -78,8 +52,13 @@ def validate_capture_configuration(
     frame_interval_seconds: float = 1.0,
     *,
     check_paths: bool = False,
+    video_path: str = "",
 ) -> None:
-    """Validate the selected acquisition mode without changing project data."""
+    """Validate the selected acquisition mode without changing project data.
+
+    ``video_path`` is the camera video source (one video file or a folder of videos); a camera project
+    uses either an image directory or a video, never both.
+    """
     if capture_type not in CAPTURE_TYPES:
         raise CaptureValidationError("Select a supported capture type")
     if frame_interval_seconds <= 0:
@@ -88,19 +67,46 @@ def validate_capture_configuration(
     if capture_type == "panorama_360":
         if not panorama_image_directory and not panorama_video_path:
             raise CaptureValidationError(
-                "Select a 360 degree video, a panorama image directory, or both"
+                "Select a 360 degree video, a folder of 360 degree videos, a panorama image directory, or a combination"
             )
-        if panorama_video_path and Path(panorama_video_path).suffix.lower() not in PANORAMA_VIDEO_EXTENSIONS:
-            raise CaptureValidationError("360 degree video must be an exported MP4 file")
-        if check_paths:
-            if panorama_video_path and not Path(panorama_video_path).is_file():
-                raise CaptureValidationError("Selected 360 degree video file was not found")
-            if panorama_image_directory and not Path(panorama_image_directory).is_dir():
-                raise CaptureValidationError("Selected panorama image directory was not found")
+        if panorama_video_path:
+            video_location = Path(panorama_video_path)
+            is_directory = video_location.is_dir()
+            if not is_directory and video_location.suffix and (
+                video_location.suffix.lower() not in PANORAMA_VIDEO_EXTENSIONS
+            ):
+                raise CaptureValidationError("360 degree video must be an exported MP4 file")
+            if check_paths:
+                if is_directory:
+                    if not find_videos(video_location, PANORAMA_VIDEO_EXTENSIONS):
+                        raise CaptureValidationError("Selected 360 degree video folder contains no MP4 videos")
+                elif not video_location.is_file():
+                    raise CaptureValidationError("Selected 360 degree video file was not found")
+        if check_paths and panorama_image_directory and not Path(panorama_image_directory).is_dir():
+            raise CaptureValidationError("Selected panorama image directory was not found")
         return
 
-    if not image_directory:
-        raise CaptureValidationError("Select an image directory before creating the project")
+    if video_path and capture_type != "camera":
+        raise CaptureValidationError("A video source is only supported for the standard camera capture type")
+    if capture_type == "camera" and image_directory and video_path:
+        raise CaptureValidationError("Select either an image directory or a video, not both")
+    if not image_directory and not video_path:
+        raise CaptureValidationError(
+            "Select an image directory before creating the project"
+            if capture_type != "camera"
+            else "Select an image directory or a video before creating the project"
+        )
+    if video_path:
+        video_location = Path(video_path)
+        if video_location.suffix and not video_location.is_dir() and (
+            video_location.suffix.lower() not in CAMERA_VIDEO_EXTENSIONS
+        ):
+            raise CaptureValidationError(
+                "Video must be one of: " + ", ".join(CAMERA_VIDEO_EXTENSIONS)
+            )
+        if check_paths and not find_videos(video_location, CAMERA_VIDEO_EXTENSIONS):
+            raise CaptureValidationError("Selected video was not found or the folder contains no videos")
+        return
     if check_paths and not Path(image_directory).is_dir():
         raise CaptureValidationError("Selected image directory was not found")
 
@@ -132,59 +138,27 @@ def validate_panorama_images(image_paths: Iterable[Path]) -> list[Path]:
     return valid_paths
 
 
+def _require_2to1(frame: np.ndarray) -> None:
+    height, width = frame.shape[:2]
+    if height == 0 or abs((width / height) - 2.0) > 0.03:
+        raise CaptureValidationError("360 degree video frames must use a 2:1 equirectangular format")
+
+
 def extract_video_frames(
     video_path: Path, output_directory: Path, interval_seconds: float,
     progress_callback: ProgressCallback | None = None,
 ) -> list[Path]:
-    """Extract one equirectangular frame at each requested fixed time interval.
+    """Extract the first equirectangular frame of each requested fixed time interval.
 
     ``progress_callback(kept, expected, detail)`` reports every kept frame;
     ``expected`` is 0 when the video does not report its frame count.
     """
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise CaptureValidationError("360 degree video cannot be opened")
-    frames_per_second = capture.get(cv2.CAP_PROP_FPS)
-    if not np.isfinite(frames_per_second) or frames_per_second <= 0:
-        capture.release()
-        raise CaptureValidationError("360 degree video does not provide a valid frame rate")
-
-    output_directory.mkdir(parents=True, exist_ok=True)
-    next_frame_index = 0
-    interval_frames = max(1, round(frames_per_second * interval_seconds))
-    expected_frames = 0
-    if progress_callback is not None:
-        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if np.isfinite(frame_count) and frame_count > 0:
-            expected_frames = int((int(frame_count) - 1) // interval_frames) + 1
-    frame_index = 0
-    extracted: list[Path] = []
-    while True:
-        success, frame = capture.read()
-        if not success:
-            break
-        if frame_index >= next_frame_index:
-            height, width = frame.shape[:2]
-            if height == 0 or abs((width / height) - 2.0) > 0.03:
-                capture.release()
-                raise CaptureValidationError("360 degree video frames must use a 2:1 equirectangular format")
-            frame_path = output_directory / f"frame_{len(extracted):06d}.jpg"
-            if not cv2.imwrite(str(frame_path), frame):
-                capture.release()
-                raise CaptureValidationError(f"Video frame could not be written: {frame_path.name}")
-            extracted.append(frame_path)
-            next_frame_index += interval_frames
-            if expected_frames:
-                shown = min(len(extracted), expected_frames)
-                _notify(progress_callback, shown, expected_frames,
-                        f"Frames extrahieren {shown}/{expected_frames}")
-            else:
-                _notify(progress_callback, len(extracted), 0, f"Frames extrahieren {len(extracted)}")
-        frame_index += 1
-    capture.release()
-    if not extracted:
-        raise CaptureValidationError("No frames could be extracted from the 360 degree video")
-    return extracted
+    frames = extract_frames(
+        [Path(video_path)], output_directory, interval_seconds,
+        pick="first", frame_check=_require_2to1, progress_callback=progress_callback,
+        label="360 degree video",
+    )
+    return [frame.path for frame in frames]
 
 
 def cubemap_face_directions(
@@ -277,17 +251,28 @@ def prepare_panorama_inputs(
     photo_count = len(image_paths)
     extracted_frames: list[Path] = []
     if panorama_video_path:
-        if progress_callback is None:
+        video_folder = Path(panorama_video_path).is_dir()
+        video_progress: ProgressCallback | None = None
+        if progress_callback is not None:
+            def video_progress(kept: int, expected: int, detail: str) -> None:
+                total = 2 * (photo_count + expected) if expected > 0 else 0
+                _notify(progress_callback, photo_count + kept, total, detail)
+
+        if video_folder:
+            extracted_frames = [
+                frame.path for frame in extract_frames(
+                    find_videos(panorama_video_path, PANORAMA_VIDEO_EXTENSIONS), frame_directory,
+                    frame_interval_seconds, pick="first", frame_check=_require_2to1,
+                    progress_callback=video_progress, label="360 degree video",
+                )
+            ]
+        elif video_progress is None:
             extracted_frames = extract_video_frames(
                 Path(panorama_video_path), frame_directory, frame_interval_seconds
             )
         else:
-            def _video_progress(kept: int, expected: int, detail: str) -> None:
-                total = 2 * (photo_count + expected) if expected > 0 else 0
-                _notify(progress_callback, photo_count + kept, total, detail)
-
             extracted_frames = extract_video_frames(
-                Path(panorama_video_path), frame_directory, frame_interval_seconds, _video_progress
+                Path(panorama_video_path), frame_directory, frame_interval_seconds, video_progress
             )
         image_paths.extend(extracted_frames)
         source_kind.update({path: "video_frame" for path in extracted_frames})

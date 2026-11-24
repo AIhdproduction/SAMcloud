@@ -56,15 +56,21 @@
     "image_directory": "Image directory",
     "rtk": "Images use RTK GPS",
     "select_directory": "Select image directory",
-    "dialog_failed": "Could not open the folder dialog: {error}",
-    "panorama_hint": "Use an exported 2:1 equirectangular MP4 video, a JPG panorama directory, or both.",
-    "panorama_video": "360 degree MP4 video (optional)",
+    "dialog_failed": "Could not open the selection dialog: {error}",
+    "panorama_hint": "Use an exported 2:1 equirectangular MP4 video, a folder of such videos, a JPG panorama directory, or a combination.",
+    "panorama_video": "360 degree MP4 video or folder of videos (optional)",
     "panorama_directory": "360 degree JPG panorama directory (optional)",
     "frame_interval": "Video frame interval in seconds",
     "select_capture_type": "Select a capture type",
     "select_class_set": "Select the indoor or outdoor semantic class set",
     "created": "Project created: {name}",
-    "button": "Create project"
+    "button": "Create project",
+    "camera_video": "Video or folder of videos (instead of photos)",
+    "camera_video_hint": "Either photos or a video: the sharpest frame of each interval (set below) is taken from the video.",
+    "select_video_file": "Select video file",
+    "select_video_folder": "Select folder with videos",
+    "select_photo_folder": "Select folder with 360 degree photos",
+    "camera_outdoor_hint": "Outdoor with a normal camera: without GPS the project needs control points with coordinates so scale, position and height are correct. Only indoors does SAMcloud level the floor automatically."
   },
   "preflight": {
     "title": "Images and storage",
@@ -102,8 +108,13 @@
       "photos_not_2to1": "The first panorama photo is not 2:1 ({width}×{height}).",
       "ignored_images": "{count} other image files (e.g. PNG, HEIC, RAW) are ignored.",
       "size_unknown": "The image size could not be read.",
-      "unreadable_generic": "The check failed."
-    }
+      "unreadable_generic": "The check failed.",
+      "video_folder_empty": "No matching video was found in the folder.",
+      "videos_unreadable": "{count} videos in the folder cannot be read; the estimate uses the readable ones.",
+      "camera_photos_and_video": "Please give either an image directory or a video, not both.",
+      "video_format": "The video does not have a supported format ({extensions})."
+    },
+    "detail_videos": "{videos} videos, {duration}, {width}×{height}, one frame every {interval} s ({count})"
   },
   "existing": {
     "title": "Existing projects",

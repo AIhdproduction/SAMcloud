@@ -56,15 +56,21 @@
     "image_directory": "Bildordner",
     "rtk": "Bilder mit RTK-GPS",
     "select_directory": "Bildordner auswählen",
-    "dialog_failed": "Der Ordnerdialog konnte nicht geöffnet werden: {error}",
-    "panorama_hint": "Verwenden Sie ein exportiertes äquirektanguläres 2:1-MP4-Video, einen Ordner mit JPG-Panoramen oder beides.",
-    "panorama_video": "360°-MP4-Video (optional)",
+    "dialog_failed": "Der Auswahldialog konnte nicht geöffnet werden: {error}",
+    "panorama_hint": "Verwenden Sie ein exportiertes äquirektanguläres 2:1-MP4-Video, einen Ordner mit solchen Videos, einen Ordner mit JPG-Panoramen oder eine Kombination.",
+    "panorama_video": "360°-MP4-Video oder Ordner mit Videos (optional)",
     "panorama_directory": "Ordner mit 360°-JPG-Panoramen (optional)",
     "frame_interval": "Bildintervall im Video (Sekunden)",
     "select_capture_type": "Wählen Sie eine Aufnahmeart",
     "select_class_set": "Wählen Sie den Klassensatz für den Innen- oder Aussenbereich",
     "created": "Projekt erstellt: {name}",
-    "button": "Projekt erstellen"
+    "button": "Projekt erstellen",
+    "camera_video": "Video oder Ordner mit Videos (statt Fotos)",
+    "camera_video_hint": "Entweder Fotos oder ein Video: Aus dem Video wird im unten gewählten Intervall je das schärfste Bild verwendet.",
+    "select_video_file": "Videodatei auswählen",
+    "select_video_folder": "Ordner mit Videos auswählen",
+    "select_photo_folder": "Ordner mit 360°-Fotos auswählen",
+    "camera_outdoor_hint": "Aussenbereich mit normaler Kamera: Ohne GPS braucht das Projekt Passpunkte mit Koordinaten, damit Massstab, Lage und Höhe stimmen. Nur im Innenbereich richtet SAMcloud den Boden automatisch waagrecht aus."
   },
   "preflight": {
     "title": "Bilder und Speicher",
@@ -102,8 +108,13 @@
       "photos_not_2to1": "Das erste Panoramafoto ist nicht 2:1 ({width}×{height}).",
       "ignored_images": "{count} weitere Bilddateien (z. B. PNG, HEIC, RAW) werden ignoriert.",
       "size_unknown": "Die Bildgrösse konnte nicht gelesen werden.",
-      "unreadable_generic": "Die Prüfung ist fehlgeschlagen."
-    }
+      "unreadable_generic": "Die Prüfung ist fehlgeschlagen.",
+      "video_folder_empty": "Im Ordner wurde kein passendes Video gefunden.",
+      "videos_unreadable": "{count} Videos im Ordner können nicht gelesen werden; die Schätzung nutzt die lesbaren.",
+      "camera_photos_and_video": "Bitte entweder einen Bildordner oder ein Video angeben, nicht beides.",
+      "video_format": "Das Video hat kein unterstütztes Format ({extensions})."
+    },
+    "detail_videos": "{videos} Videos, {duration}, {width}×{height}, alle {interval} s ein Bild ({count})"
   },
   "existing": {
     "title": "Vorhandene Projekte",

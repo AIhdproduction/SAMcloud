@@ -328,7 +328,7 @@ def _wall_point_back(points: np.ndarray | None, front: _Chain, side: float, span
     bin_size = settings.wall_point_bin_m * upm
     index = np.floor((across_s - lower) / bin_size).astype(int)
     counts = np.bincount(index).astype(float)
-    smooth = np.convolve(counts, np.ones(3), mode="same")
+    smooth = np.convolve(counts, np.ones(3), mode="same")[: len(counts)]
     for position in range(len(smooth)):
         if smooth[position] < settings.wall_point_min_count:
             continue
@@ -337,6 +337,8 @@ def _wall_point_back(points: np.ndarray | None, front: _Chain, side: float, span
         if position + 1 < len(smooth) and smooth[position + 1] > smooth[position]:
             continue
         members = (index >= position - 1) & (index <= position + 1)
+        if not members.any():
+            continue
         if float(np.ptp(along_s[members])) < settings.wall_point_min_extent_m * upm:
             continue
         return float(np.median(across_s[members])), int(members.sum())
