@@ -311,6 +311,25 @@ def load_svg_meta(svg_path: Path | str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) and data.get("version") == SVG_META_VERSION else None
 
 
+def svg_origin(meta: dict[str, Any] | None) -> tuple[float, float] | None:
+    """``(ox, oy)`` of the SVG preview metadata (the DXF coordinate of SVG (0, 0)); None when missing or invalid."""
+    try:
+        origin = (meta or {})["origin"]
+        return float(origin[0]), float(origin[1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def svg_to_dxf(origin: tuple[float, float], sx: float, sy: float) -> tuple[float, float]:
+    """SVG user coordinates -> DXF coordinates (LV95 E/N for drone projects): ``E = ox + sx``, ``N = oy - sy``."""
+    return float(origin[0]) + float(sx), float(origin[1]) - float(sy)
+
+
+def dxf_to_svg(origin: tuple[float, float], e: float, n: float) -> tuple[float, float]:
+    """Inverse of :func:`svg_to_dxf`."""
+    return float(e) - float(origin[0]), float(origin[1]) - float(n)
+
+
 def _esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 

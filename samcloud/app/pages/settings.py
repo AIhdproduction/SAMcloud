@@ -19,6 +19,7 @@ from samcloud.app.i18n import (
     t,
     user_language,
 )
+from samcloud.app.components.assistant_settings import render_assistant_settings_card
 from samcloud.app.components.native_dialogs import attach_file_button, attach_folder_button
 from samcloud.app.layout import render_page
 from samcloud.app.pages.projects import (
@@ -145,6 +146,7 @@ def render() -> None:
         draft_owner = str(project_directory)
         _render_language_card(draft_controls, draft_owner)
         render_share_settings_card()
+        render_assistant_settings_card()
         project = state.active_project()
         if project_directory is None or project is None:
             ui.label(t("settings.no_project"))

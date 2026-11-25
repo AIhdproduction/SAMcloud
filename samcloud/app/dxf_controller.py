@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -16,9 +17,9 @@ from samcloud.app.i18n import t
 from samcloud.classification.profiles import ProfileInfo
 from samcloud.core.configuration import load_yaml
 from samcloud.dxf.config import load_dxf_config
-from samcloud.dxf.job_runner import DxfJobRunner
+from samcloud.dxf.job_runner import DxfJobRunner, dxf_text_language
 from samcloud.bim.jobs import ifc_export_status as _ifc_export_status
-from samcloud.dxf.jobs import export_manifest_path
+from samcloud.dxf.jobs import export_manifest_path, exported_file_language
 from samcloud.dxf.las_source import Frame, is_ply_source, read_las_header_origin, read_las_header_profile
 from samcloud.dxf.layers import load_layer_config
 from samcloud.dxf.levels import Level
@@ -31,6 +32,8 @@ from samcloud.dxf.writer import sanitize_dxf_name
 
 if TYPE_CHECKING:
     from samcloud.ortho.build import OrthoResult
+
+LOGGER = logging.getLogger(__name__)
 
 MODEL_PROFILES: tuple[str, ...] = ("sam3_outdoor", "sam3_indoor", "flurseg_v1", "legacy_v1")
 """Profiles offered when a LAS file carries no provenance."""
@@ -151,6 +154,8 @@ class DxfPageController:
         self.refresh_state()
         if self._las_path is None and self.state.view.get("las_path"):
             self._las_path = Path(str(self.state.view["las_path"])).resolve()
+        # The interactive DXF page calls sync_export_language() itself once (DxfPage.build); constructing a controller
+        # (HTTP routes, tests) never starts a job.
 
     def _load_las_info_cache(self) -> dict[str, Any] | None:
         """Read cached products/dxf/las_info.json without computing anything.
@@ -684,12 +689,75 @@ class DxfPageController:
         raise ValueError("Plan variant must be 'pointcloud' or 'ortho'")
 
     def plan_version(self, level_id: str | None, variant: str = "pointcloud") -> str:
-        """Return a cache-busting token for one cached plan variant."""
+        """Return a cache-busting token for one cached plan variant.
+
+        The ortho plan of a level with AI assistant edits also changes its token on every accept / undo / re-apply
+        (``assistant_edits_version``): its payload shows the edits (``plan_payload``). Without edits it is unchanged."""
         result_file = self.plan_cache_dir(level_id, variant) / "result.json"
         if not result_file.is_file():
             return "none"
         stat = result_file.stat()
-        return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+        token = f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+        edits = self.assistant_edits_version(level_id) if variant == "ortho" else ""
+        return f"{token}-e{edits}" if edits else token
+
+    def assistant_level_key(self, level_id: str | None) -> str:
+        """Assistant level key of a review target ('site' for the outdoor plan)."""
+        return "site" if level_id is None else str(level_id)
+
+    def assistant_edits_version(self, level_id: str | None) -> str:
+        """'' without an assistant ``edits.json``; else a token of edits.json, the assistant state.json and the ortho
+        plan_model.json (changes on accept, undo and when the pipeline re-applies the edits)."""
+        from samcloud.dxf.assistant_hooks import edits_path
+
+        edits = edits_path(self.project_dir, self.assistant_level_key(level_id))
+        if not edits.is_file():
+            return ""
+        paths = [edits, edits.with_name("state.json")]
+        try:
+            paths.append(self.plan_cache_dir(level_id, "ortho") / "plan_model.json")
+        except Exception:  # noqa: BLE001 - an unresolvable level only drops that part of the token
+            pass
+        parts = []
+        for path in paths:
+            try:
+                parts.append(f"{path.stat().st_mtime_ns:x}")
+            except OSError:
+                parts.append("0")
+        return "-".join(parts)
+
+    def with_assistant_edits(self, result: DxfPlanResult, level_id: str | None) -> DxfPlanResult:
+        """The cached ortho result with the level's active assistant edits patched in, like the DXF export draws them.
+
+        Read only: nothing is re-applied or written (the export hook does that); the same object without edits.json,
+        without active edits or when the edits cannot be drawn (logged as a warning, never raised)."""
+        from samcloud.dxf.assistant_hooks import has_edits
+
+        key = self.assistant_level_key(level_id)
+        if not has_edits(self.project_dir, key):
+            return result
+        try:
+            from samcloud.assistant.dxf_patch import apply_dxf_patch
+            from samcloud.assistant.history import edit_changes
+
+            base, edited, changes = edit_changes(self.project_dir, key)
+            if base is None or edited is None or not changes:
+                return result
+            return apply_dxf_patch(result, base, edited, changes)
+        except Exception as error:  # noqa: BLE001 - the plan view falls back to the unedited plan
+            LOGGER.warning("assistant edits of level '%s' could not be drawn into the plan view (%s)", key, type(error).__name__)
+            return result
+
+    def assistant_export_ready(self, level_id: str | None) -> bool:
+        """True when the AI assistant's export can run on the existing result: the clean (ortho) plan of the level is
+        cached and the point source exists. Otherwise the assistant runs the full computation ("Compute everything")."""
+        las = self.las_path
+        if las is None or not Path(las).is_file():
+            return False
+        try:
+            return (self.plan_cache_dir(level_id, "ortho") / "result.json").is_file()
+        except Exception:  # noqa: BLE001
+            return False
 
     def cached_result(self, level_id: str | None = None) -> DxfPlanResult | None:
         """Load cached vector plan from disk without recomputing (memoised by file stat)."""
@@ -729,24 +797,30 @@ class DxfPageController:
         self._result_memo[str(cache_dir)] = (key, result)
         return result
 
-    def cached_payload(self, level_id: str | None = None, grid_size: int | None = None) -> dict[str, Any] | None:
+    def cached_payload(self, level_id: str | None = None, grid_size: int | None = None, *, language: str | None = None) -> dict[str, Any] | None:
         """Return browser vector payload for cached result, or None if cache missing.
 
-        The culling grid defaults to geometry.vector_grid_size from config/dxf_export.yaml.
+        The culling grid defaults to geometry.vector_grid_size from config/dxf_export.yaml; ``language`` translates
+        the texts like the DXF export (None = cached texts).
         """
         result = self.cached_result(level_id)
         if result is None:
             return None
         size = int(grid_size) if grid_size is not None else int(load_dxf_config().geometry.vector_grid_size)
-        return vector_payload(result, grid_size=size)
+        return vector_payload(result, grid_size=size, language=language)
 
-    def plan_payload(self, level_id: str | None, variant: str = "pointcloud", grid_size: int | None = None) -> dict[str, Any] | None:
-        """Return a browser payload for one cached plan variant without generating it."""
+    def plan_payload(self, level_id: str | None, variant: str = "pointcloud", grid_size: int | None = None, *,
+                     language: str | None = None) -> dict[str, Any] | None:
+        """Return a browser payload for one cached plan variant without generating it (``language``: see cached_payload).
+
+        The ortho plan shows the level's active AI assistant edits (``with_assistant_edits``; unchanged without them)."""
         result = self.plan_result(level_id, variant)
         if result is None:
             return None
+        if variant == "ortho":
+            result = self.with_assistant_edits(result, level_id)
         size = int(grid_size) if grid_size is not None else int(load_dxf_config().geometry.vector_grid_size)
-        return vector_payload(result, grid_size=size)
+        return vector_payload(result, grid_size=size, language=language)
 
     def is_stale(self, level_id: str | None = None) -> bool:
         """Check whether cached vector plan differs from current settings."""
@@ -848,8 +922,11 @@ class DxfPageController:
     # Subprocess jobs (heavy work only through DxfJobRunner.start)
     # -------------------------------------------------------------------------
 
-    def start_job(self, action: str, level_id: str | None = None, *, force: bool = False) -> Any:
-        """Launch background subprocess job via the runner."""
+    def start_job(self, action: str, level_id: str | None = None, *, force: bool = False, assistant: bool = False) -> Any:
+        """Launch background subprocess job via the runner.
+
+        ``assistant`` (export only): the AI assistant's export after accept / undo - always the ortho plan, and a stale
+        cached plan is exported as it is (``run_export(allow_stale_plan=True)``) instead of failing."""
         if self.blocked_message is not None:
             raise ValueError(self.blocked_message)
         if self.profile_required:
@@ -859,14 +936,79 @@ class DxfPageController:
             raise ValueError(t("dxf_ui.errors.no_las", action=action))
         if action not in {"preview", "align", "levels", "generate", "export", "export_ifc", "ortho", "segment", "clean_plan", "prepare_levels", "run_all"}:
             raise ValueError(t("dxf_ui.errors.unsupported_action", action=action))
-        options: dict[str, str] = {}
+        options: dict[str, Any] = {}
         if action in {"segment", "clean_plan", "run_all"}:
             options["source"] = self.state.segment_source
         if action == "run_all":
             options["variant"] = "ortho"
+        elif action == "export" and assistant:
+            options["variant"] = "ortho"
+            options["assistant"] = True
         elif action == "export":
             options["variant"] = self.state.plan_variant
         return self.runner.start(action, las=las, level=level_id, mode=self.mode, force=force, **options)
+
+    def _exported_clean_dxf(self, level_id: str | None) -> Path:
+        suffix = "site" if level_id is None else sanitize_dxf_name(self.level_label(level_id))
+        return self.project_dir / "products" / "dxf" / "export" / f"{sanitize_dxf_name(self.project_dir.name)}_{suffix}_clean.dxf"
+
+    def export_misses_assistant_edits(self, level_id: str | None = None) -> bool:
+        """True when the level's exported clean DXF is older than its assistant edits (edits.json / state.json)."""
+        from samcloud.dxf.assistant_hooks import edits_newer_than
+
+        exported = self._exported_clean_dxf(level_id)
+        return exported.is_file() and edits_newer_than(self.project_dir, "site" if level_id is None else str(level_id), exported)
+
+    def export_language_outdated(self, level_id: str | None = None) -> bool:
+        """True when the level's exported clean DXF was written in another (known) language than the current UI language."""
+        current = dxf_text_language()
+        if current is None:
+            return False
+        exported = self._exported_clean_dxf(level_id)
+        recorded = exported_file_language(self.project_dir, exported) if exported.is_file() else None
+        return recorded is not None and recorded != current
+
+    def relabel_uncached_exports(self, language: str | None = None) -> list[str]:
+        """Translate exported DXFs without a clean plan cache into ``language`` (default: UI language); returns level keys.
+
+        Only files with a recorded language (``<file>.lang.json`` or ``last_export.json``) are rewritten, like
+        ``sync_export_language`` leaves exports without a recorded language alone.
+        """
+        language = language or dxf_text_language()
+        if language is None or (self.uses_environment_chain and self.environment_running()):
+            return []  # the environment chain may be publishing its DXF right now
+        from samcloud.share.project import relabel_uncached_dxfs
+
+        return relabel_uncached_dxfs(self.project_dir, language, only_known=True)
+
+    def sync_export_language(self) -> bool:
+        """Re-run only the export step when the last export was written in another language than the current UI language.
+
+        Uses the variant and level recorded in ``last_export.json``; exports without a recorded language (made before
+        the DXF language feature) are left alone. Exported DXFs without a clean plan cache (e.g. the drone
+        ``*_Site_clean.dxf``) cannot be exported again: when their language is recorded they are relabelled in place
+        first (cheap, no job).
+        Returns True when an export job was started (shown like any export run).
+        """
+        current = dxf_text_language()
+        if current is not None:
+            self.relabel_uncached_exports(current)
+        manifest = self.last_export() or {}
+        recorded = manifest.get("language")
+        if current is None or recorded is None or recorded == current:
+            return False
+        if self.uses_environment_chain or self.blocked_message is not None or self.profile_required or self.runner.is_running():
+            return False
+        las = self.las_path
+        if las is None or not Path(las).is_file():
+            return False
+        variant = str(manifest.get("variant") or "pointcloud")
+        level = manifest.get("level")
+        targets = [str(level)] if level is not None else (self.review_targets() if self.mode == "indoor" else [None])
+        if not targets or not all(self.plan_status(target, variant) == "ok" for target in targets):
+            return False
+        self.runner.start("export", las=las, level=None if level is None else str(level), mode=self.mode, variant=variant, language=current)
+        return True
 
     def ifc_export_status(self, level_key: str | None) -> Literal["missing", "fresh", "stale"]:
         """Freshness of the level's IFC export (products/bim/<level>/export.json vs plan_model.json)."""
@@ -926,7 +1068,9 @@ class DxfPageController:
             except Exception:  # noqa: BLE001 - an unreadable cache counts as stale in the checklist
                 refine = "stale"
             rows.append(("refine", "ok" if refine == "fresh" else refine))
-        rows.append(("export", self.plan_status(level_id, "ortho")))
+        export_status = self.plan_status(level_id, "ortho")
+        outdated = export_status == "ok" and (self.export_language_outdated(level_id) or self.export_misses_assistant_edits(level_id))
+        rows.append(("export", "stale" if outdated else export_status))
         rows.append(("ifc", "ok" if ifc == "fresh" else ifc))
         return {"kind": "classic", "rows": rows}
 

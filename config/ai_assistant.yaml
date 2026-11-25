@@ -1,0 +1,30 @@
+# Defaults of the optional AI assistant (samcloud/assistant). Off by default.
+# The app never writes this file: user choices go to <user config dir>/ai_settings.yaml and API keys to
+# <user config dir>/ai_credentials.yaml (both outside the repository). No secrets belong in this file.
+enabled: false
+provider: ollama              # ollama | anthropic | openai | openrouter
+model: ""                     # model id of the selected provider
+text_only: true               # true = never send images to the model
+max_tool_calls: 20            # tool calls per user request before the assistant stops
+request_timeout_s: 120        # seconds per provider request
+max_output_tokens: 4096
+cost_limit_request_usd: 0.50  # 0 = no limit (cloud providers only; Ollama is never limited)
+cost_limit_project_day_usd: 5.00
+ollama_url_default: http://localhost:11434
+ollama_num_ctx: auto          # Ollama context window: auto (model maximum, capped below) or a fixed number of tokens
+ollama_num_ctx_max: 32768     # upper bound for "auto" (larger windows need more GPU memory)
+context_history_turns: 3      # previous question/answer pairs sent with each request
+full_control: null            # full control (changes applied after a passed QA): null = on for cloud providers, off for Ollama
+base_urls:
+  anthropic: https://api.anthropic.com
+  openai: https://api.openai.com/v1
+  openrouter: https://openrouter.ai/api/v1
+# Prices in USD per million tokens, keyed by model-id prefix (the longest matching prefix wins).
+# OpenRouter prices are read live from its /models endpoint and need no entry here.
+# Without a price, a cloud request is blocked while a cost limit is set. Enter current prices from the provider's
+# price list, for example:
+#   prices_usd_per_mtok:
+#     some-model-family:
+#       input: 1.00
+#       output: 5.00
+prices_usd_per_mtok: {}

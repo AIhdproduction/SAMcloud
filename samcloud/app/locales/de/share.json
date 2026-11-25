@@ -41,7 +41,11 @@
     "view_pc": "Punktwolke",
     "view_ifc": "IFC-Modell",
     "phase_dxf": "DXF aufbereiten",
-    "phase_ifc": "IFC aufbereiten"
+    "phase_ifc": "IFC aufbereiten",
+    "dxf_language_export": "DXF in der App-Sprache neu exportieren",
+    "privacy_failed": "Datenschutzprüfung fehlgeschlagen: {problems}",
+    "unavailable_error": "Verfügbar nach dem DXF/IFC-Export: Punktwolke, DXF und IFC-Modell müssen vorhanden sein.",
+    "qr_created": "QR-Code erzeugt"
   },
   "setup": {
     "title": "Cloudflare R2 einrichten",

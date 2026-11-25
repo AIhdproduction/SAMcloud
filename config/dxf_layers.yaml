@@ -52,3 +52,11 @@ outdoor_extra_layers:
   - {name: S-TOPO-TEXT, color: 34, true_color: [150, 60, 40], linetype: CONTINUOUS, lineweight: 18}
   - {name: S-ELEV, color: 7, linetype: CONTINUOUS, lineweight: 18}
   - {name: S-ANNO-GRENZE, color: 1, linetype: DASHED, lineweight: 25}
+
+# AI assistant (samcloud/assistant/dxf_patch.py): layers drawn only into plans the assistant edited (not class-driven,
+# ignored by the loader in samcloud/dxf/layers.py; plans without assistant edits never get them).
+assistant_layers:
+  - {name: A-FURN-MANUAL, color: 6, linetype: DASHED, lineweight: 18}
+  # outdoor (samcloud/assistant/domains/outdoor_pipeline.py): trees / manholes added without point-cloud evidence
+  - {name: S-TREE-MANUAL, color: 6, linetype: DASHED, lineweight: 18}
+  - {name: S-MANH-MANUAL, color: 6, linetype: DASHED, lineweight: 18}

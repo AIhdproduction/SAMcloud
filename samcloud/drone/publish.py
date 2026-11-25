@@ -220,6 +220,9 @@ def publish_environment_exports(project_dir: str | Path, exports: Mapping[str, A
     if "dxf" in sources:
         export_dir = root / "products" / "dxf" / "export"
         published["dxf"] = _copy(sources["dxf"], export_dir / f"{name}_Site_clean.dxf")
+        from samcloud.dxf.text_language import copy_dxf_language
+
+        copy_dxf_language(sources["dxf"], published["dxf"])  # the DXF page / share know its text language
 
     bim_dir = root / "products" / "bim" / SITE_KEY
     if "ifc" in sources:

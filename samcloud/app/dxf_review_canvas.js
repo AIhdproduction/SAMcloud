@@ -23,6 +23,10 @@ export default {
     tool: String,
     background: Array,
     strings: Object,
+    // AI assistant (all off unless the page enables them): click picking and highlight overlays in world units.
+    pickEnabled: Boolean,
+    selectionOverlay: Array,
+    previewOverlay: Array,
   },
   data() {
     return { message: "" };
@@ -100,6 +104,12 @@ export default {
       this.requestDraw();
     },
     background() {
+      this.requestDraw();
+    },
+    selectionOverlay() {
+      this.requestDraw();
+    },
+    previewOverlay() {
       this.requestDraw();
     },
     tool() {
@@ -189,7 +199,8 @@ export default {
     resize() {
       const canvas = this.$refs.canvas;
       if (!canvas) return;
-      const rect = this.$el.getBoundingClientRect();
+      // the canvas box (inside the 1 px border of $el) is what eventPoint() measures and what the bitmap is shown in
+      const rect = canvas.getBoundingClientRect();
       const ratio = window.devicePixelRatio || 1;
       const oldWidth = this.cssWidth;
       const oldHeight = this.cssHeight;
@@ -347,6 +358,9 @@ export default {
         this.drawLayers(ctx, this.compareLayers, Math.max(0, Math.min(1, Number(this.compareOpacity ?? 1))), hidden, viewport, ratio);
       }
       ctx.globalAlpha = 1;
+      if ((this.previewOverlay && this.previewOverlay.length) || (this.selectionOverlay && this.selectionOverlay.length)) {
+        this.drawOverlays(ctx);
+      }
       if (this.measurePoints.length) {
         ctx.strokeStyle = "#ffd23f";
         ctx.fillStyle = "#ffd23f";
@@ -367,6 +381,75 @@ export default {
           ctx.fillText(`${distance.toFixed(3)} m`, (screen[0][0] + screen[1][0]) / 2 + 6, (screen[0][1] + screen[1][1]) / 2 - 6);
         }
       }
+    },
+    overlayRing(ctx, ring) {
+      if (!Array.isArray(ring) || ring.length < 2) return false;
+      ctx.beginPath();
+      ring.forEach((point, index) => {
+        const [sx, sy] = this.toScreen(Number(point[0]), Number(point[1]));
+        if (index) ctx.lineTo(sx, sy);
+        else ctx.moveTo(sx, sy);
+      });
+      ctx.closePath();
+      return true;
+    },
+    drawOverlays(ctx) {
+      // Assistant preview: added green, removed red, moved / modified amber; "before" dashed, "after" solid.
+      // The selection is drawn first so the preview colours stay visible on selected elements.
+      const colors = { added: "#4bc692", removed: "#ef6b73", moved: "#ffb74d", modified: "#ffb74d" };
+      const fills = { added: "rgba(75,198,146,.22)", removed: "rgba(239,107,115,.20)", moved: "rgba(255,183,77,.22)", modified: "rgba(255,183,77,.22)" };
+      ctx.save();
+      ctx.lineJoin = "round";
+      ctx.setLineDash([]);
+      for (const item of this.selectionOverlay || []) {
+        if (!item) continue;
+        if (item.ring && this.overlayRing(ctx, item.ring)) {
+          ctx.fillStyle = "rgba(38,183,239,.20)";
+          ctx.fill();
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = "#26b7ef";
+          ctx.stroke();
+        } else if (Array.isArray(item.point) && item.point.length >= 2) {
+          const [sx, sy] = this.toScreen(Number(item.point[0]), Number(item.point[1]));
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "#26b7ef";
+          ctx.fillStyle = "rgba(38,183,239,.35)";
+          ctx.beginPath();
+          ctx.arc(sx, sy, 7, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(sx - 11, sy);
+          ctx.lineTo(sx + 11, sy);
+          ctx.moveTo(sx, sy - 11);
+          ctx.lineTo(sx, sy + 11);
+          ctx.stroke();
+        }
+      }
+      for (const item of this.previewOverlay || []) {
+        if (!item) continue;
+        const change = colors[item.change] ? item.change : "modified";
+        if (item.before && this.overlayRing(ctx, item.before)) {
+          ctx.setLineDash([6, 4]);
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = change === "removed" ? colors.removed : "#9aa7b3";
+          if (change === "removed") {
+            ctx.fillStyle = fills.removed;
+            ctx.fill();
+          }
+          ctx.stroke();
+        }
+        if (item.after && this.overlayRing(ctx, item.after)) {
+          ctx.setLineDash([]);
+          ctx.lineWidth = 3;
+          ctx.fillStyle = fills[change];
+          ctx.fill();
+          ctx.strokeStyle = colors[change];
+          ctx.stroke();
+        }
+      }
+      ctx.setLineDash([]);
+      ctx.restore();
     },
     drawLayers(ctx, layers, opacity, hidden, viewport, ratio) {
       if (opacity <= 0 || !layers.length) return;
@@ -418,8 +501,10 @@ export default {
     },
     onDown(event) {
       if (event.button !== 0) return;
-      this.$refs.canvas.focus();
+      // measure before focusing, and never let focus() scroll the page: the canvas is often taller than the window and
+      // a scroll between pointerdown and the coordinate read shifted measure / pick points by the scrolled distance
       const [x, y] = this.eventPoint(event);
+      this.$refs.canvas.focus({ preventScroll: true });
       if (this.tool === "measure") {
         if (this.measurePoints.length >= 2) this.measurePoints = [];
         this.measurePoints.push(this.toWorld(x, y));
@@ -431,7 +516,8 @@ export default {
         return;
       }
       this.$refs.canvas.setPointerCapture(event.pointerId);
-      this.drag = { x, y, ox: this.view.ox, oy: this.view.oy };
+      this.drag = { x, y, ox: this.view.ox, oy: this.view.oy, t: performance.now(), moved: 0,
+        cx: event.clientX, cy: event.clientY, world: this.toWorld(x, y) };
       this.view.userMoved = true;
       this.$refs.canvas.style.cursor = "grabbing";
     },
@@ -440,12 +526,22 @@ export default {
       const [wx, wy] = this.toWorld(x, y);
       this.$refs.status.textContent = `X ${wx.toFixed(3)} m · Y ${wy.toFixed(3)} m`;
       if (this.drag) {
+        this.drag.moved = Math.max(this.drag.moved || 0, Math.hypot(event.clientX - this.drag.cx, event.clientY - this.drag.cy));
         this.view.ox = this.drag.ox + (x - this.drag.x);
         this.view.oy = this.drag.oy + (y - this.drag.y);
         this.requestDraw();
       }
     },
     onUp(event) {
+      if (this.pickEnabled && this.drag && event.button === 0) {
+        // a short click without dragging selects (AI assistant); a drag stays a pan.  The pick uses the world point
+        // under the pointer at pointerdown (client-space movement test), so a page scroll in between cannot shift it.
+        const moved = Math.max(this.drag.moved || 0, Math.hypot(event.clientX - this.drag.cx, event.clientY - this.drag.cy));
+        if (moved < 4 && performance.now() - this.drag.t < 400) {
+          const [wx, wy] = this.drag.world;
+          this.$emit("pick", { x: wx, y: wy, ctrl: !!(event.ctrlKey || event.metaKey) });
+        }
+      }
       if (this.drag && this.$refs.canvas.hasPointerCapture(event.pointerId)) {
         this.$refs.canvas.releasePointerCapture(event.pointerId);
       }

@@ -107,8 +107,16 @@ def result_from_dict(payload: dict[str, Any], *, rgb_png: bytes | None = None, c
     )
 
 
-def vector_payload(result: DxfPlanResult, *, grid_size: int = 64) -> dict[str, Any]:
-    """Build a JSON-serializable browser payload with RGB colors and bounds."""
+def vector_payload(result: DxfPlanResult, *, grid_size: int = 64, language: str | None = None) -> dict[str, Any]:
+    """Build a JSON-serializable browser payload with RGB colors and bounds.
+
+    ``language`` ("de" / "en") translates the texts exactly like the DXF export (``samcloud.dxf.text_language``),
+    so viewer and file agree; ``None`` shows the cached texts unchanged.
+    """
+    if language is not None:
+        from samcloud.dxf.text_language import translate_result
+
+        result = translate_result(result, language)[0]
     payload_layers: dict[str, dict[str, Any]] = {}
     for name, entities in result.layers.items():
         browser_entities = []

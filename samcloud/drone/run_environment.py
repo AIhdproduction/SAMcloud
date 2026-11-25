@@ -561,9 +561,41 @@ def _boundary_dxf_entities(boundary, frame) -> dict:
 
 
 def _step_scene(project, out, cfg, cache):
+    scene, dxf, qa = build_scene_outputs(project, cfg, cache)
+    _dump(cache / "scene.pkl", {"scene": scene, "dxf": dxf, "qa": qa}); return {"elements": len(scene.elements)}
+
+
+def _assistant_scene_plan(project, scene, groups, edited_scene=None):
+    """AI-assistant edits of the site (``products/assistant/site/edits.json``) as a ``ScenePlan``; None without edits.
+
+    Without ``edits.json`` (and without ``edited_scene``) nothing of the assistant is imported: the output is unchanged.
+    """
+    if edited_scene is None and not (Path(project) / "products" / "assistant" / "site" / "edits.json").is_file():
+        return None
+    try:
+        from samcloud.assistant.domains.outdoor_pipeline import scene_plan
+    except Exception as exc:  # noqa: BLE001 - the assistant never breaks the chain
+        LOGGER.warning("assistant edits not applied: %s", exc)
+        return None
+    if edited_scene is not None:
+        return scene_plan(project, scene, groups, edited_scene=edited_scene, logger=LOGGER)
+    try:
+        return scene_plan(project, scene, groups, logger=LOGGER)
+    except Exception as exc:  # noqa: BLE001 - the assistant never breaks the chain
+        LOGGER.warning("assistant edits not applied: %s", exc)
+        return None
+
+
+def build_scene_outputs(project, cfg, cache, *, edited_scene=None, frame=None):
+    """``(scene, neutral DXF result, QA entries)`` of the scene step from the step checkpoints.
+
+    The AI-assistant edits of the site are applied to the elements before any DXF builder runs, so DXF and IFC come from
+    the edited elements; ``edited_scene`` (the assistant's proposal QA) replaces the stored edits.  ``frame`` saves
+    loading ``load.pkl`` when the caller knows the local frame.
+    """
     from samcloud.outdoor_model.scene import assemble_dxf, assemble_scene
     from samcloud.outdoor_model import buildings, site_walls, vegetation, pavement, civil, terrain as terrain_builder
-    ps, frame = _working_pointset(cache), _load(cache / "load.pkl")[1]; veg = _load(cache / "vegetation.pkl"); pave = _load(cache / "pavement.pkl"); tin = _load(cache / "tin.pkl"); bld = _load(cache / "buildings.pkl"); site = _load(cache / "site.pkl"); terrain_data = _load(cache / "terrain.pkl")
+    frame = _load(cache / "load.pkl")[1] if frame is None else frame; veg = _load(cache / "vegetation.pkl"); pave = _load(cache / "pavement.pkl"); tin = _load(cache / "tin.pkl"); bld = _load(cache / "buildings.pkl"); site = _load(cache / "site.pkl"); terrain_data = _load(cache / "terrain.pkl")
     pavement_elements, pavement_qa = pavement.build_pavement_elements(
         pave["polygons"], [], pave["curbs"], tin, config=cfg, topology_ready=True,
     )
@@ -571,21 +603,29 @@ def _step_scene(project, out, cfg, cache):
     if tin is not None: veg.elements = vegetation.rebase_trees_on_tin(veg.elements, tin)  # trunk base flush with the final TIN
     groups=[veg.elements, pavement_elements, terrain_elements, bld["elements"], site["elements"]]
     scene=assemble_scene(*groups, frame=frame)
-    manholes = [tuple(item.params.center[:2]) for item in site["elements"] if hasattr(item.params, "center")]
+    plan = _assistant_scene_plan(project, scene, groups, edited_scene)
+    if plan is not None:
+        scene = plan.scene
+    veg_elements, pavement_elements, terrain_elements, building_elements, site_elements = plan.dxf_groups if plan is not None else groups
+    manholes = [tuple(item.params.center[:2]) for item in site_elements if hasattr(item.params, "center")]
     terrain_dxf, _terrain_info = terrain_builder.terrain_dxf_entities(terrain_elements, frame,
         dtm=terrain_data["dtm"], validity=terrain_data["validity"], dtm_bounds=tuple(terrain_data["bounds"]),
-        resolution=terrain_data["resolution"], curbs=pave["curbs"], manholes=manholes, footprints=terrain_builder.building_footprints(bld["elements"]), config=cfg)
-    entities={"vegetation": vegetation.to_dxf_entities(veg.elements, frame, config=cfg), "pavement": pavement.to_dxf_entities(pavement_elements, frame, config=cfg, edge_fit=pave.get("edge_fit")), "terrain": terrain_dxf, "buildings": buildings.to_dxf_entities(bld["elements"], frame), "site": site_walls.to_dxf_entities(site["elements"], frame), "civil": civil.to_dxf_entities(site["elements"], frame, config=cfg)}
+        resolution=terrain_data["resolution"], curbs=pave["curbs"], manholes=manholes, footprints=terrain_builder.building_footprints(building_elements), config=cfg)
+    entities={"vegetation": vegetation.to_dxf_entities(veg_elements, frame, config=cfg), "pavement": pavement.to_dxf_entities(pavement_elements, frame, config=cfg, edge_fit=pave.get("edge_fit")), "terrain": terrain_dxf, "buildings": buildings.to_dxf_entities(building_elements, frame), "site": site_walls.to_dxf_entities(site_elements, frame), "civil": civil.to_dxf_entities(site_elements, frame, config=cfg)}
     fitted_curbs = getattr(pave.get("edge_fit"), "curbs", None)  # curbs as lines/arcs (bulges), fitted with the outlines
+    if fitted_curbs and plan is not None: fitted_curbs = plan.fitted_curbs(fitted_curbs)  # a deleted curb is not drawn from the fit
     if fitted_curbs:
-        fitted_curbs = civil.apply_curb_heights(fitted_curbs, site["elements"])  # DXF z = the surface-snapped curb top of the IFC body
-        skip, clipped = civil.curbs_off_the_fit(site["elements"], fitted_curbs, cfg)  # clipped / unfitted curbs keep their element axis
+        fitted_curbs = civil.apply_curb_heights(fitted_curbs, site_elements)  # DXF z = the surface-snapped curb top of the IFC body
+        skip, clipped = civil.curbs_off_the_fit(site_elements, fitted_curbs, cfg)  # clipped / unfitted curbs keep their element axis
         fitted_dxf = pavement.curb_dxf_entities(fitted_curbs, frame, config=cfg, exclude_ids=skip)
         element_dxf = civil.to_dxf_entities(clipped, frame, config=cfg).get("S-CURB", [])
         if fitted_dxf or element_dxf: entities["civil"] = {**entities["civil"], "S-CURB": fitted_dxf.get("S-CURB", []) + element_dxf}
     boundary_dxf = _boundary_dxf_entities(_load(cache / "boundary.pkl"), frame)
     if boundary_dxf: entities["boundary"] = boundary_dxf
-    dxf=assemble_dxf(entities, frame, cfg); _dump(cache / "scene.pkl", {"scene": scene, "dxf": dxf, "qa": pave.get("topology_qa", []) + pavement_qa + terrain_qa + bld["qa"] + site["qa"]}); return {"elements": len(scene.elements)}
+    if plan is not None: entities = plan.add_manual_entities(entities, frame, cfg)  # elements without evidence: <layer>-MANUAL
+    dxf=assemble_dxf(entities, frame, cfg)
+    if plan is not None: plan.style(dxf)
+    return scene, dxf, pave.get("topology_qa", []) + pavement_qa + terrain_qa + bld["qa"] + site["qa"]
 
 
 def _element_category(element) -> str:
@@ -691,11 +731,53 @@ def _transfer_classes_nearest(full: PointSet, working: PointSet, *, chunk_size: 
     return result
 
 
-def _step_export(project, out, cfg, cache):
+def write_cad_exports(scene, dxf_result, frame, cfg, ifc_path, dxf_path):
+    """Write the IFC and the DXF of a scene-step result (export step, ``cad_only`` export and the assistant QA)."""
     from samcloud.bim.core.ifc.writer import write_ifc
+    from samcloud.dxf.writer import build_dxf_document, ensure_outdoor_layers
+    write_ifc(scene, ifc_path)
+    from samcloud.dxf.text_language import current_dxf_language, localize_result, record_dxf_language, translate_document_notes
+    dxf_language = current_dxf_language()  # DXF texts in the app language, like the DXF page export
+    doc=build_dxf_document(localize_result(dxf_result, dxf_language), coordinates="local", local_origin=bool(cfg.get("dxf", {}).get("local_origin", False)), origin_offset=frame.origin_lv95)
+    if dxf_language: translate_document_notes(doc, dxf_language)
+    ensure_outdoor_layers(doc, tin_frozen=bool(cfg.get("dxf", {}).get("tin_layer_frozen", True))); doc.saveas(dxf_path)
+    if dxf_language and Path(dxf_path).is_file(): record_dxf_language(dxf_path, dxf_language)  # outdoor.dxf.lang.json, copied on publish
+
+
+def _publish_exports(project, exports):
+    """``publish_environment_exports`` that never raises: (published, error)."""
+    try:
+        from samcloud.drone.publish import publish_environment_exports
+    except ImportError:
+        LOGGER.info("environment export publishing is unavailable")
+        return None, None
+    try:
+        return publish_environment_exports(project, exports), None
+    except Exception as exc:
+        LOGGER.warning("environment export publishing failed: %s", exc)
+        return None, str(exc)
+
+
+def _step_export_cad_only(project, out, cfg, cache):
+    """Fast export after an AI-assistant edit: IFC + DXF + publish (viewer assets from the IFC); LAZ, OBJ and
+    environment.glb of the last full export stay as they are."""
+    frame = _load(cache / "load.pkl")[1]; data = _load(cache / "scene.pkl")
+    ifc_path=out / "outdoor.ifc"; dxf_path=out / "outdoor.dxf"; glb_path=out / "environment.glb"
+    write_cad_exports(data["scene"], data["dxf"], frame, cfg, ifc_path, dxf_path)
+    exports = {"ifc": ifc_path, "dxf": dxf_path}
+    if glb_path.is_file(): exports["glb"] = glb_path  # fallback viewer model only when the IFC gives none
+    published, publish_error = _publish_exports(project, exports)
+    result = {"ifc": str(ifc_path), "dxf": str(dxf_path), "cad_only": True, "published": published}
+    if publish_error is not None:
+        result["publish_error"] = publish_error
+    return result
+
+
+def _step_export(project, out, cfg, cache, cad_only=False):
+    if cad_only:
+        return _step_export_cad_only(project, out, cfg, cache)
     from samcloud.bim.core.model import BuildingElement
     from samcloud.drone.export import export_mesh, export_point_cloud
-    from samcloud.dxf.writer import build_dxf_document, ensure_outdoor_layers
     ps, frame = _working_pointset(cache), _load(cache / "load.pkl")[1]; data = _load(cache / "scene.pkl")
     full = _load(cache / "load_full.pkl")
     source = "working"
@@ -712,8 +794,7 @@ def _step_export(project, out, cfg, cache):
         if len(ps) == 0:
             raise ValueError("processing boundary contains no points; cannot export classified.laz")
     ifc_path=out / "outdoor.ifc"; dxf_path=out / "outdoor.dxf"; laz_path=out / "classified.laz"; glb_path=out / "environment.glb"
-    write_ifc(data["scene"], ifc_path)
-    doc=build_dxf_document(data["dxf"], coordinates="local", local_origin=bool(cfg.get("dxf", {}).get("local_origin", False)), origin_offset=frame.origin_lv95); ensure_outdoor_layers(doc, tin_frozen=bool(cfg.get("dxf", {}).get("tin_layer_frozen", True))); doc.saveas(dxf_path)
+    write_cad_exports(data["scene"], data["dxf"], frame, cfg, ifc_path, dxf_path)
     extras={name: getattr(ps, name) for name in ("confidence", "margin", "view_count", "adjusted") if getattr(ps, name) is not None}
     extras.update({"hag": np.zeros(len(ps), np.float32), "building_id": np.zeros(len(ps), np.int32), "tree_id": np.zeros(len(ps), np.int32)})
     export_point_cloud(ps, laz_path, frame, extra=extras)
@@ -728,18 +809,7 @@ def _step_export(project, out, cfg, cache):
         nodes["dsm-surface"] = (*dsm, "dsm")
     if nodes: _write_environment_glb(nodes, glb_path, frame)
     else: glb_path.write_bytes(b"glTF")
-    published = None
-    publish_error = None
-    try:
-        from samcloud.drone.publish import publish_environment_exports
-    except ImportError:
-        LOGGER.info("environment export publishing is unavailable")
-    else:
-        try:
-            published = publish_environment_exports(project, {"ifc": ifc_path, "dxf": dxf_path, "glb": glb_path, "laz": laz_path})
-        except Exception as exc:
-            publish_error = str(exc)
-            LOGGER.warning("environment export publishing failed: %s", exc)
+    published, publish_error = _publish_exports(project, {"ifc": ifc_path, "dxf": dxf_path, "glb": glb_path, "laz": laz_path})
     result = {"ifc": str(ifc_path), "dxf": str(dxf_path), "laz": str(laz_path), "glb": str(glb_path),
               "nodes": len(nodes), "point_source": source, "published": published}
     if clip_info is not None:
@@ -759,6 +829,12 @@ def _step_qa(project, out, cfg, cache):
     for getter in (buildings.category_counts, civil.category_counts, pavement.category_counts, vegetation.category_counts):
         counts.update(getter(elements))
     results=check_dxf(out / "outdoor.dxf", cfg)+check_ifc(out / "outdoor.ifc", cfg)+count_consistency(counts, out / "outdoor.dxf", out / "outdoor.ifc")
+    if (Path(project) / "products" / "assistant" / "site" / "edits.json").is_file():  # AI-assistant elements on <layer>-MANUAL count with their category
+        try:
+            from samcloud.assistant.domains.outdoor_pipeline import adjust_manual_qa
+            results = adjust_manual_qa(results, out / "outdoor.dxf")
+        except Exception as exc:  # noqa: BLE001 - the assistant never breaks the chain
+            LOGGER.warning("assistant QA adjustment skipped: %s", exc)
     validation = validate_exports({"ifc": out / "outdoor.ifc", "dxf": out / "outdoor.dxf", "laz": out / "classified.laz", "glb": out / "environment.glb"})
     results += [{"rule": "exports", "ok": all(item.get("ok", False) for item in validation.values()), "value": validation, "threshold": "all exports valid", "offenders": []}]
     write_qa_report(results, out); _dump(cache / "qa.pkl", results); return {"results": len(results)}
@@ -922,8 +998,12 @@ def _apply_boundary(name: str, out: Path, cache: Path) -> dict | None:
     return dict(counts) if name in ("pavement", "vegetation", "site") else None
 
 
-def run_environment(project_dir, *, out_dir=None, config=None, steps=None, resume=True) -> dict:
-    """Run the resumable outdoor chain; failures are recorded and independent steps continue."""
+def run_environment(project_dir, *, out_dir=None, config=None, steps=None, resume=True, cad_only=False) -> dict:
+    """Run the resumable outdoor chain; failures are recorded and independent steps continue.
+
+    ``cad_only`` (used after AI-assistant edits, typically with ``steps="scene,export,qa"``) makes the export step write
+    only IFC + DXF and publish them; LAZ, OBJ and environment.glb of the last full export are kept.
+    """
     project=Path(project_dir); out=Path(out_dir) if out_dir else project / "products" / "environment"; out.mkdir(parents=True, exist_ok=True); cache=out / "cache"; cache.mkdir(exist_ok=True)
     cfg=load_drone_config() if config is None else config; state_path=out / "state.json"; state=json.loads(state_path.read_text(encoding="utf-8")) if resume and state_path.exists() else {"steps": {}}
     requested=set(STEPS if not steps else ([x.strip() for x in steps.split(",")] if isinstance(steps,str) else steps)); active=set()
@@ -950,7 +1030,7 @@ def run_environment(project_dir, *, out_dir=None, config=None, steps=None, resum
         monitor = _PeakRssMonitor(psutil.Process())
         monitor.start()
         try:
-            outputs=_step_report(project,out,cfg,cache,state) if name=="report" else HANDLERS[name](project,out,cfg,cache)
+            outputs=_step_report(project,out,cfg,cache,state) if name=="report" else (_step_export(project,out,cfg,cache,cad_only=True) if name=="export" and cad_only else HANDLERS[name](project,out,cfg,cache))
             if name in ("terrain", "pavement", "tin", "vegetation", "site"):
                 clip = _apply_boundary(name, out, cache)
                 if clip is not None and isinstance(outputs, dict): outputs["boundary_clip"] = clip
@@ -965,6 +1045,7 @@ def run_environment(project_dir, *, out_dir=None, config=None, steps=None, resum
 
 def main(argv=None):
     parser=argparse.ArgumentParser(); parser.add_argument("--project",required=True); parser.add_argument("--steps"); parser.add_argument("--no-resume",action="store_true")
-    args=parser.parse_args(argv); print(json.dumps(run_environment(args.project,steps=args.steps,resume=not args.no_resume),indent=2,default=str))
+    parser.add_argument("--cad-only",action="store_true",help="export step: only IFC + DXF + publish (after AI-assistant edits)")
+    args=parser.parse_args(argv); print(json.dumps(run_environment(args.project,steps=args.steps,resume=not args.no_resume,cad_only=args.cad_only),indent=2,default=str))
 
 if __name__ == "__main__": main()

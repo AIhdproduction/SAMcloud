@@ -546,8 +546,11 @@ def provenance_props(element: Any) -> dict[str, Any]:
             if isinstance(value, (int, float)):
                 props["Normgroesse_m"] = _r3(value)
                 break
+    manual = element.evidence.get("evidence") == "manual"  # added by the AI assistant without point-cloud evidence
+    if manual:
+        props["SAMcloud_Evidence"] = "manual"
     for name, value in element.evidence.items():
-        if name in _EVIDENCE_SKIP:
+        if name in _EVIDENCE_SKIP or (manual and name == "evidence"):
             continue
         if isinstance(value, (str, int, float, bool)):
             props[f"Evidence_{name}"] = value

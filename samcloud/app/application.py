@@ -10,7 +10,7 @@ from nicegui import app, ui
 from starlette.responses import FileResponse, JSONResponse, Response
 
 from samcloud.app.pages import control_points, dense_cloud, dxf, home, projects, settings, sparse_cloud, targets
-from samcloud.app.i18n import t
+from samcloud.app.i18n import current_language, t
 from samcloud.app.state import state
 from samcloud.app.dxf_controller import DxfPageController
 from samcloud.app.dxf_review_canvas import review_background, review_payload
@@ -420,7 +420,8 @@ def dxf_review_payload(level_key: str, variant: str = "pointcloud"):
     try:
         if variant not in {"pointcloud", "ortho"}:
             raise ValueError(t("app.errors.invalid_plan_variant"))
-        payload = review_payload(project_directory, level_key, variant)
+        # Same texts as the exported DXF: translated into the current UI language (the cache stays unchanged).
+        payload = review_payload(project_directory, level_key, variant, language=current_language())
     except ValueError as error:
         return JSONResponse({"error": str(error)}, status_code=400)
     if payload is None:

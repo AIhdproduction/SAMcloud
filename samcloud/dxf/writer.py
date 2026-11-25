@@ -9,7 +9,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import ezdxf
 from ezdxf.enums import TextEntityAlignment
@@ -109,9 +109,12 @@ def build_dxf_document(
     if "X-NOTE" not in document.layers:
         document.layers.add("X-NOTE", color=8, linetype="CONTINUOUS")
     _ensure_furniture_block(document)
-    if result.blocks:
+    # outdoor symbols (TREE, TREE_STEM, SHRUB, MANHOLE) are already defined by _ensure_used_outdoor_items; the ortho
+    # symbol table does not know TREE_STEM, so they are not passed on (existing blocks are skipped there anyway)
+    symbol_blocks = [name for name in result.blocks if not (name in OUTDOOR_BLOCK_ATTRIBUTES and name in document.blocks)]
+    if symbol_blocks:
         from samcloud.ortho.vector.symbols import add_symbol_blocks
-        add_symbol_blocks(document, result.blocks)
+        add_symbol_blocks(document, symbol_blocks)
     scale_div, yaw = frame_scale_and_yaw(result.frame, coordinates)
     modelspace = document.modelspace()
     # Draw order = entity order: area fills (wall poché) first, texts last, so no fill ever covers a label.
@@ -390,14 +393,25 @@ def sanitize_dxf_name(name: str) -> str:
     return result or "_"
 
 
-def export_plan(result: DxfPlanResult, out_dir: Path, coordinates: str = "local") -> Path:
-    """Atomically export exactly the reviewed result and verify the saved DXF."""
+def export_plan(
+    result: DxfPlanResult,
+    out_dir: Path,
+    coordinates: str = "local",
+    post_build: Callable[[ezdxf.document.Drawing], None] | None = None,
+) -> Path:
+    """Atomically export exactly the reviewed result and verify the saved DXF.
+
+    ``post_build`` (optional) may adjust the built document before it is saved (e.g. translate the X-NOTE line);
+    without it the output is unchanged.
+    """
     destination_directory = Path(out_dir)
     destination_directory.mkdir(parents=True, exist_ok=True)
     suffix = "site" if result.level_name == "site" else sanitize_dxf_name(result.level_name)
     safe_project = sanitize_dxf_name(result.project_name)
     destination = destination_directory / f"{safe_project}_{suffix}.dxf"
     document = build_dxf_document(result, coordinates=coordinates)
+    if post_build is not None:
+        post_build(document)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.stem}.", suffix=".tmp", dir=destination_directory)
     os.close(descriptor)
     temporary = Path(temporary_name)

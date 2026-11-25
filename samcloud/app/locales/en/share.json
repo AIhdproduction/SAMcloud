@@ -41,7 +41,11 @@
     "view_pc": "Point cloud",
     "view_ifc": "IFC model",
     "phase_dxf": "Preparing DXF",
-    "phase_ifc": "Preparing IFC"
+    "phase_ifc": "Preparing IFC",
+    "dxf_language_export": "Re-exporting the DXF in the app language",
+    "privacy_failed": "Privacy check failed: {problems}",
+    "unavailable_error": "Available after the DXF/IFC export: point cloud, DXF and IFC model must exist.",
+    "qr_created": "QR code created"
   },
   "setup": {
     "title": "Set up Cloudflare R2",

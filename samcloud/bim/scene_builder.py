@@ -1457,6 +1457,8 @@ def _add_furniture(
                     back_wall_id=item.back_wall_id,
                     shape_source=item.shape_source,
                     **_furniture_shape(item, upm, elevation + height),
+                    # AI-assistant items without point-cloud evidence (samcloud.assistant): only then the key exists at all
+                    **({"evidence": "manual"} if (item.fit or {}).get("evidence") == "manual" else {}),
                 ),
             )
         )

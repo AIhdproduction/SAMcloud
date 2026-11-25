@@ -17,6 +17,15 @@ from samcloud.core.paths import PROJECT_ROOT
 from samcloud.dxf.jobs import replace_with_retry
 
 _WINDOWS_NO_CONSOLE = 0x08000000
+# Job actions that write DXF files; they always get the DXF text language (``--lang``).
+LANGUAGE_ACTIONS = frozenset({"export", "run_all"})
+
+
+def dxf_text_language() -> str | None:
+    """The UI language the DXF texts are written in ("de" / "en"), None when it cannot be determined."""
+    from samcloud.dxf.text_language import current_dxf_language
+
+    return current_dxf_language()
 
 
 def is_process_alive(pid: int) -> bool:
@@ -122,8 +131,15 @@ class DxfJobRunner:
         source: str | None = None,
         variant: str | None = None,
         force: bool = False,
+        language: str | None = None,
+        assistant: bool = False,
     ) -> subprocess.Popen[str]:
-        """Launch a background DXF job subprocess with sys.executable (only one at a time)."""
+        """Launch a background DXF job subprocess with sys.executable (only one at a time).
+
+        Export actions (``LANGUAGE_ACTIONS``) always pass ``--lang``: ``language`` or the current UI language.
+        ``assistant`` (export only) passes ``--assistant``: the AI assistant's export after accept / undo, which exports
+        a stale cached plan as it is instead of failing.
+        """
         if self.is_running():
             raise RuntimeError(f"A DXF job is already running for project '{self.project_dir.name}'")
 
@@ -153,6 +169,12 @@ class DxfJobRunner:
             command.extend(["--variant", str(variant)])
         if force:
             command.append("--force")
+        if assistant and str(action) == "export":
+            command.append("--assistant")
+        if str(action) in LANGUAGE_ACTIONS:
+            text_language = language or dxf_text_language()
+            if text_language is not None:
+                command.extend(["--lang", str(text_language)])
         launched = time.time()
         command.extend(["--launched", repr(launched)])
 

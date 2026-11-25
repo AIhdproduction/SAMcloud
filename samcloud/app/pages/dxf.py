@@ -2,6 +2,10 @@
 
 Nothing heavy runs automatically: every preview, alignment, level detection, generation and export
 is started by an explicit button through DxfPageController.start_job. Settings only mark caches stale.
+Accept / undo in the AI assistant card (also an explicit click) updates the DXF and the IFC on its own: the export
+steps on the cached plan, or "Compute everything" for the level when no cached plan exists.  On drone projects (the
+environment chain) it runs the fast environment job of the outdoor domain (``env:scene,export,qa:cad_only``) and then
+reloads the DXF preview and the IFC viewer in place; there the assistant picks and colours in the SVG preview.
 """
 
 from __future__ import annotations
@@ -25,8 +29,10 @@ from samcloud.app.ifc_viewer import IfcViewer, model_url
 from samcloud.app.layout import render_page
 from samcloud.app.state import state
 from samcloud.bim import ui_data as bim_ui_data
-from samcloud.drone import dxf_preview
+from samcloud.drone import dxf_preview, env_job
 from samcloud.dxf.job_runner import DxfJobRunner
+
+LOGGER = logging.getLogger(__name__)
 
 ACTION_LABELS: dict[str, str] = {
     "preview": "dxf.action.preview",
@@ -45,8 +51,25 @@ ACTION_LABELS: dict[str, str] = {
 """Job action -> translation key of its display label (resolved at render time by _action_label)."""
 
 
+ENV_ACTION_PREFIX = "env:"
+"""Assistant export action of the environment chain: ``env:<steps>[:cad_only]`` (see ``OutdoorDomain.export_actions``)."""
+ENV_ASSISTANT_ACTION = "env:scene,export,qa:cad_only"
+"""Fallback when the outdoor domain cannot name its export action."""
+
+
+def parse_env_action(action: str) -> tuple[str, bool] | None:
+    """``"env:scene,export,qa:cad_only"`` -> ``("scene,export,qa", True)``; None for other actions."""
+    if not str(action).startswith(ENV_ACTION_PREFIX):
+        return None
+    parts = str(action)[len(ENV_ACTION_PREFIX):].split(":")
+    steps = parts[0].strip()
+    return steps, "cad_only" in [part.strip() for part in parts[1:]]
+
+
 def _action_label(action: str, fallback: str | None = None) -> str:
     """Translated display label of a DXF job action; unknown actions show ``fallback`` (default: the action itself)."""
+    if str(action).startswith(ENV_ACTION_PREFIX):
+        return t("assistant.panel.update_env_action")
     key = ACTION_LABELS.get(action)
     if key is None:
         return action if fallback is None else fallback
@@ -178,6 +201,51 @@ def dxf_preview_file(name: str, v: str | None = None):
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": "no-cache"})
 
 
+def _preview_js(code: str, element: Any = None) -> None:
+    """JavaScript of the DXF preview's assistant layer (one place, so tests can record the calls).
+
+    With ``element`` it goes to that element's client: the panel also updates the overlay after an awaited assistant
+    turn, when the slot of the clicked button may already be gone."""
+    if element is not None:
+        element.client.run_javascript(code)
+    else:
+        ui.run_javascript(code)
+
+
+class DxfPreviewView:
+    """The outdoor DXF preview as the AI assistant panel sees it (:meth:`AssistantPanel.attach_preview`).
+
+    Overlays arrive in LV95 (``set_overlay``) and are drawn by ``samDxfpOverlay`` above the SVG; the page keeps the last
+    items so a rebuilt viewer (new SVG after an export) shows them again.  Clicks come from ``DxfPage.on_dxfp_pick``."""
+
+    def __init__(self, page: "DxfPage") -> None:
+        self.page = page
+        self.selection: list[dict[str, Any]] = []
+        self.preview: list[dict[str, Any]] = []
+
+    @property
+    def is_deleted(self) -> bool:
+        card = getattr(self.page, "dxfp_card", None)
+        return card is None or card.is_deleted
+
+    def set_overlay(self, *, selection: list[dict[str, Any]] | None = None, preview: list[dict[str, Any]] | None = None) -> None:
+        if selection is not None:
+            self.selection = list(selection)
+        if preview is not None:
+            self.preview = list(preview)
+        self.push()
+
+    def items(self) -> dict[str, list[dict[str, Any]]]:
+        return {"selection": list(self.selection), "preview": list(self.preview)}
+
+    def push(self) -> None:
+        """Send the current items to the browser (stored there per viewport and redrawn after every SVG load)."""
+        if self.is_deleted:
+            return
+        _preview_js(f"samDxfpOverlay('{self.page.dxfp_view_id}', {json.dumps(self.items(), separators=(',', ':'))})",
+                    self.page.dxfp_card)
+
+
 def runner_for(project_directory: Path) -> DxfJobRunner:
     """One job runner per project, shared across page visits so a running Popen stays tracked."""
     key = Path(project_directory).resolve()
@@ -214,6 +282,38 @@ def render() -> None:
         DxfPage(controller).build()
 
     render_page(t("dxf.page.title"), content, current_path="/dxf", wide=True)
+
+
+def create_assistant_panel(page: "DxfPage", level_id: str) -> Any:
+    """The AI assistant panel of a level, or None while the assistant is off, not configured or the level has no plan.
+
+    Without a panel the page and both viewers stay exactly as before (no panel, no extra viewer props or handlers)."""
+    from samcloud.app.components.assistant_panel import create_panel
+
+    return create_panel(
+        page.controller.project_dir, level_id,
+        request_exports=page.request_assistant_exports,
+        jobs_running=page.assistant_jobs_running,
+        export_state=page.assistant_export_state,
+        export_outcome=page.assistant_export_outcome,
+        # the environment run of drone projects writes the DXF and the IFC together
+        ifc_export=page.controller.mode == "indoor" or page.controller.uses_environment_chain,
+        mode=page.controller.mode,
+    )
+
+
+def assistant_is_available(project_directory: Path, level_id: str, mode: str | None = None) -> bool:
+    """True when the assistant could work on the level (enabled, configured, its project type editable)."""
+    from samcloud.app.components.assistant_panel import assistant_available
+
+    return assistant_available(project_directory, level_id, mode)
+
+
+def assistant_unavailable_reason(project_directory: Path, level_id: str, mode: str | None = None) -> str | None:
+    """i18n key of the hint line shown instead of the assistant (enabled, but the project / level is not supported)."""
+    from samcloud.app.components.assistant_panel import assistant_unavailable_reason as reason_for
+
+    return reason_for(project_directory, level_id, mode)
 
 
 def _banner(text: str, kind: str = "warning") -> ui.label:
@@ -260,15 +360,43 @@ class DxfPage:
         self.cancel_button: ui.button | None = None
         self.job_log: ui.label | None = None
         self.measure_label: ui.label | None = None
+        self.assistant: Any = None  # AssistantPanel while the AI assistant is active for the shown level
+        self.assistant_hint = False  # assistant available, but the view shows another plan variant than ortho
+        self.assistant_reason: str | None = None  # assistant on, but the project type / level is not supported (i18n key)
+        self.assistant_queue: list[tuple[str, str | None]] = []  # export steps still to run after accept / undo
+        self.assistant_job: str | None = None  # export step started for the assistant and still running
+        # result of the last automatic update after accept / undo: {"state": None | "done" | "failed", "error", "plan_stale"}
+        self.assistant_outcome: dict[str, Any] = {"state": None, "error": None, "plan_stale": False}
+        self.dxfp_card: ui.card | None = None
+        self.dxfp_view_id = f"samdxfp-{id(self)}"
+        self.dxfp_url: str | None = None  # versioned URL of the shown SVG preview (None: raster or nothing shown)
+        self.dxfp_version: int | None = None
+        self.dxfp_view: DxfPreviewView | None = None  # the preview as the assistant sees it (outdoor, assistant on)
+        self.refresh_after_turn = False  # an environment run ended during an assistant turn: rebuild the page afterwards
 
     # ------------------------------------------------------------------ frame
 
     def build(self) -> None:
         ui.add_head_html(_STYLE)
         ui.add_head_html(_PREVIEW_SCRIPT)
+        self.sync_export_language()
         with ui.column().classes("w-full gap-4"):
             self.body()
         ui.timer(1.0, self.poll)
+
+    def sync_export_language(self) -> None:
+        """Re-export once per controller when the last export was written in another language (idempotent: the
+        controller does nothing when the language matches or a job is running)."""
+        if getattr(self.controller, "_page_language_synced", False):
+            return
+        self.controller._page_language_synced = True  # type: ignore[attr-defined]
+        try:
+            started = bool(self.controller.sync_export_language())
+        except Exception as error:  # noqa: BLE001 - a failed language refresh never blocks the page
+            LOGGER.warning("DXF export language refresh failed (%s)", type(error).__name__)
+            started = False
+        if started:
+            self.was_running = True
 
     @ui.refreshable_method
     def body(self) -> None:
@@ -283,6 +411,7 @@ class DxfPage:
         self.ifc_row = None
         self.ifc_fullscreen = False
         self.dxfp_body = None
+        self.dxfp_card = None
         self.dxfp_row = None
         self.dxfp_fullscreen = False
         self.run_all_button = None
@@ -297,10 +426,23 @@ class DxfPage:
         if blocked is not None:
             _banner(blocked, "error").props("data-testid=blocked")
             return
+        self.assistant = self.assistant_for_view()
+        self.dxfp_view = DxfPreviewView(self) if self.assistant is not None and self.controller.uses_environment_chain else None
         self.build_compute_card()
         self.build_result_card()
         if self.controller.uses_environment_chain:
             self.build_dxf_preview_card()
+        # one chat card between the DXF card(s) and the IFC card (or the variant hint at the same place)
+        if self.assistant is not None:
+            if self.dxfp_view is not None:
+                self.assistant.attach_preview(self.dxfp_view)  # outdoor: picks / colours in the DXF preview (LV95)
+            elif self.result_canvas is not None:
+                self.assistant.attach_canvas(self.result_canvas)
+            self.assistant.render()
+        elif self.assistant_hint:
+            self.build_assistant_variant_hint()
+        elif self.assistant_reason:
+            self.build_assistant_reason_hint()
         self.build_ifc_card()
         if not self.controller.uses_environment_chain:
             # The ortho/clean-plan settings and review have no effect on the outdoor environment chain.
@@ -447,6 +589,11 @@ class DxfPage:
             action = _action_label(str(status.get("action", "")), t("dxf.job.fallback"))
             kind = "positive" if job_state == "done" else ("warning" if job_state == "cancelled" else "negative")
             ui.notify(t("dxf.job.finished", action=action, state=_job_state_label(job_state or "finished")), type=kind)
+            if self.continue_assistant_exports(job_state, status):
+                # the next assistant export step runs: rebuild the viewers once after the last step
+                if self.assistant is not None:
+                    self.assistant.update_jobs(True, self.controller.job_status())
+                return
             targets = self.controller.review_targets()
             if self.review_level not in targets:
                 self.review_level = targets[0] if targets else None
@@ -455,6 +602,214 @@ class DxfPage:
         self.was_running = running
         self.update_job_bar(status, running)
         self.apply_busy(running)
+        if self.assistant is not None:
+            self.assistant.update_jobs(running, status)
+
+    # ------------------------------------------------------------------ AI assistant
+
+    def assistant_for_view(self) -> Any:
+        """The assistant panel for the level of the result view (kept across refreshes), or None.
+
+        The assistant edits the ortho plan_model only: in another plan variant the page shows a hint line with a
+        switch button instead (``self.assistant_hint``), and only when the assistant would otherwise be available.
+        When the assistant is on but the project type / level cannot be edited (drone projects until their domain is
+        ready, outdoor without environment chain, no plan yet) one hint line names the reason (``self.assistant_reason``)."""
+        controller = self.controller
+        self.assistant_hint = False
+        self.assistant_reason = None
+        if controller.mode == "indoor" and self.compute_level is None:
+            return None
+        level_id = level_key(self.compute_level if controller.mode == "indoor" else None)
+        # drone projects: the domain registry picks the outdoor domain (Scene of the environment chain); the ortho plan
+        # variant does not matter there
+        if not controller.uses_environment_chain and controller.state.plan_variant != "ortho":
+            self.assistant_hint = assistant_is_available(controller.project_dir, level_id, controller.mode)
+            return None
+        current = self.assistant
+        if current is not None and current.level_id == level_id and current.service.is_available()[0]:
+            return current
+        panel = create_assistant_panel(self, level_id)
+        if panel is None:
+            self.assistant_reason = assistant_unavailable_reason(controller.project_dir, level_id, controller.mode)
+        return panel
+
+    def build_assistant_variant_hint(self) -> None:
+        """One line instead of the assistant panel while the view shows another plan variant than the ortho plan."""
+        with ui.row().classes("items-center gap-3 w-full no-wrap sam-dxf-banner is-info").mark("assistant-variant-hint"):
+            ui.icon("smart_toy").classes("text-lg")
+            ui.label(t("assistant.panel.variant_hint")).classes("flex-1")
+            ui.button(t("assistant.panel.variant_switch"), icon="swap_horiz", on_click=self.switch_to_ortho_view).props(
+                "flat dense no-caps").mark("assistant-variant-switch")
+
+    def build_assistant_reason_hint(self) -> None:
+        """One line instead of the assistant panel while the assistant cannot work on this project / level."""
+        with ui.row().classes("items-center gap-3 w-full no-wrap sam-dxf-banner is-info").mark("assistant-unsupported-hint"):
+            ui.icon("smart_toy").classes("text-lg")
+            ui.label(t(self.assistant_reason or "assistant.agent.no_plan")).classes("flex-1")
+
+    def switch_to_ortho_view(self) -> None:
+        self.controller.set_plan_variant("ortho")
+        self.body.refresh()
+
+    def assistant_busy(self) -> bool:
+        """True while the assistant panel waits for a model answer."""
+        return bool(self.assistant is not None and getattr(self.assistant, "busy", False))
+
+    def assistant_jobs_running(self) -> bool:
+        """The job that blocks accept / undo: the environment job on drone projects, else the DXF job."""
+        if self.controller.uses_environment_chain:
+            return self.controller.environment_running()
+        return self.controller.is_running()
+
+    def assistant_export_state(self) -> tuple[str | None, list[str]]:
+        return self.assistant_job, [action for action, _level in self.assistant_queue]
+
+    def assistant_export_outcome(self) -> dict[str, Any]:
+        return dict(self.assistant_outcome)
+
+    def assistant_level(self) -> str | None:
+        """Level the assistant works on (None = the outdoor site)."""
+        return self.compute_level if self.controller.mode == "indoor" else None
+
+    def assistant_update_actions(self, level: str | None) -> list[str]:
+        """Jobs that bring DXF and IFC up to date after accept / undo.
+
+        The export steps run on the existing (possibly stale) clean plan; when the export cannot run on it at all
+        (no cached clean plan, no point source) the full computation of the level runs instead, whose hooks re-apply
+        the accepted edits before its own DXF and IFC export.  Drone projects run the domain's fast environment job."""
+        if self.controller.uses_environment_chain:
+            actions: list[str] = []
+            if self.assistant is not None:
+                try:
+                    actions = [str(action) for action in self.assistant.service.export_actions()]
+                except Exception as error:  # noqa: BLE001 - fall back to the known outdoor action
+                    LOGGER.info("assistant: export jobs unknown (%s)", type(error).__name__)
+            return [action for action in actions if parse_env_action(action) is not None] or [ENV_ASSISTANT_ACTION]
+        if not self.controller.assistant_export_ready(level):
+            return ["run_all"]
+        if self.assistant is not None:  # the domain of the edited level knows its export jobs
+            try:
+                actions = list(self.assistant.service.export_actions())
+            except Exception as error:  # noqa: BLE001 - fall back to the mode rule below
+                LOGGER.info("assistant: export jobs unknown (%s)", type(error).__name__)
+                actions = []
+            if actions:
+                return actions
+        return ["export", "export_ifc"] if self.controller.mode == "indoor" else ["export"]
+
+    def request_assistant_exports(self) -> bool:
+        """After accept / undo (or "Export again"): show the edited plan at once, then update DXF and IFC by themselves."""
+        level = self.assistant_level()
+        self.assistant_outcome = {"state": None, "error": None, "plan_stale": False}
+        self.reload_viewers()  # the 2D plan shows the accepted / undone edit before any job ran
+        self.assistant_queue = [(action, level) for action in self.assistant_update_actions(level)]
+        if self.assistant_jobs_running():
+            return True  # started by poll() when the running job ends
+        return self.start_next_assistant_export()
+
+    def start_next_assistant_export(self) -> bool:
+        if not self.assistant_queue:
+            return False
+        action, level = self.assistant_queue.pop(0)
+        if parse_env_action(action) is not None:
+            return self.start_assistant_environment_run(action)
+        if action == "export" and not self.controller.assistant_export_ready(level):
+            action, self.assistant_queue = "run_all", []  # the cache vanished while waiting: compute everything
+        try:
+            if action == "export":
+                # the panel only exists in the ortho view: the assistant export always writes the ortho plan and
+                # exports a stale cached plan as it is (``--assistant``)
+                self.controller.start_job(action, level, assistant=True)
+            else:
+                self.controller.start_job(action, level)
+        except (ValueError, RuntimeError) as error:
+            self.assistant_queue = []
+            self.assistant_job = None
+            message = t("assistant.panel.export_start_failed", error=error)
+            self.assistant_outcome = {"state": "failed", "error": message, "plan_stale": False}
+            ui.notify(message, type="negative")
+            return False
+        self.assistant_job = action
+        self.was_running = True
+        self.apply_busy(True)
+        self.update_job_bar(self.controller.job_status(), True)
+        ui.notify(t("dxf.job.started", action=_action_label(action)))
+        return True
+
+    def start_assistant_environment_run(self, action: str) -> bool:
+        """Drone projects: start the fast environment job of an assistant update (``env:<steps>[:cad_only]``)."""
+        steps, cad_only = parse_env_action(action) or ("", False)
+        try:
+            if self.controller.blocked_message is not None:
+                raise ValueError(self.controller.blocked_message)
+            env_job.start_environment_job(self.controller.project_dir, False, steps=steps or None, cad_only=cad_only)
+        except (ValueError, RuntimeError, OSError) as error:
+            self.assistant_queue = []
+            self.assistant_job = None
+            reason = t("dxf_ui.errors.environment_running") if isinstance(error, RuntimeError) else error
+            message = t("assistant.panel.export_start_failed", error=reason)
+            self.assistant_outcome = {"state": "failed", "error": message, "plan_stale": False}
+            ui.notify(message, type="negative")
+            return False
+        self.assistant_job = action
+        self.env_was_running = True
+        self.apply_busy(True)
+        self.update_environment_status()
+        ui.notify(t("dxf.job.started", action=_action_label(action)))
+        return True
+
+    def continue_assistant_exports(self, job_state: str, status: dict[str, Any] | None = None) -> bool:
+        """A job ended: start the next queued assistant export step (True), or stop the queue when ours failed.
+
+        After each finished step of ours the viewers reload the files it wrote; the outcome (done / failed with the
+        job's message) is shown in the chat card, a failed step keeps the accepted edit and offers "Export again"."""
+        finished, self.assistant_job = self.assistant_job, None
+        if finished is not None and job_state != "done":
+            self.assistant_queue = []
+            detail = str((status or {}).get("message") or "").strip() or _job_state_label(job_state or "failed")
+            self.assistant_outcome = {"state": "failed", "plan_stale": False,
+                                      "error": t("assistant.panel.update_failed", action=_action_label(finished), error=detail)}
+            ui.notify(t("assistant.panel.export_failed", action=_action_label(finished)), type="warning")
+            return False
+        if finished == "export":
+            manifest = self.controller.last_export() or {}
+            self.assistant_outcome["plan_stale"] = bool(manifest.get("plan_stale"))
+        if finished is not None:
+            self.reload_viewers()
+        if self.assistant_queue:
+            return self.start_next_assistant_export()
+        if finished is not None:
+            self.assistant_outcome["state"] = "done"
+        return False
+
+    def reload_viewers(self) -> None:
+        """Point the 2D result canvas and the IFC viewer at the current files (versioned URLs) without rebuilding them;
+        the browser loads only what changed (a payload / model URL with a new version token).  Drone projects also
+        reload the SVG preview of the published DXF (rebuilt when the DXF is newer, versioned ``?v=`` URL)."""
+        self.reload_dxf_preview()
+        level = self.assistant_level()
+        canvas = self.result_canvas
+        if canvas is not None and not canvas.is_deleted and self.controller.state.plan_variant == "ortho":
+            url = payload_url(self.controller, level, "ortho")
+            if canvas.props.get("payload-url") != url:
+                canvas.props["payload-url"] = url
+                canvas.update()
+        viewer = getattr(self, "ifc_viewer", None)
+        if viewer is None or viewer.is_deleted:
+            return
+        key = level_key(level)
+        glb = bim_ui_data.glb_path(self.controller.project_dir, key)
+        if glb is None:
+            return
+        try:
+            url = model_url(key, glb.stat().st_mtime_ns)
+        except OSError:
+            return
+        if viewer.props.get("src") == url:
+            return
+        data = bim_ui_data.props(self.controller.project_dir, key)
+        by_node = bim_ui_data.viewer_config(key, data)["by_node"] if data else dict(viewer.props.get("class-by-node") or {})
+        viewer.show(url, by_node)
 
     # ------------------------------------------------------------------ simple workflow
 
@@ -593,17 +948,60 @@ class DxfPage:
         self.env_ticks += 1
         if self.env_ticks % 2:
             return
+        if self.refresh_after_turn and not self.assistant_busy():
+            self.refresh_after_turn = False
+            self.body.refresh()
+            return
         running = self.controller.environment_running()
         if self.env_was_running and not running:
             self.env_was_running = False
             status = self.controller.environment_status()
             kind = "positive" if status["state"] == "finished" else "negative"
             ui.notify(t("dxf.compute.env_finished") if kind == "positive" else t("dxf.compute.env_failed", detail=""), type=kind)
+            if self.finish_assistant_environment_run(status):
+                return  # assistant update: viewers reloaded in place, no page rebuild
+            if self.assistant_busy():
+                self.refresh_after_turn = True  # no page rebuild while the assistant answers; done after the turn
+                return
             self.body.refresh()
             return
         self.env_was_running = running
         self.update_environment_status()
         self.apply_busy(running)
+        if self.assistant is not None:
+            self.assistant.update_jobs(running, self.assistant_env_progress() if running else None)
+
+    def assistant_env_progress(self) -> dict[str, Any]:
+        """Job status for the chat card's progress line while the environment run of an assistant update runs."""
+        try:
+            return {"fraction": float(self.controller.environment_status().get("progress") or 0.0)}
+        except Exception:  # noqa: BLE001 - the progress line is informative only
+            return {"fraction": 0.0}
+
+    def finish_assistant_environment_run(self, status: dict[str, Any]) -> bool:
+        """The environment job ended while assistant updates were running / queued: hand it to the export queue.
+
+        True when the page handled it (the next queued run started, or the viewers were reloaded in place and the chat
+        card shows the outcome); False when the run was not the assistant's (the page refreshes as before)."""
+        if self.assistant_job is None and not self.assistant_queue:
+            return False
+        job_state = "done" if status.get("state") == "finished" else "failed"
+        detail = ""
+        if job_state != "done":
+            failed = next((item for item in status.get("steps") or [] if item.get("status") == "failed"), None)
+            if failed is not None:
+                detail = t("assistant.panel.update_env_failed_step", step=t(f"dxf.compute.env_steps.{failed['name']}"),
+                           error=str(failed.get("error") or status.get("error") or _job_state_label("failed")))
+            else:
+                detail = str(status.get("error") or "")
+        if self.continue_assistant_exports(job_state, {"message": detail}):
+            return True  # the next queued run started
+        self.update_environment_status()
+        self.apply_busy(self.env_running())
+        if self.assistant is not None:
+            self.assistant.update_jobs(self.env_running(), None)
+            self.assistant.refresh_all()
+        return True
 
     # ------------------------------------------------------------------ stale + preparation
 
@@ -977,9 +1375,11 @@ class DxfPage:
         Falls back to the zoomable raster preview when the SVG cannot be built."""
         self.dxfp_images: dict[str, ui.element] = {}
         self.dxfp_checks: dict[str, ui.checkbox] = {}
-        self.dxfp_view_id = f"samdxfp-{id(self)}"
         self.dxfp_vector = False
-        with ui.card().classes("w-full gap-3").mark("dxf-preview-card"):
+        self.dxfp_url = None
+        self.dxfp_version = None
+        with ui.card().classes("w-full gap-3").mark("dxf-preview-card") as card:
+            self.dxfp_card = card
             ui.label(t("dxf.dxf_preview.title")).classes("sam-section-title")
             self.dxfp_body = ui.column().classes("w-full gap-2")
             target = self.controller.dxf_preview_path()
@@ -997,6 +1397,34 @@ class DxfPage:
                         ui.spinner(size="md")
                         ui.label(t("dxf.dxf_preview.rendering_svg")).classes("sam-muted")
                 ui.timer(0.2, lambda: self.render_dxf_preview(dxf, target, svg), once=True)
+
+    def reload_dxf_preview(self) -> None:
+        """After an assistant update: show the newly published DXF in the preview card without rebuilding the page.
+
+        Nothing happens while the shown SVG is current; a fresh SVG is shown at once, an outdated one is rendered in a
+        worker thread first (the old drawing stays visible meanwhile)."""
+        if not self.controller.uses_environment_chain:
+            return
+        card, body = self.dxfp_card, self.dxfp_body
+        if card is None or card.is_deleted or body is None or body.is_deleted:
+            return
+        target = self.controller.dxf_preview_path()
+        svg = self.controller.dxf_preview_svg_path()
+        dxf = self.controller.outdoor_export_files().get("dxf")
+        if target is None or svg is None or dxf is None:
+            return
+        if dxf_preview.svg_is_fresh(dxf, svg) and dxf_preview.load_svg_meta(svg) is not None:
+            try:
+                version = svg.stat().st_mtime_ns
+            except OSError:
+                return
+            if version == self.dxfp_version:
+                return
+            body.clear()
+            self.fill_dxf_preview_svg(svg)
+            return
+        with card:
+            ui.timer(0.05, lambda: self.render_dxf_preview(dxf, target, svg), once=True)
 
     async def render_dxf_preview(self, dxf: Path, target: Path, svg: Path | None = None) -> None:
         """Build the SVG (raster as fallback) in a worker thread so the UI stays responsive, then show the viewer."""
@@ -1036,8 +1464,13 @@ class DxfPage:
         self.dxfp_vector = True
         self.dxfp_images = {}
         self.dxfp_checks = {}
-        self.build_dxfp_viewer(layers, meta.get("background", dxf_preview.DEFAULT_BACKGROUND), vector=True)
-        ui.run_javascript(f"samDxfpLoad('{self.dxfp_view_id}', '{PREVIEW_ROUTE}/{dxf_preview.SVG_NAME}?v={version}')")
+        self.dxfp_version = version
+        self.dxfp_url = f"{PREVIEW_ROUTE}/{dxf_preview.SVG_NAME}?v={version}"
+        self.build_dxfp_viewer(layers, meta.get("background", dxf_preview.DEFAULT_BACKGROUND), vector=True,
+                               origin=dxf_preview.svg_origin(meta))
+        ui.run_javascript(f"samDxfpLoad('{self.dxfp_view_id}', '{self.dxfp_url}')")
+        if self.dxfp_view is not None:
+            self.dxfp_view.push()  # the browser redraws the assistant overlay once the SVG is loaded
 
     def fill_dxf_preview(self, target: Path) -> None:
         """Raster fallback viewer (stack of layer PNGs)."""
@@ -1047,9 +1480,14 @@ class DxfPage:
         self.dxfp_vector = False
         self.dxfp_images = {}
         self.dxfp_checks = {}
+        self.dxfp_url = None
+        self.dxfp_version = None
         self.build_dxfp_viewer(layers, meta.get("background", dxf_preview.DEFAULT_BACKGROUND), vector=False, version=version)
 
-    def build_dxfp_viewer(self, layers: list[dict[str, Any]], background: str, *, vector: bool, version: int = 0) -> None:
+    def build_dxfp_viewer(self, layers: list[dict[str, Any]], background: str, *, vector: bool, version: int = 0,
+                          origin: tuple[float, float] | None = None) -> None:
+        """The preview viewport with its legend.  With the assistant on (outdoor) the vector viewport also forwards clicks
+        (``data-sam-pick``, ``data-sam-origin`` = SVG origin in LV95, DOM event ``sampick``); otherwise it is unchanged."""
         self.dxfp_fullscreen = False
         view_id = self.dxfp_view_id
         with self.dxfp_body:
@@ -1060,6 +1498,11 @@ class DxfPage:
                         f"background:{background}").mark("dxf-preview-view")
                     if vector:
                         viewport.classes("sam-dxfp-svg")
+                        if self.dxfp_view is not None and origin is not None:
+                            viewport.props["data-sam-pick"] = "1"
+                            viewport.props["data-sam-origin"] = json.dumps([origin[0], origin[1]])
+                            viewport.props["tabindex"] = "-1"
+                            viewport.on("sampick", lambda event, base=origin: self.on_dxfp_pick(event.args, base), args=["detail"])
                     with viewport:
                         if vector:
                             ui.element("div").classes("sam-dxfp-svgbox").mark("dxf-preview-svg")
@@ -1089,6 +1532,23 @@ class DxfPage:
                                 name, value=True, on_change=lambda event, layer=name: self.toggle_dxfp_layer(layer, bool(event.value)),
                             ).mark(f"dxf-preview-layer-{name}")
                             ui.label(str(item["count"])).classes("sam-muted text-xs")
+
+    def on_dxfp_pick(self, args: Any, origin: tuple[float, float] | None = None) -> None:
+        """A click in the DXF preview (assistant on): LV95 E/N (from the browser, or from the SVG coordinates) -> panel."""
+        detail = args.get("detail", args) if isinstance(args, dict) else {}
+        if not isinstance(detail, dict) or self.assistant is None:
+            return
+        try:
+            if detail.get("e") is not None and detail.get("n") is not None:
+                e, n = float(detail["e"]), float(detail["n"])
+            elif origin is not None:
+                e, n = dxf_preview.svg_to_dxf(origin, float(detail["sx"]), float(detail["sy"]))
+            else:
+                return
+        except (KeyError, TypeError, ValueError):
+            ui.notify(t("assistant.panel.pick_failed"), type="warning")
+            return
+        self.assistant.on_preview_pick(e, n, bool(detail.get("ctrl")))
 
     def toggle_dxfp_layer(self, layer: str, visible: bool) -> None:
         if self.dxfp_vector:
@@ -1151,6 +1611,8 @@ class DxfPage:
                     self.ifc_viewer.set_hidden_classes(self.ifc_hidden)
                     self.ifc_viewer.on("pick", lambda event: self.on_ifc_pick(event.args, key))
                     self.ifc_viewer.on("ready", lambda event: self.on_ifc_ready(event.args))
+                    if self.assistant is not None:
+                        self.assistant.attach_viewer(self.ifc_viewer, data)
                     self.ifc_fullscreen_button = ui.button(icon="fullscreen", on_click=self.toggle_ifc_fullscreen).props(
                         "flat round dense color=white").classes("absolute").style(
                         "top:8px;left:8px;z-index:10;background:rgba(9,19,29,.65)").mark("ifc-fullscreen")

@@ -246,6 +246,143 @@ def ifc_view_json(level_key: str, ifc_dir: Path | str, lang: str) -> dict[str, A
             "by_node": dict(cfg.get("by_node", {}))}
 
 
+def _text(key: str, fallback: str, **params: Any) -> str:
+    """UI text of ``key`` in the current language (``fallback`` without the i18n module)."""
+    try:
+        from samcloud.app.i18n import translate_or
+
+        return translate_or(key, fallback, **params)
+    except Exception:  # noqa: BLE001 - the package build never fails on a text
+        return fallback.format(**params) if params else fallback
+
+
+def share_language() -> str:
+    """The UI language the package is built in ("de" or "en")."""
+    try:
+        from samcloud.app.i18n import current_language
+        language = current_language()
+    except Exception:
+        language = "de"
+    return language if language in {"de", "en"} else "de"
+
+
+def _dxf_point_source(project_dir: Path) -> Path | None:
+    """The point source the DXF jobs of the project use (chosen LAS, else the classified LAS / PLY)."""
+    from samcloud.app.dxf_controller import chosen_las_path, project_point_source
+
+    chosen = chosen_las_path(project_dir)
+    if chosen is not None and chosen.is_file():
+        return chosen
+    return project_point_source(project_dir)
+
+
+def reexport_dxf_level(project_dir: Path | str, level_key: str, language: str) -> bool:
+    """Re-run only the DXF export step of one level (``"site"`` = outdoor) with the texts in ``language``.
+
+    In-process call of the same ``samcloud.dxf.jobs.run_export`` the DXF job uses (clean plan variant). Returns False
+    when the project has no point source; export errors propagate.
+    """
+    from samcloud.dxf import jobs
+    from samcloud.dxf.cancel import CancelToken
+
+    directory = Path(project_dir)
+    point_source = _dxf_point_source(directory)
+    if point_source is None:
+        return False
+    jobs.run_export(directory, point_source, None if level_key == "site" else level_key, lambda *_args: None, CancelToken(), LOGGER,
+                    variant="ortho", language=language)
+    return True
+
+
+def _has_clean_plan_cache(project_dir: Path, level_key: str) -> bool:
+    return not level_key.startswith("dxf_") and (project_dir / "products" / "dxf" / level_key / "ortho" / "result.json").is_file()
+
+
+def relabel_level_dxf(level: Level, language: str) -> bool:
+    """Translate the level's existing DXF file in place (no plan cache to export from); False when that failed."""
+    from samcloud.dxf.text_language import relabel_dxf_file
+
+    if level.dxf is None:
+        return False
+    try:
+        missing = relabel_dxf_file(level.dxf, language)
+    except Exception as error:  # noqa: BLE001 - keep the file as it is
+        LOGGER.warning("project share: relabelling the DXF of level %s in '%s' failed: %s", level.key, language, error)
+        return False
+    if missing:
+        LOGGER.info("project share: %d DXF text(s) of level %s without a '%s' translation kept: %s", len(missing), level.key, language, missing[:10])
+    return True
+
+
+def refresh_dxf_language(project_dir: Path | str, levels: list[Level], language: str) -> list[str]:
+    """Bring every level DXF that is not (known to be) in ``language`` into it; returns the refreshed level keys.
+
+    Levels with a clean plan cache re-run the export step; the others (e.g. the drone ``*_Site_clean.dxf``) are relabelled
+    in place (``relabel_dxf_file``). A failure only logs a warning: the package then shows the DXF as it was.
+    """
+    from samcloud.dxf.jobs import exported_file_language
+
+    directory = Path(project_dir)
+    refreshed: list[str] = []
+    for level in levels:
+        if level.dxf is None or exported_file_language(directory, level.dxf) == language:
+            continue
+        if not _has_clean_plan_cache(directory, level.key):
+            if relabel_level_dxf(level, language):
+                refreshed.append(level.key)
+            continue
+        try:
+            if reexport_dxf_level(directory, level.key, language):
+                refreshed.append(level.key)
+        except Exception as error:  # noqa: BLE001 - keep the existing export
+            LOGGER.warning("project share: DXF re-export of level %s in '%s' failed: %s", level.key, language, error)
+    return refreshed
+
+
+def relabel_uncached_dxfs(project_dir: Path | str, language: str, *, only_known: bool = False) -> list[str]:
+    """Relabel the exported level DXFs without a clean plan cache that are not (known to be) in ``language``.
+
+    Cheap and in-process (no export job); used by the DXF page after a language switch. ``only_known`` leaves files
+    whose language was never recorded alone (the page does not rewrite files it knows nothing about; the share does).
+    Returns the relabelled keys.
+    """
+    from samcloud.dxf.jobs import exported_file_language
+
+    directory = Path(project_dir)
+    relabelled: list[str] = []
+    for level in find_project_outputs(directory):
+        if level.dxf is None or _has_clean_plan_cache(directory, level.key):
+            continue
+        recorded = exported_file_language(directory, level.dxf)
+        if recorded == language or (only_known and recorded is None):
+            continue
+        if relabel_level_dxf(level, language):
+            relabelled.append(level.key)
+    return relabelled
+
+
+def write_shared_edits(project_dir: Path | str, package_dir: Path | str, levels: list[Level]) -> dict[str, str]:
+    """Write ``data/edits/<level_key>.json`` for every level with an assistant ``edits.json``; returns key -> package path.
+
+    Only the ACTIVE edits with id, timestamp, ops, changes, provider and model: the user's prompt sentence and the chat
+    (chat.json) are never shared.
+    """
+    from samcloud.dxf.assistant_hooks import shared_active_edits
+
+    written: dict[str, str] = {}
+    for level in levels:
+        edits = shared_active_edits(project_dir, level.key)
+        if edits is None:
+            continue
+        relative = f"data/edits/{level.key}.json"
+        target = Path(package_dir) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"version": 1, "level": level.key, "edits": edits}, ensure_ascii=False, separators=(",", ":")),
+                          encoding="utf-8")
+        written[level.key] = relative
+    return written
+
+
 def _copy_tree(source: Path, destination: Path) -> None:
     for path in source.rglob("*"):
         if path.is_file():
@@ -266,24 +403,27 @@ def build_project_package(project_dir: Path | str, package_dir: Path | str, *, c
     metadata = export.build_octree(points, package.parent / "work", package / "pc" / export.OCTREE_DIRECTORY, octree, check,
                                    encoding=str(config.get("octree_encoding", "BROTLI")), converter=converter)
     levels = find_project_outputs(directory)
+    language = share_language()
 
     dxf_progress = progress_for_phase(2)
+    # The DXF texts follow the app language: an export in another language is redone first (export step only).
+    if any(level.dxf is not None for level in levels):
+        dxf_progress(0.0, _text("share.project.dxf_language_export", "DXF in der App-Sprache neu exportieren"))
+        if refresh_dxf_language(directory, levels, language):
+            levels = find_project_outputs(directory)
+        check()
+    dxf_phase = _text("share.project.phase_dxf", "DXF aufbereiten")
     dxf_levels = [level for level in levels if level.dxf is not None]
     for index, level in enumerate(dxf_levels, start=1):
         check()
         target = package / "data" / "dxf" / f"{level.key}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(dxf_to_json(level.dxf), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        dxf_progress(index / len(dxf_levels), "DXF aufbereiten")
+        dxf_progress(index / len(dxf_levels), dxf_phase)
     if not dxf_levels:
-        dxf_progress(1.0, "DXF aufbereiten")
+        dxf_progress(1.0, dxf_phase)
 
-    try:
-        from samcloud.app.i18n import current_language
-        language = current_language()
-    except Exception:
-        language = "de"
-    language = language if language in {"de", "en"} else "de"
+    ifc_phase = _text("share.project.phase_ifc", "IFC aufbereiten")
     ifc_progress = progress_for_phase(3)
     ifc_levels = [level for level in levels if level.ifc_dir is not None]
     for index, level in enumerate(ifc_levels, start=1):
@@ -292,9 +432,9 @@ def build_project_package(project_dir: Path | str, package_dir: Path | str, *, c
         target.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(level.ifc_dir / "model.glb", target / "model.glb")
         (target / "view.json").write_text(json.dumps(ifc_view_json(level.key, level.ifc_dir, language), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        ifc_progress(index / len(ifc_levels), "IFC aufbereiten")
+        ifc_progress(index / len(ifc_levels), ifc_phase)
     if not ifc_levels:
-        ifc_progress(1.0, "IFC aufbereiten")
+        ifc_progress(1.0, ifc_phase)
 
     assemble = progress_for_phase(4)
     export.assemble_package(directory, package / "pc", points=points, original_points=original, metadata=metadata, progress=assemble, register=True)
@@ -303,12 +443,14 @@ def build_project_package(project_dir: Path | str, package_dir: Path | str, *, c
         target = package / "lib" / "three" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(THREE_ASSETS / name, target)
+    edit_files = write_shared_edits(directory, package, levels)
     document = export._load_project(directory)
     name = str(document.get("project", {}).get("name") or directory.name)
     view_names = [name for name, present in (("dxf", dxf_levels), ("pc", True), ("ifc", ifc_levels)) if present]
     level_rows = [{"key": level.key, "label": level.label,
                    "dxf": f"data/dxf/{level.key}.json" if level.dxf else None,
-                   "ifc": f"data/ifc/{level.key}/" if level.ifc_dir else None} for level in levels]
+                   "ifc": f"data/ifc/{level.key}/" if level.ifc_dir else None,
+                   **({"edits": edit_files[level.key]} if level.key in edit_files else {})} for level in levels]
     project_data = {"version": 1, "name": name, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                     "lang": language, "generator": "SAMcloud", "points": len(points), "views": view_names,
                     "default_level": next((level.key for level in levels if level.key == "site"), levels[0].key if levels else "site"),
@@ -316,5 +458,5 @@ def build_project_package(project_dir: Path | str, package_dir: Path | str, *, c
     (package / "data" / "project.json").write_text(json.dumps(project_data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     problems = export.scan_package(package)
     if problems:
-        raise RuntimeError("Datenschutzprüfung fehlgeschlagen: " + "; ".join(problems[:5]))
+        raise RuntimeError(_text("share.project.privacy_failed", "Datenschutzprüfung fehlgeschlagen: {problems}", problems="; ".join(problems[:5])))
     return {"points": len(points), "views": view_names, "levels": [level.key for level in levels]}

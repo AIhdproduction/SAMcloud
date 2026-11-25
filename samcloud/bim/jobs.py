@@ -103,6 +103,10 @@ def run_ifc_export(
         check()
 
     check()
+    # Re-apply the AI assistant's accepted edits before the plan is hashed and read (no-op without edits.json, never raises).
+    from samcloud.dxf.assistant_hooks import ensure_applied_safely
+
+    assistant_report = ensure_applied_safely(root, level_key, "ifc_export")
     plan_hash = plan_model_sha256(root, level_key)
     if plan_hash is None:
         raise RuntimeError(f"plan_model.json not found for level '{level_key}'. Generate the clean plan first.")
@@ -131,6 +135,8 @@ def run_ifc_export(
         "express_findings": int(result.express_findings),
         "warnings": list(result.warnings),
     }
+    if assistant_report is not None:
+        manifest["assistant"] = assistant_report
     _write_manifest(out_dir, manifest)
     report(1.0, "IFC export complete")
     return manifest

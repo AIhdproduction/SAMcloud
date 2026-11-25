@@ -18,12 +18,14 @@ import numpy as np
 
 from samcloud.bim.jobs import ifc_export_status, run_ifc_export
 from samcloud.dxf.alignment import estimate_alignment
+from samcloud.dxf.assistant_hooks import apply_to_result_safely, edits_newer_than, ensure_applied_safely, level_key_of, levels_with_edits
 from samcloud.dxf.cancel import CancelToken, Cancelled, ProgressCallback
 from samcloud.dxf.las_source import Frame, plausibility_warnings, read_las_info
 from samcloud.dxf.levels import Level, detect_levels
 from samcloud.dxf.pipeline import cache_directory, generate_plan, is_stale, load_cached_result, save_cached_result
 from samcloud.dxf.preview import create_preview
 from samcloud.dxf.state import load_state, ortho_config_for, plan_settings_for, save_state
+from samcloud.dxf.text_language import dxf_file_language, export_plan_localized, normalize_dxf_language
 from samcloud.dxf.writer import export_plan, sanitize_dxf_name
 
 if TYPE_CHECKING:
@@ -421,6 +423,8 @@ def run_clean_plan(
         settings = None
     result = generate_clean_plan(project_dir, level=level, mode=effective_mode, settings=settings, progress=progress, cancel=cancel, point_source=las_path)
     logger.info(f"Orthophoto clean plan cached at {result.project_name}")
+    # plan_model.json was rewritten: re-apply the assistant's accepted edits (no-op without edits.json, never raises)
+    ensure_applied_safely(project_dir, level_key_of(level), "clean_plan", logger)
 
 
 def refine_openings_status(project_dir: Path, level_id: str | None) -> str:
@@ -468,6 +472,8 @@ def run_refine_openings(
         return callback
 
     logger.info(f"Refining openings for level '{level.name}'...")
+    # The refinement only writes openings_3d.json; plan_model.json is rewritten solely by run_clean_plan below, whose
+    # assistant hook re-applies the edits. The early returns leave plan_model.json untouched (no hook needed there).
     outcome = refine_level_openings(project_dir, level.id, point_source=las_path, progress=inner(0.0, 0.6), cancel=cancel.is_cancelled, force=force)
     logger.info(f"Opening refinement: {outcome.status} (mode {outcome.mode or '-'}, {outcome.openings} openings, changed={outcome.changed}, {outcome.seconds:.1f} s) {outcome.message}".rstrip())
     if outcome.status == "failed":
@@ -496,8 +502,22 @@ def run_export(
     logger: logging.Logger,
     mode: str | None = None,
     variant: str = "pointcloud",
+    language: str | None = None,
+    allow_stale_plan: bool = False,
 ) -> None:
-    """Export DXF files from cached results into products/dxf/export/."""
+    """Export DXF files from cached results into products/dxf/export/.
+
+    ``language`` ("de" / "en") writes every DXF text in that language (``samcloud.dxf.text_language``; the cached
+    result stays unchanged) and records it in ``last_export.json``. ``None`` keeps today's output byte for byte.
+
+    ``allow_stale_plan`` (only the AI assistant's export after accept / undo, CLI ``--assistant``): a cached result
+    whose settings / code fingerprint no longer matches is exported anyway (outlines -> assistant edits -> language ->
+    DXF as usual) instead of failing; ``last_export.json`` then records ``plan_stale``. A missing cache still fails.
+    The default keeps the normal export exactly as before.
+    """
+    requested_language = normalize_dxf_language(language)
+    if language is not None and requested_language is None:
+        raise ValueError(f"Unsupported DXF text language: {language!r}")
     state = load_state(project_dir)
     info = read_las_info(las_path, cancel=cancel)
     mode = _effective_mode(mode, state.mode_override, info.mode)
@@ -527,6 +547,7 @@ def run_export(
         raise ValueError("variant must be 'pointcloud' or 'ortho'")
 
     # First verify every checked level has a cache and is not stale; fail before writing anything
+    plan_stale = False
     for lvl in levels_to_export:
         if cancel.is_cancelled():
             raise Cancelled("Job 'export' cancelled")
@@ -544,7 +565,11 @@ def run_export(
         cached_result = load_cached_result(cache_dir)
         # Generation records the LAS provenance profile, so compare against that (profile_name=None);
         # a profile chosen manually for a LAS without provenance must not make every cache stale.
-        if variant == "ortho":
+        if allow_stale_plan:
+            if _cached_plan_is_stale(project_dir, state, lvl, variant, cached_result, settings):
+                plan_stale = True
+                logger.warning(f"Cached plan for level '{level_label}' is stale; the assistant export uses it as it is.")
+        elif variant == "ortho":
             from samcloud.ortho.plan import load_clean_plan_settings
             from samcloud.ortho.segment import load_segment_result
 
@@ -560,6 +585,8 @@ def run_export(
     with tempfile.TemporaryDirectory(prefix=".export.", dir=dxf_dir) as temp_dir_str:
         temp_dir = Path(temp_dir_str)
         exported_files: list[Path] = []
+        untranslated: list[str] = []
+        assistant_reports: list[dict[str, Any]] = []
         total = len(levels_to_export)
 
         for idx, lvl in enumerate(levels_to_export):
@@ -580,7 +607,17 @@ def run_export(
                 from samcloud.bim.furniture_recon.dxf_outline import apply_reconstructed_outlines
 
                 cached_result = apply_reconstructed_outlines(cached_result, cache_dir)
-            dest = export_plan(cached_result, temp_dir, coordinates=coordinates)
+                # then the assistant's accepted edits (texts stay pipeline German; the translation below covers them)
+                cached_result, assistant_report = apply_to_result_safely(cached_result, project_dir, level_key_of(lvl), logger)
+                if assistant_report is not None:
+                    assistant_reports.append(assistant_report)
+            if requested_language is None:
+                dest = export_plan(cached_result, temp_dir, coordinates=coordinates)
+            else:
+                dest, missing = export_plan_localized(cached_result, temp_dir, requested_language, coordinates=coordinates)
+                untranslated.extend(text for text in missing if text not in untranslated)
+                if missing:
+                    logger.warning(f"{len(missing)} DXF text(s) without a '{requested_language}' translation kept as they are: {missing[:10]}")
             if variant == "ortho":
                 clean_dest = dest.with_name(f"{dest.stem}_clean{dest.suffix}")
                 os.replace(dest, clean_dest)
@@ -601,9 +638,33 @@ def run_export(
                 raise RuntimeError(f"DXF export did not reach the export folder: {target}")
             final_files.append(target)
             logger.info(f"Moved exported DXF to {target}")
-        write_export_manifest(export_dir, final_files, coordinates)
+        assistant_kwargs: dict[str, Any] = {"assistant": assistant_reports} if assistant_reports else {}
+        if allow_stale_plan:
+            assistant_kwargs["plan_stale"] = plan_stale
+        if requested_language is None:
+            write_export_manifest(export_dir, final_files, coordinates, **assistant_kwargs)
+        else:
+            write_export_manifest(export_dir, final_files, coordinates, language=requested_language, untranslated=untranslated,
+                                  variant=variant, level=level_id, **assistant_kwargs)
 
         progress(1.0, f"Exported {len(exported_files)} DXF file(s)")
+
+
+def _cached_plan_is_stale(project_dir: Path, state: Any, level: Level | None, variant: str, cached_result: Any, settings: Any) -> bool:
+    """Freshness check of ``run_export`` that never raises (assistant exports): True when the cached plan counts as
+    stale or its inputs (orthophoto / segmentation) can no longer be fingerprinted."""
+    try:
+        if variant == "ortho":
+            from samcloud.ortho.plan import clean_plan_fingerprint, load_clean_plan_settings
+            from samcloud.ortho.segment import load_segment_result
+
+            clean_settings = replace(load_clean_plan_settings(), segment_source=state.segment_source)
+            if load_segment_result(project_dir, level, state.segment_source) is None:
+                clean_settings = None
+            return cached_result.settings_fingerprint != clean_plan_fingerprint(project_dir, level, clean_settings)
+        return bool(is_stale(cached_result, settings, level=level, profile_name=None))
+    except Exception:  # noqa: BLE001 - e.g. the segmentation is gone: the cached plan itself is still exportable
+        return True
 
 
 def run_export_ifc(
@@ -629,6 +690,9 @@ def run_export_ifc(
     from samcloud.dxf.writer3d import export_level_3d_dxf
 
     export_level_3d_dxf(project_dir, level.id, level.name, logger)  # 3D DXF of the IFC; logs a warning on failure, never raises
+    for other_level in levels_with_edits(project_dir):  # the combined IFC reads every level's plan_model.json
+        if other_level != level.id:
+            ensure_applied_safely(project_dir, other_level, "building_ifc", logger)
     try:  # combined multi-storey IFC, only when the project has more than one level (never fatal)
         from samcloud.bim.building_export import export_building_ifc
 
@@ -808,8 +872,11 @@ def run_all(
     mode: str | None = None,
     source: str = "combined",
     force: bool = False,
+    language: str | None = None,
 ) -> None:
     """Build the selected target's orthophoto, clean plan, and DXF export (+ IFC when indoor).
+
+    ``language`` is the DXF text language (see ``run_export``); an export in another language is not fresh.
 
     The wall time and per-step seconds are recorded in reports/dxf_run_metrics.json, also on failure."""
     started_at = datetime.now(timezone.utc).isoformat()
@@ -817,7 +884,8 @@ def run_all(
     step_seconds: dict[str, float] = {}
     status = "failed"
     try:
-        _run_all_steps(project_dir, las_path, level_id, progress, cancel, logger, mode=mode, source=source, force=force, timings=step_seconds)
+        _run_all_steps(project_dir, las_path, level_id, progress, cancel, logger, mode=mode, source=source, force=force, timings=step_seconds,
+                       language=language)
         status = "completed"
     except Cancelled:
         status = "cancelled"
@@ -849,6 +917,7 @@ def _run_all_steps(
     source: str,
     force: bool,
     timings: dict[str, float],
+    language: str | None = None,
 ) -> None:
     state = load_state(project_dir)
     info = read_las_info(las_path, cancel=cancel)
@@ -870,7 +939,11 @@ def _run_all_steps(
         suffix = "site" if level is None else sanitize_dxf_name(level.name)
         exported = project_dir / "products" / "dxf" / "export" / f"{sanitize_dxf_name(project_dir.name)}_{suffix}_clean.dxf"
         clean_result = project_dir / "products" / "dxf" / ("site" if level is None else level.id) / "ortho" / "result.json"
-        return exported.is_file() and clean_result.is_file() and exported.stat().st_mtime_ns >= clean_result.stat().st_mtime_ns
+        if not (exported.is_file() and clean_result.is_file() and exported.stat().st_mtime_ns >= clean_result.stat().st_mtime_ns):
+            return False
+        if edits_newer_than(project_dir, level_key_of(level), exported):
+            return False  # an assistant edit was accepted / undone / re-applied after this export
+        return language is None or exported_file_language(project_dir, exported) == normalize_dxf_language(language)
 
     def refine_is_fresh() -> bool:
         return not force and refine_openings_status(project_dir, level_id) == "fresh"
@@ -896,7 +969,7 @@ def _run_all_steps(
                 if effective_mode == "indoor"
                 else []
             ),
-            ("Export DXF", lambda report: run_export(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode, variant="ortho"), export_is_fresh),
+            ("Export DXF", lambda report: run_export(project_dir, las_path, level_id, report, cancel, logger, mode=effective_mode, variant="ortho", **_language_kwargs(language)), export_is_fresh),
         ]
     )
     if effective_mode == "indoor":
@@ -919,9 +992,37 @@ def export_manifest_path(project_dir: Path) -> Path:
     return Path(project_dir) / "products" / "dxf" / "export" / "last_export.json"
 
 
-def write_export_manifest(export_dir: Path, files: list[Path], coordinates: str) -> Path:
-    """Record exported files and their audit result; export_plan already re-read and audited each file."""
-    manifest = {
+def _language_kwargs(language: str | None) -> dict[str, str]:
+    """``{"language": ...}`` only when a language is requested (calls without one stay exactly as before)."""
+    return {} if language is None else {"language": language}
+
+
+def write_export_manifest(
+    export_dir: Path,
+    files: list[Path],
+    coordinates: str,
+    *,
+    language: str | None = None,
+    untranslated: list[str] | None = None,
+    variant: str | None = None,
+    level: str | None = None,
+    assistant: list[dict[str, Any]] | None = None,
+    plan_stale: bool | None = None,
+) -> Path:
+    """Record exported files and their audit result; export_plan already re-read and audited each file.
+
+    ``assistant`` (only when a level has assistant edits): one report per level (``samcloud.dxf.assistant_hooks``) with
+    the applied and stale edit ids and an error text when the edits could not be drawn.
+    ``plan_stale`` (only exports of the AI assistant, ``run_export(allow_stale_plan=True)``): True when the exported
+    cached plan itself no longer matches its inputs / code ("Compute everything" brings it up to date).
+
+    With a ``language`` the manifest also holds ``language`` (DXF text language of this export), ``untranslated``
+    (texts that matched no translation rule and were kept as they are), ``variant``, ``level`` (None = all checked
+    levels / the site) and ``file_languages`` (file name -> language, merged with the previous manifest so the
+    language of files exported by earlier runs stays known). Without a language (exports made before the DXF
+    language feature, or callers that do not ask for one) these fields are absent: the language is unknown.
+    """
+    manifest: dict[str, Any] = {
         "finished": datetime.now(timezone.utc).isoformat(),
         "coordinates": coordinates,
         "files": [str(path.resolve()) for path in files],
@@ -929,10 +1030,44 @@ def write_export_manifest(export_dir: Path, files: list[Path], coordinates: str)
         "audit_detail": "Every file was re-read with ezdxf and audited without errors before it was moved into place.",
     }
     target = export_dir / "last_export.json"
+    if language is not None:
+        file_languages = dict(_read_manifest(target).get("file_languages") or {})
+        file_languages.update({path.name: language for path in files})
+        manifest.update({"language": language, "untranslated": list(untranslated or []), "variant": variant, "level": level,
+                         "file_languages": file_languages})
+    if assistant:
+        manifest["assistant"] = list(assistant)
+    if plan_stale is not None:
+        manifest["plan_stale"] = bool(plan_stale)
     temporary = export_dir / ".last_export.tmp.json"
     temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     os.replace(temporary, target)
     return target
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def exported_file_language(project_dir: Path, file: Path | str) -> str | None:
+    """DXF text language of an exported file; None when unknown.
+
+    A ``<file>.lang.json`` sidecar written by ``relabel_dxf_file`` wins while it still matches the file (same mtime and
+    size); otherwise ``last_export.json`` decides.
+    """
+    relabelled = dxf_file_language(file)
+    if relabelled is not None:
+        return relabelled
+    manifest = _read_manifest(export_manifest_path(project_dir))
+    name = Path(file).name
+    recorded = (manifest.get("file_languages") or {}).get(name)
+    if recorded is None and name in {Path(str(item)).name for item in manifest.get("files") or []}:
+        recorded = manifest.get("language")
+    return normalize_dxf_language(recorded)
 
 
 def main() -> None:
@@ -947,6 +1082,8 @@ def main() -> None:
     parser.add_argument("--variant", required=False, default="pointcloud", choices=["pointcloud", "ortho"], help="DXF export cache variant")
     parser.add_argument("--force", action="store_true", help="Recompute workflow steps even when caches are current")
     parser.add_argument("--launched", required=False, default=None, type=float, help="Epoch seconds when the runner launched this job")
+    parser.add_argument("--lang", required=False, default=None, choices=["de", "en"], help="Language of the DXF texts (export and run_all)")
+    parser.add_argument("--assistant", action="store_true", help="Export started by the AI assistant: a stale cached plan is exported as it is")
 
     args = parser.parse_args()
     project_dir = Path(args.project).resolve()
@@ -957,6 +1094,8 @@ def main() -> None:
     source = args.source
     variant = args.variant
     force = bool(args.force)
+    language = args.lang
+    assistant_export = bool(args.assistant)
 
     dxf_dir = project_dir / "products" / "dxf"
     dxf_dir.mkdir(parents=True, exist_ok=True)
@@ -1002,7 +1141,8 @@ def main() -> None:
         elif action == "generate":
             run_generate(project_dir, las_path, level_id, progress, token, logger, mode=mode)
         elif action == "export":
-            run_export(project_dir, las_path, level_id, progress, token, logger, mode=mode, variant=variant)
+            run_export(project_dir, las_path, level_id, progress, token, logger, mode=mode, variant=variant, **_language_kwargs(language),
+                       **({"allow_stale_plan": True} if assistant_export else {}))
         elif action == "export_ifc":
             run_export_ifc(project_dir, las_path, level_id, progress, token, logger, mode=mode)
         elif action == "refine_openings":
@@ -1016,7 +1156,7 @@ def main() -> None:
         elif action == "prepare_levels":
             run_prepare_levels(project_dir, las_path, progress, token, logger, mode=mode, force=force)
         elif action == "run_all":
-            run_all(project_dir, las_path, level_id, progress, token, logger, mode=mode, source=source, force=force)
+            run_all(project_dir, las_path, level_id, progress, token, logger, mode=mode, source=source, force=force, **_language_kwargs(language))
 
         finished_iso = datetime.now(timezone.utc).isoformat()
         write_job_status(status_file, action, "done", 1.0, "Complete", started=started_iso, finished=finished_iso, pid=os.getpid())

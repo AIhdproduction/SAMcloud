@@ -90,11 +90,25 @@ def _short(text: Any) -> str:
     return one_line if len(one_line) <= _ERROR_MAX_CHARS else one_line[: _ERROR_MAX_CHARS - 1] + "…"
 
 
-def build_command(project_dir: Path | str, rerun_all: bool) -> list[str]:
-    """Command line of the chain subprocess; ``--no-resume`` only for a full recompute."""
+def build_command(project_dir: Path | str, rerun_all: bool, *, steps: str | list[str] | tuple[str, ...] | None = None,
+                  cad_only: bool = False) -> list[str]:
+    """Command line of the chain subprocess; ``--no-resume`` only for a full recompute.
+
+    ``steps`` (e.g. ``"scene,export,qa"``) runs only those steps and their descendants; ``cad_only`` makes the export step
+    write only IFC + DXF + publish (the fast run after an AI-assistant edit).
+    """
     command = [sys.executable, "-m", "samcloud.drone.run_environment", "--project", str(project_dir)]
     if rerun_all:
         command.append("--no-resume")
+    if steps:
+        names = [str(name).strip() for name in (steps.split(",") if isinstance(steps, str) else steps) if str(name).strip()]
+        unknown = [name for name in names if name not in ENVIRONMENT_STEPS]
+        if unknown:
+            raise ValueError(f"unknown environment step(s): {', '.join(unknown)}")
+        if names:
+            command += ["--steps", ",".join(names)]
+    if cad_only:
+        command.append("--cad-only")
     return command
 
 
@@ -115,10 +129,12 @@ def _watch(project_dir: Path, process: subprocess.Popen, started_at: str) -> Non
         _write_json(job_status_path(project_dir), record)
 
 
-def start_environment_job(project_dir: Path | str, rerun_all: bool = False) -> dict[str, Any]:
+def start_environment_job(project_dir: Path | str, rerun_all: bool = False, *, steps: str | list[str] | tuple[str, ...] | None = None,
+                          cad_only: bool = False) -> dict[str, Any]:
     """Start the environment chain in a background subprocess and return the new job record.
 
     Only one job per project may run: raises ``RuntimeError`` while ``job_status.json`` says running and its pid is alive.
+    ``steps`` / ``cad_only`` see :func:`build_command` (the record carries them as ``steps`` / ``cad_only`` when given).
     """
     project = Path(project_dir)
     with _lock:
@@ -127,7 +143,7 @@ def start_environment_job(project_dir: Path | str, rerun_all: bool = False) -> d
             raise RuntimeError("environment job already running")
         out = environment_dir(project)
         out.mkdir(parents=True, exist_ok=True)
-        command = build_command(project, rerun_all)
+        command = build_command(project, rerun_all, steps=steps, cad_only=cad_only) if (steps or cad_only) else build_command(project, rerun_all)
         started_at = _now()
         with (out / "job.log").open("a", encoding="utf-8") as log:
             process = subprocess.Popen(
@@ -136,6 +152,9 @@ def start_environment_job(project_dir: Path | str, rerun_all: bool = False) -> d
             )
         record = {"state": "running", "pid": process.pid, "started_at": started_at, "finished_at": None,
                   "rerun_all": bool(rerun_all), "returncode": None, "error": None, "command": command}
+        if steps or cad_only:
+            record["steps"] = command[command.index("--steps") + 1] if "--steps" in command else None
+            record["cad_only"] = bool(cad_only)
         _write_json(job_status_path(project), record)
         _handles[str(project)] = process
     threading.Thread(target=_watch, args=(project, process, started_at), daemon=True).start()

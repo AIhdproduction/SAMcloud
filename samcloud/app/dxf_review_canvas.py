@@ -49,10 +49,13 @@ def ortho_preview_url(controller: DxfPageController, level_id: str | None) -> st
     return f"{ORTHO_ROUTE}/{quote(level_key(level_id))}/preview?v={controller.ortho_version(level_id)}"
 
 
-def review_payload(project_directory: Path, key: str, variant: str = "pointcloud") -> dict[str, Any] | None:
-    """Vector payload for the HTTP route; reads only the cache (never generates)."""
+def review_payload(project_directory: Path, key: str, variant: str = "pointcloud", language: str | None = None) -> dict[str, Any] | None:
+    """Vector payload for the HTTP route; reads only the cache (never generates).
+
+    ``language`` ("de" / "en") shows the texts as the DXF export writes them; None keeps the cached texts.
+    """
     controller = DxfPageController(project_directory)
-    return controller.plan_payload(level_from_key(key), variant)
+    return controller.plan_payload(level_from_key(key), variant, language=language)
 
 
 def review_background(project_directory: Path, key: str, source: str) -> Path | None:
@@ -74,6 +77,11 @@ class DxfReviewCanvas(ui.element, component="dxf_review_canvas.js"):
 
     JS -> Python (events): ``measure`` {p1: [x, y], p2: [x, y], distance}, ``loaded`` {entities, layers}.
     Holding the key "H" hides the DXF layer while held (client side only).
+
+    AI assistant (only set by the page while the assistant is active; never set otherwise): ``pick-enabled``
+    (a short click without drag emits ``pick`` {x, y, ctrl} in world units), ``selection-overlay``
+    (``[{"ring": [[x, y], ...]} | {"point": [x, y]}]``, drawn highlighted) and ``preview-overlay``
+    (``[{"change": "added"|"removed"|"moved"|"modified", "before": ring|None, "after": ring|None}]``).
     """
 
     def __init__(self) -> None:
@@ -140,3 +148,18 @@ class DxfReviewCanvas(ui.element, component="dxf_review_canvas.js"):
     def fit(self) -> None:
         """Fit the cached plan into the canvas."""
         self.run_method("fit")
+
+    def set_pick_enabled(self, enabled: bool) -> None:
+        """Emit ``pick`` {x, y, ctrl} (world units) on a short click without dragging (AI assistant selection)."""
+        self._props["pick-enabled"] = bool(enabled)
+        self.update()
+
+    def set_selection_overlay(self, items: list[dict[str, Any]]) -> None:
+        """Highlighted selection: ``{"ring": [[x, y], ...]}`` outlines and ``{"point": [x, y]}`` markers (world units)."""
+        self._props["selection-overlay"] = [dict(item) for item in items or []]
+        self.update()
+
+    def set_preview_overlay(self, items: list[dict[str, Any]]) -> None:
+        """Proposal preview: ``{"change", "before", "after"}`` rings (world units); added green, removed red, moved amber."""
+        self._props["preview-overlay"] = [dict(item) for item in items or []]
+        self.update()

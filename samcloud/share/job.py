@@ -218,7 +218,7 @@ class ShareJob:
             self.progress.update(state="running", started_at=time.time(), error=None, result=None, phases_done=[])
             if not self.kind.available(self.project_dir, None):
                 raise RuntimeError(
-                    "Verfügbar nach dem DXF/IFC-Export: Punktwolke, DXF und IFC-Modell müssen vorhanden sein."
+                    project_share._text("share.project.unavailable_error", "Verfügbar nach dem DXF/IFC-Export: Punktwolke, DXF und IFC-Modell müssen vorhanden sein.")
                     if self.kind.name == PROJECT.name else "Verfügbar nach Schritt 6: die klassifizierte Punktwolke fehlt.")
             provider = provider or get_provider(self.config, self.project_dir)
             self._drop_previous_share()
@@ -230,6 +230,9 @@ class ShareJob:
 
             problems = export.scan_package(package_dir)
             if problems:
+                if self.kind.name == PROJECT.name:  # the project share speaks the UI language (the point-cloud share stays as it was)
+                    raise RuntimeError(project_share._text("share.project.privacy_failed", "Datenschutzprüfung fehlgeschlagen: {problems}",
+                                                           problems="; ".join(problems[:5])))
                 raise RuntimeError("Datenschutzprüfung fehlgeschlagen: " + "; ".join(problems[:5]))
             size_mb = round(export.package_size_mb(package_dir), 2)
             self.check()
@@ -252,7 +255,7 @@ class ShareJob:
             report = self.progress.phase(len(self.kind.phases) - 1)
             share_root.mkdir(parents=True, exist_ok=True)
             make_qr(url, share_root / "qr.png", share_root / "qr.svg")
-            report(1.0, "QR-Code erzeugt")
+            report(1.0, project_share._text("share.project.qr_created", "QR-Code erzeugt") if self.kind.name == PROJECT.name else "QR-Code erzeugt")
             created = datetime.now(timezone.utc)
             block = {
                 "url": url, "share_id": share_id, "created_at": created.isoformat(timespec="seconds"),

@@ -17,7 +17,8 @@ Per element:
 * One type object per ``(ifc_class, predefined type, object type)`` with ``Pset_*TypeCommon``
   (Reference) where the standard defines one.
 * Property set ``SAMcloud_Scan`` (never ``Pset_``): InstanceId, Label, SemanticLabel,
-  Confidence, ZSource, Layer, CatalogueKind, Length, Width, Height, ZMin.
+  Confidence, ZSource, Layer, CatalogueKind, Length, Width, Height, ZMin; ``SAMcloud_Evidence = "manual"`` only
+  for items the AI assistant added without point-cloud evidence (``evidence`` param).
 * Containment in the storey; ``IfcRelReferencedInSpatialStructure`` to the room
   (``element.space_ids[0]``).
 
@@ -324,6 +325,8 @@ def write_furniture(ctx: ExportContext) -> int:
             props["FacingDeg"] = float(extra["facing_deg"])
         if extra.get("back_wall_id"):
             props["BackWallId"] = str(extra["back_wall_id"])
+        if extra.get("evidence") == "manual":  # added by the AI assistant without point-cloud evidence
+            props["SAMcloud_Evidence"] = "manual"
         product.Description = element.description or (
             f"{_type_name(ifc_class, predefined, object_type)}, "
             f"{edges[1]:.2f} x {edges[0]:.2f} x {z1 - z0:.2f} m"

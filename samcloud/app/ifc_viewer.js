@@ -19,6 +19,12 @@ export default {
     background: Array,
     selected: String,
     strings: Object,
+    // AI assistant (all off unless the page enables them): pick with ctrl + point, multi highlight, preview colours/boxes.
+    pickEnabled: Boolean,
+    pickFloor: Number,
+    selectedMany: Array,
+    highlight: Object,
+    boxes: Array,
   },
   data() {
     return { message: "" };
@@ -28,6 +34,9 @@ export default {
     this.ready = false;
     this.elements = [];
     this.pickedElement = null;
+    this.marked = new Set(); // GlobalIds currently tinted by the assistant marks
+    this.selectedManySet = new Set();
+    this.boxGroup = null;
     this.frameRequested = false;
     this.loadToken = 0;
     try {
@@ -55,6 +64,7 @@ export default {
     classByNode() {
       this.indexElements();
       this.applyVisibility();
+      if (this.hasMarks()) this.applyMarks();
     },
     categoryColors() {
       this.applyColors();
@@ -66,7 +76,16 @@ export default {
       this.applyBackground();
     },
     selected() {
-      this.highlight(this.selected || null);
+      this.pickHighlight(this.selected || null);
+    },
+    selectedMany() {
+      this.applyMarks();
+    },
+    highlight() {
+      this.applyMarks();
+    },
+    boxes() {
+      this.applyBoxes();
     },
   },
   methods: {
@@ -129,6 +148,7 @@ export default {
       this.observer.observe(this.$el);
       this.applyBackground();
       this.resize();
+      if (this.boxes && this.boxes.length) this.applyBoxes();
     },
     teardown() {
       if (this.observer) this.observer.disconnect();
@@ -140,6 +160,7 @@ export default {
       }
       if (this.controls) this.controls.dispose();
       this.controls = null;
+      this.clearBoxes();
       this.disposeModel();
       if (this.renderer) {
         this.renderer.dispose();
@@ -152,6 +173,7 @@ export default {
     disposeModel() {
       this.elements = [];
       this.pickedElement = null;
+      this.marked = new Set();
       if (!this.modelRoot) return;
       this.modelRoot.traverse((object) => {
         if (object.geometry) object.geometry.dispose();
@@ -252,7 +274,8 @@ export default {
         max_height: box ? box.max.y : 0,
         up_converted: this.upConverted,
       });
-      if (this.selected) this.highlight(this.selected);
+      if (this.selected) this.pickHighlight(this.selected);
+      if (this.hasMarks()) this.applyMarks();
     },
     prepareMaterials(scene) {
       const THREE = this.THREE;
@@ -304,6 +327,7 @@ export default {
       if (this.modelRoot) for (const child of this.modelRoot.children) walk(child, null);
       for (const element of found) this.applyGlass(element);
       this.elements = found;
+      // keep this.marked (GlobalIds): re-indexing keeps the materials, so the tints must stay known to be cleared later
       this.applyColors();
     },
     applyColors() {
@@ -349,7 +373,7 @@ export default {
       for (const element of this.elements) {
         element.root.visible = !hidden.has(element.category);
       }
-      if (this.pickedElement && !this.pickedElement.root.visible) this.highlight(null, true);
+      if (this.pickedElement && !this.pickedElement.root.visible) this.pickHighlight(null, true);
       this.requestDraw();
     },
     applyClip() {
@@ -489,10 +513,29 @@ export default {
         }
         if (!chosen) chosen = element;
       }
-      this.highlight(chosen, true);
+      if (this.pickEnabled) {
+        // AI assistant: Python owns the (multi) selection; send the hit point or the floor-plane point (model frame).
+        const hit = chosen ? hits.find((item) => item.object.userData.__element === chosen) : null;
+        let point = hit ? hit.point.clone() : null;
+        if (!point) {
+          const box = this.visibleBox();
+          const floor = typeof this.pickFloor === "number" && Number.isFinite(this.pickFloor) ? this.pickFloor : box ? box.min.y : 0;
+          const target = new THREE.Vector3();
+          if (this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -floor), target)) point = target;
+        }
+        if (point) this.modelRoot.worldToLocal(point);
+        this.$emit("pick", {
+          global_id: chosen ? chosen.guid : null,
+          ifc_class: chosen ? chosen.ifcClass : "",
+          ctrl: !!(event.ctrlKey || event.metaKey),
+          point: point ? [point.x, point.y, point.z].map((value) => Math.round(value * 10000) / 10000) : null,
+        });
+        return;
+      }
+      this.pickHighlight(chosen, true);
       this.$emit("pick", { global_id: chosen ? chosen.guid : null, ifc_class: chosen ? chosen.ifcClass : "" });
     },
-    highlight(target, byElement) {
+    pickHighlight(target, byElement) {
       let element = target;
       if (!byElement) element = target ? this.elements.find((item) => item.guid === target) || null : null;
       if (this.pickedElement) this.paint(this.pickedElement, false);
@@ -501,17 +544,85 @@ export default {
       this.requestDraw();
     },
     paint(element, on) {
+      this.paintColor(element, on ? 0x2a6bff : this.markColor(element));
+    },
+    paintColor(element, color) {
+      // color: hex number to tint the element, null restores the model colour
+      const on = color !== null && color !== undefined;
       for (const mesh of element.meshes) {
         const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
         for (const material of materials) {
           if (material.emissive) {
-            material.emissive.setHex(on ? 0x2a6bff : material.userData.baseEmissive || 0x000000);
+            material.emissive.setHex(on ? color : material.userData.baseEmissive || 0x000000);
             material.emissiveIntensity = on ? 0.9 : 1;
           } else if (material.color && material.userData.baseColor !== null) {
-            material.color.setHex(on ? 0x2a6bff : material.userData.baseColor);
+            material.color.setHex(on ? color : material.userData.baseColor);
           }
         }
       }
+    },
+    hasMarks() {
+      return (this.selectedMany && this.selectedMany.length > 0) || (this.highlight && Object.keys(this.highlight).length > 0)
+        || (this.marked && this.marked.size > 0);
+    },
+    markColor(element) {
+      // AI assistant marks; null = no mark
+      // the preview colour wins over the selection, so a selected element in the proposal shows its change colour
+      const value = this.highlight ? this.highlight[element.guid] : null;
+      if (value) {
+        const parsed = parseInt(String(value).replace("#", ""), 16);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+      if (this.selectedManySet && this.selectedManySet.has(element.guid)) return 0x2a6bff;
+      return null;
+    },
+    applyMarks() {
+      this.selectedManySet = new Set(this.selectedMany || []);
+      const previous = this.marked || new Set();
+      const next = new Set();
+      for (const element of this.elements || []) {
+        const color = this.markColor(element);
+        if (color !== null) next.add(element.guid);
+        if (element === this.pickedElement) continue;
+        if (color !== null || previous.has(element.guid)) this.paintColor(element, color);
+      }
+      this.marked = next;
+      this.requestDraw();
+    },
+    clearBoxes() {
+      if (!this.boxGroup) return;
+      this.boxGroup.traverse((object) => {
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) object.material.dispose();
+      });
+      if (this.scene) this.scene.remove(this.boxGroup);
+      this.boxGroup = null;
+    },
+    applyBoxes() {
+      // Preview boxes (model frame, Y up): added elements without geometry in the model, new positions of moved ones.
+      if (!this.scene) return;
+      const THREE = this.THREE;
+      this.clearBoxes();
+      const list = Array.isArray(this.boxes) ? this.boxes : [];
+      const group = new THREE.Group();
+      for (const item of list) {
+        const low = item && Array.isArray(item.min) ? item.min.map(Number) : null;
+        const high = item && Array.isArray(item.max) ? item.max.map(Number) : null;
+        if (!low || !high || low.length < 3 || high.length < 3 || ![...low, ...high].every(Number.isFinite)) continue;
+        const size = [0, 1, 2].map((axis) => Math.max(0.02, high[axis] - low[axis]));
+        const geometry = new THREE.BoxGeometry(size[0], size[1], size[2]);
+        const color = new THREE.Color(item.color || "#4bc692");
+        const holder = new THREE.Group();
+        holder.add(new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.28, depthWrite: false })));
+        holder.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry), new THREE.LineBasicMaterial({ color })));
+        holder.position.set((low[0] + high[0]) / 2, (low[1] + high[1]) / 2, (low[2] + high[2]) / 2);
+        group.add(holder);
+      }
+      if (group.children.length) {
+        this.boxGroup = group;
+        this.scene.add(group);
+      }
+      this.requestDraw();
     },
   },
 };

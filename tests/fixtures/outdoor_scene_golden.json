@@ -1,0 +1,28 @@
+{
+ "counts": {
+  "dxf_entities": 527,
+  "elements": 9,
+  "ifc_lines": 954,
+  "layers": {
+   "S-BLDG": 1,
+   "S-BLDG-ROOF": 1,
+   "S-BLDG-ROOF-EDGE": 1,
+   "S-CURB": 1,
+   "S-FENC": 1,
+   "S-MANH": 1,
+   "S-PAVE": 1,
+   "S-TOPO-MAJR": 1,
+   "S-TOPO-MINR": 5,
+   "S-TOPO-TEXT": 1,
+   "S-TOPO-TIN": 510,
+   "S-TREE": 2,
+   "S-WALL": 1
+  }
+ },
+ "dxf_document_sha256": "2caa14de1f3282c10cac64c7b81717674c774cecff786a4a5ea01c1cb3529fc0",
+ "dxf_entities_sha256": "1d0a6a7bf9a06e31d016c919e4aabe3925d8636abb6304f0a1954a3fb41be166",
+ "dxf_styling_sha256": "42b9c9f08f95727de77db6f0a8da08009720b60695f6aa51f3625953d3fd9f9e",
+ "ifc_sha256": "46ceff71739d290b443c6e19fa2af7634db4eaeae1130adfbd3ae66349e9706e",
+ "scene_sha256": "c9c2597de88b372b04af6caba053e1bbe8877da0367bef71f273ed41be99e3a6",
+ "source": "HEAD samcloud/drone/run_environment.py _step_scene on tests/assistant_outdoor_synthetic.write_checkpoints()"
+}
